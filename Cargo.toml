@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = ["crates/harvester-proto", "crates/harvesterd"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "process",
+    "io-util",
+    "sync",
+    "fs",
+    "time",
+] }
+
+# harvesterd ships as a static musl binary; keep it small.
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"

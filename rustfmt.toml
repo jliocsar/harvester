@@ -1,0 +1,8 @@
+# Deterministic formatting baseline — `cargo fmt --check` gates CI.
+# Note: rustfmt cannot enforce blank-line padding around blocks (the nidus
+# ESLint `expect-padding` style); that stays human-reviewed until a dylint
+# custom lint is worth building. Stable options only.
+edition = "2021"
+max_width = 100
+newline_style = "Unix"
+use_field_init_shorthand = true
