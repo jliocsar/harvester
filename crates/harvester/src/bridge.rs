@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use harvester_client_core::{bootstrap_and_connect, DaemonConnection, DaemonWriter, SshTarget};
-use harvester_proto::{HarvesterCmd, Outgoing, Request, SessionInfo};
+use harvester_proto::{HarvesterCmd, HarvesterResponse, Outgoing, Request, SessionInfo};
 use serde_json::{json, Value};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
@@ -260,44 +260,10 @@ async fn handle_daemon_line(outgoing: Outgoing, link: &mut Link) {
             };
 
             match purpose {
-                Pending::ListSessions => {
-                    if response.success {
-                        link.publish_sessions(response.data.as_ref());
-                    } else {
-                        link.report_failure("list_sessions", response.error);
-                    }
-                }
-                Pending::Create { sid } => {
-                    if response.success {
-                        link.send_harvester(
-                            HarvesterCmd::Attach { sid: sid.clone() },
-                            Pending::Attach { sid },
-                        )
-                        .await;
-                    } else {
-                        link.report_failure("resume session", response.error);
-                    }
-                }
-                Pending::Attach { sid } => {
-                    if response.success {
-                        link.attached = Some(sid.clone());
-                        // History replay: attach → get_entries → live events
-                        // (DAEMON.md §attach). No `since`: full history.
-                        link.send_pi(
-                            &sid.clone(),
-                            json!({"type": "get_entries"}),
-                            Pending::Entries { sid },
-                        )
-                        .await;
-                    } else {
-                        link.report_failure("attach", response.error);
-                    }
-                }
-                Pending::Detach => {
-                    if !response.success {
-                        link.report_failure("detach", response.error);
-                    }
-                }
+                Pending::ListSessions => handle_list_sessions_response(link, response),
+                Pending::Create { sid } => handle_create_response(link, sid, response).await,
+                Pending::Attach { sid } => handle_attach_response(link, sid, response).await,
+                Pending::Detach => handle_detach_response(link, response),
                 Pending::Entries { .. } | Pending::Prompt => {
                     eprintln!("harvester: pi-bound request answered by daemon envelope");
                 }
@@ -307,32 +273,10 @@ async fn handle_daemon_line(outgoing: Outgoing, link: &mut Link) {
             let Some(purpose) = link.take_pending(id.as_ref()) else {
                 return;
             };
-            let success = response
-                .get("success")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
 
             match purpose {
-                Pending::Entries { sid } => {
-                    if success {
-                        let entries = response
-                            .get("data")
-                            .and_then(|data| data.get("entries"))
-                            .and_then(Value::as_array)
-                            .cloned()
-                            .unwrap_or_default();
-                        let _ = link.events.send(Event::Attached { sid, entries });
-                    } else {
-                        link.report_failure("get_entries", pi_error(&response));
-                    }
-                }
-                Pending::Prompt => {
-                    // Accepted means queued, not completed; progress arrives
-                    // as events. Only rejection is notable.
-                    if !success {
-                        link.report_failure("prompt", pi_error(&response));
-                    }
-                }
+                Pending::Entries { sid } => handle_entries_response(link, sid, &response),
+                Pending::Prompt => handle_prompt_response(link, &response),
                 Pending::ListSessions
                 | Pending::Create { .. }
                 | Pending::Attach { .. }
@@ -342,6 +286,81 @@ async fn handle_daemon_line(outgoing: Outgoing, link: &mut Link) {
             }
         }
     }
+}
+
+fn handle_list_sessions_response(link: &mut Link, response: HarvesterResponse) {
+    if response.success {
+        link.publish_sessions(response.data.as_ref());
+    } else {
+        link.report_failure("list_sessions", response.error);
+    }
+}
+
+/// A resume's `create_session` answered; chain into attach.
+async fn handle_create_response(link: &mut Link, sid: String, response: HarvesterResponse) {
+    if response.success {
+        link.send_harvester(
+            HarvesterCmd::Attach { sid: sid.clone() },
+            Pending::Attach { sid },
+        )
+        .await;
+    } else {
+        link.report_failure("resume session", response.error);
+    }
+}
+
+/// Attach answered; record the attachment and chain into history replay:
+/// attach → get_entries → live events (DAEMON.md §attach). No `since`:
+/// full history.
+async fn handle_attach_response(link: &mut Link, sid: String, response: HarvesterResponse) {
+    if response.success {
+        link.attached = Some(sid.clone());
+        link.send_pi(
+            &sid.clone(),
+            json!({"type": "get_entries"}),
+            Pending::Entries { sid },
+        )
+        .await;
+    } else {
+        link.report_failure("attach", response.error);
+    }
+}
+
+fn handle_detach_response(link: &mut Link, response: HarvesterResponse) {
+    if !response.success {
+        link.report_failure("detach", response.error);
+    }
+}
+
+/// `get_entries` answered (pi envelope); publish the attached session with
+/// its history.
+fn handle_entries_response(link: &mut Link, sid: String, response: &Value) {
+    if pi_success(response) {
+        let entries = response
+            .get("data")
+            .and_then(|data| data.get("entries"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let _ = link.events.send(Event::Attached { sid, entries });
+    } else {
+        link.report_failure("get_entries", pi_error(response));
+    }
+}
+
+/// Accepted means queued, not completed; progress arrives as events. Only
+/// rejection is notable.
+fn handle_prompt_response(link: &mut Link, response: &Value) {
+    if !pi_success(response) {
+        link.report_failure("prompt", pi_error(response));
+    }
+}
+
+fn pi_success(response: &Value) -> bool {
+    response
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn pi_error(response: &Value) -> Option<String> {
