@@ -1,0 +1,14 @@
+[package]
+name = "harvester-cli"
+version.workspace = true
+edition.workspace = true
+
+# Its own crate (not a bin in harvester-client-core) so clap never enters the
+# library's dependency tree — the gpui client consumes the library, not this.
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+harvester-client-core = { path = "../harvester-client-core" }
+harvester-proto = { path = "../harvester-proto" }
+serde_json.workspace = true
+# io-std feeds raw mode's stdin JSONL pump.
+tokio = { workspace = true, features = ["io-std"] }

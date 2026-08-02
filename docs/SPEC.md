@@ -2,7 +2,7 @@
 
 > Status: planning complete + implementation started, 2026-08-01. This is the umbrella spec. Normative details live in the referenced docs; where they conflict, the referenced doc wins.
 >
-> Implemented so far: `crates/harvester-proto` (wire types), `crates/harvesterd` (daemon: socket loop, session spawn/stop/resume, pi passthrough, dialog policy, list_sessions) — verified end-to-end against a real exe.dev VM over an SSH-forwarded socket, including mid-turn stop and resume (`HARNESS_RESEARCH.md` §E2E log) — and `providers/exe-dev` (the reference provider, live-tested). `list_models` is a deliberate stub until the ghost-chat UI exists. Not started: bootstrap-over-SSH flow, gpui client.
+> Implemented so far: `crates/harvester-proto` (wire types), `crates/harvesterd` (daemon: socket loop, session spawn/stop/resume, pi passthrough, dialog policy, list_sessions) — verified end-to-end against a real exe.dev VM over an SSH-forwarded socket, including mid-turn stop and resume (`HARNESS_RESEARCH.md` §E2E log) — `providers/exe-dev` (the reference provider, live-tested), and `crates/harvester-client-core` (bootstrap-over-SSH + socket forward + envelope client, live-tested including both upgrade paths) with its `crates/harvester-cli` dev driver. `list_models` is a deliberate stub until the ghost-chat UI exists. Not started: gpui client.
 >
 > - `HARNESS_RESEARCH.md` — verified facts about Pi and exe.dev (every claim sourced or marked UNVERIFIED)
 > - `PROVIDERS.md` — machine provider contract (protocol v1)

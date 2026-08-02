@@ -29,9 +29,9 @@ is still there.
 ## Status
 
 Early development. Contracts are designed and hands-on verified against pi
-0.83.0 and real exe.dev VMs; `harvesterd` and the wire protocol crate are
-implemented and protocol-tested. The gpui client, SSH bootstrap flow, and the
-`exe-dev` provider script are next.
+0.83.0 and real exe.dev VMs; `harvesterd`, the wire protocol crate, the
+`exe-dev` provider, and the SSH bootstrap/connect library are implemented and
+live-tested. The gpui client is next.
 
 ## Layout
 
@@ -40,8 +40,10 @@ docs/            specs & contracts (start at docs/SPEC.md)
 providers/
   exe-dev            the built-in machine provider (sh + jq, the contract's reference)
 crates/
-  harvester-proto/   typed envelope for the client ↔ daemon wire (JSONL)
-  harvesterd/        the per-machine daemon
+  harvester-proto/       typed envelope for the client ↔ daemon wire (JSONL)
+  harvesterd/            the per-machine daemon
+  harvester-client-core/ bootstrap-over-SSH + socket forward + envelope client
+  harvester-cli/         dev driver for the client library (ping / list-sessions / raw)
 ```
 
 ## Build

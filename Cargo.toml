@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/harvester-proto", "crates/harvesterd"]
+members = [
+    "crates/harvester-proto",
+    "crates/harvesterd",
+    "crates/harvester-client-core",
+    "crates/harvester-cli",
+]
 
 [workspace.package]
 version = "0.1.0"

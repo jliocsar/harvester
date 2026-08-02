@@ -167,13 +167,13 @@ Vanilla pi never asks questions — these only occur when extensions are loaded 
 
 ## Bootstrap & upgrade
 
-On first connect to a machine, over plain SSH:
+Implemented in `harvester-client-core::bootstrap_and_connect` (driveable via the `harvester-cli` dev bin). On every connect, over plain SSH (`BatchMode=yes` + `StrictHostKeyChecking=accept-new` — never prompts, first-seen host keys are trusted, changed keys hard-fail):
 
-1. `~/.harvester/bin/harvesterd version` → missing or mismatched → pipe the static binary over the same SSH connection, `chmod +x`.
-2. Start it: harvesterd daemonizes and binds the socket. The socket bind is the single-instance lock (stale socket file: connect fails → unlink → bind).
-3. Client forwards the socket and sends `ping`; version is re-checked on every connect.
+1. Probe, one round trip: print the remote `$HOME` (the socket forward needs an absolute remote path — ssh does not expand `~` in `-L`), then `~/.harvester/bin/harvesterd version`. Missing or mismatched → pipe the static binary over the same SSH connection into `~/.harvester/bin/harvesterd` (`cat > .next && chmod +x && mv` — atomic swap, no ETXTBSY against a running daemon).
+2. Start it detached: `(setsid ~/.harvester/bin/harvesterd < /dev/null >> ~/.harvester/log/harvesterd.log 2>&1 &)`. **harvesterd does not self-daemonize** — this line is the whole daemonization story. Idempotent: the socket bind is the single-instance lock (a second daemon loses the race and exits; stale socket file: connect fails → unlink → bind). The parentheses are load-bearing: a bare trailing `&` would background the entire preceding `&&` chain, whose async-list stdin is `/dev/null` per POSIX — which truncates the binary upload to zero bytes.
+3. Client forwards the socket (`ssh -N -L`) and sends `ping`; the version is re-checked on every connect. A running daemon that answers with the wrong version (started before an upgrade) is force-upgraded exactly once — `pkill -x harvesterd`, wait for it to die, reinstall, restart, re-ping; a second mismatch is an error (a stale client-shipped binary).
 
-**Upgrading harvesterd kills its pi children** (their stdin pipes close). That is acceptable by design: session state is on disk and resume is the same launch line. Upgrade flow: warn while sessions are `running`, stop them, replace the binary, restart. **Resume after upgrade is manual** — sessions show as `exited` and the user resumes the ones they care about (visible, boring).
+**Upgrading harvesterd kills its pi children** (their stdin pipes close — SIGTERM to the daemon is fine; it is SIGTERM to *pi* that is forbidden). That is acceptable by design: session state is on disk and resume is the same launch line. Upgrade flow: warn while sessions are `running`, stop them, replace the binary, restart. **Resume after upgrade is manual** — sessions show as `exited` and the user resumes the ones they care about (visible, boring).
 
 ## What is deliberately NOT in the contract
 

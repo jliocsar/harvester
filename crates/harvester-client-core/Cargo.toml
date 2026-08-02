@@ -1,0 +1,9 @@
+[package]
+name = "harvester-client-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+harvester-proto = { path = "../harvester-proto" }
+serde_json.workspace = true
+tokio.workspace = true
