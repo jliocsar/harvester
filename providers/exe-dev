@@ -1,0 +1,108 @@
+#!/bin/sh
+# exe-dev — Harvester's default machine provider (docs/PROVIDERS.md).
+#
+# A field-renaming wrapper over exe.dev's SSH control plane, implemented in the
+# same format as user providers: one exec per operation, args as one JSON
+# object on stdin, result as one JSON object on stdout, diagnostics on stderr.
+# It doubles as the contract's living documentation.
+#
+# Auth rides the user's existing exe.dev SSH key; nothing is stored here.
+set -eu
+
+# BatchMode: providers must never prompt (stdin is closed after the args object).
+EXE_SSH="ssh -o BatchMode=yes -o ConnectTimeout=10 exe.dev"
+
+# Maps one exe.dev vm object to a Harvester machine object. `status` is
+# advisory by contract — the UI dot comes from Harvester's own SSH probe.
+MACHINE_JQ='{
+  id: .vm_name,
+  label: .vm_name,
+  status: (if .status == "running" or .status == "stopped" then .status else "unknown" end),
+  ssh: {host: .ssh_dest, user: "exedev"}
+}'
+
+require_jq() {
+    if command -v jq >/dev/null 2>&1; then
+        return 0
+    fi
+
+    echo '{"error": "the exe-dev provider needs jq (https://jqlang.org) on PATH"}'
+    exit 1
+}
+
+# Machine ids travel into a remote shell command line; refuse anything that
+# is not a plain exe.dev vm name rather than trying to quote it.
+require_safe_name() {
+    case "$1" in
+    *[!A-Za-z0-9-]* | "")
+        printf '{"error": "invalid machine name: %s"}\n' "$1" >&2
+        echo '{"error": "invalid machine name"}'
+        exit 1
+        ;;
+    esac
+}
+
+case "${1:-}" in
+info)
+    cat <<'EOF'
+{
+  "protocol": 1,
+  "name": "exe.dev",
+  "capabilities": ["create", "delete"],
+  "create_fields": [
+    {"key": "name", "label": "Machine name", "type": "string", "required": true},
+    {"key": "cpu", "label": "CPUs", "type": "number", "required": false},
+    {"key": "memory", "label": "Memory (e.g. 8g)", "type": "string", "required": false}
+  ]
+}
+EOF
+    ;;
+
+list)
+    require_jq
+    $EXE_SSH ls --json | jq "{machines: [.vms[] | $MACHINE_JQ]}"
+    ;;
+
+create)
+    require_jq
+    args=$(cat)
+
+    if ! name=$(printf '%s' "$args" | jq -er '.name'); then
+        echo '{"error": "create: \"name\" is required"}'
+        exit 1
+    fi
+    require_safe_name "$name"
+
+    set -- new --json --name "$name"
+    cpu=$(printf '%s' "$args" | jq -r '.cpu // empty')
+    if [ -n "$cpu" ]; then
+        set -- "$@" --cpu "$cpu"
+    fi
+    memory=$(printf '%s' "$args" | jq -r '.memory // empty')
+    if [ -n "$memory" ]; then
+        set -- "$@" --memory "$memory"
+    fi
+
+    # `new --json` returns the vm object (tolerate a {vm: ...} wrapper too).
+    $EXE_SSH "$@" | jq "{machine: ((.vm // .) | $MACHINE_JQ)}"
+    ;;
+
+delete)
+    require_jq
+
+    if ! id=$(jq -er '.id'); then
+        echo '{"error": "delete: \"id\" is required"}'
+        exit 1
+    fi
+    require_safe_name "$id"
+
+    # `rm` prints a plain-text confirmation — diagnostics, not a result.
+    $EXE_SSH rm "$id" >&2
+    echo '{}'
+    ;;
+
+*)
+    printf '{"error": "unknown operation: %s"}\n' "${1:-<none>}"
+    exit 1
+    ;;
+esac
