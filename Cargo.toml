@@ -5,6 +5,7 @@ members = [
     "crates/harvesterd",
     "crates/harvester-client-core",
     "crates/harvester-cli",
+    "crates/harvester",
 ]
 
 [workspace.package]
@@ -24,6 +25,11 @@ tokio = { version = "1", features = [
     "fs",
     "time",
 ] }
+
+# gpui's dependency tree with full debuginfo produces a multi-GB target dir;
+# line tables keep panic backtraces readable at a fraction of the disk.
+[profile.dev]
+debug = "line-tables-only"
 
 # harvesterd ships as a static musl binary; keep it small.
 [profile.release]

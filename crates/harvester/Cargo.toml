@@ -1,0 +1,15 @@
+# The desktop client. gpui lives here and only here — same quarantine logic
+# as clap-in-harvester-cli: the library crates stay UI-framework-free.
+[package]
+name = "harvester"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gpui = "0.2"
+harvester-client-core = { path = "../harvester-client-core" }
+harvester-proto = { path = "../harvester-proto" }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+# Grapheme-boundary cursor movement in the vendored text input.
+unicode-segmentation = "1"

@@ -2,7 +2,7 @@
 
 > Status: planning complete + implementation started, 2026-08-01. This is the umbrella spec. Normative details live in the referenced docs; where they conflict, the referenced doc wins.
 >
-> Implemented so far: `crates/harvester-proto` (wire types), `crates/harvesterd` (daemon: socket loop, session spawn/stop/resume, pi passthrough, dialog policy, list_sessions) — verified end-to-end against a real exe.dev VM over an SSH-forwarded socket, including mid-turn stop and resume (`HARNESS_RESEARCH.md` §E2E log) — `providers/exe-dev` (the reference provider, live-tested), and `crates/harvester-client-core` (bootstrap-over-SSH + socket forward + envelope client, live-tested including both upgrade paths) with its `crates/harvester-cli` dev driver. `list_models` is a deliberate stub until the ghost-chat UI exists. Not started: gpui client.
+> Implemented so far: `crates/harvester-proto` (wire types), `crates/harvesterd` (daemon: socket loop, session spawn/stop/resume, pi passthrough, dialog policy, list_sessions) — verified end-to-end against a real exe.dev VM over an SSH-forwarded socket, including mid-turn stop and resume (`HARNESS_RESEARCH.md` §E2E log) — `providers/exe-dev` (the reference provider, live-tested), `crates/harvester-client-core` (bootstrap-over-SSH + socket forward + envelope client, live-tested including both upgrade paths) with its `crates/harvester-cli` dev driver, and `crates/harvester` (the gpui client, first vertical slice: one machine from argv, sessions sidebar, attach/resume, prompt, streaming turn; tokio lives on a dedicated bridge thread, the musl daemon is embedded via build.rs with a dev-time disk fallback). `list_models` is a deliberate stub until the ghost-chat UI exists. Not started: providers-in-UI (machines list), ghost chat, tool-call blocks, dialogs-as-modals.
 >
 > - `HARNESS_RESEARCH.md` — verified facts about Pi and exe.dev (every claim sourced or marked UNVERIFIED)
 > - `PROVIDERS.md` — machine provider contract (protocol v1)
@@ -142,7 +142,7 @@ Consolidated from the contract docs; all non-blocking, burn down while building:
 
 ## Tech stack
 
-- **Client**: Rust + gpui.
+- **Client**: Rust + gpui (crates.io `gpui = "0.2"`), crate `crates/harvester` — gpui enters no other crate, same quarantine rule as clap-in-`harvester-cli`. Layout: `main.rs` (argv, keybindings, embedded musl daemon via build.rs), `bridge.rs` (dedicated tokio-runtime thread owning the daemon connection; UI ↔ bridge over reactor-independent tokio mpsc channels), `workbench.rs` (top-level state: sidebar, content, statusbar), `chat.rs` (one session's conversation), `input.rs` (prompt input vendored from gpui's canonical example), `theme.rs` (palette).
 - **harvesterd**: Rust, static musl binary (`x86_64-unknown-linux-musl`), no runtime deps, uploaded over SSH. Layout: `main.rs` (CLI + socket lock + accept), `daemon.rs` (pid table — the only state), `server.rs` (controller: frame/decode/route/encode), `ops.rs` (one function per command), `passthrough.rs` (pi relay + id correlation), `session.rs` (spawn/pump/dialog policy), `fslist.rs` (session listing).
 - **Shared**: `harvester-proto` — serde types for the envelope only (pi payloads stay `serde_json::Value` — pass-through by design), plus the `LF`/`CR` framing constants.
 - **Providers**: any language, one-shot JSON-stdio executables.

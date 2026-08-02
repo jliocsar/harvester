@@ -361,3 +361,10 @@ The 5s-grace stop was redesigned (abort → stdin EOF → 30s SIGKILL backstop, 
 - **Host keys**: `BatchMode=yes` alone cannot reach a *fresh* VM (unknown host key → hard fail). `StrictHostKeyChecking=accept-new` fixes first contact without prompts and still hard-fails if a known key changes; adequate given exe.dev's fleet-wide shared host key.
 - `ssh -L` does **not** expand `~` in the remote socket path — the probe fetches the remote `$HOME` (same round trip as the version check) and the forward uses the absolute path.
 - Upgrade kill: remote `pkill -x harvesterd` + a `pgrep` wait-loop before starting the replacement, so the new daemon cannot lose the socket-bind race to a dying predecessor. SIGTERM to harvesterd closes its pi children's stdin — their clean shutdown path, per contract.
+
+### Round 4 — gpui client vertical slice (2026-08-02, throwaway VM `egg-by-penguin`)
+
+`crates/harvester` (gpui 0.2 from crates.io) verified live against a session seeded via `harvester-cli raw` (`SLICE4_OK`, stopped clean): the app bootstrapped the VM by itself, listed the exited session, resumed it on click (`create_session` same sid → attach → `get_entries`), rendered history including tool-call placeholders and tool-result messages, and streamed fresh turns. Confirms `get_entries` with no `since` returns full history, and that chaining `get_entries` right after `create_session` needs no readiness probe — pi answers once its stdin queue drains.
+
+- gpui facts: published on crates.io since this round (`0.2.x`, out of the Zed monorepo); smol-based executor, **no tokio interop** — the client runs tokio on a dedicated bridge thread, tokio mpsc channels are reactor-independent and awaitable from gpui tasks; no built-in text-input widget (`examples/input.rs` is the canonical IME-correct implementation, vendored); `tokio::select!` + client-core's `DaemonReader::next` is unsafe under cancellation (partial line dropped) — reads live on their own task.
+- Build facts: needs `libxkbcommon-x11-dev` on Linux (X11 feature links it even under Wayland); full-DWARF dev builds of the gpui tree are multi-GB — workspace `[profile.dev] debug = "line-tables-only"`.

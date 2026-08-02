@@ -31,7 +31,8 @@ is still there.
 Early development. Contracts are designed and hands-on verified against pi
 0.83.0 and real exe.dev VMs; `harvesterd`, the wire protocol crate, the
 `exe-dev` provider, and the SSH bootstrap/connect library are implemented and
-live-tested. The gpui client is next.
+live-tested. The gpui client exists as a first vertical slice: connect to one
+machine, list sessions, attach (or resume), send a prompt, watch it stream.
 
 ## Layout
 
@@ -44,6 +45,7 @@ crates/
   harvesterd/            the per-machine daemon
   harvester-client-core/ bootstrap-over-SSH + socket forward + envelope client
   harvester-cli/         dev driver for the client library (ping / list-sessions / raw)
+  harvester/             the gpui desktop client
 ```
 
 ## Build
