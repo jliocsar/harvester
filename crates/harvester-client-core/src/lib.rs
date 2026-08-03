@@ -9,10 +9,12 @@
 mod bootstrap;
 mod connection;
 mod ssh;
+mod workspace;
 
 pub use bootstrap::{bootstrap_and_connect, BootstrapOutcome, Connected};
 pub use connection::{DaemonConnection, DaemonReader, DaemonWriter};
 pub use ssh::SshTarget;
+pub use workspace::{list_directory, validate_git_workspace, RemoteDirEntry};
 
 pub type Result<T> = std::result::Result<T, Error>;
 

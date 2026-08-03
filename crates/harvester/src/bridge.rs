@@ -6,7 +6,10 @@
 
 use std::collections::HashMap;
 
-use harvester_client_core::{bootstrap_and_connect, DaemonConnection, DaemonWriter, SshTarget};
+use harvester_client_core::{
+    bootstrap_and_connect, list_directory, validate_git_workspace, DaemonConnection, DaemonWriter,
+    RemoteDirEntry, SshTarget,
+};
 use harvester_proto::{HarvesterCmd, HarvesterResponse, Outgoing, Request, SessionInfo};
 use serde_json::{json, Value};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -25,6 +28,16 @@ pub enum Command {
         sid: String,
         text: String,
     },
+    /// List a remote directory for the folder picker (plain SSH exec,
+    /// multiplexed — never the daemon). Answered by `Event::DirListed`.
+    ListDir {
+        path: String,
+    },
+    /// `git -C <path> rev-parse --git-dir` over SSH. Answered by
+    /// `Event::WorkspaceValidated`.
+    ValidateWorkspace {
+        path: String,
+    },
 }
 
 /// bridge → UI. Pi payloads stay verbatim `Value` — the client speaks Pi.
@@ -32,6 +45,8 @@ pub enum Command {
 pub enum Event {
     Connected {
         daemon_version: String,
+        /// Remote `$HOME` — the folder picker's start directory.
+        remote_home: String,
     },
     ConnectFailed {
         detail: String,
@@ -56,6 +71,17 @@ pub enum Event {
     /// connection itself is still healthy.
     RequestFailed {
         detail: String,
+    },
+    /// A `ListDir` answered; errors render inside the picker, not the
+    /// statusbar.
+    DirListed {
+        path: String,
+        result: Result<Vec<RemoteDirEntry>, String>,
+    },
+    /// A `ValidateWorkspace` answered; `None` means the path is a git repo.
+    WorkspaceValidated {
+        path: String,
+        error: Option<String>,
     },
     Disconnected,
 }
@@ -132,10 +158,12 @@ async fn bridge_main(
     };
     let _ = events.send(Event::Connected {
         daemon_version: connected.daemon_version,
+        remote_home: connected.remote_home,
     });
 
     let DaemonConnection { mut reader, writer } = connected.connection;
     let mut link = Link {
+        ssh_target: target,
         writer,
         events,
         pending: HashMap::new(),
@@ -243,7 +271,36 @@ async fn handle_ui_command(command: Command, link: &mut Link) {
             )
             .await;
         }
+        Command::ListDir { path } => handle_list_dir(path, link),
+        Command::ValidateWorkspace { path } => handle_validate_workspace(path, link),
     }
+}
+
+/// SSH execs ride their own task: even multiplexed they take tens of ms, and
+/// the select loop must keep pumping pi events meanwhile.
+fn handle_list_dir(path: String, link: &Link) {
+    let target = link.ssh_target.clone();
+    let events = link.events.clone();
+
+    tokio::spawn(async move {
+        let result = list_directory(&target, &path)
+            .await
+            .map_err(|error| error.to_string());
+        let _ = events.send(Event::DirListed { path, result });
+    });
+}
+
+fn handle_validate_workspace(path: String, link: &Link) {
+    let target = link.ssh_target.clone();
+    let events = link.events.clone();
+
+    tokio::spawn(async move {
+        let error = validate_git_workspace(&target, &path)
+            .await
+            .err()
+            .map(|error| error.to_string());
+        let _ = events.send(Event::WorkspaceValidated { path, error });
+    });
 }
 
 async fn handle_daemon_line(outgoing: Outgoing, link: &mut Link) {
@@ -371,6 +428,8 @@ fn pi_error(response: &Value) -> Option<String> {
 }
 
 struct Link {
+    /// The machine this bridge serves; cloned into spawned SSH exec tasks.
+    ssh_target: SshTarget,
     writer: DaemonWriter,
     events: UnboundedSender<Event>,
     pending: HashMap<u64, Pending>,

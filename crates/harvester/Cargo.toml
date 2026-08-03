@@ -9,6 +9,7 @@ edition.workspace = true
 gpui = "0.2"
 harvester-client-core = { path = "../harvester-client-core" }
 harvester-proto = { path = "../harvester-proto" }
+serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 # Grapheme-boundary cursor movement in the vendored text input.

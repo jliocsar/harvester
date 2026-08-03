@@ -4,7 +4,7 @@
 //! chaining (`.on_click`, extra children); behavior stays with the caller,
 //! looks stay here.
 
-use gpui::{div, prelude::*, px, rgb, Div, ElementId, FontWeight, SharedString, Stateful};
+use gpui::{div, prelude::*, px, rgb, rgba, Div, ElementId, FontWeight, SharedString, Stateful};
 
 use crate::theme;
 
@@ -161,6 +161,79 @@ pub fn input_frame(focused: bool) -> Div {
         })
         .px_2()
         .py_1()
+}
+
+/// One sidebar workspace row: `folder_name in machine_label` (SPEC
+/// §Workspace). Inert in this slice; ghost chat hangs its "+" here later.
+pub fn workspace_row(name: SharedString, machine: SharedString) -> Div {
+    div()
+        // Same 6+6 inset as session_row, aligning with section_header text.
+        .mx(px(6.))
+        .px(px(6.))
+        .py_1()
+        .flex()
+        .items_baseline()
+        .gap_1()
+        .child(
+            div()
+                .flex_none()
+                // Cap the folder name so a long one still leaves the machine
+                // label readable inside the 240px sidebar.
+                .max_w(px(140.))
+                .overflow_hidden()
+                .text_ellipsis()
+                .child(name),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_FAINT))
+                .overflow_hidden()
+                .text_ellipsis()
+                .child(format!("in {machine}")),
+        )
+}
+
+/// A clickable directory row in the folder picker (trailing `/` marks it as
+/// enterable). Caller chains `.on_click` to navigate into it.
+pub fn picker_dir_row(id: impl Into<ElementId>, name: SharedString) -> Stateful<Div> {
+    div()
+        .id(id)
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .cursor_pointer()
+        .hover(|style| style.bg(rgb(theme::ROW_HOVER)))
+        .overflow_hidden()
+        .text_ellipsis()
+        .child(format!("{name}/"))
+}
+
+/// A non-directory entry in the folder picker: shown faint for orientation,
+/// not clickable.
+pub fn picker_file_row(name: SharedString) -> Div {
+    div()
+        .px_2()
+        .py_1()
+        .text_color(rgb(theme::TEXT_FAINT))
+        .overflow_hidden()
+        .text_ellipsis()
+        .child(name)
+}
+
+/// Full-window backdrop that centers its child (the modal). Caller chains
+/// `.on_click` for click-outside dismissal; the modal itself must `.occlude()`
+/// so clicks inside it don't reach the scrim's hitbox.
+pub fn modal_scrim(id: impl Into<ElementId>) -> Stateful<Div> {
+    div()
+        .id(id)
+        .absolute()
+        .inset_0()
+        .bg(rgba(theme::SCRIM_RGBA))
+        .flex()
+        .items_center()
+        .justify_center()
+        .occlude()
 }
 
 /// A modal dialog panel: title header, then whatever body the caller adds.

@@ -18,6 +18,13 @@ pub struct SshTarget {
 /// password or host-key prompt. `accept-new` trusts a first-seen host key
 /// without a prompt (fresh VMs would otherwise be unreachable under
 /// BatchMode) but still hard-fails if a known key *changes*.
+///
+/// Multiplexing: the first connection to a machine becomes a master and every
+/// later exec rides it, skipping the SSH handshake — a listing then costs
+/// about one network round trip (measured on exe.dev: ~1.7s cold, ~0.35s
+/// multiplexed), which makes the folder picker's per-click `ls` affordable.
+/// `auto` degrades to a plain connection whenever the master is unusable, so
+/// this is pure speedup, never a new failure mode.
 const SSH_BASE_ARGS: &[&str] = &[
     "-o",
     "BatchMode=yes",
@@ -25,14 +32,29 @@ const SSH_BASE_ARGS: &[&str] = &[
     "ConnectTimeout=10",
     "-o",
     "StrictHostKeyChecking=accept-new",
+    "-o",
+    "ControlMaster=auto",
+    "-o",
+    // The master lingers this long past its last client, then exits on its
+    // own — nothing for us to manage or clean up.
+    "ControlPersist=60",
 ];
+
+/// Control-socket filename inside the temp dir. `%C` is ssh's own short hash
+/// of (local host, remote host, port, user) — distinct per target and well
+/// under the ~108-byte `sun_path` limit.
+const CONTROL_SOCKET_TEMPLATE: &str = "harvester-ssh-%C";
 
 impl SshTarget {
     /// An ssh invocation against this target; `extra_args` land before the
     /// destination (ssh requires options first).
     pub(crate) fn command(&self, extra_args: &[&str]) -> Command {
+        let control_path = std::env::temp_dir().join(CONTROL_SOCKET_TEMPLATE);
         let mut command = Command::new("ssh");
         command.args(SSH_BASE_ARGS);
+        command
+            .arg("-o")
+            .arg(format!("ControlPath={}", control_path.display()));
         command.args(extra_args);
 
         if let Some(port) = self.port {

@@ -74,6 +74,8 @@ impl Render for Kitchen {
                     .child(section("buttons", render_buttons()))
                     .child(section("status dots", render_status_dots()))
                     .child(section("session rows", render_session_rows()))
+                    .child(section("workspace rows", render_workspace_rows()))
+                    .child(section("folder picker", render_folder_picker_sample()))
                     .child(section(
                         "text input",
                         div()
@@ -135,6 +137,7 @@ fn render_palette() -> impl IntoElement {
             "SELECTION_RGBA",
             div().bg(rgba(theme::SELECTION_RGBA)),
         ))
+        .child(swatch("SCRIM_RGBA", div().bg(rgba(theme::SCRIM_RGBA))))
 }
 
 fn swatch(name: &'static str, fill: gpui::Div) -> impl IntoElement {
@@ -277,6 +280,76 @@ fn render_session_rows() -> impl IntoElement {
             false,
             false,
         ))
+}
+
+fn render_workspace_rows() -> impl IntoElement {
+    // Sidebar-width container, like the session-row samples.
+    div()
+        .w(px(240.))
+        .bg(rgb(theme::PANEL_BG))
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .rounded_md()
+        .py_1()
+        .flex()
+        .flex_col()
+        .child(ui::workspace_row("bloggy".into(), "egg-by-penguin".into()))
+        .child(ui::workspace_row(
+            "a-very-long-workspace-folder-name".into(),
+            "some-machine-with-a-long-label.exe.xyz".into(),
+        ))
+}
+
+/// The add-workspace picker as it composes in production: modal frame, path
+/// line, `../` + dir/file rows, a validation error, the button row.
+fn render_folder_picker_sample() -> impl IntoElement {
+    ui::modal_frame("Add workspace")
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_DIM))
+                .overflow_hidden()
+                .text_ellipsis()
+                .child("/home/exedev/projects"),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .child(ui::picker_dir_row("kitchen-picker-up", "..".into()))
+                .child(ui::picker_dir_row("kitchen-picker-dir-1", "bloggy".into()))
+                .child(ui::picker_dir_row("kitchen-picker-dir-2", ".config".into()))
+                .child(ui::picker_dir_row(
+                    "kitchen-picker-dir-3",
+                    "a-very-long-directory-name-that-should-ellipsize-cleanly".into(),
+                ))
+                .child(ui::picker_file_row("README.md".into()))
+                .child(ui::picker_file_row("notes.txt".into())),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme::STATUS_ERROR))
+                .child("validate workspace: fatal: not a git repository"),
+        )
+        .child(
+            div()
+                .flex()
+                .justify_end()
+                .gap_2()
+                .child(ui::button(
+                    "kitchen-picker-cancel",
+                    "Cancel",
+                    ui::ButtonKind::Neutral,
+                    true,
+                ))
+                .child(ui::button(
+                    "kitchen-picker-add",
+                    "Add",
+                    ui::ButtonKind::Primary,
+                    true,
+                )),
+        )
 }
 
 fn render_chat_messages() -> impl IntoElement {

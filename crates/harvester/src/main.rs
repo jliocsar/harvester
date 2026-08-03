@@ -14,6 +14,7 @@ mod kitchen;
 mod theme;
 mod ui;
 mod workbench;
+mod workspaces;
 
 use gpui::{
     actions, px, size, App, AppContext, Application, Bounds, KeyBinding, TitlebarOptions,

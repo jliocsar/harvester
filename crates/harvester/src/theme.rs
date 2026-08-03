@@ -38,6 +38,9 @@ pub const BUTTON_BG: u32 = 0x3a3a3c;
 pub const BUTTON_HOVER: u32 = 0x48484a;
 pub const BUTTON_ACTIVE: u32 = 0x2c2c2e;
 
+/// Modal backdrop: black at 50%, dimming the workbench while a dialog is up.
+pub const SCRIM_RGBA: u32 = 0x00000080;
+
 pub const ROW_HOVER: u32 = 0x232325;
 /// Sidebar selection pill (Apple uses a gray pill; accent stays for text).
 pub const ROW_SELECTED: u32 = 0x3a3a3c;
