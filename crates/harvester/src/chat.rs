@@ -12,6 +12,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::bridge::Command;
 use crate::input::{PromptSubmitted, TextInput};
 use crate::theme;
+use crate::ui;
 
 /// Who said a rendered message — only what slice 4 draws. Tool-result and
 /// system entries are skipped, tool calls render as placeholders.
@@ -174,18 +175,12 @@ impl Chat {
             Role::Assistant => ("pi", theme::TEXT_DIM),
         };
 
-        div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(div().text_xs().text_color(rgb(label_color)).child(label))
-            .child(
-                div()
-                    .when(message.role == Role::User, |style| {
-                        style.bg(rgb(theme::INPUT_BG)).rounded_md().px_3().py_2()
-                    })
-                    .child(message.text.clone()),
-            )
+        ui::chat_message(
+            label,
+            label_color,
+            message.text.clone(),
+            message.role == Role::User,
+        )
     }
 
     fn render_streaming(&self) -> Option<impl IntoElement> {
@@ -196,14 +191,7 @@ impl Chat {
             (None, false) => return None,
         };
 
-        Some(
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(div().text_xs().text_color(rgb(theme::TEXT_DIM)).child("pi"))
-                .child(div().child(text)),
-        )
+        Some(ui::chat_message("pi", theme::TEXT_DIM, text, false))
     }
 
     fn render_input_row(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement {
@@ -224,20 +212,7 @@ impl Chat {
 
         let input_focused = self.input.read(cx).focus_handle(cx).is_focused(window);
 
-        row.child(
-            div()
-                .bg(rgb(theme::INPUT_BG))
-                .rounded_md()
-                .border_1()
-                .border_color(if input_focused {
-                    rgb(theme::ACCENT)
-                } else {
-                    rgb(theme::BORDER)
-                })
-                .px_2()
-                .py_1()
-                .child(self.input.clone()),
-        )
+        row.child(ui::input_frame(input_focused).child(self.input.clone()))
     }
 }
 

@@ -1,7 +1,8 @@
 //! Harvester — the desktop client (docs/SPEC.md). Slice 4: connect to one
 //! machine, list its sessions, attach, render one streaming turn.
 //!
-//! `harvester <ssh-destination>`. The machine list UI (providers, add-machine)
+//! `harvester <ssh-destination>`, or `harvester kitchen` for the design-system
+//! catalog. The machine list UI (providers, add-machine)
 //! is a later slice; until then the destination comes from argv, like
 //! harvester-cli. Argument parsing stays manual — clap lives in harvester-cli
 //! only, and one positional argument does not earn it here either.
@@ -9,7 +10,9 @@
 mod bridge;
 mod chat;
 mod input;
+mod kitchen;
 mod theme;
+mod ui;
 mod workbench;
 
 use gpui::{
@@ -17,6 +20,7 @@ use gpui::{
     WindowBounds, WindowOptions,
 };
 
+use crate::kitchen::Kitchen;
 use crate::workbench::Workbench;
 
 actions!(harvester, [Quit]);
@@ -29,9 +33,15 @@ const DEV_DAEMON_PATH: &str = "target/x86_64-unknown-linux-musl/release/harveste
 
 fn main() {
     let Some(dest) = std::env::args().nth(1) else {
-        eprintln!("usage: harvester <ssh-destination>");
+        eprintln!("usage: harvester <ssh-destination> | harvester kitchen");
         std::process::exit(2);
     };
+
+    // The design-system catalog: pure rendering, no bridge, no daemon.
+    if dest == "kitchen" {
+        run_kitchen();
+        return;
+    }
 
     let daemon_binary = match daemon_binary() {
         Ok(bytes) => bytes,
@@ -70,6 +80,34 @@ fn main() {
             Ok(_) => cx.activate(true),
             Err(error) => {
                 eprintln!("harvester: open window: {error}");
+                cx.quit();
+            }
+        }
+    });
+}
+
+fn run_kitchen() {
+    Application::new().run(|cx: &mut App| {
+        bind_keys(cx);
+        cx.on_action(|_: &Quit, cx| cx.quit());
+
+        let bounds = Bounds::centered(None, size(px(820.), px(720.)), cx);
+        let open_result = cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("Harvester — kitchen".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            |_, cx| cx.new(Kitchen::new),
+        );
+
+        match open_result {
+            Ok(_) => cx.activate(true),
+            Err(error) => {
+                eprintln!("harvester: open kitchen window: {error}");
                 cx.quit();
             }
         }

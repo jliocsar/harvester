@@ -10,6 +10,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::bridge::{Bridge, Command, Event as BridgeEvent};
 use crate::chat::Chat;
 use crate::theme;
+use crate::ui;
 
 const SIDEBAR_WIDTH: f32 = 240.;
 /// Enough of a uuidv7 to tell sessions apart at a glance.
@@ -73,7 +74,12 @@ impl Workbench {
                 self.link = Link::Connected { daemon_version };
             }
             BridgeEvent::ConnectFailed { detail } => self.link = Link::Failed { detail },
-            BridgeEvent::Sessions(sessions) => self.sessions = sessions,
+            BridgeEvent::Sessions(mut sessions) => {
+                // Newest first; uuidv7 sids sort chronologically, so the sid
+                // itself is the created-at key.
+                sessions.sort_by(|a, b| b.sid.cmp(&a.sid));
+                self.sessions = sessions;
+            }
             BridgeEvent::Attached { sid, entries } => {
                 // The daemon's list may predate a resume we just did; disk on
                 // the VM stays authoritative, this is display state only.
@@ -163,7 +169,7 @@ impl Workbench {
             .bg(rgb(theme::PANEL_BG))
             .border_r_1()
             .border_color(rgb(theme::BORDER))
-            .child(section_header("machine"))
+            .child(ui::section_header("machine"))
             .child(
                 div()
                     .px_3()
@@ -173,7 +179,7 @@ impl Workbench {
                     .child(div().child(self.dest.clone()))
                     .child(self.render_link_line()),
             )
-            .child(section_header("sessions"))
+            .child(ui::section_header("sessions"))
             .child(
                 div()
                     .id("sessions")
@@ -241,41 +247,15 @@ impl Workbench {
             .to_string()
             .into();
 
-        div()
-            .id(("session", index))
-            .px_3()
-            .py_1()
-            .flex()
-            .flex_col()
-            .cursor_pointer()
-            .hover(|style| style.bg(rgb(theme::ROW_HOVER)))
-            .when(selected, |style| style.bg(rgb(theme::ROW_SELECTED)))
-            .on_click(cx.listener(move |workbench, _, _, cx| workbench.open_session(index, cx)))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(div().size(px(6.)).rounded_full().bg(rgb(dot_color)))
-                    .child(div().overflow_hidden().text_ellipsis().child(title))
-                    .when(opening, |row| {
-                        row.child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(theme::TEXT_FAINT))
-                                .child("opening…"),
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .pl(px(14.))
-                    .text_xs()
-                    .text_color(rgb(theme::TEXT_FAINT))
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .child(workspace_name),
-            )
+        ui::session_row(
+            ("session", index),
+            title,
+            workspace_name,
+            dot_color,
+            selected,
+            opening,
+        )
+        .on_click(cx.listener(move |workbench, _, _, cx| workbench.open_session(index, cx)))
     }
 
     fn render_content(&self) -> impl IntoElement {
@@ -318,17 +298,7 @@ impl Workbench {
             _ => theme::TEXT_FAINT,
         };
 
-        div()
-            .h(px(26.))
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap_3()
-            .px_3()
-            .border_t_1()
-            .border_color(rgb(theme::BORDER))
-            .bg(rgb(theme::PANEL_BG))
-            .text_xs()
+        ui::statusbar_frame()
             .child(div().text_color(rgb(link_color)).child(link_text))
             .child(div().flex_1())
             .children(self.last_error.clone().map(|error| {
@@ -360,16 +330,6 @@ impl Render for Workbench {
             )
             .child(self.render_statusbar())
     }
-}
-
-fn section_header(title: &'static str) -> impl IntoElement {
-    div()
-        .px_3()
-        .pt_3()
-        .pb_1()
-        .text_xs()
-        .text_color(rgb(theme::TEXT_FAINT))
-        .child(title.to_uppercase())
 }
 
 fn sid_preview(sid: &str) -> String {

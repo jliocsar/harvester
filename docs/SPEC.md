@@ -2,7 +2,7 @@
 
 > Status: planning complete + implementation started, 2026-08-01. This is the umbrella spec. Normative details live in the referenced docs; where they conflict, the referenced doc wins.
 >
-> Implemented so far: `crates/harvester-proto` (wire types), `crates/harvesterd` (daemon: socket loop, session spawn/stop/resume, pi passthrough, dialog policy, list_sessions) — verified end-to-end against a real exe.dev VM over an SSH-forwarded socket, including mid-turn stop and resume (`HARNESS_RESEARCH.md` §E2E log) — `providers/exe-dev` (the reference provider, live-tested), `crates/harvester-client-core` (bootstrap-over-SSH + socket forward + envelope client, live-tested including both upgrade paths) with its `crates/harvester-cli` dev driver, and `crates/harvester` (the gpui client, first vertical slice: one machine from argv, sessions sidebar, attach/resume, prompt, streaming turn; tokio lives on a dedicated bridge thread, the musl daemon is embedded via build.rs with a dev-time disk fallback). `list_models` is a deliberate stub until the ghost-chat UI exists. Not started: providers-in-UI (machines list), ghost chat, tool-call blocks, dialogs-as-modals.
+> Implemented so far: `crates/harvester-proto` (wire types), `crates/harvesterd` (daemon: socket loop, session spawn/stop/resume, pi passthrough, dialog policy, list_sessions) — verified end-to-end against a real exe.dev VM over an SSH-forwarded socket, including mid-turn stop and resume (`HARNESS_RESEARCH.md` §E2E log) — `providers/exe-dev` (the reference provider, live-tested), `crates/harvester-client-core` (bootstrap-over-SSH + socket forward + envelope client, live-tested including both upgrade paths) with its `crates/harvester-cli` dev driver, and `crates/harvester` (the gpui client, first vertical slice: one machine from argv, sessions sidebar, attach/resume, prompt, streaming turn; tokio lives on a dedicated bridge thread, the musl daemon is embedded via build.rs with a dev-time disk fallback). `list_models` is a deliberate stub until the ghost-chat UI exists. The client also ships `ui.rs` (the design-system primitives) with a live catalog window (`harvester kitchen`) where every component's variants are verified before production use. Agreed slice order for what remains: workspaces (full SSH-`ls` folder picker) → ghost chat; then providers-in-UI (machines list), tool-call blocks, dialogs-as-modals.
 >
 > - `HARNESS_RESEARCH.md` — verified facts about Pi and exe.dev (every claim sourced or marked UNVERIFIED)
 > - `PROVIDERS.md` — machine provider contract (protocol v1)
@@ -56,6 +56,8 @@ Harvester ships one default provider, `exe-dev` — a thin wrapper over exe.dev'
 
 A git repo on a machine, stored as `machine → path`, displayed as `folder_name in machine_label`. Validation and browsing are plain SSH execs by the client (`ls`, `git -C <path> rev-parse --git-dir`) — no daemon or provider involvement.
 
+The workspace list lives client-side in `~/.harvester/workspaces.json` (plain JSON, `[{machine, path}]`). This is user configuration, not session state — the "client caches nothing authoritative" rule is about session data, whose truth stays on the VM's disk.
+
 ### Session
 
 A running (or resumable) `pi --mode rpc` process in a workspace, owned by that machine's harvesterd. Session id = client-generated **uuidv7** (pi's own native id format). One pi process = one session file, always — the session-swapping pi commands (`new_session`, `switch_session`, `fork`, `clone`) are never sent.
@@ -99,7 +101,7 @@ Extension dialogs map to native modals: `select` → list, `confirm` → yes/no,
 
 **Add workspace** — "+" in workspaces_header → machine dropdown → folder picker (SSH `ls` walk) → `git rev-parse` validation (clear error, re-pick on failure) → store.
 
-**Start session (ghost chat)** — "+" on a workspace → empty chat opens client-side only, with model picker (daemon `list_models`: throwaway `pi --no-session` answering `get_available_models`) and thinking-level picker. On first prompt: generate uuidv7 sid → `create_session` → health-probe `get_state` → `prompt` → session appears in sessions_list with a temporary randomized title.
+**Start session (ghost chat)** — "+" on a workspace → empty chat opens client-side only, titled "New session", with model picker (daemon `list_models`: throwaway `pi --no-session` answering `get_available_models`) and thinking-level picker. On first prompt: generate uuidv7 sid → `create_session` (with `name` derived from the prompt itself: first line, truncated) → attach → `prompt`. No readiness probe — pi's stdin queue drains in order (verified, `HARNESS_RESEARCH.md` §Round 4), so commands chained right after `create_session` are safe.
 
 **Rename session** — right-click → Rename → inline input → Enter → passthrough `set_session_name`.
 
@@ -142,7 +144,7 @@ Consolidated from the contract docs; all non-blocking, burn down while building:
 
 ## Tech stack
 
-- **Client**: Rust + gpui (crates.io `gpui = "0.2"`), crate `crates/harvester` — gpui enters no other crate, same quarantine rule as clap-in-`harvester-cli`. Layout: `main.rs` (argv, keybindings, embedded musl daemon via build.rs), `bridge.rs` (dedicated tokio-runtime thread owning the daemon connection; UI ↔ bridge over reactor-independent tokio mpsc channels), `workbench.rs` (top-level state: sidebar, content, statusbar), `chat.rs` (one session's conversation), `input.rs` (prompt input vendored from gpui's canonical example), `theme.rs` (palette).
+- **Client**: Rust + gpui (crates.io `gpui = "0.2"`), crate `crates/harvester` — gpui enters no other crate, same quarantine rule as clap-in-`harvester-cli`. Layout: `main.rs` (argv, keybindings, embedded musl daemon via build.rs), `bridge.rs` (dedicated tokio-runtime thread owning the daemon connection; UI ↔ bridge over reactor-independent tokio mpsc channels), `workbench.rs` (top-level state: sidebar, content, statusbar), `chat.rs` (one session's conversation), `input.rs` (prompt input vendored from gpui's canonical example), `theme.rs` (palette), `ui.rs` (design-system primitives — every reusable visual component lives here), `kitchen.rs` (the component catalog behind `harvester kitchen`: each primitive's variants rendered live, no bridge/daemon).
 - **harvesterd**: Rust, static musl binary (`x86_64-unknown-linux-musl`), no runtime deps, uploaded over SSH. Layout: `main.rs` (CLI + socket lock + accept), `daemon.rs` (pid table — the only state), `server.rs` (controller: frame/decode/route/encode), `ops.rs` (one function per command), `passthrough.rs` (pi relay + id correlation), `session.rs` (spawn/pump/dialog policy), `fslist.rs` (session listing).
 - **Shared**: `harvester-proto` — serde types for the envelope only (pi payloads stay `serde_json::Value` — pass-through by design), plus the `LF`/`CR` framing constants.
 - **Providers**: any language, one-shot JSON-stdio executables.
