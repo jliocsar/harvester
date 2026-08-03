@@ -147,30 +147,103 @@ pub fn chat_message(
         )
 }
 
-/// The bordered container around a `TextInput`; accent border while focused.
-/// Caller adds the input as a child.
-pub fn input_frame(focused: bool) -> Div {
+/// The agent prompt box (SPEC §Flows "Start session", chat input): one
+/// rounded card holding the text input on top and a controls row at the
+/// bottom of the same frame; accent border while the input is focused.
+/// Compose with `prompt_box_input` and `prompt_box_controls`.
+pub fn prompt_box(focused: bool) -> Div {
     div()
+        .rounded_xl()
         .bg(rgb(theme::INPUT_BG))
-        .rounded_md()
         .border_1()
         .border_color(if focused {
             rgb(theme::ACCENT)
         } else {
             rgb(theme::BORDER)
         })
-        .px_2()
-        .py_1()
+        .flex()
+        .flex_col()
 }
 
-/// One sidebar workspace row: `folder_name in machine_label` (SPEC
-/// §Workspace). Inert in this slice; ghost chat hangs its "+" here later.
-pub fn workspace_row(name: SharedString, machine: SharedString) -> Div {
+/// The prompt box's input slot: padding around the caller's `TextInput`.
+pub fn prompt_box_input(input: impl IntoElement) -> Div {
+    div().px_3().pt_3().pb_2().child(input)
+}
+
+/// The prompt box's bottom row. Caller adds `prompt_box_control`s, a
+/// `flex_1` spacer, then `prompt_box_send`.
+pub fn prompt_box_controls() -> Div {
+    div().px_3().pb_2().flex().items_center().gap_2()
+}
+
+/// A flat dropdown control inside the prompt box (the model picker trigger):
+/// quiet dim text with a caret, brightening on hover. Disabled ones lose the
+/// caret and the pointer affordances — the caller must also skip the click
+/// handler (loading / no models to offer).
+pub fn prompt_box_control(
+    id: impl Into<ElementId>,
+    label: SharedString,
+    enabled: bool,
+) -> Stateful<Div> {
+    let base = div()
+        .id(id)
+        .text_xs()
+        // Cap so an unreasonably long model name leaves room for the rest
+        // of the row.
+        .max_w(px(220.))
+        .overflow_hidden()
+        .text_ellipsis();
+
+    if enabled {
+        base.text_color(rgb(theme::TEXT_DIM))
+            .cursor_pointer()
+            .hover(|style| style.text_color(rgb(theme::TEXT)))
+            .child(format!("{label} ▾"))
+    } else {
+        base.text_color(rgb(theme::TEXT_FAINT)).child(label)
+    }
+}
+
+/// Diameter of the prompt box's round send button.
+const SEND_BUTTON_SIZE: f32 = 22.;
+
+/// The prompt box's round accent send button ("↑"). Caller chains
+/// `.on_click`; Enter in the input is the other path to the same submit.
+pub fn prompt_box_send(id: impl Into<ElementId>) -> Stateful<Div> {
     div()
+        .id(id)
+        .size(px(SEND_BUTTON_SIZE))
+        .flex_none()
+        .rounded_full()
+        .bg(rgb(theme::ACCENT))
+        .text_color(rgb(theme::TEXT_ON_ACCENT))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_xs()
+        .cursor_pointer()
+        .hover(|style| style.bg(rgb(theme::ACCENT_HOVER)))
+        .active(|style| style.bg(rgb(theme::ACCENT_ACTIVE)))
+        .child("↑")
+}
+
+/// One sidebar workspace row: `folder_name in machine_label`, trailing "+"
+/// affordance — the whole row is the click target for starting a ghost chat
+/// there (SPEC §Flows "Start session"). Caller chains `.on_click`.
+pub fn workspace_row(
+    id: impl Into<ElementId>,
+    name: SharedString,
+    machine: SharedString,
+) -> Stateful<Div> {
+    div()
+        .id(id)
         // Same 6+6 inset as session_row, aligning with section_header text.
         .mx(px(6.))
         .px(px(6.))
         .py_1()
+        .rounded_md()
+        .cursor_pointer()
+        .hover(|style| style.bg(rgb(theme::ROW_HOVER)))
         .flex()
         .items_baseline()
         .gap_1()
@@ -191,6 +264,66 @@ pub fn workspace_row(name: SharedString, machine: SharedString) -> Div {
                 .overflow_hidden()
                 .text_ellipsis()
                 .child(format!("in {machine}")),
+        )
+        .child(div().flex_1())
+        .child(
+            div()
+                .flex_none()
+                .text_color(rgb(theme::TEXT_FAINT))
+                .child("+"),
+        )
+}
+
+/// One model in the ghost chat's picker; the selected one carries a leading
+/// check, the others an equally wide blank so names align. Caller chains
+/// `.on_click` (select-and-close — no confirm step).
+pub fn model_row(id: impl Into<ElementId>, name: SharedString, selected: bool) -> Stateful<Div> {
+    div()
+        .id(id)
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .cursor_pointer()
+        .hover(|style| style.bg(rgb(theme::ROW_HOVER)))
+        .when(selected, |style| style.bg(rgb(theme::ROW_SELECTED)))
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .flex_none()
+                .w(px(14.))
+                .text_color(rgb(theme::ACCENT))
+                .when(selected, |check| check.child("✓")),
+        )
+        .child(div().overflow_hidden().text_ellipsis().child(name))
+}
+
+/// Chat pane header: title + faint subtitle (the ghost chat's "New session"
+/// line — the model control lives in the prompt box, not here).
+pub fn chat_header(title: SharedString, subtitle: SharedString) -> Div {
+    div()
+        .flex_none()
+        .px_3()
+        .py_2()
+        .border_b_1()
+        .border_color(rgb(theme::BORDER))
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .flex_none()
+                .font_weight(FontWeight::MEDIUM)
+                .child(title),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_FAINT))
+                .overflow_hidden()
+                .text_ellipsis()
+                .child(subtitle),
         )
 }
 

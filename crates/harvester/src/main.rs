@@ -11,6 +11,7 @@ mod bridge;
 mod chat;
 mod input;
 mod kitchen;
+mod models;
 mod theme;
 mod ui;
 mod workbench;

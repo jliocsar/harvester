@@ -2,12 +2,14 @@
 //! `server.rs` is the controller: it decodes, routes here, encodes.
 
 use std::collections::HashMap;
+use std::process::Stdio;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use harvester_proto::{HarvesterCmd, HarvesterResponse, Outgoing};
-use serde_json::json;
+use harvester_proto::{HarvesterCmd, HarvesterResponse, Outgoing, CR, LF};
+use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
@@ -20,6 +22,12 @@ use crate::session::{Session, SessionOutput, SpawnArgs};
 /// never waits for an in-flight turn. This only breaks a genuinely wedged
 /// process (hung extension `session_shutdown` handler, stuck runtime).
 const STOP_KILL_BACKSTOP: Duration = Duration::from_secs(30);
+
+/// Ceiling on the whole throwaway `list_models` pi run (spawn → answer →
+/// exit; measured ~1s on exe.dev). Same role as `STOP_KILL_BACKSTOP`: only a
+/// wedged pi hits it, and `kill_on_drop` SIGKILLs on expiry — safe here
+/// because a `--no-session` pi has nothing durable to truncate.
+const LIST_MODELS_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// One live attachment: the forwarder task plus the exact session object whose
 /// `attached` counter it incremented. Holding the `Arc<Session>` (not just the
@@ -69,7 +77,7 @@ pub async fn dispatch(
             )
             .await
         }
-        HarvesterCmd::ListModels { cwd } => list_models(cwd),
+        HarvesterCmd::ListModels { cwd } => list_models(cwd).await,
         HarvesterCmd::Attach { sid } => attach(daemon, sid, out_tx, attached).await,
         HarvesterCmd::Detach { sid } => detach(sid, attached),
         HarvesterCmd::Stop { sid } => stop(daemon, sid).await,
@@ -108,10 +116,111 @@ async fn create_session(daemon: &Daemon, args: SpawnArgs) -> HarvesterResponse {
     }
 }
 
-fn list_models(_cwd: String) -> HarvesterResponse {
-    // TODO(list_models): throwaway `pi --mode rpc --no-session` in cwd,
-    // ask get_available_models, close stdin. Needs the ghost-chat UI first.
-    HarvesterResponse::err("list_models: not implemented yet")
+/// The models pi would offer in `cwd`, fetched fresh every call (DAEMON.md:
+/// deterministic, touches no session, no caching): a throwaway
+/// `PI_OFFLINE=1 pi --mode rpc --no-session` answers `get_available_models`
+/// and pi's `data` is returned verbatim. Runs inline in the connection's
+/// command loop (~1s) — attached event streams ride their own forwarder
+/// tasks, so nothing user-visible stalls.
+async fn list_models(cwd: String) -> HarvesterResponse {
+    match tokio::time::timeout(LIST_MODELS_TIMEOUT, query_available_models(&cwd)).await {
+        Ok(Ok(data)) => HarvesterResponse::ok(data),
+        Ok(Err(detail)) => HarvesterResponse::err(format!("list_models: {detail}")),
+        Err(_elapsed) => HarvesterResponse::err(format!(
+            "list_models: pi gave no answer within {LIST_MODELS_TIMEOUT:?}"
+        )),
+    }
+}
+
+/// Spawn the throwaway pi, ask, read the one answer. Stdin must stay open
+/// until the response line is read — pi treats EOF as shutdown and dies
+/// before answering otherwise (verified live on pi 0.83.0). The child is
+/// `kill_on_drop`: on every exit path it is either already exiting (stdin
+/// dropped) or gets SIGKILLed, so no pi outlives this function.
+async fn query_available_models(cwd: &str) -> Result<Value, String> {
+    const REQUEST_LINE: &[u8] = br#"{"id":"hv-models","type":"get_available_models"}"#;
+
+    let mut child = tokio::process::Command::new("pi")
+        .current_dir(cwd)
+        .env("PI_OFFLINE", "1")
+        .args(["--mode", "rpc", "--no-session"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| format!("spawn pi: {error}"))?;
+
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+
+    let mut request = REQUEST_LINE.to_vec();
+    request.push(LF);
+    stdin
+        .write_all(&request)
+        .await
+        .map_err(|error| format!("write to pi: {error}"))?;
+    stdin
+        .flush()
+        .await
+        .map_err(|error| format!("write to pi: {error}"))?;
+
+    // LF-only framing, like session.rs's pump: read_until(LF), strip a
+    // trailing CR, skip non-JSON and non-matching lines (pi may emit events
+    // before the response).
+    let mut reader = BufReader::new(stdout);
+    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+
+    loop {
+        buf.clear();
+
+        let read = reader
+            .read_until(LF, &mut buf)
+            .await
+            .map_err(|error| format!("read from pi: {error}"))?;
+
+        if read == 0 {
+            return Err("pi exited before answering".to_string());
+        }
+
+        let mut line = buf.as_slice();
+
+        if line.last() == Some(&LF) {
+            line = &line[..line.len() - 1];
+        }
+
+        if line.last() == Some(&CR) {
+            line = &line[..line.len() - 1];
+        }
+
+        let Ok(value) = serde_json::from_slice::<Value>(line) else {
+            continue;
+        };
+
+        if value.get("id").and_then(Value::as_str) != Some("hv-models") {
+            continue;
+        }
+
+        if value
+            .get("success")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            // EOF starts pi's graceful exit; the wait is bounded by the
+            // caller's timeout (EOF shutdown is immediate — source-verified).
+            drop(stdin);
+            let _ = child.wait().await;
+
+            return Ok(value.get("data").cloned().unwrap_or(json!({})));
+        }
+
+        let detail = value
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("pi rejected get_available_models");
+
+        return Err(detail.to_string());
+    }
 }
 
 async fn attach(

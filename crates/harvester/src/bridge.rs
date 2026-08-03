@@ -28,6 +28,42 @@ pub enum Command {
         sid: String,
         text: String,
     },
+    /// Turn a ghost chat into a real session (SPEC §Flows "Start session"):
+    /// `create_session` → `attach` → first prompt, all riding pi's in-order
+    /// stdin queue — no readiness probe. Ends in `Event::Attached` (with
+    /// empty entries — the session is brand new) or a failure event.
+    StartSession {
+        sid: String,
+        cwd: String,
+        provider: Option<String>,
+        model: Option<String>,
+        name: String,
+        first_prompt: String,
+    },
+    /// Fetch the models pi would offer in `cwd` (daemon `list_models`,
+    /// uncached — costs a pi startup). Answered by `Event::ModelsListed`.
+    /// For a running session use `ListSessionModels` instead.
+    ListModels {
+        cwd: String,
+    },
+    /// Fetch the models a running session offers (passthrough
+    /// `get_available_models` — no throwaway pi). Answered by
+    /// `Event::SessionModelsListed`.
+    ListSessionModels {
+        sid: String,
+    },
+    /// Fetch a running session's state (passthrough `get_state`) — the chat
+    /// reads its current model from it. Answered by `Event::SessionState`.
+    GetSessionState {
+        sid: String,
+    },
+    /// Switch a running session's model (passthrough `set_model`). Answered
+    /// by `Event::ModelSet`.
+    SetModel {
+        sid: String,
+        provider: String,
+        model_id: String,
+    },
     /// List a remote directory for the folder picker (plain SSH exec,
     /// multiplexed — never the daemon). Answered by `Event::DirListed`.
     ListDir {
@@ -72,6 +108,32 @@ pub enum Event {
     RequestFailed {
         detail: String,
     },
+    /// A `ListModels` answered; pi's `data` verbatim (the client speaks Pi —
+    /// the workbench extracts what its picker renders). `cwd` is echoed back
+    /// as the staleness guard, like `DirListed`'s `path`. Errors render
+    /// inside the ghost chat, not the statusbar.
+    ModelsListed {
+        cwd: String,
+        result: Result<Value, String>,
+    },
+    /// A `ListSessionModels` answered; pi's `data` verbatim. Errors render
+    /// in the owning chat, not the statusbar.
+    SessionModelsListed {
+        sid: String,
+        result: Result<Value, String>,
+    },
+    /// A `GetSessionState` answered; pi's `data` verbatim (`model` is the
+    /// field the chat reads).
+    SessionState {
+        sid: String,
+        result: Result<Value, String>,
+    },
+    /// A `SetModel` answered; `Ok` carries pi's `data` — the full Model
+    /// object now in effect.
+    ModelSet {
+        sid: String,
+        result: Result<Value, String>,
+    },
     /// A `ListDir` answered; errors render inside the picker, not the
     /// statusbar.
     DirListed {
@@ -95,11 +157,36 @@ pub struct Bridge {
 /// depends on it (create chains into attach chains into get_entries).
 enum Pending {
     ListSessions,
-    Create { sid: String },
-    Attach { sid: String },
+    /// `cwd` rides along because the daemon response doesn't echo it and the
+    /// UI needs it to drop stale answers.
+    ListModels {
+        cwd: String,
+    },
+    /// `first_prompt` is carried through the create → attach chain: `Some`
+    /// marks a ghost-chat start (send it after attach, skip `get_entries` —
+    /// the session file is brand new), `None` a plain resume.
+    Create {
+        sid: String,
+        first_prompt: Option<String>,
+    },
+    Attach {
+        sid: String,
+        first_prompt: Option<String>,
+    },
     Detach,
-    Entries { sid: String },
+    Entries {
+        sid: String,
+    },
     Prompt,
+    SessionModels {
+        sid: String,
+    },
+    SessionState {
+        sid: String,
+    },
+    SetModel {
+        sid: String,
+    },
 }
 
 pub fn start(dest: String, daemon_binary: Vec<u8>) -> std::io::Result<Bridge> {
@@ -228,40 +315,23 @@ async fn bridge_main(
 
 async fn handle_ui_command(command: Command, link: &mut Link) {
     match command {
-        Command::Open { sid, cwd, running } => {
-            // One chat pane means one attachment: leaving the previous
-            // session keeps the daemon from streaming events nobody renders.
-            if let Some(previous_sid) = link.attached.take() {
-                if previous_sid != sid {
-                    link.send_harvester(
-                        HarvesterCmd::Detach { sid: previous_sid },
-                        Pending::Detach,
-                    )
-                    .await;
-                }
-            }
-
-            if running {
-                link.send_harvester(
-                    HarvesterCmd::Attach { sid: sid.clone() },
-                    Pending::Attach { sid },
-                )
-                .await;
-            } else {
-                // Resume = create with the same sid (DAEMON.md). Follow-up
-                // requests queue on pi's stdin, so no readiness probe needed.
-                link.send_harvester(
-                    HarvesterCmd::CreateSession {
-                        sid: sid.clone(),
-                        cwd,
-                        provider: None,
-                        model: None,
-                        name: None,
-                    },
-                    Pending::Create { sid },
-                )
-                .await;
-            }
+        Command::Open { sid, cwd, running } => handle_open_command(sid, cwd, running, link).await,
+        Command::StartSession {
+            sid,
+            cwd,
+            provider,
+            model,
+            name,
+            first_prompt,
+        } => {
+            handle_start_session_command(sid, cwd, provider, model, name, first_prompt, link).await
+        }
+        Command::ListModels { cwd } => {
+            link.send_harvester(
+                HarvesterCmd::ListModels { cwd: cwd.clone() },
+                Pending::ListModels { cwd },
+            )
+            .await;
         }
         Command::Prompt { sid, text } => {
             link.send_pi(
@@ -271,8 +341,108 @@ async fn handle_ui_command(command: Command, link: &mut Link) {
             )
             .await;
         }
+        Command::ListSessionModels { sid } => {
+            link.send_pi(
+                &sid.clone(),
+                json!({"type": "get_available_models"}),
+                Pending::SessionModels { sid },
+            )
+            .await;
+        }
+        Command::GetSessionState { sid } => {
+            link.send_pi(
+                &sid.clone(),
+                json!({"type": "get_state"}),
+                Pending::SessionState { sid },
+            )
+            .await;
+        }
+        Command::SetModel {
+            sid,
+            provider,
+            model_id,
+        } => {
+            link.send_pi(
+                &sid.clone(),
+                json!({"type": "set_model", "provider": provider, "modelId": model_id}),
+                Pending::SetModel { sid },
+            )
+            .await;
+        }
         Command::ListDir { path } => handle_list_dir(path, link),
         Command::ValidateWorkspace { path } => handle_validate_workspace(path, link),
+    }
+}
+
+/// `Open`: attach if running, resume then attach if exited. Resume = create
+/// with the same sid (DAEMON.md); follow-up requests queue on pi's stdin, so
+/// no readiness probe is needed.
+async fn handle_open_command(sid: String, cwd: String, running: bool, link: &mut Link) {
+    detach_previous(link, &sid).await;
+
+    if running {
+        link.send_harvester(
+            HarvesterCmd::Attach { sid: sid.clone() },
+            Pending::Attach {
+                sid,
+                first_prompt: None,
+            },
+        )
+        .await;
+    } else {
+        link.send_harvester(
+            HarvesterCmd::CreateSession {
+                sid: sid.clone(),
+                cwd,
+                provider: None,
+                model: None,
+                name: None,
+            },
+            Pending::Create {
+                sid,
+                first_prompt: None,
+            },
+        )
+        .await;
+    }
+}
+
+/// `StartSession`: the ghost chat's create → attach → prompt chain, entered
+/// here; the first prompt rides `Pending::Create` through the follow-ups.
+async fn handle_start_session_command(
+    sid: String,
+    cwd: String,
+    provider: Option<String>,
+    model: Option<String>,
+    name: String,
+    first_prompt: String,
+    link: &mut Link,
+) {
+    detach_previous(link, &sid).await;
+    link.send_harvester(
+        HarvesterCmd::CreateSession {
+            sid: sid.clone(),
+            cwd,
+            provider,
+            model,
+            name: Some(name),
+        },
+        Pending::Create {
+            sid,
+            first_prompt: Some(first_prompt),
+        },
+    )
+    .await;
+}
+
+/// One chat pane means one attachment: leaving the previous session keeps
+/// the daemon from streaming events nobody renders.
+async fn detach_previous(link: &mut Link, next_sid: &str) {
+    if let Some(previous_sid) = link.attached.take() {
+        if previous_sid != next_sid {
+            link.send_harvester(HarvesterCmd::Detach { sid: previous_sid }, Pending::Detach)
+                .await;
+        }
     }
 }
 
@@ -318,10 +488,19 @@ async fn handle_daemon_line(outgoing: Outgoing, link: &mut Link) {
 
             match purpose {
                 Pending::ListSessions => handle_list_sessions_response(link, response),
-                Pending::Create { sid } => handle_create_response(link, sid, response).await,
-                Pending::Attach { sid } => handle_attach_response(link, sid, response).await,
+                Pending::ListModels { cwd } => handle_list_models_response(link, cwd, response),
+                Pending::Create { sid, first_prompt } => {
+                    handle_create_response(link, sid, first_prompt, response).await
+                }
+                Pending::Attach { sid, first_prompt } => {
+                    handle_attach_response(link, sid, first_prompt, response).await
+                }
                 Pending::Detach => handle_detach_response(link, response),
-                Pending::Entries { .. } | Pending::Prompt => {
+                Pending::Entries { .. }
+                | Pending::Prompt
+                | Pending::SessionModels { .. }
+                | Pending::SessionState { .. }
+                | Pending::SetModel { .. } => {
                     eprintln!("harvester: pi-bound request answered by daemon envelope");
                 }
             }
@@ -334,7 +513,26 @@ async fn handle_daemon_line(outgoing: Outgoing, link: &mut Link) {
             match purpose {
                 Pending::Entries { sid } => handle_entries_response(link, sid, &response),
                 Pending::Prompt => handle_prompt_response(link, &response),
+                Pending::SessionModels { sid } => {
+                    let _ = link.events.send(Event::SessionModelsListed {
+                        sid,
+                        result: pi_result(&response),
+                    });
+                }
+                Pending::SessionState { sid } => {
+                    let _ = link.events.send(Event::SessionState {
+                        sid,
+                        result: pi_result(&response),
+                    });
+                }
+                Pending::SetModel { sid } => {
+                    let _ = link.events.send(Event::ModelSet {
+                        sid,
+                        result: pi_result(&response),
+                    });
+                }
                 Pending::ListSessions
+                | Pending::ListModels { .. }
                 | Pending::Create { .. }
                 | Pending::Attach { .. }
                 | Pending::Detach => {
@@ -353,31 +551,71 @@ fn handle_list_sessions_response(link: &mut Link, response: HarvesterResponse) {
     }
 }
 
-/// A resume's `create_session` answered; chain into attach.
-async fn handle_create_response(link: &mut Link, sid: String, response: HarvesterResponse) {
+fn handle_list_models_response(link: &mut Link, cwd: String, response: HarvesterResponse) {
+    let result = if response.success {
+        Ok(response.data.unwrap_or(Value::Null))
+    } else {
+        Err(response
+            .error
+            .unwrap_or_else(|| "unknown error".to_string()))
+    };
+    let _ = link.events.send(Event::ModelsListed { cwd, result });
+}
+
+/// A `create_session` answered (resume or ghost-chat start); chain into attach.
+async fn handle_create_response(
+    link: &mut Link,
+    sid: String,
+    first_prompt: Option<String>,
+    response: HarvesterResponse,
+) {
     if response.success {
         link.send_harvester(
             HarvesterCmd::Attach { sid: sid.clone() },
-            Pending::Attach { sid },
+            Pending::Attach { sid, first_prompt },
         )
         .await;
     } else {
-        link.report_failure("resume session", response.error);
+        link.report_failure("create session", response.error);
     }
 }
 
-/// Attach answered; record the attachment and chain into history replay:
-/// attach → get_entries → live events (DAEMON.md §attach). No `since`:
-/// full history.
-async fn handle_attach_response(link: &mut Link, sid: String, response: HarvesterResponse) {
+/// Attach answered; record the attachment. A resume chains into history
+/// replay: attach → get_entries → live events (DAEMON.md §attach, no
+/// `since`: full history). A ghost-chat start sends the first prompt instead
+/// — the session file is brand new, there is no history to fetch — and
+/// publishes `Attached` right away so the UI can swap the ghost for the chat.
+async fn handle_attach_response(
+    link: &mut Link,
+    sid: String,
+    first_prompt: Option<String>,
+    response: HarvesterResponse,
+) {
     if response.success {
         link.attached = Some(sid.clone());
-        link.send_pi(
-            &sid.clone(),
-            json!({"type": "get_entries"}),
-            Pending::Entries { sid },
-        )
-        .await;
+
+        match first_prompt {
+            Some(text) => {
+                link.send_pi(
+                    &sid,
+                    json!({"type": "prompt", "message": text}),
+                    Pending::Prompt,
+                )
+                .await;
+                let _ = link.events.send(Event::Attached {
+                    sid,
+                    entries: Vec::new(),
+                });
+            }
+            None => {
+                link.send_pi(
+                    &sid.clone(),
+                    json!({"type": "get_entries"}),
+                    Pending::Entries { sid },
+                )
+                .await;
+            }
+        }
     } else {
         link.report_failure("attach", response.error);
     }
@@ -410,6 +648,16 @@ fn handle_entries_response(link: &mut Link, sid: String, response: &Value) {
 fn handle_prompt_response(link: &mut Link, response: &Value) {
     if !pi_success(response) {
         link.report_failure("prompt", pi_error(response));
+    }
+}
+
+/// A pi response → the `Result` the session-model events carry: `data`
+/// verbatim on success, pi's error string otherwise.
+fn pi_result(response: &Value) -> Result<Value, String> {
+    if pi_success(response) {
+        Ok(response.get("data").cloned().unwrap_or(Value::Null))
+    } else {
+        Err(pi_error(response).unwrap_or_else(|| "unknown error".to_string()))
     }
 }
 

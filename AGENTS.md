@@ -52,6 +52,9 @@ itself is broken — node version mismatch — but the source is readable).
 - **Factor out named handlers**: prefer `handle_x`/`create_x` extractions over
   inline branching (`handle_response_line`, `handle_dialog_request`,
   `create_pi_command` are the pattern).
+- **Match arms delegate**: every enum match arm calls a dedicated handler
+  function unless the arm is trivial (a one-line assignment). Dispatch
+  functions like `handle_bridge_event`/`dispatch` are pure routers.
 - **Group declarations before actions** inside a function body.
 - **Blank-line padding around blocks** (before/after `if`/`loop`/`match`, before
   `return`) — rustfmt cannot enforce this; write it that way. A dylint custom

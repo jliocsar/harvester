@@ -68,7 +68,10 @@ impl TextInput {
         }
     }
 
-    fn submit(&mut self, _: &Submit, _window: &mut Window, cx: &mut Context<Self>) {
+    /// Emit the trimmed content as `PromptSubmitted` and clear the input.
+    /// Enter routes here via the `Submit` action; the prompt box's send
+    /// button calls it directly. No-op while blank.
+    pub fn submit_prompt(&mut self, cx: &mut Context<Self>) {
         let text = self.content.trim().to_string();
 
         if text.is_empty() {
@@ -78,6 +81,10 @@ impl TextInput {
         self.reset();
         cx.emit(PromptSubmitted(text));
         cx.notify();
+    }
+
+    fn submit(&mut self, _: &Submit, _window: &mut Window, cx: &mut Context<Self>) {
+        self.submit_prompt(cx);
     }
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {

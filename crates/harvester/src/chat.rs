@@ -4,13 +4,15 @@
 //! `agent_end`) ends the turn.
 
 use gpui::{
-    div, prelude::*, px, rgb, Context, Entity, Focusable, ScrollHandle, Subscription, Window,
+    div, prelude::*, px, rgb, Context, Entity, Focusable, ScrollHandle, SharedString, Subscription,
+    Window,
 };
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::bridge::Command;
 use crate::input::{PromptSubmitted, TextInput};
+use crate::models::{self, ModelChoice, ModelsState};
 use crate::theme;
 use crate::ui;
 
@@ -39,6 +41,15 @@ pub struct Chat {
     /// again requires a resume (re-open from the sidebar — resume is
     /// `create_session` with the same sid).
     exited_notice: Option<String>,
+    /// The session's switchable models (passthrough `get_available_models`,
+    /// fetched at open — milliseconds against the running pi).
+    models: ModelsState,
+    /// The session's current model (`get_state` at open, replaced by each
+    /// successful `set_model`); drives the control's label and check mark.
+    current_model: Option<ModelChoice>,
+    /// The model picker modal is open. Rendered by the workbench — the
+    /// scrim has to cover the whole window, not just this pane.
+    picker_open: bool,
     /// Focus the prompt input on the next frame (set at creation; render has
     /// the `Window` that focusing needs).
     focus_input: bool,
@@ -49,22 +60,42 @@ pub struct Chat {
 }
 
 impl Chat {
+    /// `first_prompt` seeds a ghost-chat start: the bridge already sent that
+    /// prompt as part of the create → attach chain, so the conversation opens
+    /// with it rendered and the turn marked busy.
     pub fn new(
         sid: String,
         entries: &[Value],
+        first_prompt: Option<String>,
         commands: UnboundedSender<Command>,
         cx: &mut Context<Self>,
     ) -> Self {
         let input = cx.new(|cx| TextInput::new("Message pi — Enter to send", cx));
         let input_subscription = cx.subscribe(&input, Self::handle_prompt_submitted);
-        let messages = entries.iter().filter_map(entry_message).collect();
+        let mut messages: Vec<ChatMessage> = entries.iter().filter_map(entry_message).collect();
+        let busy = first_prompt.is_some();
+
+        if let Some(text) = first_prompt {
+            messages.push(ChatMessage {
+                role: Role::User,
+                text,
+            });
+        }
+
+        // The model control needs the list and the current model; both queue
+        // on pi's in-order stdin. A dead bridge is handled by `Disconnected`.
+        let _ = commands.send(Command::ListSessionModels { sid: sid.clone() });
+        let _ = commands.send(Command::GetSessionState { sid: sid.clone() });
 
         Self {
             sid,
             messages,
             streaming: None,
-            busy: false,
+            busy,
             exited_notice: None,
+            models: ModelsState::Loading,
+            current_model: None,
+            picker_open: false,
             focus_input: true,
             input,
             scroll: ScrollHandle::new(),
@@ -75,6 +106,100 @@ impl Chat {
 
     pub fn sid(&self) -> &str {
         &self.sid
+    }
+
+    /// A `ListSessionModels` answered. On failure the control just stays
+    /// disabled — the session keeps running on its current model.
+    pub fn handle_session_models(&mut self, result: Result<Value, String>, cx: &mut Context<Self>) {
+        self.models = match result {
+            Ok(data) => ModelsState::Loaded(models::extract_model_choices(&data)),
+            Err(detail) => {
+                eprintln!("harvester: get_available_models ({}): {detail}", self.sid);
+
+                ModelsState::Failed(detail)
+            }
+        };
+        cx.notify();
+    }
+
+    /// A `GetSessionState` answered; the current model labels the control.
+    /// Failure is cosmetic (generic label), so it is only logged.
+    pub fn handle_session_state(&mut self, result: Result<Value, String>, cx: &mut Context<Self>) {
+        match result {
+            Ok(data) => {
+                self.current_model = data.get("model").and_then(models::model_choice_from_value);
+                cx.notify();
+            }
+            Err(detail) => eprintln!("harvester: get_state ({}): {detail}", self.sid),
+        }
+    }
+
+    /// A `set_model` succeeded; pi's `data` is the full Model object now in
+    /// effect (failures surface in the statusbar, workbench-side).
+    pub fn handle_model_set(&mut self, data: &Value, cx: &mut Context<Self>) {
+        if let Some(choice) = models::model_choice_from_value(data) {
+            self.current_model = Some(choice);
+            cx.notify();
+        }
+    }
+
+    pub fn open_model_picker(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.models, ModelsState::Loaded(_)) {
+            self.picker_open = true;
+            cx.notify();
+        }
+    }
+
+    pub fn close_model_picker(&mut self, cx: &mut Context<Self>) {
+        self.picker_open = false;
+        cx.notify();
+    }
+
+    /// A picker row was clicked: fire `set_model` on the running session.
+    /// No optimism — the label changes when `ModelSet` confirms.
+    pub fn pick_model(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.picker_open = false;
+
+        let ModelsState::Loaded(model_choices) = &self.models else {
+            return;
+        };
+        let Some(choice) = model_choices.get(index) else {
+            return;
+        };
+
+        if self
+            .commands
+            .send(Command::SetModel {
+                sid: self.sid.clone(),
+                provider: choice.provider.clone(),
+                model_id: choice.id.clone(),
+            })
+            .is_err()
+        {
+            // Bridge gone; the Disconnected event drives the visible state.
+            eprintln!("harvester: bridge gone; set_model not sent");
+        }
+
+        cx.notify();
+    }
+
+    /// What the workbench's shared picker modal renders when this chat's
+    /// picker is open: the loaded list and the current model's index.
+    pub fn picker_contents(&self) -> Option<(Vec<ModelChoice>, Option<usize>)> {
+        if !self.picker_open {
+            return None;
+        }
+
+        let ModelsState::Loaded(model_choices) = &self.models else {
+            return None;
+        };
+        let current_index = self.current_model.as_ref().and_then(|current| {
+            model_choices
+                .iter()
+                .position(|choice| choice.provider == current.provider && choice.id == current.id)
+        });
+
+        Some((model_choices.clone(), current_index))
     }
 
     fn handle_prompt_submitted(
@@ -194,12 +319,18 @@ impl Chat {
         Some(ui::chat_message("pi", theme::TEXT_DIM, text, false))
     }
 
-    fn render_input_row(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement {
-        let row = div()
-            .flex_none()
-            .p_2()
-            .border_t_1()
-            .border_color(rgb(theme::BORDER));
+    /// The send button's path; Enter inside the input reaches the same
+    /// `PromptSubmitted` through the `Submit` action.
+    fn submit_prompt(&mut self, cx: &mut Context<Self>) {
+        self.input
+            .clone()
+            .update(cx, |input, cx| input.submit_prompt(cx));
+    }
+
+    fn render_input_row(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The prompt box floats in the pane's padding (no separator line —
+        // the card's own border is the boundary).
+        let row = div().flex_none().px_3().pb_3();
 
         if let Some(notice) = &self.exited_notice {
             return row.child(
@@ -211,8 +342,36 @@ impl Chat {
         }
 
         let input_focused = self.input.read(cx).focus_handle(cx).is_focused(window);
+        // Label = the session's current model once `get_state` answered;
+        // clickable once the switchable list is loaded.
+        let model_label: SharedString = match &self.current_model {
+            Some(choice) => choice.name.clone(),
+            None => "model".into(),
+        };
+        let model_enabled = matches!(self.models, ModelsState::Loaded(_));
 
-        row.child(ui::input_frame(input_focused).child(self.input.clone()))
+        row.child(
+            ui::prompt_box(input_focused)
+                .child(ui::prompt_box_input(self.input.clone()))
+                .child(
+                    ui::prompt_box_controls()
+                        .child(
+                            ui::prompt_box_control("chat-model", model_label, model_enabled).when(
+                                model_enabled,
+                                |control| {
+                                    control.on_click(
+                                        cx.listener(|chat, _, _, cx| chat.open_model_picker(cx)),
+                                    )
+                                },
+                            ),
+                        )
+                        .child(div().flex_1())
+                        .child(
+                            ui::prompt_box_send("chat-send")
+                                .on_click(cx.listener(|chat, _, _, cx| chat.submit_prompt(cx))),
+                        ),
+                ),
+        )
     }
 }
 

@@ -102,7 +102,7 @@ The "ghost chat" from the spec is purely client-side; `create_session` fires on 
 {"id": 4, "type": "harvester", "cmd": {"type": "list_models", "cwd": "/work/repo"}}
 ```
 
-For the ghost-chat model picker, which needs answers before any session exists. The daemon spawns a throwaway `PI_OFFLINE=1 pi --mode rpc --no-session` in `cwd`, sends `get_available_models`, returns the models, closes stdin. Deterministic, touches no session.
+For the ghost-chat model picker, which needs answers before any session exists. The daemon spawns a throwaway `PI_OFFLINE=1 pi --mode rpc --no-session` in `cwd`, sends `get_available_models`, returns pi's `data` verbatim, then closes stdin. Ordering matters: stdin stays open **until the response line is read** — pi treats EOF as shutdown and dies before answering otherwise (verified live on pi 0.83.0). A 15s backstop SIGKILLs a wedged pi (safe: `--no-session` has nothing durable to truncate). Deterministic, touches no session, never cached — every call costs a pi startup (~1s measured on exe.dev).
 
 ### `attach` / `detach`
 

@@ -368,3 +368,19 @@ The 5s-grace stop was redesigned (abort → stdin EOF → 30s SIGKILL backstop, 
 
 - gpui facts: published on crates.io since this round (`0.2.x`, out of the Zed monorepo); smol-based executor, **no tokio interop** — the client runs tokio on a dedicated bridge thread, tokio mpsc channels are reactor-independent and awaitable from gpui tasks; no built-in text-input widget (`examples/input.rs` is the canonical IME-correct implementation, vendored); `tokio::select!` + client-core's `DaemonReader::next` is unsafe under cancellation (partial line dropped) — reads live on their own task.
 - Build facts: needs `libxkbcommon-x11-dev` on Linux (X11 feature links it even under Wayland); full-DWARF dev builds of the gpui tree are multi-GB — workspace `[profile.dev] debug = "line-tables-only"`.
+
+### Round 5 — ghost chat / `list_models` (2026-08-03, same VM `egg-by-penguin`)
+
+- **Stdin EOF races the response on a throwaway pi**: `echo '{"type":"get_available_models",...}' | pi --mode rpc --no-session` returns *nothing* — pi sees EOF and takes its shutdown path before answering the queued command. Holding stdin open until the response line is read (then closing) works every time. Consequence for harvesterd's `list_models`: write request → read response → close stdin, never write-and-close. This does not contradict the Round-4 "stdin queue drains in order" fact — *commands* queue in order; EOF is not a command, it preempts.
+- `get_available_models` on an exe.dev VM: 50 models, each with `id`/`name`/`provider` (`provider` present on gateway models too, e.g. `exe-dev-openai`), whole run ~0.9–1.4s including pi startup.
+- Full ghost chain verified over the daemon socket (protocol e2e, no UI): `create_session` (fresh sid + `--provider`/`--model` from the models list + `name`) → `attach` → passthrough `prompt`, no probe between — prompt answered, `get_entries` showed both messages, `list_sessions` carried the name, `stop` clean.
+
+### Round 6 — mid-session model switching (2026-08-03, pi 0.83.0 `docs/rpc.md` + live e2e on `egg-by-penguin`)
+
+Source-verified in `~/.local/pi/docs/rpc.md` (§Model, §get_state) and confirmed live over the daemon socket (create → attach → `get_state` → `get_available_models` (50) → `set_model` gpt-5.6-sol→terra confirmed by a second `get_state` → bad model rejected `"Model not found"` → stop):
+
+- `set_model {"provider": "...", "modelId": "..."}` switches the **running** session's model; response `data` is the full Model object now in effect. Errors are clean (`"Model not found: ..."`).
+- `get_state` returns `data.model` — the current Model object or `null` — plus `thinkingLevel`, `isStreaming`, `sessionName`, etc.
+- `get_available_models` works on a running session too — no throwaway pi needed when one is attached; harvesterd's generic passthrough carries all three (no daemon changes).
+- `cycle_model` / `set_thinking_level` / `cycle_thinking_level` exist (thinking levels still deferred client-side).
+- UNVERIFIED: `set_model` behavior mid-turn (verified idle-session only; docs state no restriction — the client allows it and surfaces any pi error in the statusbar).

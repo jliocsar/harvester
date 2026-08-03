@@ -34,14 +34,12 @@ const PALETTE: &[(&str, u32)] = &[
 
 pub struct Kitchen {
     prompt_input: Entity<TextInput>,
-    path_input: Entity<TextInput>,
 }
 
 impl Kitchen {
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
             prompt_input: cx.new(|cx| TextInput::new("Message pi — Enter to send", cx)),
-            path_input: cx.new(|cx| TextInput::new("/absolute/path/to/workspace", cx)),
         }
     }
 }
@@ -53,7 +51,6 @@ impl Render for Kitchen {
             .read(cx)
             .focus_handle(cx)
             .is_focused(window);
-        let path_focused = self.path_input.read(cx).focus_handle(cx).is_focused(window);
 
         div()
             .id("kitchen")
@@ -75,27 +72,86 @@ impl Render for Kitchen {
                     .child(section("status dots", render_status_dots()))
                     .child(section("session rows", render_session_rows()))
                     .child(section("workspace rows", render_workspace_rows()))
-                    .child(section("folder picker", render_folder_picker_sample()))
+                    .child(section("chat header", render_chat_header_sample()))
                     .child(section(
-                        "text input",
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_3()
-                            .child(labeled(
-                                "chat prompt (click to focus)",
-                                ui::input_frame(prompt_focused).child(self.prompt_input.clone()),
-                            ))
-                            .child(labeled(
-                                "path field",
-                                ui::input_frame(path_focused).child(self.path_input.clone()),
-                            )),
+                        "prompt box",
+                        render_prompt_box_samples(self.prompt_input.clone(), prompt_focused),
                     ))
+                    .child(section("model picker", render_model_picker_sample()))
+                    .child(section("folder picker", render_folder_picker_sample()))
                     .child(section("chat messages", render_chat_messages()))
                     .child(section("modal", render_modal_sample()))
                     .child(section("statusbar", render_statusbar_sample())),
             )
     }
+}
+
+/// The prompt box as it composes in production (ghost and live chat share
+/// the shape: model control + send), plus the static loading/ellipsis
+/// states. The first sample carries a real `TextInput` so focus and typing
+/// are tastable.
+fn render_prompt_box_samples(
+    prompt_input: Entity<TextInput>,
+    prompt_focused: bool,
+) -> impl IntoElement {
+    // Faint placeholder standing in for a `TextInput` in the static samples.
+    let static_input = || {
+        div()
+            .text_color(rgb(theme::TEXT_FAINT))
+            .child("Message pi — Enter to send")
+    };
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_4()
+        .w(px(560.))
+        .child(labeled(
+            "model control + send (click to focus)",
+            ui::prompt_box(prompt_focused)
+                .child(ui::prompt_box_input(prompt_input))
+                .child(
+                    ui::prompt_box_controls()
+                        .child(ui::prompt_box_control(
+                            "kitchen-prompt-model",
+                            "openai/gpt-5.6-sol (llm)".into(),
+                            true,
+                        ))
+                        .child(div().flex_1())
+                        .child(ui::prompt_box_send("kitchen-prompt-send")),
+                ),
+        ))
+        .child(labeled(
+            "models loading — control disabled, no caret",
+            ui::prompt_box(false)
+                .child(ui::prompt_box_input(static_input()))
+                .child(
+                    ui::prompt_box_controls()
+                        .child(ui::prompt_box_control(
+                            "kitchen-prompt-model-loading",
+                            "loading models…".into(),
+                            false,
+                        ))
+                        .child(div().flex_1())
+                        .child(ui::prompt_box_send("kitchen-prompt-send-loading")),
+                ),
+        ))
+        .child(labeled(
+            "long model name ellipsizes",
+            ui::prompt_box(false)
+                .child(ui::prompt_box_input(static_input()))
+                .child(
+                    ui::prompt_box_controls()
+                        .child(ui::prompt_box_control(
+                            "kitchen-prompt-model-long",
+                            "a-provider/a-model-with-an-unreasonably-long-name-that-ellipsizes (llm)"
+                                .into(),
+                            true,
+                        ))
+                        .child(div().flex_1())
+                        .child(ui::prompt_box_send("kitchen-prompt-send-long")),
+                ),
+        ))
 }
 
 /// A catalog section: faint uppercase title over its samples.
@@ -283,7 +339,8 @@ fn render_session_rows() -> impl IntoElement {
 }
 
 fn render_workspace_rows() -> impl IntoElement {
-    // Sidebar-width container, like the session-row samples.
+    // Sidebar-width container, like the session-row samples. The whole row is
+    // the ghost-chat click target; the trailing "+" is the affordance.
     div()
         .w(px(240.))
         .bg(rgb(theme::PANEL_BG))
@@ -293,10 +350,78 @@ fn render_workspace_rows() -> impl IntoElement {
         .py_1()
         .flex()
         .flex_col()
-        .child(ui::workspace_row("bloggy".into(), "egg-by-penguin".into()))
         .child(ui::workspace_row(
+            "kitchen-workspace-1",
+            "bloggy".into(),
+            "egg-by-penguin".into(),
+        ))
+        .child(ui::workspace_row(
+            "kitchen-workspace-2",
             "a-very-long-workspace-folder-name".into(),
             "some-machine-with-a-long-label.exe.xyz".into(),
+        ))
+}
+
+/// The ghost chat's model picker as it composes in production: modal frame,
+/// fixed-height scrollable list (50 models on exe.dev), one selected row.
+fn render_model_picker_sample() -> impl IntoElement {
+    ui::modal_frame("Choose model")
+        .child(
+            div()
+                .id("kitchen-model-list")
+                .h(px(160.))
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .child(ui::model_row(
+                    "kitchen-model-1",
+                    "openai/gpt-5.6-sol (llm)".into(),
+                    false,
+                ))
+                .child(ui::model_row(
+                    "kitchen-model-2",
+                    "anthropic/claude-sonnet-4.7 (llm)".into(),
+                    true,
+                ))
+                .child(ui::model_row(
+                    "kitchen-model-3",
+                    "a-provider/a-model-with-an-unreasonably-long-name-that-ellipsizes (llm)"
+                        .into(),
+                    false,
+                ))
+                .child(ui::model_row(
+                    "kitchen-model-4",
+                    "google/gemini-3.2-pro (llm)".into(),
+                    false,
+                )),
+        )
+        .child(labeled(
+            "loading state",
+            div()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_FAINT))
+                .child("loading models…"),
+        ))
+        .child(labeled(
+            "error state",
+            div()
+                .text_xs()
+                .text_color(rgb(theme::STATUS_ERROR))
+                .child("list_models: pi gave no answer within 15s"),
+        ))
+}
+
+/// The ghost chat's header: title + faint folder subtitle (the model control
+/// lives in the prompt box).
+fn render_chat_header_sample() -> impl IntoElement {
+    div()
+        .bg(rgb(theme::WINDOW_BG))
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .rounded_md()
+        .child(ui::chat_header(
+            "New session".into(),
+            "bloggy on egg-by-penguin".into(),
         ))
 }
 
@@ -384,13 +509,6 @@ fn render_modal_sample() -> impl IntoElement {
                 .text_sm()
                 .text_color(rgb(theme::TEXT_DIM))
                 .child("Path to a git repository on the machine."),
-        )
-        .child(
-            ui::input_frame(false).child(
-                div()
-                    .text_color(rgb(theme::TEXT_FAINT))
-                    .child("/home/exedev/bloggy"),
-            ),
         )
         .child(
             div()
