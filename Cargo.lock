@@ -2492,6 +2492,7 @@ dependencies = [
  "harvester-proto",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

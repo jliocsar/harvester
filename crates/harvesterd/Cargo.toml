@@ -8,3 +8,7 @@ harvester-proto = { path = "../harvester-proto" }
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 tokio.workspace = true
+
+[dev-dependencies]
+# Session-file fixtures for the fslist tests; never linked into the shipped binary.
+tempfile = "3"

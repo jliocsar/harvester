@@ -109,6 +109,54 @@ struct DialogRoom {
     pending: HashMap<String, Arc<[u8]>>,
 }
 
+/// The state machine itself, deliberately plain and synchronous: the locking
+/// belongs to [`Session`], so the policy can be exercised without a pi child.
+impl DialogRoom {
+    /// Join the room; returns the dialog envelopes already waiting, which the
+    /// caller's forwarder replays so a late attacher sees them too.
+    fn attach(&mut self) -> Vec<Arc<[u8]>> {
+        self.attached += 1;
+
+        self.pending.values().cloned().collect()
+    }
+
+    /// Leave the room. When the last watcher goes, every still-pending dialog
+    /// is returned for cancellation — nothing could answer them anymore, and
+    /// pi would wait forever (docs/DAEMON.md: never leave a dialog unanswered).
+    fn detach(&mut self) -> Vec<String> {
+        self.attached = self.attached.saturating_sub(1);
+
+        if self.attached > 0 {
+            return Vec::new();
+        }
+
+        self.pending
+            .drain()
+            .map(|(dialog_id, _)| dialog_id)
+            .collect()
+    }
+
+    /// Remove-and-return: true means the dialog was still pending and this
+    /// caller's answer is the winning one (first answer wins).
+    fn claim_pending(&mut self, dialog_id: &str) -> bool {
+        self.pending.remove(dialog_id).is_some()
+    }
+
+    /// Remember a dialog (with the envelope to replay on a later attach).
+    /// `false` means the room is empty, so nobody will ever answer it and the
+    /// caller must cancel instead — decided in the same critical section as the
+    /// insert, which is what keeps the two outcomes mutually exclusive.
+    fn remember(&mut self, dialog_id: &str, envelope: Arc<[u8]>) -> bool {
+        if self.attached == 0 {
+            return false;
+        }
+
+        self.pending.insert(dialog_id.to_owned(), envelope);
+
+        true
+    }
+}
+
 pub struct SpawnArgs {
     pub sid: String,
     pub cwd: String,
@@ -211,33 +259,20 @@ impl Session {
     /// Join the room; returns the dialog envelopes already waiting, which the
     /// caller's forwarder replays so a late attacher sees them too.
     pub fn attach(&self) -> Vec<Arc<[u8]>> {
-        let mut room = self.lock_room();
-        room.attached += 1;
-
-        room.pending.values().cloned().collect()
+        self.lock_room().attach()
     }
 
     /// Leave the room. When the last watcher goes, every still-pending dialog
     /// is returned for cancellation — nothing could answer them anymore, and
     /// pi would wait forever (docs/DAEMON.md: never leave a dialog unanswered).
     pub fn detach(&self) -> Vec<String> {
-        let mut room = self.lock_room();
-        room.attached = room.attached.saturating_sub(1);
-
-        if room.attached > 0 {
-            return Vec::new();
-        }
-
-        room.pending
-            .drain()
-            .map(|(dialog_id, _)| dialog_id)
-            .collect()
+        self.lock_room().detach()
     }
 
     /// Remove-and-return: true means the dialog was still pending and this
     /// caller's answer is the winning one (first answer wins).
     pub fn claim_pending_dialog(&self, dialog_id: &str) -> bool {
-        self.lock_room().pending.remove(dialog_id).is_some()
+        self.lock_room().claim_pending(dialog_id)
     }
 
     /// Remember a dialog (with the envelope to replay on a later attach).
@@ -245,15 +280,7 @@ impl Session {
     /// caller must cancel instead — checked under the same lock as the insert,
     /// which is what keeps the two outcomes mutually exclusive.
     fn remember_dialog(&self, dialog_id: &str, envelope: Arc<[u8]>) -> bool {
-        let mut room = self.lock_room();
-
-        if room.attached == 0 {
-            return false;
-        }
-
-        room.pending.insert(dialog_id.to_owned(), envelope);
-
-        true
+        self.lock_room().remember(dialog_id, envelope)
     }
 
     fn resolve_response(&self, request_key: &str, response: Value) {
@@ -473,4 +500,142 @@ fn dialog_id_awaiting_answer<'probe>(probe: &'probe LineProbe<'_>) -> Option<&'p
     }
 
     probe.id.as_deref()
+}
+
+/// The dialog room in isolation — no pi child, no tokio, no sockets. Every case
+/// here is a clause of the dialog policy in docs/DAEMON.md.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Stand-in for the wire envelope the pump would have built; the room only
+    /// ever stores and hands back these bytes, never inspects them.
+    fn envelope(dialog_id: &str) -> Arc<[u8]> {
+        Arc::from(format!(r#"{{"type":"event","id":"{dialog_id}"}}"#).into_bytes())
+    }
+
+    fn sorted(mut dialog_ids: Vec<String>) -> Vec<String> {
+        dialog_ids.sort();
+
+        dialog_ids
+    }
+
+    #[test]
+    fn attach_on_empty_room_replays_nothing() {
+        let mut room = DialogRoom::default();
+
+        assert!(room.attach().is_empty());
+        assert_eq!(room.attached, 1);
+    }
+
+    #[test]
+    fn remember_is_refused_when_the_room_is_empty() {
+        let mut room = DialogRoom::default();
+
+        assert!(!room.remember("d1", envelope("d1")));
+        assert!(room.pending.is_empty());
+    }
+
+    #[test]
+    fn remember_is_accepted_while_a_watcher_is_attached() {
+        let mut room = DialogRoom::default();
+        room.attach();
+
+        assert!(room.remember("d1", envelope("d1")));
+        assert_eq!(room.pending.len(), 1);
+    }
+
+    #[test]
+    fn a_pending_dialog_is_replayed_to_a_later_attacher() {
+        let mut room = DialogRoom::default();
+        room.attach();
+        room.remember("d1", envelope("d1"));
+
+        let replayed = room.attach();
+
+        assert_eq!(replayed, vec![envelope("d1")]);
+    }
+
+    #[test]
+    fn detach_with_another_watcher_left_cancels_nothing() {
+        let mut room = DialogRoom::default();
+        room.attach();
+        room.attach();
+        room.remember("d1", envelope("d1"));
+
+        assert!(room.detach().is_empty());
+        assert_eq!(room.attached, 1);
+        assert_eq!(room.pending.len(), 1);
+    }
+
+    #[test]
+    fn the_last_detach_drains_every_pending_dialog() {
+        let mut room = DialogRoom::default();
+        room.attach();
+        room.attach();
+        room.remember("d1", envelope("d1"));
+        room.remember("d2", envelope("d2"));
+        room.detach();
+
+        let to_cancel = room.detach();
+
+        assert_eq!(sorted(to_cancel), vec!["d1".to_owned(), "d2".to_owned()]);
+        assert_eq!(room.attached, 0);
+        assert!(room.pending.is_empty());
+    }
+
+    #[test]
+    fn claim_pending_lets_only_the_first_answer_win() {
+        let mut room = DialogRoom::default();
+        room.attach();
+        room.remember("d1", envelope("d1"));
+
+        assert!(room.claim_pending("d1"));
+        assert!(!room.claim_pending("d1"));
+    }
+
+    #[test]
+    fn claiming_an_unknown_dialog_is_refused() {
+        let mut room = DialogRoom::default();
+        room.attach();
+
+        assert!(!room.claim_pending("nope"));
+    }
+
+    #[test]
+    fn a_claimed_dialog_is_no_longer_replayed_on_attach() {
+        let mut room = DialogRoom::default();
+        room.attach();
+        room.remember("d1", envelope("d1"));
+        room.claim_pending("d1");
+
+        assert!(room.attach().is_empty());
+    }
+
+    #[test]
+    fn detaching_more_often_than_attaching_saturates_at_zero() {
+        let mut room = DialogRoom::default();
+        room.attach();
+        room.detach();
+
+        assert!(room.detach().is_empty());
+        assert_eq!(room.attached, 0);
+
+        assert!(room.detach().is_empty());
+        assert_eq!(room.attached, 0);
+    }
+
+    #[test]
+    fn only_the_unanswered_dialog_comes_back_for_cancellation() {
+        let mut room = DialogRoom::default();
+        room.attach();
+        room.remember("answered", envelope("answered"));
+        room.remember("stranded", envelope("stranded"));
+
+        assert!(room.claim_pending("answered"));
+
+        let to_cancel = room.detach();
+
+        assert_eq!(to_cancel, vec!["stranded".to_owned()]);
+    }
 }
