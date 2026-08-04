@@ -369,9 +369,9 @@ async fn sessions_flow(context: BridgeContext) {
 /// on pi's stdin, so no readiness probe is needed.
 async fn open_flow(context: BridgeContext, sid: String, cwd: String) {
     let attached = context.attached.clone();
-    let mut attached = attached.lock().await;
+    let mut attachment = attached.lock().await;
 
-    detach_previous(&context, &mut attached, &sid).await;
+    detach_previous(&context, &mut attachment, &sid).await;
 
     let create = context
         .client
@@ -390,9 +390,15 @@ async fn open_flow(context: BridgeContext, sid: String, cwd: String) {
         return;
     }
 
-    if !attach(&context, &mut attached, &sid).await {
+    if !attach(&context, &mut attachment, &sid).await {
         return;
     }
+
+    // The attachment transition is done, so the guard's job is done: an async
+    // mutex may cover a state transition, never a remote call. Holding it
+    // across `get_entries` is what let one wedged pi block every later Open
+    // on this bridge for the life of the app.
+    drop(attachment);
 
     // History replay: attach → get_entries → live events (DAEMON.md §attach).
     replay_history(&context, sid).await;

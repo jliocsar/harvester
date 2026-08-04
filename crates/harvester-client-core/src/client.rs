@@ -122,23 +122,23 @@ impl DaemonClient {
     ) -> std::io::Result<CorrelatedResponse> {
         let id = self.inner.last_request_id.fetch_add(1, Ordering::Relaxed) + 1;
         let (sender, receiver) = oneshot::channel();
-
-        self.lock_pending().insert(id, sender);
-
+        let pending = Pending::register(self, id, sender);
         let request = build(Some(json!(id)));
 
-        if let Err(error) = self.inner.writer.lock().await.send(&request).await {
-            self.lock_pending().remove(&id);
+        self.inner.writer.lock().await.send(&request).await?;
 
-            return Err(error);
-        }
-
-        receiver.await.map_err(|_closed| {
+        let response = receiver.await.map_err(|_closed| {
             std::io::Error::new(
                 std::io::ErrorKind::ConnectionAborted,
                 "connection closed before the response",
             )
-        })
+        });
+        // The waiter is resolved (or gone) either way; releasing it here is
+        // only tidiness — the guard's Drop covers every path, including the
+        // cancelled-future one that has no code at all.
+        drop(pending);
+
+        response
     }
 
     fn route_line(
@@ -192,6 +192,38 @@ impl DaemonClient {
         &self,
     ) -> std::sync::MutexGuard<'_, HashMap<u64, oneshot::Sender<CorrelatedResponse>>> {
         self.inner.pending.lock().expect("pending mutex")
+    }
+}
+
+/// Owns one entry in the pending map for as long as the request is in
+/// flight. RAII because the ways out are more numerous than the ways
+/// through: a failed write, a cancelled future (the caller's task dropped
+/// mid-await — the UI does this whenever a flow is abandoned), or the normal
+/// resolution. A leaked entry is a waiter that can never be woken and a
+/// `HashMap` that only grows, so the removal cannot live at a call site.
+struct Pending {
+    client: DaemonClient,
+    id: u64,
+}
+
+impl Pending {
+    fn register(
+        client: &DaemonClient,
+        id: u64,
+        sender: oneshot::Sender<CorrelatedResponse>,
+    ) -> Pending {
+        client.lock_pending().insert(id, sender);
+
+        Pending {
+            client: client.clone(),
+            id,
+        }
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        self.client.lock_pending().remove(&self.id);
     }
 }
 

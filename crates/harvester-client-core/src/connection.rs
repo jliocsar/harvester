@@ -31,19 +31,25 @@ const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 /// Request id of the handshake ping — the first request on every connection,
 /// so 0 is unambiguous.
 const HANDSHAKE_PING_ID: u64 = 0;
+/// Forward socket file names: `harvester-<pid>-<hash>.sock`. The prefix and
+/// suffix are what [`sweep_leaked_forward_sockets`] matches on, and the
+/// suffix is what keeps the sweep off ssh's own control sockets
+/// (`harvester-ssh-%C`, no extension) in the same directory.
+const FORWARD_SOCKET_PREFIX: &str = "harvester-";
+const FORWARD_SOCKET_SUFFIX: &str = ".sock";
 
 /// Keeps the ssh forward process alive (killed on drop via `kill_on_drop`)
 /// and owns the forward's local socket file. The local (no-SSH) machine
 /// needs neither: `ForwardGuard::none()` — the daemon owns its socket.
 struct ForwardGuard {
-    _child: Option<Child>,
+    child: Option<Child>,
     local_socket: Option<PathBuf>,
 }
 
 impl ForwardGuard {
     fn none() -> Self {
         ForwardGuard {
-            _child: None,
+            child: None,
             local_socket: None,
         }
     }
@@ -141,21 +147,24 @@ async fn connect(target: &SshTarget, remote_home: &str) -> Result<(DaemonConnect
         Err(error) => return Err(Error::Io(error)),
     }
 
-    let mut child = create_forward_command(target, &local_socket, remote_home).spawn()?;
+    let child = create_forward_command(target, &local_socket, remote_home).spawn()?;
+    // Guarded from the spawn, not from the success path: every error return
+    // below leaves through this scope, and the socket file is bound the
+    // moment ssh comes up. Building it later orphaned one socket file per
+    // expired connect attempt.
+    let mut guard = ForwardGuard {
+        child: Some(child),
+        local_socket: Some(local_socket.clone()),
+    };
     let deadline = Instant::now() + CONNECT_TIMEOUT;
 
     loop {
-        if let Some(status) = child.try_wait()? {
+        if let Some(status) = guard.child.as_mut().expect("forward child").try_wait()? {
             return Err(Error::DaemonConnect(format!("ssh exited: {status}")));
         }
 
         match bounded_handshake(&local_socket, deadline).await {
             Ok((reader, writer, daemon_version)) => {
-                let guard = ForwardGuard {
-                    _child: Some(child),
-                    local_socket: Some(local_socket),
-                };
-
                 return Ok((assemble(reader, writer, guard), daemon_version));
             }
             Err(error) => {
@@ -337,8 +346,112 @@ fn local_socket_path(dest: &str) -> PathBuf {
     dest.hash(&mut hasher);
 
     crate::ssh::client_socket_dir().join(format!(
-        "harvester-{}-{:016x}.sock",
+        "{FORWARD_SOCKET_PREFIX}{}-{:016x}{FORWARD_SOCKET_SUFFIX}",
         std::process::id(),
         hasher.finish()
     ))
+}
+
+/// Removes forward socket files no daemon connection can be reached through
+/// any more — the ones a previous client left behind when it died without
+/// running [`ForwardGuard`]'s `Drop` (SIGKILL, OOM, a panic-abort). The
+/// same-pid `remove_file` preamble in [`connect`] never reclaims those: the
+/// next process has a different pid, so without this they accumulate in
+/// `~/.harvester/run` forever, one per destination per crash.
+///
+/// The liveness test is a connect, not a pid check: a bound socket whose
+/// listener is gone refuses with `ECONNREFUSED`, while a live forward — this
+/// process's own included — accepts. That is pid-reuse-proof, which a
+/// filename-pid check would not be.
+pub(crate) async fn sweep_leaked_forward_sockets() {
+    let dir = crate::ssh::client_socket_dir();
+
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!("harvester: reading {} failed: {error}", dir.display());
+
+            return;
+        }
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+
+        if !name.starts_with(FORWARD_SOCKET_PREFIX) || !name.ends_with(FORWARD_SOCKET_SUFFIX) {
+            continue;
+        }
+
+        remove_if_refused(&path).await;
+    }
+}
+
+/// One socket's liveness test. Only `ECONNREFUSED` proves the listener is
+/// gone; every other error (permissions, a path that stopped being a socket)
+/// is a reason to leave the file alone.
+async fn remove_if_refused(path: &Path) {
+    let Err(error) = UnixStream::connect(path).await else {
+        return;
+    };
+
+    if error.kind() != std::io::ErrorKind::ConnectionRefused {
+        return;
+    }
+
+    if let Err(error) = std::fs::remove_file(path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            eprintln!(
+                "harvester: removing leaked forward socket {} failed: {error}",
+                path.display()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use tokio::net::UnixListener;
+
+    /// A socket file whose listener is gone is exactly what a SIGKILLed
+    /// client leaves behind: still bound on disk, refusing every connect.
+    #[tokio::test]
+    async fn removes_a_socket_whose_listener_is_gone() {
+        let dir = std::env::temp_dir().join(format!("harvester-sweep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("test dir");
+
+        let dead = dir.join("harvester-1-dead.sock");
+        let listener = UnixListener::bind(&dead).expect("bind");
+        // Dropping the listener does not unlink the file — that is the leak.
+        drop(listener);
+
+        assert!(dead.exists(), "dropping a listener must leave the file");
+
+        remove_if_refused(&dead).await;
+
+        assert!(!dead.exists(), "a refusing socket must be reclaimed");
+
+        std::fs::remove_dir_all(&dir).expect("test dir cleanup");
+    }
+
+    /// The other half of the invariant: a forward this or another live client
+    /// still owns must survive the sweep.
+    #[tokio::test]
+    async fn keeps_a_socket_with_a_live_listener() {
+        let dir = std::env::temp_dir().join(format!("harvester-sweep-live-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("test dir");
+
+        let live = dir.join("harvester-1-live.sock");
+        let _listener = UnixListener::bind(&live).expect("bind");
+
+        remove_if_refused(&live).await;
+
+        assert!(live.exists(), "a live forward must not be reclaimed");
+
+        std::fs::remove_dir_all(&dir).expect("test dir cleanup");
+    }
 }

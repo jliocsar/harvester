@@ -629,8 +629,16 @@ impl Workbench {
     /// By sid, not index — the sidebar renders a filtered view of
     /// `self.sessions`, so display positions don't map back to the list.
     fn open_session(&mut self, sid: &str, cx: &mut Context<Self>) {
-        if self.opening.is_some() {
-            return;
+        // The guard is cleared by Attached/RequestFailed/ConnectFailed, none
+        // of which arrive from a daemon that is live but silent — so clicking
+        // the same row again is the escape hatch: it clears the guard and
+        // reissues Open (create-or-resume + attach is idempotent).
+        if let Some(opening) = self.opening.as_deref() {
+            if opening != sid {
+                return;
+            }
+
+            self.opening = None;
         }
 
         let Some(session) = self.sessions.iter().find(|session| session.info.sid == sid) else {

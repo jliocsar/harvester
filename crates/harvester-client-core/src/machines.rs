@@ -95,6 +95,11 @@ async fn worker_main(mut commands: UnboundedReceiver<Command>, events: Unbounded
         eprintln!("harvester: install bundled providers: {error}");
     }
 
+    // This worker is the client's one startup point inside client-core, and
+    // it runs before any bridge binds a forward — the moment to reclaim the
+    // socket files a previously killed client could not clean up itself.
+    crate::connection::sweep_leaked_forward_sockets().await;
+
     let mut ad_hoc_machines: Vec<String> = Vec::new();
     let mut provider_rows = ProviderRows::new();
     let mut provider_machines: Vec<MachineRow> = Vec::new();
