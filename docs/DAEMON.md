@@ -125,6 +125,8 @@ For the ghost-chat model picker, which needs answers before any session exists. 
 
 Subscribes this connection to the session's live event stream. A connection may attach to any number of sessions. The daemon guarantee stands as written, but **no client exercises it today**: the gpui client's bridge holds exactly one attachment per machine (one chat pane — `bridge.rs`'s `attached`), detaching from the previous session before attaching to the next. Reconnect/replay is NOT a daemon feature — after attaching, the client sends passthrough `get_entries {since: <last seen entry id>}` to recover history from pi's durable cursor, then renders live events. The verbose delta stream is never replayed.
 
+**Streaming starts when the attach lands, not when the client is ready** — so the events that arrive during the `get_entries` round trip are in neither the snapshot nor the client's rendered state. That ordering is the daemon's, and it is not negotiable (a daemon that waited for a client to say "ready" would be holding per-client state it does not have); closing the window is the client's job. The client therefore registers the sid *before* sending `attach`, holds its live events, and releases them in arrival order the instant the snapshot is published (`bridge.rs`'s `AttachEventBuffers`). A held-back window that overflows is treated exactly like a daemon `event_gap`: discard and resync. This matters most for events that only *mutate* prior state — a lost `tool_execution_end` leaves a tool card running forever, while a lost `message_update` self-repairs on the next delta.
+
 ### `stop`
 
 ```json

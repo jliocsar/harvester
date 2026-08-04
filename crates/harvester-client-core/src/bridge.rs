@@ -13,8 +13,8 @@
 //! responses resolve at their await points, so there is no response-routing
 //! state machine here at all.
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -194,6 +194,14 @@ struct BridgeContext {
     /// async mutex also *serializes* attachment changes: a second Open waits
     /// out the first flow instead of interleaving with it.
     attached: Arc<AsyncMutex<Option<String>>>,
+    /// Live events held back while an attach flow is still fetching history.
+    /// std::sync — every use is a lock/mutate/unlock with no await inside.
+    attach_buffers: Arc<Mutex<AttachEventBuffers>>,
+    /// Dialog ids already answered, per session. Shared rather than owned by
+    /// the select loop because a flushed attach buffer replays through
+    /// [`handle_pi_event`] from inside a flow. std::sync — never held across
+    /// an await.
+    answered_dialogs: Arc<Mutex<HashSet<(String, String)>>>,
 }
 
 pub fn start(
@@ -267,12 +275,12 @@ async fn bridge_main(
         events,
         host,
         attached: Arc::new(AsyncMutex::new(None)),
+        attach_buffers: Arc::new(Mutex::new(AttachEventBuffers::default())),
+        answered_dialogs: Arc::new(Mutex::new(HashSet::new())),
     };
 
     // The sidebar renders from this; fetch immediately.
     spawn_flow(sessions_flow(context.clone()));
-
-    let mut answered_dialogs = HashSet::new();
 
     loop {
         tokio::select! {
@@ -284,7 +292,7 @@ async fn bridge_main(
             },
             event = session_events.recv() => match event {
                 Some(SessionEvent::Pi { sid, event }) => {
-                    handle_pi_event(&context, &mut answered_dialogs, sid, event);
+                    handle_live_pi_event(&context, sid, event);
                 }
                 Some(SessionEvent::SessionExit { sid, exit_code }) => {
                     context.events.send(Event::SessionExit { sid, exit_code });
@@ -294,7 +302,7 @@ async fn bridge_main(
                 // frontend already knows how to render.
                 Some(SessionEvent::EventGap { sid, skipped }) => {
                     eprintln!("bridge: lost {skipped} events for session {sid}; resyncing");
-                    spawn_flow(replay_history_owned(context.clone(), sid));
+                    spawn_flow(resync_flow(context.clone(), sid));
                 }
                 Some(SessionEvent::Disconnected) | None => {
                     context.events.send(Event::Disconnected);
@@ -347,6 +355,191 @@ fn spawn_flow(flow: impl std::future::Future<Output = ()> + Send + 'static) {
     tokio::spawn(flow);
 }
 
+// --- the attach window -----------------------------------------------------
+//
+// The daemon starts streaming a session's events the instant its `attach`
+// lands (docs/DAEMON.md §attach — deliberate, and not ours to reorder), but a
+// frontend has nowhere to put them until `Event::Attached` publishes the
+// `get_entries` snapshot one round trip later. An event that arrives in that
+// window is missing from the snapshot *and* dropped by the frontend: a lost
+// `tool_execution_end` leaves a tool card spinning for the life of that chat
+// (streaming text self-repairs — every `message_update` carries the whole
+// partial — tool ends do not). So the bridge holds that window back.
+
+/// How many live events one session may hold back while its history is in
+/// flight. A `get_entries` round trip is milliseconds and pi emits a few
+/// events per second, so this is orders of magnitude of headroom; the cap only
+/// exists so a wedged fetch cannot grow a `Vec` without bound.
+const ATTACH_EVENT_BUFFER_CAP: usize = 1024;
+
+/// What the select loop should do with an event it just offered the buffers.
+enum PushOutcome {
+    /// No flow is holding this session back — deliver it live.
+    Deliver(Value),
+    Buffered,
+    /// The cap was just hit: the held events are gone and the session is
+    /// marked for resync. Worth one line on stderr.
+    Overflowed,
+    /// Already overflowed; dropped on the floor because the resync that
+    /// follows the flush is authoritative anyway.
+    Discarded,
+}
+
+/// What an attach flow finds waiting for it once `Attached` is published.
+enum FlushOutcome {
+    /// Deliver these, in arrival order, before anything else.
+    Events(Vec<Value>),
+    /// Events were lost, so the snapshot just published is already stale.
+    Overflowed,
+}
+
+enum SessionBuffer {
+    Buffering(Vec<Value>),
+    Overflowed,
+}
+
+/// The held-back windows, keyed by sid. Pure and synchronous on purpose: it is
+/// the one piece of this fix that can be tested without a daemon.
+#[derive(Default)]
+struct AttachEventBuffers {
+    by_session: HashMap<String, SessionBuffer>,
+}
+
+impl AttachEventBuffers {
+    /// Idempotent: a resync racing an open joins the window already in flight
+    /// rather than resetting it, which would discard everything held so far.
+    fn register(&mut self, sid: &str) {
+        self.by_session
+            .entry(sid.to_string())
+            .or_insert_with(|| SessionBuffer::Buffering(Vec::new()));
+    }
+
+    fn push(&mut self, sid: &str, event: Value) -> PushOutcome {
+        let Some(buffer) = self.by_session.get_mut(sid) else {
+            return PushOutcome::Deliver(event);
+        };
+
+        match buffer {
+            SessionBuffer::Overflowed => PushOutcome::Discarded,
+            SessionBuffer::Buffering(events) if events.len() < ATTACH_EVENT_BUFFER_CAP => {
+                events.push(event);
+
+                PushOutcome::Buffered
+            }
+            SessionBuffer::Buffering(_) => {
+                *buffer = SessionBuffer::Overflowed;
+
+                PushOutcome::Overflowed
+            }
+        }
+    }
+
+    fn flush(&mut self, sid: &str) -> FlushOutcome {
+        match self.by_session.remove(sid) {
+            Some(SessionBuffer::Buffering(events)) => FlushOutcome::Events(events),
+            Some(SessionBuffer::Overflowed) => FlushOutcome::Overflowed,
+            // Another flow for the same sid flushed first; its events are out
+            // and its `Attached` seeded the chat, so there is nothing owed.
+            None => FlushOutcome::Events(Vec::new()),
+        }
+    }
+
+    fn drop_registration(&mut self, sid: &str) {
+        self.by_session.remove(sid);
+    }
+}
+
+/// Owns one session's registration for the length of an attach flow. RAII
+/// because the ways out are more numerous than the way through — a failed
+/// attach and a failed `get_entries` both return early, and a registration
+/// that outlives its flow swallows that session's live events for the life of
+/// the bridge, which is strictly worse than the gap it closes. Same shape as
+/// `Pending` in `client.rs` and `ForwardGuard` in `connection.rs`.
+struct AttachRegistration {
+    buffers: Arc<Mutex<AttachEventBuffers>>,
+    sid: String,
+    /// Set by [`AttachRegistration::flush`], which already removed the entry;
+    /// without it a `Drop` landing after a same-sid re-registration would wipe
+    /// somebody else's window.
+    flushed: bool,
+}
+
+impl AttachRegistration {
+    /// Call this *before* the `attach` request goes out — the streaming starts
+    /// the moment it lands, not when its response comes back.
+    fn register(buffers: &Arc<Mutex<AttachEventBuffers>>, sid: &str) -> AttachRegistration {
+        lock_attach_buffers(buffers).register(sid);
+
+        AttachRegistration {
+            buffers: buffers.clone(),
+            sid: sid.to_string(),
+            flushed: false,
+        }
+    }
+
+    /// The held events, in arrival order. Consuming `self` makes "flushed" and
+    /// "registration released" the same event.
+    fn flush(mut self) -> FlushOutcome {
+        self.flushed = true;
+
+        lock_attach_buffers(&self.buffers).flush(&self.sid)
+    }
+}
+
+impl Drop for AttachRegistration {
+    fn drop(&mut self) {
+        if self.flushed {
+            return;
+        }
+
+        lock_attach_buffers(&self.buffers).drop_registration(&self.sid);
+    }
+}
+
+fn lock_attach_buffers(
+    buffers: &Arc<Mutex<AttachEventBuffers>>,
+) -> std::sync::MutexGuard<'_, AttachEventBuffers> {
+    buffers.lock().expect("attach buffer mutex")
+}
+
+/// One event off the daemon stream: held back while its session's history is
+/// in flight, delivered otherwise.
+fn handle_live_pi_event(context: &BridgeContext, sid: String, event: Value) {
+    let outcome = lock_attach_buffers(&context.attach_buffers).push(&sid, event);
+
+    match outcome {
+        PushOutcome::Deliver(event) => handle_pi_event(context, sid, event),
+        PushOutcome::Buffered | PushOutcome::Discarded => {}
+        PushOutcome::Overflowed => eprintln!(
+            "bridge: session {sid} exceeded {ATTACH_EVENT_BUFFER_CAP} events while its history \
+             was in flight; resyncing once it lands"
+        ),
+    }
+}
+
+/// Release the window the instant the frontend has a chat to put it in. There
+/// is no await between the `Attached` send and this, so no live event can slip
+/// in front of the events it held back.
+fn deliver_buffered_events(context: &BridgeContext, sid: String, registration: AttachRegistration) {
+    match registration.flush() {
+        FlushOutcome::Events(events) => {
+            for event in events {
+                handle_pi_event(context, sid.clone(), event);
+            }
+        }
+        // Reuse the daemon's own vocabulary for this situation rather than
+        // inventing a second recovery: events were lost, so the snapshot we
+        // just published is stale and the cure is another `get_entries`. The
+        // retry can in principle overflow again, but that needs a session
+        // outrunning the cap on every attempt — the ring in front of us is the
+        // narrower bound.
+        FlushOutcome::Overflowed => {
+            eprintln!("bridge: held-back events overflowed for session {sid}; resyncing");
+            spawn_flow(resync_flow(context.clone(), sid));
+        }
+    }
+}
+
 // --- INTERIM: the unanswered-dialog stopgap --------------------------------
 //
 // Delete this whole block — the const, `handle_pi_event`'s dialog branch,
@@ -361,20 +554,20 @@ fn spawn_flow(flow: impl std::future::Future<Output = ()> + Send + 'static) {
 /// methods (`notify`, `setStatus`, …) are forwarded and never answered.
 const DIALOG_METHODS: [&str; 4] = ["select", "confirm", "input", "editor"];
 
-/// One live pi event: forwarded verbatim, and — interim — auto-cancelled first
-/// when it is a dialog request.
-fn handle_pi_event(
-    context: &BridgeContext,
-    answered_dialogs: &mut HashSet<(String, String)>,
-    sid: String,
-    event: Value,
-) {
+/// One pi event on its way to the frontend: forwarded verbatim, and — interim
+/// — auto-cancelled first when it is a dialog request. Reached both live and
+/// from a flushed attach window, so it must not depend on the select loop.
+fn handle_pi_event(context: &BridgeContext, sid: String, event: Value) {
     if let Some((dialog_id, method)) = forwarded_dialog(&event) {
         // The daemon replays a pending dialog to every client that attaches
         // later, so the same id arriving twice is by design (DAEMON.md
         // §Dialogs) — answer each id once. Unbounded by session lifetime, but
         // a dialog needs a user-installed pi extension to exist at all.
-        let first_sighting = answered_dialogs.insert((sid.clone(), dialog_id.to_string()));
+        let first_sighting = context
+            .answered_dialogs
+            .lock()
+            .expect("answered dialogs mutex")
+            .insert((sid.clone(), dialog_id.to_string()));
 
         if first_sighting {
             spawn_flow(cancel_dialog_flow(
@@ -478,6 +671,11 @@ async fn open_flow(context: BridgeContext, sid: String, cwd: String) {
         return;
     }
 
+    // Before the attach, not after: the daemon streams from the moment it
+    // lands, and `Attached` is a whole `get_entries` away. Dropped on every
+    // early return below by the guard's `Drop`.
+    let registration = AttachRegistration::register(&context.attach_buffers, &sid);
+
     if !attach(&context, &mut attachment, &sid).await {
         return;
     }
@@ -489,31 +687,44 @@ async fn open_flow(context: BridgeContext, sid: String, cwd: String) {
     drop(attachment);
 
     // History replay: attach → get_entries → live events (DAEMON.md §attach).
-    replay_history(&context, sid).await;
+    replay_history(&context, sid, registration).await;
+}
+
+/// A resync after events were lost: the daemon's `event_gap` and our own
+/// attach-window overflow are the same situation, and `get_entries` is the
+/// same cure. Owns its future for [`spawn_flow`], and registers its own
+/// window — a resync that dropped the events arriving during its own fetch
+/// would reintroduce exactly the hole it exists to close.
+async fn resync_flow(context: BridgeContext, sid: String) {
+    let registration = AttachRegistration::register(&context.attach_buffers, &sid);
+
+    replay_history(&context, sid, registration).await;
 }
 
 /// Fetch a session's history and publish it as `Attached` — the one path that
 /// (re)seeds a chat, whether the user just opened the session or the daemon
 /// told us we missed events. pi's session file is the source of truth, so a
-/// refetch is always the correct repair.
-/// `replay_history` for [`spawn_flow`], which needs an owning future.
-async fn replay_history_owned(context: BridgeContext, sid: String) {
-    replay_history(&context, sid).await;
-}
+/// refetch is always the correct repair. `registration` holds back the live
+/// events that race this fetch; it is released the moment `Attached` is out.
+async fn replay_history(context: &BridgeContext, sid: String, registration: AttachRegistration) {
+    let entries = match pi_flow_result(context, &sid, json!({"type": "get_entries"})).await {
+        Ok(data) => data
+            .get("entries")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+        Err(detail) => {
+            report_failure(context, "get_entries", detail);
 
-async fn replay_history(context: &BridgeContext, sid: String) {
-    match pi_flow_result(context, &sid, json!({"type": "get_entries"})).await {
-        Ok(data) => {
-            let entries = data
-                .get("entries")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-
-            context.events.send(Event::Attached { sid, entries });
+            return;
         }
-        Err(detail) => report_failure(context, "get_entries", detail),
-    }
+    };
+
+    context.events.send(Event::Attached {
+        sid: sid.clone(),
+        entries,
+    });
+    deliver_buffered_events(context, sid, registration);
 }
 
 /// `StartSession`: the ghost chat's create → attach → first-prompt chain as
@@ -550,6 +761,11 @@ async fn start_session_flow(
         return;
     }
 
+    // No `get_entries` here, so the window is empty in practice — registered
+    // anyway so that "events between attach and `Attached` are held" is a
+    // property of every attach path rather than an accident of this one.
+    let registration = AttachRegistration::register(&context.attach_buffers, &sid);
+
     if !attach(&context, &mut attached, &sid).await {
         return;
     }
@@ -560,6 +776,7 @@ async fn start_session_flow(
         sid: sid.clone(),
         entries: Vec::new(),
     });
+    deliver_buffered_events(&context, sid.clone(), registration);
     spawn_flow(prompt_flow(context.clone(), sid, first_prompt));
 }
 
@@ -732,11 +949,175 @@ fn pi_error(response: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The interim dialog stopgap in isolation — no daemon, no pi. Delete with the
-/// block it covers when dialogs become modals.
+/// The attach window and the interim dialog stopgap in isolation — no daemon,
+/// no pi. Delete the dialog half with the block it covers when dialogs become
+/// modals.
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pi_event(kind: &str) -> Value {
+        json!({"type": kind})
+    }
+
+    fn buffers() -> Arc<Mutex<AttachEventBuffers>> {
+        Arc::new(Mutex::new(AttachEventBuffers::default()))
+    }
+
+    fn push(buffers: &Arc<Mutex<AttachEventBuffers>>, sid: &str, event: Value) -> PushOutcome {
+        lock_attach_buffers(buffers).push(sid, event)
+    }
+
+    #[test]
+    fn an_unregistered_session_is_delivered_live() {
+        let buffers = buffers();
+
+        assert!(
+            matches!(
+                push(&buffers, "01H", pi_event("agent_settled")),
+                PushOutcome::Deliver(_)
+            ),
+            "buffering is only for the attach window; everything else streams"
+        );
+    }
+
+    #[test]
+    fn the_window_is_flushed_in_arrival_order() {
+        let buffers = buffers();
+        let registration = AttachRegistration::register(&buffers, "01H");
+
+        for kind in [
+            "tool_execution_start",
+            "tool_execution_end",
+            "agent_settled",
+        ] {
+            assert!(matches!(
+                push(&buffers, "01H", pi_event(kind)),
+                PushOutcome::Buffered
+            ));
+        }
+
+        let FlushOutcome::Events(events) = registration.flush() else {
+            panic!("three events is nowhere near the cap");
+        };
+
+        assert_eq!(
+            events,
+            vec![
+                pi_event("tool_execution_start"),
+                pi_event("tool_execution_end"),
+                pi_event("agent_settled"),
+            ],
+            "a `tool_execution_end` only mutates an existing block, so order is load-bearing"
+        );
+    }
+
+    #[test]
+    fn another_sessions_events_are_never_held() {
+        let buffers = buffers();
+        let _registration = AttachRegistration::register(&buffers, "01H");
+
+        assert!(matches!(
+            push(&buffers, "02H", pi_event("agent_settled")),
+            PushOutcome::Deliver(_)
+        ));
+    }
+
+    #[test]
+    fn a_dropped_registration_reopens_the_live_stream() {
+        // The failure mode that matters: a failed attach or a failed
+        // `get_entries` returns early, and a registration that outlived it
+        // would swallow that session's events for the life of the bridge.
+        let buffers = buffers();
+
+        {
+            let _registration = AttachRegistration::register(&buffers, "01H");
+
+            assert!(matches!(
+                push(&buffers, "01H", pi_event("agent_settled")),
+                PushOutcome::Buffered
+            ));
+        }
+
+        assert!(matches!(
+            push(&buffers, "01H", pi_event("agent_settled")),
+            PushOutcome::Deliver(_)
+        ));
+    }
+
+    #[test]
+    fn overflowing_the_window_discards_it_and_asks_for_a_resync() {
+        let buffers = buffers();
+        let registration = AttachRegistration::register(&buffers, "01H");
+
+        for _ in 0..ATTACH_EVENT_BUFFER_CAP {
+            assert!(matches!(
+                push(&buffers, "01H", pi_event("message_update")),
+                PushOutcome::Buffered
+            ));
+        }
+
+        assert!(
+            matches!(
+                push(&buffers, "01H", pi_event("message_update")),
+                PushOutcome::Overflowed
+            ),
+            "the event past the cap trips it, and only that one logs"
+        );
+        assert!(
+            matches!(
+                push(&buffers, "01H", pi_event("message_update")),
+                PushOutcome::Discarded
+            ),
+            "everything after is dropped — the resync is authoritative"
+        );
+        assert!(
+            matches!(registration.flush(), FlushOutcome::Overflowed),
+            "the snapshot just published is stale; mirror the daemon's event_gap"
+        );
+    }
+
+    #[test]
+    fn a_flushed_registration_does_not_wipe_the_next_one() {
+        let buffers = buffers();
+        let first = AttachRegistration::register(&buffers, "01H");
+
+        assert!(matches!(first.flush(), FlushOutcome::Events(_)));
+
+        let _second = AttachRegistration::register(&buffers, "01H");
+
+        assert!(
+            matches!(
+                push(&buffers, "01H", pi_event("agent_settled")),
+                PushOutcome::Buffered
+            ),
+            "the consumed guard's Drop must not release a window it no longer owns"
+        );
+    }
+
+    #[test]
+    fn a_second_registration_joins_the_window_already_in_flight() {
+        // An `event_gap` resync racing an open: resetting the buffer here
+        // would drop everything the open flow is already holding.
+        let buffers = buffers();
+        let open = AttachRegistration::register(&buffers, "01H");
+
+        assert!(matches!(
+            push(&buffers, "01H", pi_event("tool_execution_end")),
+            PushOutcome::Buffered
+        ));
+
+        let resync = AttachRegistration::register(&buffers, "01H");
+        let FlushOutcome::Events(events) = open.flush() else {
+            panic!("one event is under the cap");
+        };
+
+        assert_eq!(events, vec![pi_event("tool_execution_end")]);
+        assert!(
+            matches!(resync.flush(), FlushOutcome::Events(events) if events.is_empty()),
+            "the loser of the race owes nothing — the winner already delivered"
+        );
+    }
 
     fn dialog_event(method: &str) -> Value {
         json!({
