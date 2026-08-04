@@ -7,7 +7,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
 use harvester_proto::{encode_frame, read_frame};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::value::RawValue;
 use serde_json::{json, Value};
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -42,24 +42,17 @@ pub enum SessionOutput {
     },
 }
 
-/// Serialize-only mirror of `Outgoing::Event` that embeds the original pi
-/// line verbatim (`&RawValue`). The shared read-side `Outgoing` cannot carry
-/// a borrowed `RawValue` (internally-tagged deserialization buffers through
-/// an owned tree), so the daemon serializes events through this instead.
-#[derive(Serialize)]
-struct EventEnvelope<'line> {
-    r#type: &'static str,
-    sid: &'line str,
-    event: &'line RawValue,
-}
-
 /// The only fields the pump routes on, borrowed straight out of the read
 /// buffer. Pi's `message_update` deltas each carry the whole partial message,
 /// so they are the largest and by far the most frequent lines — building an
 /// owned `Value` for every one of them, only to read `type`, would make the
 /// throwaway DOM the pump's dominant cost. The full tree is parsed in exactly
 /// one arm below, where a client is actually waiting for it.
-#[derive(Deserialize)]
+///
+/// `Default` is the "none of the routing fields apply" probe: [`pump_stdout`]
+/// falls back to it for a line that is valid JSON but does not fit this shape,
+/// so the line is still forwarded verbatim instead of vanishing.
+#[derive(Default, Deserialize)]
 struct LineProbe<'line> {
     #[serde(rename = "type", borrow, default)]
     kind: Option<Cow<'line, str>>,
@@ -72,6 +65,15 @@ struct LineProbe<'line> {
 pub struct Session {
     pub sid: Sid,
     pub pid: Option<u32>,
+    /// `{"type":"event","sid":<escaped sid>,"event":` — the constant head of
+    /// every event envelope this session emits, built once at spawn so
+    /// [`encode_event`] is a byte concatenation instead of a second full JSON
+    /// scan. **Soundness depends on [`route_line`] only ever being handed a
+    /// line that parsed as JSON**: the pi line is spliced in as raw bytes, so a
+    /// non-JSON line would corrupt the client's frame. [`pump_stdout`] is what
+    /// guarantees that (it re-parses as `&RawValue` before falling back to a
+    /// default probe) — do not weaken it without changing this.
+    event_prefix: String,
     /// Frames bound for pi's stdin. Private on purpose: every write goes
     /// through `write_line`, and [`pump_stdin`] is the only holder of the pipe
     /// handle — so no caller ever awaits pi's stdin, and writes keep their
@@ -179,10 +181,12 @@ impl Session {
         let stdout = child.stdout.take().expect("piped stdout");
         let (output, _) = broadcast::channel(SESSION_EVENT_BUFFER);
         let (stdin_sender, stdin_receiver) = mpsc::channel(STDIN_QUEUE_DEPTH);
+        let event_prefix = create_event_prefix(args.sid.as_str());
 
         let session = Arc::new(Session {
             sid: args.sid,
             pid,
+            event_prefix,
             stdin_queue: Mutex::new(Some(stdin_sender)),
             output,
             room: Mutex::new(DialogRoom::default()),
@@ -442,10 +446,8 @@ async fn pump_stdout(
             continue;
         }
 
-        let probe: LineProbe = match serde_json::from_slice(line) {
-            Ok(probe) => probe,
-            // Should never happen (pi guarantees stdout purity); don't die on it.
-            Err(_) => continue,
+        let Some(probe) = probe_line(&session.sid, line) else {
+            continue;
         };
 
         route_line(&session, line, probe);
@@ -456,6 +458,33 @@ async fn pump_stdout(
     daemon.remove_session_if_same(&session);
     session.fail_pending_responses();
     let _ = session.output.send(SessionOutput::Exit { exit_code });
+}
+
+/// The routing probe for one pi stdout line, or `None` when the line is not
+/// JSON at all and must be dropped.
+///
+/// A line that *is* JSON but does not fit [`LineProbe`] (a non-string `type`,
+/// `id` or `method`, which pi 0.83.0 never emits but a later pi might) is not a
+/// routing decision we can make — yet docs/DAEMON.md is unconditional: every
+/// line pi emits on stdout is forwarded verbatim. So it is forwarded under a
+/// default probe rather than dropped; a swallowed `agent_settled` would spin a
+/// client's turn forever. The `&RawValue` re-parse that separates the two cases
+/// runs on the error path only, so the pump's hot loop is unchanged.
+fn probe_line<'line>(sid: &Sid, line: &'line [u8]) -> Option<LineProbe<'line>> {
+    let shape_error = match serde_json::from_slice::<LineProbe<'line>>(line) {
+        Ok(probe) => return Some(probe),
+        Err(error) => error,
+    };
+
+    if let Err(json_error) = serde_json::from_slice::<&RawValue>(line) {
+        eprintln!("session {sid}: unparseable stdout line dropped: {json_error}");
+
+        return None;
+    }
+
+    eprintln!("session {sid}: unexpected line shape, forwarding verbatim: {shape_error}");
+
+    Some(LineProbe::default())
 }
 
 /// Dialog policy (docs/DAEMON.md): a dialog that expects an answer is
@@ -477,7 +506,7 @@ fn route_line(session: &Arc<Session>, line: &[u8], probe: LineProbe<'_>) {
         return;
     }
 
-    let event = encode_event(session, line);
+    let event = encode_event(&session.event_prefix, line);
 
     if let Some(dialog_id) = dialog_id_awaiting_answer(&probe) {
         if !session.remember_dialog(dialog_id, event.clone()) {
@@ -504,19 +533,28 @@ fn passthrough_response_key<'probe>(probe: &'probe LineProbe<'_>) -> Option<&'pr
         .then_some(request_key)
 }
 
-/// Build the wire envelope exactly once; every subscriber shares the bytes,
-/// and a pending dialog keeps the same `Arc` for its later replay.
-fn encode_event(session: &Session, line: &[u8]) -> Arc<[u8]> {
-    // The line parsed as JSON above, so it is valid UTF-8 JSON text.
-    let raw_line = std::str::from_utf8(line).expect("parsed as JSON above");
-    let event: &RawValue = serde_json::from_str(raw_line).expect("parsed as JSON above");
-    let envelope = EventEnvelope {
-        r#type: "event",
-        sid: session.sid.as_str(),
-        event,
-    };
+/// The constant head of this session's event envelopes, with the sid escaped
+/// exactly as serde would escape it (so the result is byte-identical to
+/// serializing `Outgoing::Event`, whose field order this matches).
+fn create_event_prefix(sid: &str) -> String {
+    let escaped_sid = serde_json::to_string(sid).expect("a str always serializes");
 
-    Arc::from(serde_json::to_vec(&envelope).expect("serializable"))
+    format!(r#"{{"type":"event","sid":{escaped_sid},"event":"#)
+}
+
+/// Build the wire envelope exactly once; every subscriber shares the bytes,
+/// and a pending dialog keeps the same `Arc` for its later replay. The pi line
+/// is spliced in verbatim — see [`Session::event_prefix`] for why that is sound
+/// and what would break it.
+fn encode_event(event_prefix: &str, line: &[u8]) -> Arc<[u8]> {
+    let prefix = event_prefix.as_bytes();
+    let mut envelope = Vec::with_capacity(prefix.len() + line.len() + 1);
+
+    envelope.extend_from_slice(prefix);
+    envelope.extend_from_slice(line);
+    envelope.push(b'}');
+
+    Arc::from(envelope)
 }
 
 /// The dialog id when this line is an `extension_ui_request` that blocks pi
@@ -539,6 +577,64 @@ fn dialog_id_awaiting_answer<'probe>(probe: &'probe LineProbe<'_>) -> Option<&'p
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use harvester_proto::Outgoing;
+
+    const FIXTURE_SID: &str = "01JABCDEF0123456789ABCDEFG";
+
+    /// What the envelope must stay byte-compatible with: the shared wire enum.
+    fn serde_serialized_event(sid: &str, event: Value) -> Vec<u8> {
+        let outgoing = Outgoing::Event {
+            sid: sid.to_owned(),
+            event,
+        };
+
+        serde_json::to_vec(&outgoing).expect("wire enum must serialize")
+    }
+
+    fn encoded_event(sid: &str, line: &str) -> Vec<u8> {
+        encode_event(&create_event_prefix(sid), line.as_bytes()).to_vec()
+    }
+
+    #[test]
+    fn the_encoded_envelope_is_valid_json() {
+        let encoded = encoded_event(FIXTURE_SID, r#"{"type":"agent_settled"}"#);
+
+        let parsed: Value = serde_json::from_slice(&encoded).expect("envelope must be valid JSON");
+
+        assert_eq!(parsed["type"], "event");
+        assert_eq!(parsed["sid"], FIXTURE_SID);
+        assert_eq!(parsed["event"]["type"], "agent_settled");
+    }
+
+    #[test]
+    fn the_encoded_envelope_matches_the_serde_serialized_wire_enum() {
+        let line = r#"{"type":"message_update","text":"héllo \"quoted\"","n":[1,2,3]}"#;
+        let event: Value = serde_json::from_str(line).expect("fixture line must parse");
+
+        let encoded = encoded_event(FIXTURE_SID, line);
+        let from_serde = serde_serialized_event(FIXTURE_SID, event);
+
+        assert_eq!(
+            serde_json::from_slice::<Value>(&encoded).expect("envelope must be valid JSON"),
+            serde_json::from_slice::<Value>(&from_serde).expect("wire enum must be valid JSON"),
+        );
+    }
+
+    #[test]
+    fn a_sid_needing_json_escaping_is_escaped_in_the_prefix() {
+        let awkward_sid = r#"we"ird\sid"#;
+
+        let encoded = encoded_event(awkward_sid, r#"{"type":"noop"}"#);
+        let parsed: Value = serde_json::from_slice(&encoded).expect("envelope must be valid JSON");
+
+        assert_eq!(parsed["sid"], awkward_sid);
+        assert_eq!(
+            encoded,
+            serde_serialized_event(awkward_sid, serde_json::json!({"type": "noop"})),
+            "the hand-built prefix must escape exactly as serde does",
+        );
+    }
 
     /// Stand-in for the wire envelope the pump would have built; the room only
     /// ever stores and hands back these bytes, never inspects them.
