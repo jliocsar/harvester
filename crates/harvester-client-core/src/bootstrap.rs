@@ -1,12 +1,18 @@
 //! First-connect bootstrap (docs/DAEMON.md §Bootstrap & upgrade): probe the
 //! machine, install/upgrade the static harvesterd binary, start it detached,
-//! then connect and version-handshake. Written once against [`Host::exec`] —
-//! the local machine runs the exact same scripts through `sh -c`, so the
-//! install/upgrade policy cannot drift between machine kinds.
+//! then connect and handshake. Written once against [`Host::exec`] — the local
+//! machine runs the exact same scripts through `sh -c`, so the install/upgrade
+//! policy cannot drift between machine kinds.
+//!
+//! Two different questions are asked here, and conflating them was a live bug
+//! (co-design C4). *Is the binary over there the one I ship?* is answered by
+//! the build fingerprint — install iff it differs — which is what makes a
+//! rebuilt daemon actually reach the machine. *Can these two peers talk?* is
+//! answered by [`PROTOCOL_VERSION`] at the ping, and nothing else.
 
 use std::time::Duration;
 
-use harvester_proto::PROTOCOL_VERSION;
+use harvester_proto::{fingerprint_bytes, PingData, PROTOCOL_VERSION};
 
 use crate::connection::{self, DaemonConnection};
 use crate::host::Host;
@@ -34,11 +40,12 @@ enum KillRunningDaemon {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootstrapOutcome {
-    /// The installed binary already matched; nothing was uploaded.
+    /// The installed binary fingerprinted identical to the one we ship;
+    /// nothing was uploaded.
     AlreadyCurrent,
-    /// No binary on the machine; uploaded and started fresh.
+    /// No usable binary on the machine; uploaded and started fresh.
     Installed,
-    /// Version mismatch; replaced the binary and restarted the daemon
+    /// A different binary was installed; replaced it and restarted the daemon
     /// (which closes its pi children's stdin — acceptable by contract).
     Upgraded,
 }
@@ -54,74 +61,108 @@ pub struct Connected {
 }
 
 /// The whole first-connect contract in one call. Also the *every*-connect
-/// contract: the version is re-checked on each ping, and a mismatched running
-/// daemon is upgraded in place (exactly once — a second mismatch is an error).
+/// contract: the binary on disk is fingerprint-checked on every connect, and a
+/// daemon still running an older image is upgraded in place (exactly once).
 pub async fn bootstrap_and_connect(host: &Host, daemon_binary: &[u8]) -> Result<Connected> {
+    let shipped_build = fingerprint_bytes(daemon_binary);
     let probe = probe(host).await?;
+    let outcome = plan_install(probe.installed_build.as_deref(), &shipped_build);
 
-    let outcome = match probe.installed_version {
-        Some(PROTOCOL_VERSION) => {
-            start(host).await?;
-
-            BootstrapOutcome::AlreadyCurrent
+    match outcome {
+        BootstrapOutcome::AlreadyCurrent => start(host).await?,
+        BootstrapOutcome::Upgraded => {
+            install_and_start(host, daemon_binary, KillRunningDaemon::Yes).await?
         }
-        Some(_) => {
-            install_and_start(host, daemon_binary, KillRunningDaemon::Yes).await?;
-
-            BootstrapOutcome::Upgraded
+        BootstrapOutcome::Installed => {
+            install_and_start(host, daemon_binary, KillRunningDaemon::No).await?
         }
-        None => {
-            install_and_start(host, daemon_binary, KillRunningDaemon::No).await?;
-
-            BootstrapOutcome::Installed
-        }
-    };
-
-    let (connection, daemon_version) = connection::connect_host(host, &probe.home).await?;
-
-    if daemon_version == PROTOCOL_VERSION {
-        return Ok(Connected {
-            connection,
-            daemon_version: daemon_version.to_string(),
-            outcome,
-            remote_home: probe.home,
-        });
     }
 
-    // A running daemon can predate the on-disk binary we just checked (it was
-    // started before an upgrade, or the disk check raced another client).
-    // Force the upgrade path exactly once: kill, reinstall, restart, re-ping.
+    let (connection, ping) = connection::connect_host(host, &probe.home).await?;
+
+    if ping.build == shipped_build {
+        return connected_if_protocol_matches(connection, ping, outcome, probe.home);
+    }
+
+    // The file on disk is ours, but the daemon *running* is not it: it was
+    // started before an upgrade, or the disk check raced another client. Only a
+    // restart can fix that, so force the upgrade path exactly once.
     drop(connection);
     install_and_start(host, daemon_binary, KillRunningDaemon::Yes).await?;
 
-    let (connection, daemon_version) = connection::connect_host(host, &probe.home).await?;
+    let (connection, ping) = connection::connect_host(host, &probe.home).await?;
 
-    if daemon_version == PROTOCOL_VERSION {
-        Ok(Connected {
-            connection,
-            daemon_version: daemon_version.to_string(),
-            outcome: BootstrapOutcome::Upgraded,
-            remote_home: probe.home,
-        })
-    } else {
-        Err(Error::VersionMismatch {
-            expected: PROTOCOL_VERSION.to_string(),
-            actual: daemon_version.to_string(),
-        })
+    // Still not our image after a kill-reinstall-restart. Deliberately NOT an
+    // error: the fingerprint is a staleness heuristic, while the thing that
+    // decides whether these two peers can actually talk is the protocol
+    // version checked below. Refusing here would brick a machine over a
+    // benign race (another client installing a different build) or over a
+    // daemon that simply cannot read its own image and reports a sentinel —
+    // both recover on a later connect, and neither is worth an unusable
+    // machine. Loud, because a permanent mismatch is worth investigating.
+    if ping.build != shipped_build {
+        eprintln!(
+            "harvester: daemon still reports build {} after a forced reinstall (we ship {shipped_build}); \
+             continuing because the protocol version is what governs compatibility",
+            ping.build
+        );
     }
+
+    connected_if_protocol_matches(connection, ping, BootstrapOutcome::Upgraded, probe.home)
+}
+
+/// Which install path a probe implies — pure, so the policy that decides
+/// whether a machine gets a new binary is testable without a machine.
+///
+/// Comparing fingerprints rather than versions is the fix for a live silent
+/// deploy failure: with the crate version as the identity, rebuilding
+/// harvesterd without bumping the workspace left every bootstrapped machine on
+/// the stale binary forever, because the probe saw a match and skipped the
+/// upload.
+fn plan_install(installed_build: Option<&str>, shipped_build: &str) -> BootstrapOutcome {
+    match installed_build {
+        Some(build) if build == shipped_build => BootstrapOutcome::AlreadyCurrent,
+        Some(_) => BootstrapOutcome::Upgraded,
+        None => BootstrapOutcome::Installed,
+    }
+}
+
+/// The protocol gate, and the only hard failure in the bootstrap: a daemon we
+/// just confirmed (or reinstalled) speaking an envelope this client does not.
+/// Unlike a build mismatch this cannot be repaired by installing again — the
+/// binary we ship *is* the wrong one — so it is an error rather than a warning.
+fn connected_if_protocol_matches(
+    connection: DaemonConnection,
+    ping: PingData,
+    outcome: BootstrapOutcome,
+    remote_home: String,
+) -> Result<Connected> {
+    if ping.version != PROTOCOL_VERSION {
+        return Err(Error::VersionMismatch {
+            expected: PROTOCOL_VERSION.to_string(),
+            actual: ping.version.to_string(),
+        });
+    }
+
+    Ok(Connected {
+        connection,
+        daemon_version: ping.version.to_string(),
+        outcome,
+        remote_home,
+    })
 }
 
 struct Probe {
     home: String,
-    installed_version: Option<u32>,
+    installed_build: Option<String>,
 }
 
 /// One round trip answering both bootstrap questions: where is `$HOME`
 /// (the socket forward needs an absolute remote path — ssh does not expand
-/// `~` in `-L`; the local connect joins it the same way), and what harvesterd
-/// version is on disk, if any.
+/// `~` in `-L`; the local connect joins it the same way), and which build of
+/// harvesterd is on disk, if any.
 async fn probe(host: &Host) -> Result<Probe> {
-    let script = format!(r#"printf '%s\n' "$HOME"; exec ~/{DAEMON_BINARY_PATH} version"#);
+    let script = format!(r#"printf '%s\n' "$HOME"; exec ~/{DAEMON_BINARY_PATH} build"#);
     let output = host.exec(&script, None, BOOTSTRAP_EXEC_TIMEOUT).await?;
 
     // The home line prints even when the binary is missing (exec fails with
@@ -134,18 +175,23 @@ async fn probe(host: &Host) -> Result<Probe> {
         });
     };
 
-    // Unparseable reads as "no daemon installed", which reinstalls — the
-    // self-healing direction. That is also how a pre-C4 binary is retired:
-    // it prints a crate version string ("0.1.0"), which is not a `u32`.
-    let installed_version = if output.status.success() {
-        stdout_lines.next().and_then(|version| version.parse().ok())
+    // Anything short of a clean answer reads as "nothing usable installed",
+    // which reinstalls — the self-healing direction, and a needless upload is
+    // the cheap failure. It needs no special case for the daemons that predate
+    // `harvesterd build`: they exit non-zero on the unknown argument, which
+    // lands here as `None` and retires them.
+    let installed_build = if output.status.success() {
+        stdout_lines
+            .next()
+            .map(str::to_string)
+            .filter(|build| !build.is_empty())
     } else {
         None
     };
 
     Ok(Probe {
         home: home.to_string(),
-        installed_version,
+        installed_build,
     })
 }
 
@@ -301,6 +347,66 @@ mod tests {
             assertion < chmod && chmod < swap,
             "a truncated upload must never be made executable or installed:\n{script}"
         );
+    }
+
+    // --- install policy (co-design C4) ------------------------------------
+
+    #[test]
+    fn an_identical_build_installs_nothing() {
+        let shipped = fingerprint_bytes(b"the daemon binary");
+
+        assert_eq!(
+            plan_install(Some(&shipped), &shipped),
+            BootstrapOutcome::AlreadyCurrent
+        );
+    }
+
+    #[test]
+    fn a_rebuilt_binary_of_the_same_version_is_installed() {
+        // The live silent-deploy failure this replaced: both of these were
+        // "0.1.0" under the old crate-version identity, so the probe saw a
+        // match and the machine stayed on the stale binary forever.
+        let installed = fingerprint_bytes(b"harvesterd, built on monday");
+        let shipped = fingerprint_bytes(b"harvesterd, rebuilt on tuesday");
+
+        assert_ne!(installed, shipped, "the fingerprints must differ at all");
+        assert_eq!(
+            plan_install(Some(&installed), &shipped),
+            BootstrapOutcome::Upgraded
+        );
+    }
+
+    #[test]
+    fn a_same_length_rebuild_is_still_detected() {
+        // Length alone was one of the rejected interim fixes; a one-byte
+        // change that keeps the size is exactly what it would have missed.
+        let installed = fingerprint_bytes(b"harvesterd build A");
+        let shipped = fingerprint_bytes(b"harvesterd build B");
+
+        assert_eq!(
+            plan_install(Some(&installed), &shipped),
+            BootstrapOutcome::Upgraded
+        );
+    }
+
+    #[test]
+    fn no_answer_from_the_probe_installs_fresh() {
+        // Covers all of: no binary, a binary too old to know `build`, and one
+        // that cannot fingerprint itself. Every one of them reinstalls, which
+        // is the self-healing direction.
+        let shipped = fingerprint_bytes(b"the daemon binary");
+
+        assert_eq!(plan_install(None, &shipped), BootstrapOutcome::Installed);
+    }
+
+    #[test]
+    fn the_probe_asks_for_the_build_not_the_version() {
+        // The version cannot answer "is this the binary I ship?" — that
+        // conflation is the whole of C4.
+        let script = format!(r#"printf '%s\n' "$HOME"; exec ~/{DAEMON_BINARY_PATH} build"#);
+
+        assert_shell_parses(&script);
+        assert!(script.ends_with("build"));
     }
 
     #[test]

@@ -116,7 +116,7 @@ impl DaemonWriter {
     }
 }
 
-/// A pinged, version-checked connection. The halves are public so callers
+/// A connection that has completed the ping handshake. The halves are public so callers
 /// needing concurrent read/write (an event pump + a command sender) can move
 /// them into separate tasks; each half keeps the ssh forward alive.
 pub struct DaemonConnection {
@@ -126,9 +126,10 @@ pub struct DaemonConnection {
 
 /// The one place the host kinds actually differ: a remote daemon's socket is
 /// reached through an `ssh -L` forward, the local one directly. Both end in
-/// the same ping handshake and return the daemon's self-reported version —
-/// the mismatch policy is bootstrap's business, not ours.
-pub(crate) async fn connect_host(host: &Host, home: &str) -> Result<(DaemonConnection, u32)> {
+/// the same ping handshake and hand back what the daemon said about itself
+/// (protocol version and build fingerprint) — judging it is bootstrap's
+/// business, not ours.
+pub(crate) async fn connect_host(host: &Host, home: &str) -> Result<(DaemonConnection, PingData)> {
     match host {
         Host::Local => connect_local(home).await,
         Host::Ssh(target) => connect(target, home).await,
@@ -137,7 +138,7 @@ pub(crate) async fn connect_host(host: &Host, home: &str) -> Result<(DaemonConne
 
 /// Forwards the daemon socket and completes the ping handshake, retrying
 /// until `CONNECT_TIMEOUT` (a just-started daemon needs a beat to bind).
-async fn connect(target: &SshTarget, remote_home: &str) -> Result<(DaemonConnection, u32)> {
+async fn connect(target: &SshTarget, remote_home: &str) -> Result<(DaemonConnection, PingData)> {
     let local_socket = local_socket_path(&target.dest);
 
     // A stale file from a previous run makes ssh refuse the bind.
@@ -164,8 +165,8 @@ async fn connect(target: &SshTarget, remote_home: &str) -> Result<(DaemonConnect
         }
 
         match bounded_handshake(&local_socket, deadline).await {
-            Ok((reader, writer, daemon_version)) => {
-                return Ok((assemble(reader, writer, guard), daemon_version));
+            Ok((reader, writer, ping)) => {
+                return Ok((assemble(reader, writer, guard), ping));
             }
             Err(error) => {
                 if Instant::now() >= deadline {
@@ -186,7 +187,7 @@ async fn connect(target: &SshTarget, remote_home: &str) -> Result<(DaemonConnect
 async fn bounded_handshake(
     socket: &Path,
     deadline: Instant,
-) -> std::io::Result<(BufReader<OwnedReadHalf>, OwnedWriteHalf, u32)> {
+) -> std::io::Result<(BufReader<OwnedReadHalf>, OwnedWriteHalf, PingData)> {
     let remaining = deadline.duration_since(Instant::now());
 
     match tokio::time::timeout(remaining, handshake(socket)).await {
@@ -201,17 +202,14 @@ async fn bounded_handshake(
 /// The local-machine variant: the daemon's socket is on this filesystem, so
 /// connect directly — no forward process, no socket-file ownership. Same
 /// retry window (a just-started daemon needs a beat to bind).
-async fn connect_local(home: &str) -> Result<(DaemonConnection, u32)> {
+async fn connect_local(home: &str) -> Result<(DaemonConnection, PingData)> {
     let socket = PathBuf::from(home).join(DAEMON_SOCKET);
     let deadline = Instant::now() + CONNECT_TIMEOUT;
 
     loop {
         match bounded_handshake(&socket, deadline).await {
-            Ok((reader, writer, daemon_version)) => {
-                return Ok((
-                    assemble(reader, writer, ForwardGuard::none()),
-                    daemon_version,
-                ));
+            Ok((reader, writer, ping)) => {
+                return Ok((assemble(reader, writer, ForwardGuard::none()), ping));
             }
             Err(error) => {
                 if Instant::now() >= deadline {
@@ -273,7 +271,7 @@ fn create_forward_command(
 /// the response. Fails (for retry) while the forward or daemon is not up yet.
 async fn handshake(
     local_socket: &Path,
-) -> std::io::Result<(BufReader<OwnedReadHalf>, OwnedWriteHalf, u32)> {
+) -> std::io::Result<(BufReader<OwnedReadHalf>, OwnedWriteHalf, PingData)> {
     let stream = UnixStream::connect(local_socket).await?;
     let (read_half, mut writer) = stream.into_split();
     let mut reader = BufReader::new(read_half);
@@ -314,7 +312,7 @@ async fn handshake(
             })
         })?;
 
-    Ok((reader, writer, ping.version))
+    Ok((reader, writer, ping))
 }
 
 async fn write_request(writer: &mut OwnedWriteHalf, request: &Request) -> std::io::Result<()> {
