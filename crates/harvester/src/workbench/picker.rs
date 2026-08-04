@@ -179,15 +179,19 @@ impl Workbench {
     /// modal — when its machine resolves to none.
     fn picker_host(&mut self) -> Option<Host> {
         let machine = self.picker.as_ref()?.machine.clone();
-        let host = self.resolve_host(&machine);
 
-        if host.is_none() {
-            if let Some(picker) = &mut self.picker {
-                picker.error = Some(format!("machine {machine} is not connectable"));
+        match self.fleet.host_for(&machine) {
+            Ok(host) => Some(host),
+            // The fleet's own sentence, rendered in the modal rather than the
+            // statusbar — the user is looking at the picker, not at the bar.
+            Err(error) => {
+                if let Some(picker) = &mut self.picker {
+                    picker.error = Some(error.to_string());
+                }
+
+                None
             }
         }
-
-        host
     }
 
     /// Records what the picker is waiting on. Every picker request goes
@@ -328,7 +332,7 @@ impl Workbench {
                             .text_ellipsis()
                             .child(format!(
                                 "on {} — {}",
-                                self.machine_label(&picker.machine),
+                                self.fleet.label(&picker.machine),
                                 picker.path
                             )),
                     )

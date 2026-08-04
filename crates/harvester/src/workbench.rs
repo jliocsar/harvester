@@ -1,23 +1,21 @@
 //! Top-level UI state and layout (docs/SPEC.md §UI): sidebar (machine +
-//! sessions), content (chat or empty state), statusbar. Owns the bridges —
-//! one per machine, created lazily on first touch and kept for the window's
-//! lifetime: commands out synchronously to the right machine's sender,
-//! events in on one gpui task awaiting the shared machine-tagged channel.
+//! sessions), content (chat or empty state), statusbar.
+//!
+//! Everything that is *not* layout or user intent lives in client-core's
+//! [`Fleet`], which owns the bridge pool, the machine table, the probe
+//! verdicts and the connect policy. What is left here reads a machine's one
+//! [`MachineState`] and renders it, routes commands by machine key, and keeps
+//! the surfaces (ghost chat, chat, pickers) the user actually touches.
 
 mod picker;
-
-use std::collections::HashMap;
-use std::sync::Arc;
 
 use gpui::{
     div, prelude::*, px, rgb, Context, Entity, Focusable, SharedString, Subscription, Window,
 };
-use harvester_client_core::{
-    Host, MachineRef, RequestToken, RequestTokens, SshTarget, LOCAL_MACHINE,
-};
+use harvester_client_core::{Fleet, MachineState, RequestToken, RequestTokens, LOCAL_MACHINE};
 use harvester_proto::{SessionInfo, SessionStatus};
 use serde_json::Value;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::chat::{BridgeLink, Chat};
 use crate::input::{PromptSubmitted, TextInput};
@@ -25,8 +23,8 @@ use crate::models::{self, ModelChoice, ModelsState};
 use crate::theme;
 use crate::ui;
 use crate::workspaces::{self, Workspace};
-use harvester_client_core::bridge::{self, Command, Event as BridgeEvent};
-use harvester_client_core::machines::{self, MachineRow};
+use harvester_client_core::bridge::{Command, Event as BridgeEvent};
+use harvester_client_core::machines;
 use picker::FolderPicker;
 
 const SIDEBAR_WIDTH: f32 = 240.;
@@ -38,20 +36,9 @@ const MODAL_LIST_HEIGHT: f32 = 280.;
 /// Cap on the session name derived from the first prompt's first line —
 /// enough to recognize, short enough for pi's session list and the sidebar.
 const SESSION_NAME_MAX_CHARS: usize = 48;
-
-/// Connection lifecycle as the statusbar tells it.
-enum Link {
-    Connecting,
-    Connected { daemon_version: String },
-    Failed { detail: String },
-    Lost,
-}
-
-/// One machine's live bridge plus what its events reported so far.
-struct MachineConnection {
-    commands: UnboundedSender<Command>,
-    link: Link,
-}
+/// The empty content pane when there is no argv machine to report on — the
+/// workspace rows are the way in.
+const NO_ARGV_MACHINE_HINT: &str = "open a workspace to begin";
 
 /// One sidebar session row, tagged with the machine whose daemon reported it
 /// (commands about it must route back to that machine's bridge).
@@ -106,22 +93,11 @@ pub struct Workbench {
     /// in place of the machines list (which arrives next stage); connected
     /// eagerly to preserve the argv workflow.
     argv_machine: Option<String>,
-    /// The embedded musl harvesterd, shared by every bridge's bootstrap.
-    daemon_binary: Arc<Vec<u8>>,
-    /// The shared machine-tagged event channel; cloned into each bridge.
-    event_sender: UnboundedSender<(String, BridgeEvent)>,
+    /// Every machine, its state and its bridge — all of it client-core's.
+    fleet: Fleet,
     /// Mints the tokens that correlate every worker answer with the request
     /// that asked for it; cloned into each chat.
     tokens: RequestTokens,
-    /// Live bridges, one per machine (lazy — see `ensure_connection`).
-    connections: HashMap<String, MachineConnection>,
-    /// Provider machines, from the machines worker's last listing cycle.
-    machines: Vec<MachineRow>,
-    /// Probe verdicts by machine key; absent = not probed yet.
-    probes: HashMap<String, bool>,
-    /// The machines worker's command sender; `None` if its thread failed to
-    /// start (the machines list then stays empty — statusbar has the reason).
-    machine_commands: Option<UnboundedSender<machines::Command>>,
     /// All connected machines' sessions, newest first.
     sessions: Vec<MachineSession>,
     /// User's workspace list (`~/.harvester/workspaces.json`), all machines.
@@ -149,8 +125,66 @@ impl Workbench {
         daemon_binary: Vec<u8>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let (event_sender, mut events) = unbounded_channel::<(String, BridgeEvent)>();
+        let (fleet, events) = Fleet::start(daemon_binary);
 
+        Self::pump_bridge_events(events.bridges, cx);
+
+        if let Some(machine_events) = events.machines {
+            Self::pump_machines_events(machine_events, cx);
+        }
+
+        let mut workbench = Self {
+            argv_machine: argv_machine.clone(),
+            fleet,
+            tokens: RequestTokens::default(),
+            sessions: Vec::new(),
+            workspaces: workspaces::load(),
+            picker: None,
+            machine_picker_open: false,
+            ghost: None,
+            opening: None,
+            machines_collapsed: false,
+            workspaces_collapsed: false,
+            sessions_collapsed: false,
+            chat: None,
+            last_error: None,
+        };
+
+        // SPEC §Flows "Reopen client": machines with stored workspaces
+        // connect in the background so their sessions reappear unprompted.
+        // Ad-hoc ones connect on this call; provider-key ones as soon as the
+        // worker's first listing makes them resolvable.
+        workbench.track_machines();
+
+        if let Some(machine) = argv_machine {
+            workbench.ensure_connection(&machine);
+        }
+
+        workbench
+    }
+
+    /// The machines this client cares about: every stored workspace's machine
+    /// plus the argv destination. What that implies — which get probed, which
+    /// connect in the background — is the fleet's call, not the UI's. Called
+    /// again whenever the workspace list changes.
+    fn track_machines(&mut self) {
+        let machines: Vec<String> = self
+            .argv_machine
+            .iter()
+            .chain(self.workspaces.iter().map(|workspace| &workspace.machine))
+            .cloned()
+            .collect();
+
+        self.fleet.track_machines(machines);
+    }
+
+    /// Every bridge's events on one machine-tagged channel, pumped by a gpui
+    /// task — an mpsc receiver is reactor-independent, so awaiting it from
+    /// gpui's executor is exactly what the split is designed for.
+    fn pump_bridge_events(
+        mut events: UnboundedReceiver<(String, BridgeEvent)>,
+        cx: &mut Context<Self>,
+    ) {
         cx.spawn(async move |this, cx| {
             while let Some((machine, event)) = events.recv().await {
                 if this
@@ -165,84 +199,12 @@ impl Workbench {
             }
         })
         .detach();
-
-        let machine_commands = Self::start_machines_worker(cx);
-        let mut workbench = Self {
-            argv_machine: argv_machine.clone(),
-            daemon_binary: Arc::new(daemon_binary),
-            event_sender,
-            tokens: RequestTokens::default(),
-            connections: HashMap::new(),
-            machines: Vec::new(),
-            probes: HashMap::new(),
-            machine_commands,
-            sessions: Vec::new(),
-            workspaces: workspaces::load(),
-            picker: None,
-            machine_picker_open: false,
-            ghost: None,
-            opening: None,
-            machines_collapsed: false,
-            workspaces_collapsed: false,
-            sessions_collapsed: false,
-            chat: None,
-            last_error: None,
-        };
-
-        workbench.publish_ad_hoc_machines();
-
-        if let Some(machine) = argv_machine {
-            workbench.ensure_connection(&machine);
-        }
-
-        // SPEC §Flows "Reopen client": machines with stored workspaces
-        // connect in the background so their sessions reappear unprompted.
-        // Ad-hoc ones connect here; provider-key ones as soon as the worker's
-        // first listing makes them resolvable.
-        workbench.auto_connect_workspace_machines();
-
-        workbench
     }
 
-    /// Connects every not-yet-touched workspace machine that can resolve to
-    /// a target. Quiet by design: unresolvable machines (provider not listed
-    /// yet, argv ssh form) are skipped without an error — the next listing
-    /// cycle retries them.
-    fn auto_connect_workspace_machines(&mut self) {
-        let mut machines: Vec<String> = self
-            .workspaces
-            .iter()
-            .map(|workspace| workspace.machine.clone())
-            .collect();
-
-        machines.sort();
-        machines.dedup();
-
-        for machine in machines {
-            let untouched = !self.connections.contains_key(&machine);
-
-            if untouched && self.resolve_host(&machine).is_some() {
-                self.ensure_connection(&machine);
-            }
-        }
-    }
-
-    /// Spawns the machines worker thread and its event pump; `None` (with a
-    /// stderr note) if the thread cannot start.
-    fn start_machines_worker(cx: &mut Context<Self>) -> Option<UnboundedSender<machines::Command>> {
-        let worker = match machines::start() {
-            Ok(worker) => worker,
-            Err(error) => {
-                eprintln!("harvester: start machines worker: {error}");
-
-                return None;
-            }
-        };
-        let machines::MachinesWorker {
-            commands,
-            mut events,
-        } = worker;
-
+    fn pump_machines_events(
+        mut events: UnboundedReceiver<machines::Event>,
+        cx: &mut Context<Self>,
+    ) {
         cx.spawn(async move |this, cx| {
             while let Some(event) = events.recv().await {
                 if this
@@ -256,19 +218,18 @@ impl Workbench {
             }
         })
         .detach();
-
-        Some(commands)
     }
 
-    /// Pure router for machines-worker events.
+    /// Pure router for machines-worker events. The fleet takes the machine
+    /// table and the probe verdicts first; what is left is this window's.
     fn handle_machines_event(&mut self, event: machines::Event, cx: &mut Context<Self>) {
+        self.fleet.record_machines_event(&event);
+
         match event {
-            machines::Event::Listed(rows) => self.handle_machines_listed(rows),
+            // The listing and the probes were the fleet's, and it took them.
+            machines::Event::Listed(_) | machines::Event::Probed { .. } => {}
             machines::Event::ProviderFailed { provider, detail } => {
                 self.last_error = Some(format!("provider {provider}: {detail}"))
-            }
-            machines::Event::Probed { key, reachable } => {
-                self.probes.insert(key, reachable);
             }
             machines::Event::HomeResolved { token, result } => {
                 self.handle_home_resolved(token, result)
@@ -282,100 +243,29 @@ impl Workbench {
         cx.notify();
     }
 
-    fn handle_machines_listed(&mut self, mut rows: Vec<MachineRow>) {
-        rows.sort_by(|a, b| a.key.cmp(&b.key));
-        self.machines = rows;
-        // Provider-key workspace machines become resolvable with the first
-        // listing — connect them so their sessions appear.
-        self.auto_connect_workspace_machines();
-    }
-
-    /// The ad-hoc destinations the worker should probe alongside provider
-    /// machines: the argv machine plus legacy (keyless) workspace machines.
-    /// `local` is excluded — it has its own row and no SSH to probe.
-    fn ad_hoc_machines(&self) -> Vec<String> {
-        let mut machines: Vec<String> = self
-            .argv_machine
-            .iter()
-            .chain(self.workspaces.iter().map(|workspace| &workspace.machine))
-            .filter_map(|machine| match MachineRef::parse(machine) {
-                // `local` has its own row and no SSH to probe; provider
-                // machines are probed off the worker's own listing.
-                MachineRef::Local | MachineRef::Provider(_) => None,
-                MachineRef::AdHoc(dest) => Some(dest),
-            })
-            .collect();
-
-        machines.sort();
-        machines.dedup();
-
-        machines
-    }
-
-    fn publish_ad_hoc_machines(&self) {
-        if let Some(commands) = &self.machine_commands {
-            let _ = commands.send(machines::Command::SetAdHocMachines(self.ad_hoc_machines()));
-        }
-    }
-
     /// Routes a host op to the machines worker. `false` (with the reason in
     /// `last_error`) when the worker never started — without it there is no
     /// runtime to exec on, and the caller has nothing to wait for.
     fn send_host_command(&mut self, command: machines::Command) -> bool {
-        let Some(commands) = &self.machine_commands else {
-            self.last_error = Some("machines worker is not running".to_string());
+        match self.fleet.send_host_command(command) {
+            Ok(()) => true,
+            Err(error) => {
+                self.last_error = Some(error.to_string());
 
-            return false;
-        };
-
-        if commands.send(command).is_err() {
-            self.last_error = Some("machines worker stopped".to_string());
-
-            return false;
+                false
+            }
         }
-
-        true
     }
 
-    /// Lazily connects: reuses a live bridge, respawns a failed or lost one
-    /// (retouching a machine is the retry), spawns a fresh one otherwise.
-    /// `false` when the machine can't be connected — the reason lands in
-    /// `last_error`.
+    /// Lazily connects through the fleet; `false` when the machine can't be
+    /// connected. The fleet's reason is carried into `last_error` verbatim —
+    /// it is the only diagnosis the user gets for a machine that will not
+    /// come up.
     fn ensure_connection(&mut self, machine: &str) -> bool {
-        let usable = match self.connections.get(machine) {
-            Some(connection) => !matches!(connection.link, Link::Failed { .. } | Link::Lost),
-            None => false,
-        };
-
-        if usable {
-            return true;
-        }
-
-        let Some(host) = self.resolve_host(machine) else {
-            self.last_error = Some(format!("machine {machine} is not connectable"));
-
-            return false;
-        };
-
-        match bridge::start(
-            machine.to_string(),
-            host,
-            self.daemon_binary.clone(),
-            self.event_sender.clone(),
-        ) {
-            Ok(handle) => {
-                self.connections.insert(
-                    machine.to_string(),
-                    MachineConnection {
-                        commands: handle.commands,
-                        link: Link::Connecting,
-                    },
-                );
-
-                true
-            }
+        match self.fleet.ensure_connection(machine) {
+            Ok(()) => true,
             Err(error) => {
-                self.last_error = Some(format!("start bridge for {machine}: {error}"));
+                self.last_error = Some(error.to_string());
 
                 false
             }
@@ -385,13 +275,16 @@ impl Workbench {
     /// Pure router (house rule: every non-trivial match arm delegates to a
     /// dedicated handler; only one-line assignments stay inline). `machine`
     /// is the bridge the event came from; sid-scoped events route by sid
-    /// alone — sids are uuids, unique across machines.
+    /// alone — sids are uuids, unique across machines. The fleet takes the
+    /// link state off the same event first.
     fn handle_bridge_event(&mut self, machine: &str, event: BridgeEvent, cx: &mut Context<Self>) {
+        self.fleet.record_bridge_event(machine, &event);
+
         match event {
-            BridgeEvent::Connected { daemon_version } => {
-                self.handle_connected(machine, daemon_version)
-            }
-            BridgeEvent::ConnectFailed { detail } => self.handle_connect_failed(machine, detail),
+            // The link state was the fleet's, and it took it; a successful
+            // connect asks nothing else of this window.
+            BridgeEvent::Connected { .. } => {}
+            BridgeEvent::ConnectFailed { detail } => self.abort_machine_flows(machine, &detail),
             BridgeEvent::Sessions(sessions) => self.handle_sessions_listed(machine, sessions),
             BridgeEvent::Attached { sid, entries } => {
                 self.handle_attached(machine, sid, entries, cx)
@@ -411,32 +304,10 @@ impl Workbench {
             BridgeEvent::ModelSet { sid, token, result } => {
                 self.handle_model_set(sid, token, result, cx)
             }
-            BridgeEvent::Disconnected => self.handle_disconnected(machine),
+            BridgeEvent::Disconnected => self.abort_machine_flows(machine, "connection lost"),
         }
 
         cx.notify();
-    }
-
-    fn handle_connected(&mut self, machine: &str, daemon_version: String) {
-        if let Some(connection) = self.connections.get_mut(machine) {
-            connection.link = Link::Connected { daemon_version };
-        }
-    }
-
-    fn handle_connect_failed(&mut self, machine: &str, detail: String) {
-        self.abort_machine_flows(machine, &detail);
-
-        if let Some(connection) = self.connections.get_mut(machine) {
-            connection.link = Link::Failed { detail };
-        }
-    }
-
-    fn handle_disconnected(&mut self, machine: &str) {
-        self.abort_machine_flows(machine, "connection lost");
-
-        if let Some(connection) = self.connections.get_mut(machine) {
-            connection.link = Link::Lost;
-        }
     }
 
     /// Commands queued for this machine died with its bridge: return any
@@ -482,14 +353,14 @@ impl Workbench {
         self.opening = None;
 
         let first_prompt = self.take_started_ghost(&sid);
-        let Some(connection) = self.connections.get(machine) else {
+        let Some(commands) = self.fleet.commands_for(machine) else {
             return;
         };
         let bridge = BridgeLink {
-            commands: connection.commands.clone(),
+            commands,
             tokens: self.tokens.clone(),
         };
-        let machine_label: SharedString = self.machine_label(machine).into();
+        let machine_label: SharedString = self.fleet.label(machine).into();
         // The session is in the list by now (a ghost start just inserted its
         // row above); its cwd names the repository in the prompt box.
         let workspace_label: SharedString = self
@@ -661,23 +532,6 @@ impl Workbench {
         cx.notify();
     }
 
-    /// Machine string → the host its execs run on, through the one place that
-    /// decides what a machine string means. A provider machine resolves
-    /// through the worker's last listing, so `None` means the key is unknown
-    /// (not listed yet) or the machine uses the unsupported argv ssh form.
-    fn resolve_host(&self, machine: &str) -> Option<Host> {
-        match MachineRef::parse(machine) {
-            MachineRef::Local => Some(Host::Local),
-            MachineRef::Provider(_) => self
-                .machines
-                .iter()
-                .find(|row| row.key == machine)
-                .and_then(|row| row.target.clone())
-                .map(Host::Ssh),
-            MachineRef::AdHoc(dest) => Some(Host::Ssh(SshTarget { dest, port: None })),
-        }
-    }
-
     fn add_workspace(&mut self, machine: String, path: String) {
         let workspace = Workspace { machine, path };
 
@@ -686,14 +540,11 @@ impl Workbench {
         }
 
         self.workspaces.push(workspace);
-        // A new ad-hoc machine may have entered the probe set.
-        self.publish_ad_hoc_machines();
-        // The picker no longer connects the machine it browses (its execs
-        // need no daemon), so this is where a machine that just earned a
-        // workspace gets its bridge — same rule as at launch: a machine with
-        // stored workspaces connects in the background so its sessions show
-        // up (SPEC §Flows "Reopen client").
-        self.auto_connect_workspace_machines();
+        // A new ad-hoc machine may have entered the probe set, and the picker
+        // no longer connects the machine it browses (its execs need no
+        // daemon) — so this is where a machine that just earned a workspace
+        // gets its bridge, same rule as at launch.
+        self.track_machines();
 
         if let Err(error) = workspaces::save(&self.workspaces) {
             self.last_error = Some(format!("save workspaces: {error}"));
@@ -874,7 +725,7 @@ impl Workbench {
             .map(|workspace| {
                 (
                     workspace.machine.clone(),
-                    self.machine_label(&workspace.machine),
+                    self.fleet.label(&workspace.machine),
                 )
             })
             .collect()
@@ -979,28 +830,6 @@ impl Workbench {
         }
     }
 
-    /// Machines a workspace can be added on (or a session spawned on): every
-    /// connectable machine — provider machines with a resolved target plus
-    /// the ad-hoc destinations. `local` joins when its daemon support lands.
-    /// Returned as (machine key, display label) pairs.
-    fn machine_candidates(&self) -> Vec<(String, String)> {
-        let mut candidates: Vec<(String, String)> =
-            vec![(LOCAL_MACHINE.to_string(), LOCAL_MACHINE.to_string())];
-
-        candidates.extend(
-            self.machines
-                .iter()
-                .filter(|row| row.target.is_some())
-                .map(|row| (row.key.clone(), row.label.clone())),
-        );
-
-        for machine in self.ad_hoc_machines() {
-            candidates.push((machine.clone(), machine));
-        }
-
-        candidates
-    }
-
     /// The workspaces-header "+": one qualifying machine goes straight to
     /// browsing; several open the "which machine?" step first.
     fn open_add_workspace(&mut self, cx: &mut Context<Self>) {
@@ -1008,11 +837,11 @@ impl Workbench {
             return;
         }
 
-        let candidates = self.machine_candidates();
+        let candidates = self.fleet.machine_candidates();
 
         match candidates.len() {
             0 => self.last_error = Some("no machines available to add a workspace on".to_string()),
-            1 => self.open_picker(candidates[0].0.clone()),
+            1 => self.open_picker(candidates[0].key.clone()),
             _ => self.machine_picker_open = true,
         }
 
@@ -1021,13 +850,14 @@ impl Workbench {
 
     /// A machine row in the add-workspace machine picker was clicked.
     fn workspace_machine_picked(&mut self, candidate_index: usize, cx: &mut Context<Self>) {
-        let candidates = self.machine_candidates();
-        let Some((machine, _)) = candidates.get(candidate_index) else {
+        let candidates = self.fleet.machine_candidates();
+        let Some(candidate) = candidates.get(candidate_index) else {
             return;
         };
+        let machine = candidate.key.clone();
 
         self.machine_picker_open = false;
-        self.open_picker(machine.clone());
+        self.open_picker(machine);
         cx.notify();
     }
 
@@ -1040,9 +870,7 @@ impl Workbench {
     /// handling here — `Disconnected`/`ConnectFailed` events drive the
     /// visible state.
     fn send_command(&self, machine: &str, command: Command) {
-        if let Some(connection) = self.connections.get(machine) {
-            let _ = connection.commands.send(command);
-        }
+        self.fleet.send(machine, command);
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1123,7 +951,7 @@ impl Workbench {
     /// workspace"); the "+" enables once at least one machine qualifies and
     /// stops propagation so adding doesn't also collapse the section.
     fn render_workspaces_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let can_add = !self.machine_candidates().is_empty()
+        let can_add = !self.fleet.machine_candidates().is_empty()
             && self.picker.is_none()
             && !self.machine_picker_open;
 
@@ -1158,7 +986,7 @@ impl Workbench {
                     .map(|(index, workspace)| {
                         ui::workspace_row(
                             folder_name(&workspace.path).to_string().into(),
-                            self.machine_label(&workspace.machine).into(),
+                            self.fleet.label(&workspace.machine).into(),
                         )
                         .child(
                             ui::workspace_row_add(("workspace-add", index)).on_click(cx.listener(
@@ -1184,7 +1012,8 @@ impl Workbench {
     /// machines, then ad-hoc SSH destinations. All rows read-only.
     fn render_machine_list(&self) -> impl IntoElement {
         let provider_rows: Vec<_> = self
-            .machines
+            .fleet
+            .provider_machines()
             .iter()
             .map(|row| {
                 ui::machine_row(
@@ -1195,13 +1024,14 @@ impl Workbench {
             })
             .collect();
         let ad_hoc_rows: Vec<_> = self
+            .fleet
             .ad_hoc_machines()
-            .into_iter()
+            .iter()
             .map(|machine| {
                 ui::machine_row(
                     machine.clone().into(),
                     Some("ssh".into()),
-                    self.machine_dot(&machine),
+                    self.machine_dot(machine),
                 )
             })
             .collect();
@@ -1225,32 +1055,18 @@ impl Workbench {
     /// `ssh <machine> true` probe says unreachable, gray = no daemon link
     /// yet (reachable or simply not probed — indistinguishable without
     /// connecting). Never provider-reported status (SPEC §Machine).
+    ///
+    /// One `match` over one value: the precedence between a probe verdict and
+    /// a daemon link used to live here, in a renderer, reading two maps. It
+    /// is the fleet's invariant now.
     fn machine_dot(&self, key: &str) -> u32 {
-        match self.connections.get(key).map(|connection| &connection.link) {
-            Some(Link::Connected { .. }) => return theme::STATUS_RUNNING,
-            Some(Link::Connecting) => return theme::STATUS_PENDING,
-            Some(Link::Failed { .. }) | Some(Link::Lost) => return theme::STATUS_ERROR,
-            None => {}
-        }
-
-        match self.probes.get(key) {
-            Some(false) => theme::STATUS_ERROR,
-            Some(true) | None => theme::TEXT_FAINT,
-        }
-    }
-
-    /// Display label for a stored machine string: the provider machine's
-    /// label when listed, the key's id half as a fallback, the string itself
-    /// for ad-hoc destinations.
-    fn machine_label(&self, machine: &str) -> String {
-        match MachineRef::parse(machine) {
-            MachineRef::Provider(key) => self
-                .machines
-                .iter()
-                .find(|row| row.key == machine)
-                .map(|row| row.label.clone())
-                .unwrap_or(key.id),
-            MachineRef::Local | MachineRef::AdHoc(_) => machine.to_string(),
+        match self.fleet.state(key) {
+            MachineState::Connected { .. } => theme::STATUS_RUNNING,
+            MachineState::Connecting => theme::STATUS_PENDING,
+            MachineState::ConnectFailed { .. }
+            | MachineState::ConnectionLost
+            | MachineState::Unreachable => theme::STATUS_ERROR,
+            MachineState::Unknown | MachineState::Reachable => theme::TEXT_FAINT,
         }
     }
 
@@ -1260,7 +1076,7 @@ impl Workbench {
         session: &MachineSession,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let machine_label = self.machine_label(&session.machine);
+        let machine_label = self.fleet.label(&session.machine);
         let session = &session.info;
         let selected = self
             .chat
@@ -1303,20 +1119,10 @@ impl Workbench {
             return content.child(chat.clone());
         }
 
-        let argv_connection = self
-            .argv_machine
-            .as_ref()
-            .map(|machine| (machine, self.connections.get(machine)));
-        let (hint, color) = match argv_connection {
-            Some((machine, Some(connection))) => match &connection.link {
-                Link::Connecting => (format!("connecting to {machine}…"), theme::TEXT_FAINT),
-                Link::Connected { .. } => ("select a session".to_string(), theme::TEXT_FAINT),
-                Link::Failed { detail } => (detail.clone(), theme::STATUS_ERROR),
-                Link::Lost => ("connection lost".to_string(), theme::STATUS_ERROR),
-            },
-            // No argv machine (or its bridge never started): the workspace
-            // rows are the way in.
-            _ => ("open a workspace to begin".to_string(), theme::TEXT_FAINT),
+        let (hint, color) = match &self.argv_machine {
+            Some(machine) => self.argv_machine_hint(machine),
+            // No argv machine: the workspace rows are the way in.
+            None => (NO_ARGV_MACHINE_HINT.to_string(), theme::TEXT_FAINT),
         };
 
         content.child(
@@ -1329,6 +1135,21 @@ impl Workbench {
                 .text_color(rgb(color))
                 .child(hint),
         )
+    }
+
+    /// The empty content pane when the argv machine has a bridge; a machine
+    /// that only ever got probed falls back to the workspace-rows hint,
+    /// because there is nothing about its daemon to report yet.
+    fn argv_machine_hint(&self, machine: &str) -> (String, u32) {
+        match self.fleet.state(machine) {
+            MachineState::Connecting => (format!("connecting to {machine}…"), theme::TEXT_FAINT),
+            MachineState::Connected { .. } => ("select a session".to_string(), theme::TEXT_FAINT),
+            MachineState::ConnectFailed { detail } => (detail.clone(), theme::STATUS_ERROR),
+            MachineState::ConnectionLost => ("connection lost".to_string(), theme::STATUS_ERROR),
+            MachineState::Unknown | MachineState::Reachable | MachineState::Unreachable => {
+                (NO_ARGV_MACHINE_HINT.to_string(), theme::TEXT_FAINT)
+            }
+        }
     }
 
     /// The send button's path; Enter inside the input reaches the same
@@ -1353,7 +1174,7 @@ impl Workbench {
         let subtitle = format!(
             "{} on {}",
             folder_name(&ghost.workspace.path),
-            self.machine_label(&ghost.workspace.machine)
+            self.fleet.label(&ghost.workspace.machine)
         );
         // The prompt box only renders before the start fires, so `Loaded`
         // alone decides whether the model control is clickable.
@@ -1381,7 +1202,7 @@ impl Workbench {
             // The machine control is live only while ≥2 stored workspaces
             // share this path; otherwise it reads as the fixed destination.
             let machine_enabled = self.ghost_machine_candidates(&ghost.workspace.path).len() >= 2;
-            let machine_label: SharedString = self.machine_label(&ghost.workspace.machine).into();
+            let machine_label: SharedString = self.fleet.label(&ghost.workspace.machine).into();
 
             bottom_row.child(
                 ui::prompt_box(input_focused)
@@ -1544,18 +1365,18 @@ impl Workbench {
     /// The add-workspace machine step: same modal-list pattern as the model
     /// picker; picking a machine opens the folder picker there.
     fn render_machine_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let candidate_rows: Vec<_> = self
-            .machine_candidates()
-            .into_iter()
-            .enumerate()
-            .map(|(index, (_, label))| {
-                ui::model_row(("workspace-machine", index), label.into(), false).on_click(
-                    cx.listener(move |workbench, _, _, cx| {
-                        workbench.workspace_machine_picked(index, cx)
-                    }),
-                )
-            })
-            .collect();
+        let candidate_rows: Vec<_> =
+            self.fleet
+                .machine_candidates()
+                .into_iter()
+                .enumerate()
+                .map(|(index, candidate)| {
+                    ui::model_row(("workspace-machine", index), candidate.label.into(), false)
+                        .on_click(cx.listener(move |workbench, _, _, cx| {
+                            workbench.workspace_machine_picked(index, cx)
+                        }))
+                })
+                .collect();
 
         ui::modal_scrim("workspace-machine-scrim")
             .on_click(cx.listener(|workbench, _, _, cx| workbench.close_machine_picker(cx)))
@@ -1637,35 +1458,43 @@ impl Workbench {
     }
 
     /// Transitional until the machines list (next stage): the argv machine's
-    /// link when present, else a connected-machine count.
+    /// link when it has one, else a connected-machine count.
     fn statusbar_link(&self) -> (String, u32) {
-        if let Some(machine) = &self.argv_machine {
-            if let Some(connection) = self.connections.get(machine) {
-                return match &connection.link {
-                    Link::Connecting => ("connecting…".to_string(), theme::TEXT_FAINT),
-                    Link::Connected { daemon_version } => (
-                        format!("{machine} · harvesterd {daemon_version}"),
-                        theme::TEXT_FAINT,
-                    ),
-                    Link::Failed { .. } => ("connect failed".to_string(), theme::STATUS_ERROR),
-                    Link::Lost => ("connection lost".to_string(), theme::STATUS_ERROR),
-                };
-            }
+        if let Some(link) = self.argv_statusbar_link() {
+            return link;
         }
-
-        let connected_count = self
-            .connections
-            .values()
-            .filter(|connection| matches!(connection.link, Link::Connected { .. }))
-            .count();
 
         (
             format!(
-                "{connected_count} of {} machines connected",
-                self.connections.len()
+                "{} of {} machines connected",
+                self.fleet.connected_machine_count(),
+                self.fleet.linked_machine_count()
             ),
             theme::TEXT_FAINT,
         )
+    }
+
+    /// `None` when there is no argv machine, or when it has no bridge yet —
+    /// the statusbar then shows the fleet-wide count instead. Returning the
+    /// absence rather than inventing a string for the probe-only states is
+    /// what keeps this a total match over [`MachineState`].
+    fn argv_statusbar_link(&self) -> Option<(String, u32)> {
+        let machine = self.argv_machine.as_ref()?;
+
+        match self.fleet.state(machine) {
+            MachineState::Connecting => Some(("connecting…".to_string(), theme::TEXT_FAINT)),
+            MachineState::Connected { daemon_version } => Some((
+                format!("{machine} · harvesterd {daemon_version}"),
+                theme::TEXT_FAINT,
+            )),
+            MachineState::ConnectFailed { .. } => {
+                Some(("connect failed".to_string(), theme::STATUS_ERROR))
+            }
+            MachineState::ConnectionLost => {
+                Some(("connection lost".to_string(), theme::STATUS_ERROR))
+            }
+            MachineState::Unknown | MachineState::Reachable | MachineState::Unreachable => None,
+        }
     }
 }
 

@@ -22,6 +22,7 @@ mod bootstrap;
 pub mod bridge;
 mod client;
 mod connection;
+mod fleet;
 mod host;
 mod machine;
 pub mod machines;
@@ -33,6 +34,7 @@ mod workspace;
 pub use bootstrap::{bootstrap_and_connect, BootstrapOutcome, Connected};
 pub use client::{DaemonClient, SessionEvent};
 pub use connection::{DaemonConnection, DaemonReader, DaemonWriter};
+pub use fleet::{Fleet, FleetError, FleetEvents, MachineCandidate, MachineState};
 pub use host::Host;
 pub use machine::{MachineRef, LOCAL_MACHINE};
 pub use provider::{
