@@ -3,19 +3,21 @@
 
 use std::collections::HashMap;
 use std::process::Stdio;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use harvester_proto::{HarvesterCmd, HarvesterResponse, Outgoing, CR, LF};
+use harvester_proto::{
+    encode_frame, read_frame, HarvesterCmd, HarvesterResponse, Outgoing, PingData, SessionsData,
+};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::daemon::Daemon;
 use crate::fslist;
-use crate::session::{Session, SessionOutput, SpawnArgs};
+use crate::server::Outbound;
+use crate::session::{self, Session, SessionOutput, SpawnArgs};
 
 /// Backstop between stdin EOF and SIGKILL on `stop`. Not a correctness knob:
 /// EOF triggers pi's immediate shutdown path — verified in rpc-mode.js, it
@@ -28,6 +30,14 @@ const STOP_KILL_BACKSTOP: Duration = Duration::from_secs(30);
 /// wedged pi hits it, and `kill_on_drop` SIGKILLs on expiry — safe here
 /// because a `--no-session` pi has nothing durable to truncate.
 const LIST_MODELS_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Correlation id for the throwaway pi's one request. Deliberately inside the
+/// `hv-` namespace the pump routes on, though this pi has no pump — the reply
+/// filter below matches it directly.
+const MODELS_REQUEST_ID: &str = "hv-models";
+
+/// `list_models` read buffer starting size; grows to the largest pi line seen.
+const MODELS_LINE_BUFFER: usize = 64 * 1024;
 
 /// One live attachment: the forwarder task plus the exact session object whose
 /// `attached` counter it incremented. Holding the `Arc<Session>` (not just the
@@ -42,75 +52,115 @@ pub struct Attachment {
 /// Connection-local state the attach/detach commands operate on: sid → attachment.
 pub type AttachedMap = HashMap<String, Attachment>;
 
-/// The single place an attachment is torn down: abort the forwarder, decrement
-/// the counter on the same session object `attach` incremented.
+/// The single place an attachment is torn down: abort the forwarder, then
+/// leave the room on the same session object `attach` joined. Leaving returns
+/// the dialogs to cancel — non-empty only when this was the last watcher, so
+/// no dialog is ever left unanswered (docs/DAEMON.md).
 pub fn release_attachment(attachment: Attachment) {
     attachment.forwarder.abort();
-    attachment.session.attached.fetch_sub(1, Ordering::SeqCst);
+
+    for dialog_id in attachment.session.detach() {
+        session::cancel_dialog(&attachment.session, &dialog_id);
+    }
 }
 
-pub async fn dispatch(
+/// Route one harvester command. `None` means a spawned task owns the response
+/// (slow commands must not head-of-line block the connection loop).
+pub fn dispatch(
     daemon: &Daemon,
+    id: Option<Value>,
     cmd: HarvesterCmd,
-    out_tx: &mpsc::Sender<Outgoing>,
+    out_tx: &mpsc::Sender<Outbound>,
     attached: &mut AttachedMap,
-) -> HarvesterResponse {
-    match cmd {
+) -> Option<Outgoing> {
+    let response = match cmd {
         HarvesterCmd::Ping { version } => ping(version),
-        HarvesterCmd::ListSessions { cwd } => list_sessions(daemon, cwd).await,
+        HarvesterCmd::ListSessions { cwd } => {
+            spawn_list_sessions(daemon, id, cwd, out_tx);
+
+            return None;
+        }
         HarvesterCmd::CreateSession {
             sid,
             cwd,
             provider,
             model,
             name,
-        } => {
-            create_session(
-                daemon,
-                SpawnArgs {
-                    sid,
-                    cwd,
-                    provider,
-                    model,
-                    name,
-                },
-            )
-            .await
+        } => create_session(
+            daemon,
+            SpawnArgs {
+                sid,
+                cwd,
+                provider,
+                model,
+                name,
+            },
+        ),
+        HarvesterCmd::ListModels { cwd } => {
+            spawn_list_models(id, cwd, out_tx);
+
+            return None;
         }
-        HarvesterCmd::ListModels { cwd } => list_models(cwd).await,
-        HarvesterCmd::Attach { sid } => attach(daemon, sid, out_tx, attached).await,
+        HarvesterCmd::Attach { sid } => attach(daemon, sid, out_tx, attached),
         HarvesterCmd::Detach { sid } => detach(sid, attached),
-        HarvesterCmd::Stop { sid } => stop(daemon, sid).await,
-    }
+        HarvesterCmd::Stop { sid } => stop(daemon, sid),
+    };
+
+    Some(Outgoing::HarvesterResponse { id, response })
 }
 
 fn ping(_client_version: String) -> HarvesterResponse {
     // The client decides what to do on mismatch; we just report ours.
-    HarvesterResponse::ok(json!({"version": harvester_proto::PROTOCOL_VERSION}))
+    data_response(PingData {
+        version: harvester_proto::PROTOCOL_VERSION.to_string(),
+    })
 }
 
-async fn list_sessions(daemon: &Daemon, cwd: Option<String>) -> HarvesterResponse {
-    let running = daemon.running_sids().await;
-    let sessions = fslist::list_sessions(cwd.as_deref(), &running);
-
-    HarvesterResponse::ok(json!({ "sessions": sessions }))
+/// Answer with a typed daemon-native payload. The payloads are our own types,
+/// so serialization cannot fail for any reason worth a runtime branch.
+fn data_response(data: impl serde::Serialize) -> HarvesterResponse {
+    HarvesterResponse::ok(serde_json::to_value(data).expect("serializable"))
 }
 
-async fn create_session(daemon: &Daemon, args: SpawnArgs) -> HarvesterResponse {
-    let mut sessions = daemon.inner().sessions.lock().await;
+/// The disk scan rides the blocking pool: session files can be large, and a
+/// synchronous read on the daemon's single runtime thread would stall every
+/// pump and connection meanwhile.
+fn spawn_list_sessions(
+    daemon: &Daemon,
+    id: Option<Value>,
+    cwd: Option<String>,
+    out_tx: &mpsc::Sender<Outbound>,
+) {
+    let running = daemon.running_sids();
+    let out_tx = out_tx.clone();
 
-    if sessions.contains_key(&args.sid) {
-        return HarvesterResponse::err(format!("session '{}' already running", args.sid));
-    }
+    tokio::spawn(async move {
+        let scan =
+            tokio::task::spawn_blocking(move || fslist::list_sessions(cwd.as_deref(), &running));
+        let response = match scan.await {
+            Ok(sessions) => data_response(SessionsData { sessions }),
+            Err(join_error) => HarvesterResponse::err(format!("list_sessions: {join_error}")),
+        };
+        let outgoing = Outgoing::HarvesterResponse { id, response };
 
-    match Session::spawn(args, &daemon.inner().log_dir).await {
-        Ok(session) => {
-            let sid = session.sid.clone();
-            sessions.insert(sid.clone(), session.clone());
-            drop(sessions);
-            daemon.reap_on_exit(session);
+        let _ = out_tx.send(Outbound::Typed(outgoing)).await;
+    });
+}
 
-            HarvesterResponse::ok(json!({"sid": sid}))
+/// Resume-or-create, and idempotent on top of that: a sid that is already
+/// running succeeds with `already: true` rather than erroring. The daemon owns
+/// this truth — a client cannot know whether a session died while it was
+/// detached — so "make it running" is the honest contract, and it lets every
+/// open be the same unconditional create → attach chain. No second pi is ever
+/// spawned: the pid table check inside `spawn_session` is what answers here,
+/// so one pi = one session file still holds.
+fn create_session(daemon: &Daemon, args: SpawnArgs) -> HarvesterResponse {
+    let sid = args.sid.clone();
+
+    match daemon.spawn_session(args) {
+        Ok(session) => HarvesterResponse::ok(json!({"sid": session.sid})),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            HarvesterResponse::ok(json!({"sid": sid, "already": true}))
         }
         Err(error) => HarvesterResponse::err(format!("spawn failed: {error}")),
     }
@@ -119,9 +169,20 @@ async fn create_session(daemon: &Daemon, args: SpawnArgs) -> HarvesterResponse {
 /// The models pi would offer in `cwd`, fetched fresh every call (DAEMON.md:
 /// deterministic, touches no session, no caching): a throwaway
 /// `PI_OFFLINE=1 pi --mode rpc --no-session` answers `get_available_models`
-/// and pi's `data` is returned verbatim. Runs inline in the connection's
-/// command loop (~1s) — attached event streams ride their own forwarder
-/// tasks, so nothing user-visible stalls.
+/// and pi's `data` is returned verbatim. Rides its own task — the ~1s pi
+/// startup (worst case `LIST_MODELS_TIMEOUT`) must not block sibling requests
+/// on this connection.
+fn spawn_list_models(id: Option<Value>, cwd: String, out_tx: &mpsc::Sender<Outbound>) {
+    let out_tx = out_tx.clone();
+
+    tokio::spawn(async move {
+        let response = list_models(cwd).await;
+        let outgoing = Outgoing::HarvesterResponse { id, response };
+
+        let _ = out_tx.send(Outbound::Typed(outgoing)).await;
+    });
+}
+
 async fn list_models(cwd: String) -> HarvesterResponse {
     match tokio::time::timeout(LIST_MODELS_TIMEOUT, query_available_models(&cwd)).await {
         Ok(Ok(data)) => HarvesterResponse::ok(data),
@@ -138,8 +199,6 @@ async fn list_models(cwd: String) -> HarvesterResponse {
 /// `kill_on_drop`: on every exit path it is either already exiting (stdin
 /// dropped) or gets SIGKILLed, so no pi outlives this function.
 async fn query_available_models(cwd: &str) -> Result<Value, String> {
-    const REQUEST_LINE: &[u8] = br#"{"id":"hv-models","type":"get_available_models"}"#;
-
     let mut child = tokio::process::Command::new("pi")
         .current_dir(cwd)
         .env("PI_OFFLINE", "1")
@@ -154,8 +213,8 @@ async fn query_available_models(cwd: &str) -> Result<Value, String> {
     let mut stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");
 
-    let mut request = REQUEST_LINE.to_vec();
-    request.push(LF);
+    let request = encode_frame(&json!({"id": MODELS_REQUEST_ID, "type": "get_available_models"}))
+        .expect("serializable");
     stdin
         .write_all(&request)
         .await
@@ -165,39 +224,23 @@ async fn query_available_models(cwd: &str) -> Result<Value, String> {
         .await
         .map_err(|error| format!("write to pi: {error}"))?;
 
-    // LF-only framing, like session.rs's pump: read_until(LF), strip a
-    // trailing CR, skip non-JSON and non-matching lines (pi may emit events
-    // before the response).
     let mut reader = BufReader::new(stdout);
-    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let mut buf: Vec<u8> = Vec::with_capacity(MODELS_LINE_BUFFER);
 
     loop {
-        buf.clear();
-
-        let read = reader
-            .read_until(LF, &mut buf)
-            .await
-            .map_err(|error| format!("read from pi: {error}"))?;
-
-        if read == 0 {
-            return Err("pi exited before answering".to_string());
-        }
-
-        let mut line = buf.as_slice();
-
-        if line.last() == Some(&LF) {
-            line = &line[..line.len() - 1];
-        }
-
-        if line.last() == Some(&CR) {
-            line = &line[..line.len() - 1];
-        }
+        // Skip non-JSON and non-matching lines (pi may emit events before the
+        // response).
+        let line = match read_frame(&mut reader, &mut buf).await {
+            Ok(Some(line)) => line,
+            Ok(None) => return Err("pi exited before answering".to_string()),
+            Err(error) => return Err(format!("read from pi: {error}")),
+        };
 
         let Ok(value) = serde_json::from_slice::<Value>(line) else {
             continue;
         };
 
-        if value.get("id").and_then(Value::as_str) != Some("hv-models") {
+        if value.get("id").and_then(Value::as_str) != Some(MODELS_REQUEST_ID) {
             continue;
         }
 
@@ -223,13 +266,13 @@ async fn query_available_models(cwd: &str) -> Result<Value, String> {
     }
 }
 
-async fn attach(
+fn attach(
     daemon: &Daemon,
     sid: String,
-    out_tx: &mpsc::Sender<Outgoing>,
+    out_tx: &mpsc::Sender<Outbound>,
     attached: &mut AttachedMap,
 ) -> HarvesterResponse {
-    let Some(session) = daemon.session(&sid).await else {
+    let Some(session) = daemon.session(&sid) else {
         return HarvesterResponse::err(format!("no running session '{sid}'"));
     };
 
@@ -244,39 +287,76 @@ async fn attach(
         release_attachment(stale);
     }
 
-    session.attached.fetch_add(1, Ordering::SeqCst);
-    let forwarder = spawn_forwarder(&session, sid.clone(), out_tx.clone());
+    // Subscribe before joining the room, never the other way round. A dialog
+    // arriving between the two steps is then auto-cancelled (the room still
+    // reads as empty), which costs one spurious "Escape" — whereas joining
+    // first would let that dialog be remembered and broadcast before this
+    // subscriber exists, so nobody would ever see it and pi would wait forever.
+    // Safe direction over convenient direction.
+    let events = session.output.subscribe();
+    let pending_dialogs = session.attach();
+    let forwarder = spawn_forwarder(events, pending_dialogs, sid.clone(), out_tx.clone());
     attached.insert(sid, Attachment { session, forwarder });
 
     HarvesterResponse::ok(json!({}))
 }
 
-/// Stream one session's events/exit to one connection until either side goes away.
+/// Stream one session's events/exit to one connection until either side goes
+/// away, after replaying the dialogs that were already waiting — a client
+/// joining mid-dialog must be able to answer it, or pi waits forever.
 fn spawn_forwarder(
-    session: &Session,
+    mut events: broadcast::Receiver<SessionOutput>,
+    pending_dialogs: Vec<Arc<[u8]>>,
     sid: String,
-    out_tx: mpsc::Sender<Outgoing>,
+    out_tx: mpsc::Sender<Outbound>,
 ) -> JoinHandle<()> {
-    let mut events = session.output.subscribe();
-
     tokio::spawn(async move {
-        while let Ok(output) = events.recv().await {
-            // Exit is terminal: deliver it and end the forwarder.
-            let is_exit = matches!(output, SessionOutput::Exit { .. });
-            let outgoing = match output {
-                SessionOutput::Event(event) => Outgoing::Event {
-                    sid: sid.clone(),
-                    event,
-                },
-                SessionOutput::Exit { exit_code } => Outgoing::SessionExit {
-                    sid: sid.clone(),
-                    exit_code,
-                },
-                SessionOutput::Response { .. } => continue,
+        for dialog in pending_dialogs {
+            if out_tx.send(Outbound::Raw(dialog)).await.is_err() {
+                return;
+            }
+        }
+
+        loop {
+            let output = match events.recv().await {
+                Ok(output) => output,
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    // Recoverable, but never silently: the ring dropped
+                    // `skipped` events for this subscriber, so tell the client
+                    // to resync (it can `get_entries` from its last seen one)
+                    // and keep streaming from the oldest retained event.
+                    eprintln!("forwarder {sid}: skipped {skipped} events (slow connection)");
+
+                    let gap = Outgoing::EventGap {
+                        sid: sid.clone(),
+                        skipped,
+                    };
+
+                    if out_tx.send(Outbound::Typed(gap)).await.is_err() {
+                        break;
+                    }
+
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
             };
 
-            if out_tx.send(outgoing).await.is_err() || is_exit {
-                break;
+            match output {
+                SessionOutput::Event(line) => {
+                    if out_tx.send(Outbound::Raw(line)).await.is_err() {
+                        break;
+                    }
+                }
+                // Exit is terminal: deliver it and end the forwarder.
+                SessionOutput::Exit { exit_code } => {
+                    let outgoing = Outgoing::SessionExit {
+                        sid: sid.clone(),
+                        exit_code,
+                    };
+                    let _ = out_tx.send(Outbound::Typed(outgoing)).await;
+
+                    break;
+                }
             }
         }
     })
@@ -292,50 +372,51 @@ fn detach(sid: String, attached: &mut AttachedMap) -> HarvesterResponse {
 
 /// Non-blocking stop: polite escalation ladder, response returns immediately.
 /// `session_exit` is the authoritative "it's done" signal — this response only
-/// means "shutdown initiated". Table removal is `reap_on_exit`'s job.
-async fn stop(daemon: &Daemon, sid: String) -> HarvesterResponse {
-    let Some(session) = daemon.session(&sid).await else {
+/// means "shutdown initiated". The stdout pump vacates the pid table on exit.
+///
+/// Rung 3 is armed *first*, on purpose: the ladder exists for a wedged pi, so
+/// no rung may depend on that pi cooperating. Both rungs below only touch the
+/// stdin queue (never the pipe), so neither can block — but ordering the
+/// backstop first keeps that guarantee independent of the queue's behaviour.
+fn stop(daemon: &Daemon, sid: String) -> HarvesterResponse {
+    let Some(session) = daemon.session(&sid) else {
         return HarvesterResponse::err(format!("no running session '{sid}'"));
     };
 
-    // Subscribe before acting so the Exit broadcast cannot slip past the backstop.
-    let events = session.output.subscribe();
+    tokio::spawn(kill_backstop(daemon.clone(), session.clone()));
 
     // Rung 1: abort any in-flight turn so pi records it cleanly in the session
     // file instead of dying mid-stream. Failure is fine — a dead or deaf pi is
-    // exactly what the rungs below are for.
-    let request_number = daemon
-        .inner()
-        .request_counter
-        .fetch_add(1, Ordering::Relaxed);
-    let abort = json!({"id": format!("hv-{request_number}"), "type": "abort"});
+    // exactly what the rungs below are for. Registering the waiter (and
+    // dropping its receiver) keeps the pump's "no waiter means a task died"
+    // branch honest when pi acknowledges the abort.
+    let request_key = daemon.next_passthrough_id();
+    // Nothing awaits this abort's answer; the receiver is dropped immediately
+    // and the pump's "closed receiver" path swallows the reply.
+    drop(session.register_response_waiter(request_key.clone()));
+    let abort = json!({"id": request_key, "type": "abort"});
 
-    if let Err(error) = session.write_line(&abort).await {
+    if let Err(error) = session.write_line(&abort) {
         eprintln!("stop {sid}: abort write failed (continuing): {error}");
     }
 
-    // Rung 2: EOF — pi's shutdown path. Rung 3 (SIGKILL) runs detached.
-    session.close_stdin().await;
-    tokio::spawn(kill_backstop(session, events));
+    // Rung 2: EOF — pi's shutdown path, after the queued abort drains.
+    session.close_stdin();
 
     HarvesterResponse::ok(json!({"stopping": true}))
 }
 
 /// Rung 3: SIGKILL a pi that ignored stdin EOF for `STOP_KILL_BACKSTOP`.
-async fn kill_backstop(session: Arc<Session>, mut events: broadcast::Receiver<SessionOutput>) {
-    let exited = tokio::time::timeout(STOP_KILL_BACKSTOP, async {
-        while let Ok(output) = events.recv().await {
-            if matches!(output, SessionOutput::Exit { .. }) {
-                return true;
-            }
-        }
+/// "Still in the pid table" is the liveness test — the pump vacates the entry
+/// before broadcasting Exit, and `ptr_eq` ignores a resumed successor.
+async fn kill_backstop(daemon: Daemon, session: Arc<Session>) {
+    tokio::time::sleep(STOP_KILL_BACKSTOP).await;
 
-        false
-    })
-    .await
-    .unwrap_or(false);
+    let still_running = daemon
+        .session(&session.sid)
+        .is_some_and(|stored| Arc::ptr_eq(&stored, &session));
 
-    if !exited {
+    if still_running {
         eprintln!(
             "stop {}: pi ignored stdin EOF for {STOP_KILL_BACKSTOP:?}, killing",
             session.sid

@@ -7,11 +7,9 @@
 //! harvester-cli only, and one positional argument does not earn it here
 //! either.
 
-mod bridge;
 mod chat;
 mod input;
 mod kitchen;
-mod machines;
 mod models;
 mod theme;
 mod ui;

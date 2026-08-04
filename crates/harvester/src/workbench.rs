@@ -10,19 +10,19 @@ use std::sync::Arc;
 use gpui::{
     div, prelude::*, px, rgb, Context, Entity, Focusable, SharedString, Subscription, Window,
 };
-use harvester_client_core::{MachineKey, RemoteDirEntry, SshTarget};
+use harvester_client_core::{Host, MachineKey, RemoteDirEntry, SshTarget};
 use harvester_proto::{SessionInfo, SessionStatus};
 use serde_json::Value;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
-use crate::bridge::{self, BridgeTarget, Command, Event as BridgeEvent};
 use crate::chat::Chat;
 use crate::input::{PromptSubmitted, TextInput};
-use crate::machines::{self, MachineRow};
 use crate::models::{self, ModelChoice, ModelsState};
 use crate::theme;
 use crate::ui;
 use crate::workspaces::{self, Workspace};
+use harvester_client_core::bridge::{self, Command, Event as BridgeEvent};
+use harvester_client_core::machines::{self, MachineRow};
 
 const SIDEBAR_WIDTH: f32 = 240.;
 /// The hardcoded local machine's key (SPEC §Machine): not a provider
@@ -639,13 +639,16 @@ impl Workbench {
         let machine = session.machine.clone();
         let sid = session.info.sid.clone();
         let cwd = session.info.cwd.clone();
-        let running = session.info.status == SessionStatus::Running;
 
         // Navigating to a session abandons any ghost chat — deliberate move
         // away from something that never existed daemon-side.
         self.ghost = None;
 
-        let already_open = self.chat_for(&sid, cx).is_some_and(|_| running);
+        // Only an open chat we have not seen exit can be re-shown as-is;
+        // anything else goes through Open, which resumes if needed.
+        let already_open = self
+            .chat_for(&sid, cx)
+            .is_some_and(|chat| chat.read(cx).is_live());
 
         if already_open {
             cx.notify();
@@ -660,7 +663,7 @@ impl Workbench {
         }
 
         self.opening = Some(sid.clone());
-        self.send_command(&machine, Command::Open { sid, cwd, running });
+        self.send_command(&machine, Command::Open { sid, cwd });
         cx.notify();
     }
 
@@ -718,14 +721,14 @@ impl Workbench {
         }
     }
 
-    /// Machine string → bridge target. `local` is the hardcoded no-SSH
-    /// machine; `<provider>/<id>` keys resolve through the worker's machine
-    /// list; anything else is an ad-hoc ssh destination used verbatim (argv
+    /// Machine string → host. `local` is the hardcoded no-SSH machine;
+    /// `<provider>/<id>` keys resolve through the worker's machine list;
+    /// anything else is an ad-hoc ssh destination used verbatim (argv
     /// machines, legacy workspaces.json entries). `None` when the key is
     /// unknown or the machine uses the unsupported argv ssh form.
-    fn resolve_target(&self, machine: &str) -> Option<BridgeTarget> {
+    fn resolve_target(&self, machine: &str) -> Option<Host> {
         if machine == LOCAL_MACHINE {
-            return Some(BridgeTarget::Local);
+            return Some(Host::Local);
         }
 
         if MachineKey::parse(machine).is_some() {
@@ -734,10 +737,10 @@ impl Workbench {
                 .iter()
                 .find(|row| row.key == machine)
                 .and_then(|row| row.target.clone())
-                .map(BridgeTarget::Ssh);
+                .map(Host::Ssh);
         }
 
-        Some(BridgeTarget::Ssh(SshTarget {
+        Some(Host::Ssh(SshTarget {
             dest: machine.to_string(),
             port: None,
         }))

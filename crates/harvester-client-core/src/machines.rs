@@ -8,10 +8,10 @@
 //! Harvester's own `ssh <machine> true` probe on a faster cycle — never with
 //! provider-reported status (docs/SPEC.md §Machine).
 
-use harvester_client_core::{
-    discover_providers, install_bundled_providers, probe_reachable, MachineKey, Provider,
-    ProviderMachine, SshTarget,
+use crate::provider::{
+    discover_providers, install_bundled_providers, MachineKey, Provider, ProviderMachine,
 };
+use crate::ssh::{probe_reachable, SshTarget};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 /// Probe cadence for the sidebar dots. A warm multiplexed probe is one
@@ -96,7 +96,11 @@ async fn worker_main(mut commands: UnboundedReceiver<Command>, events: Unbounded
     }
 
     let mut ad_hoc_machines: Vec<String> = Vec::new();
+    let mut provider_rows = ProviderRows::new();
     let mut provider_machines: Vec<MachineRow> = Vec::new();
+    // Listing runs off the loop and reports back here, so a slow provider
+    // never delays a probe tick or a command.
+    let (listed_sender, mut listed_receiver) = unbounded_channel();
     // Both intervals fire immediately on the first tick, so startup does one
     // list cycle and one probe cycle without extra code.
     let mut list_tick = tokio::time::interval(LIST_INTERVAL);
@@ -109,11 +113,19 @@ async fn worker_main(mut commands: UnboundedReceiver<Command>, events: Unbounded
                 None => break,
                 Some(Command::SetAdHocMachines(machines)) => {
                     ad_hoc_machines = machines;
-                    probe_ad_hoc(&ad_hoc_machines, &events).await;
+                    probe_ad_hoc(&ad_hoc_machines, &events);
                 }
             },
             _ = list_tick.tick() => {
-                provider_machines = list_provider_machines(&events).await;
+                spawn_list_cycle(provider_rows.clone(), events.clone(), listed_sender.clone());
+            }
+            listed = listed_receiver.recv() => {
+                let Some(rows) = listed else {
+                    break;
+                };
+
+                provider_rows = rows;
+                provider_machines = provider_rows.values().flatten().cloned().collect();
 
                 if events.send(Event::Listed(provider_machines.clone())).is_err() {
                     break;
@@ -121,96 +133,152 @@ async fn worker_main(mut commands: UnboundedReceiver<Command>, events: Unbounded
 
                 // Fresh rows get their dots right away instead of waiting
                 // out the probe interval.
-                probe_provider_machines(&provider_machines, &events).await;
+                probe_provider_machines(&provider_machines, &events);
             }
             _ = probe_tick.tick() => {
-                probe_provider_machines(&provider_machines, &events).await;
-                probe_ad_hoc(&ad_hoc_machines, &events).await;
+                probe_provider_machines(&provider_machines, &events);
+                probe_ad_hoc(&ad_hoc_machines, &events);
             }
         }
     }
 }
 
-/// One listing cycle: discover, protocol-gate via `info`, `list`. A failing
-/// provider reports and contributes nothing this cycle; the others still
-/// list.
-async fn list_provider_machines(events: &UnboundedSender<Event>) -> Vec<MachineRow> {
+/// Run one listing cycle detached. A provider executable that hangs is bounded
+/// only by its own kill-timeout, which is far longer than a probe interval —
+/// so the cycle must not sit in the select loop.
+fn spawn_list_cycle(
+    previous: ProviderRows,
+    events: UnboundedSender<Event>,
+    listed: UnboundedSender<ProviderRows>,
+) {
+    tokio::spawn(async move {
+        if let Some(rows) = list_provider_machines(&previous, &events).await {
+            let _ = listed.send(rows);
+        }
+    });
+}
+
+/// Each provider's rows from its last *successful* listing. Keeping them per
+/// provider is what makes a failed cycle survivable: a single blip on one
+/// provider's control plane would otherwise unlist its machines for a full
+/// interval — and since workspaces resolve their machine key through this
+/// list, those workspaces become unopenable meanwhile.
+type ProviderRows = std::collections::HashMap<String, Vec<MachineRow>>;
+
+/// One listing cycle: discover, then protocol-gate and `list` every provider
+/// concurrently. A provider that fails reports and keeps its previous rows;
+/// `None` means discovery itself failed, so the caller changes nothing at all.
+async fn list_provider_machines(
+    previous: &ProviderRows,
+    events: &UnboundedSender<Event>,
+) -> Option<ProviderRows> {
     let providers = match discover_providers() {
         Ok(providers) => providers,
         Err(error) => {
             eprintln!("harvester: discover providers: {error}");
 
-            return Vec::new();
+            return None;
         }
     };
 
-    let mut rows = Vec::new();
+    // Concurrent, so the cycle costs the slowest provider rather than the sum
+    // of all of them.
+    let mut listings = tokio::task::JoinSet::new();
 
-    for provider in &providers {
-        match list_one_provider(provider).await {
-            Ok(machines) => rows.extend(machines.into_iter().map(|machine| {
-                let target = machine.ssh.target().ok();
+    for provider in providers {
+        listings.spawn(async move {
+            let result = list_one_provider(&provider).await;
 
-                MachineRow {
-                    key: MachineKey {
-                        provider: provider.name.clone(),
-                        id: machine.id,
-                    }
-                    .to_string(),
-                    label: machine.label,
-                    provider: provider.name.clone(),
-                    target,
-                }
-            })),
+            (provider, result)
+        });
+    }
+
+    let mut rows = ProviderRows::new();
+
+    while let Some(joined) = listings.join_next().await {
+        let Ok((provider, result)) = joined else {
+            continue;
+        };
+
+        match result {
+            Ok(machines) => {
+                rows.insert(provider.name.clone(), machine_rows(&provider, machines));
+            }
             Err(error) => {
                 let _ = events.send(Event::ProviderFailed {
                     provider: provider.name.clone(),
                     detail: error.to_string(),
                 });
+
+                if let Some(last_good) = previous.get(&provider.name) {
+                    rows.insert(provider.name.clone(), last_good.clone());
+                }
             }
         }
     }
 
-    rows
+    Some(rows)
 }
 
-async fn list_one_provider(
-    provider: &Provider,
-) -> harvester_client_core::Result<Vec<ProviderMachine>> {
+fn machine_rows(provider: &Provider, machines: Vec<ProviderMachine>) -> Vec<MachineRow> {
+    machines
+        .into_iter()
+        .map(|machine| MachineRow {
+            key: MachineKey {
+                provider: provider.name.clone(),
+                id: machine.id,
+            }
+            .to_string(),
+            label: machine.label,
+            provider: provider.name.clone(),
+            // No target for the argv ssh form (unsupported yet): such machines
+            // list, but stay unreachable.
+            target: machine.ssh.target().ok(),
+        })
+        .collect()
+}
+
+async fn list_one_provider(provider: &Provider) -> crate::Result<Vec<ProviderMachine>> {
     // `info` gates the protocol version before the first `list` and on every
     // cycle after — cheap next to the `list` itself, and providers can be
     // swapped out on disk between cycles.
-    provider.info().await?;
+    provider.check_protocol().await?;
 
     provider.list_machines().await
 }
 
-/// Probes run sequentially: the machine count is small, the worker thread is
-/// free anyway, and results stream into the UI as they land.
-async fn probe_provider_machines(machines: &[MachineRow], events: &UnboundedSender<Event>) {
+/// Every probe rides its own task and streams its result as it lands: one
+/// dead machine burning its ConnectTimeout no longer stalls every later
+/// machine's dot, and the worker loop keeps answering commands meanwhile.
+/// Overlap between cycles is bounded (probe timeout < probe interval) and a
+/// duplicate probe is idempotent — the dot just updates twice.
+fn probe_machine(key: String, target: SshTarget, events: &UnboundedSender<Event>) {
+    let events = events.clone();
+
+    tokio::spawn(async move {
+        let reachable = probe_reachable(&target).await;
+        let _ = events.send(Event::Probed { key, reachable });
+    });
+}
+
+fn probe_provider_machines(machines: &[MachineRow], events: &UnboundedSender<Event>) {
     for machine in machines {
         // No target (argv ssh form) → no probe; the dot stays unknown.
         let Some(target) = &machine.target else {
             continue;
         };
-        let reachable = probe_reachable(target).await;
-        let _ = events.send(Event::Probed {
-            key: machine.key.clone(),
-            reachable,
-        });
+
+        probe_machine(machine.key.clone(), target.clone(), events);
     }
 }
 
-async fn probe_ad_hoc(machines: &[String], events: &UnboundedSender<Event>) {
+fn probe_ad_hoc(machines: &[String], events: &UnboundedSender<Event>) {
     for machine in machines {
         let target = SshTarget {
             dest: machine.clone(),
             port: None,
         };
-        let reachable = probe_reachable(&target).await;
-        let _ = events.send(Event::Probed {
-            key: machine.clone(),
-            reachable,
-        });
+
+        probe_machine(machine.clone(), target, events);
     }
 }

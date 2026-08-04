@@ -10,11 +10,11 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::host;
 use crate::ssh::SshTarget;
 use crate::{Error, Result};
 
@@ -41,15 +41,6 @@ pub struct Provider {
     /// of every machine key.
     pub name: String,
     path: PathBuf,
-}
-
-/// `info` result. Only the fields this slice consumes; `capabilities` and
-/// `create_fields` parsing arrive with the machine-CRUD slice.
-#[derive(Debug, Clone)]
-pub struct ProviderInfo {
-    /// The provider's human display name (e.g. "exe.dev"), distinct from the
-    /// file-name id.
-    pub name: String,
 }
 
 /// How Harvester keys a machine: `<provider>/<id>` (docs/SPEC.md §Machine).
@@ -122,7 +113,7 @@ impl SshInfo {
 
                 Ok(SshTarget { dest, port: *port })
             }
-            SshInfo::Argv(_) => Err(Error::Ssh {
+            SshInfo::Argv(_) => Err(Error::Exec {
                 context: "derive ssh target",
                 detail: "the argv ssh form is not supported yet — \
                          use {host, user, port}"
@@ -216,10 +207,13 @@ pub fn discover_providers() -> Result<Vec<Provider>> {
 }
 
 impl Provider {
-    /// `info`: identity check. Errors when the provider speaks a protocol
-    /// version this Harvester does not support.
-    pub async fn info(&self) -> Result<ProviderInfo> {
-        let result = self.invoke("info").await?;
+    /// `info`: the protocol gate. Nothing consumes the reported identity —
+    /// the UI labels machines by the provider's file name (PROVIDERS.md
+    /// §Discovery) — so this checks the contract and returns nothing. A typed
+    /// result belongs to the slice that first needs `capabilities` /
+    /// `create_fields`, which is also the slice that defines its shape.
+    pub async fn check_protocol(&self) -> Result<()> {
+        let result = self.invoke("info", None).await?;
 
         let Some(protocol) = result.get("protocol").and_then(Value::as_u64) else {
             return Err(self.error("info: missing required field \"protocol\"".to_string()));
@@ -232,19 +226,17 @@ impl Provider {
             )));
         }
 
-        let Some(name) = result.get("name").and_then(Value::as_str) else {
+        if result.get("name").and_then(Value::as_str).is_none() {
             return Err(self.error("info: missing required field \"name\"".to_string()));
-        };
+        }
 
-        Ok(ProviderInfo {
-            name: name.to_string(),
-        })
+        Ok(())
     }
 
     /// `list`: enumerate machines. Entries missing required fields are
     /// skipped with a stderr note rather than failing the whole list.
     pub async fn list_machines(&self) -> Result<Vec<ProviderMachine>> {
-        let result = self.invoke("list").await?;
+        let result = self.invoke("list", None).await?;
 
         let Some(entries) = result.get("machines").and_then(Value::as_array) else {
             return Err(self.error("list: missing required field \"machines\"".to_string()));
@@ -269,62 +261,53 @@ impl Provider {
     /// parses as the result object; non-zero = failure with an optional
     /// `{"error"}` object surfaced verbatim. Killed at [`INVOKE_TIMEOUT`]
     /// (`kill_on_drop` — the timeout drops the child future).
-    async fn invoke(&self, operation: &'static str) -> Result<Value> {
+    /// Spawning, piping and decoding are [`host::run`]'s job — the crate's one
+    /// exec helper — so this keeps only what is provider-specific: the
+    /// deadline and the contract's result classification. `stdin_data` is
+    /// carried through for the operations that take a JSON object on stdin.
+    async fn invoke(&self, operation: &'static str, stdin_data: Option<&[u8]>) -> Result<Value> {
         let mut command = tokio::process::Command::new(&self.path);
-        command
-            .arg(operation)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+        command.arg(operation);
 
-        let child = command.spawn()?;
-
-        let output = match tokio::time::timeout(INVOKE_TIMEOUT, child.wait_with_output()).await {
-            Ok(io_result) => io_result?,
-            Err(_elapsed) => {
-                return Err(self.error(format!(
-                    "`{operation}` timed out after {}s",
-                    INVOKE_TIMEOUT.as_secs()
-                )))
-            }
-        };
+        let output =
+            match tokio::time::timeout(INVOKE_TIMEOUT, host::run(command, stdin_data)).await {
+                Ok(io_result) => io_result?,
+                Err(_elapsed) => {
+                    return Err(self.error(format!(
+                        "`{operation}` timed out after {}s",
+                        INVOKE_TIMEOUT.as_secs()
+                    )))
+                }
+            };
 
         // Diagnostics are logged, never parsed (docs/PROVIDERS.md §Transport).
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = output.stderr.trim();
 
-        if !stderr.trim().is_empty() {
-            eprintln!(
-                "harvester: provider {} `{operation}`: {}",
-                self.name,
-                stderr.trim()
-            );
+        if !stderr.is_empty() {
+            eprintln!("harvester: provider {} `{operation}`: {stderr}", self.name);
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-
         if output.status.success() {
-            serde_json::from_str(&stdout).map_err(|parse_error| {
+            return serde_json::from_str(&output.stdout).map_err(|parse_error| {
                 self.error(format!(
                     "`{operation}` returned invalid JSON: {parse_error}"
                 ))
-            })
-        } else {
-            let reported: Option<String> = serde_json::from_str::<Value>(&stdout)
-                .ok()
-                .as_ref()
-                .and_then(|value| value.get("error"))
-                .and_then(Value::as_str)
-                .map(str::to_string);
+            });
+        }
 
-            match reported {
-                Some(message) => Err(self.error(message)),
-                None => Err(self.error(format!(
-                    "`{operation}` failed ({}) — {}",
-                    output.status,
-                    stderr.trim()
-                ))),
-            }
+        let reported: Option<String> = serde_json::from_str::<Value>(&output.stdout)
+            .ok()
+            .as_ref()
+            .and_then(|value| value.get("error"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+
+        match reported {
+            Some(message) => Err(self.error(message)),
+            None => Err(self.error(format!(
+                "`{operation}` failed ({}) — {stderr}",
+                output.status
+            ))),
         }
     }
 

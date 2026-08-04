@@ -1,8 +1,10 @@
 //! The controller layer: JSONL framing, decode, route, encode. Command logic
 //! lives in `ops.rs` (harvester) and `passthrough.rs` (pi).
 
-use harvester_proto::{HarvesterResponse, Outgoing, Request, CR, LF};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use std::sync::Arc;
+
+use harvester_proto::{read_frame, HarvesterResponse, Outgoing, Request, LF};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -14,45 +16,71 @@ use crate::passthrough;
 /// Outgoing lines queued per connection before backpressure kicks in.
 const OUTGOING_QUEUE_DEPTH: usize = 256;
 
+/// Writer buffer starting size; grows to the largest line seen.
+const OUTGOING_LINE_BUFFER: usize = 64 * 1024;
+
+/// One line bound for a connection. Everything flows through the single
+/// writer task, so responses and events never interleave mid-line — which is
+/// also what makes it safe for spawned handlers to answer out of request order
+/// (the envelope `id` is the correlation, not arrival order).
+pub enum Outbound {
+    Typed(Outgoing),
+    /// A pre-serialized wire line (no LF) shared straight from a session's
+    /// event fan-out — written as-is, never re-serialized.
+    Raw(Arc<[u8]>),
+}
+
 pub async fn serve_connection(daemon: Daemon, stream: UnixStream) {
     let (read_half, write_half) = stream.into_split();
 
-    // Single writer task: everything outgoing is serialized through one channel
-    // so response lines and forwarded events never interleave mid-line.
-    let (out_tx, out_rx) = mpsc::channel::<Outgoing>(OUTGOING_QUEUE_DEPTH);
+    let (out_tx, out_rx) = mpsc::channel::<Outbound>(OUTGOING_QUEUE_DEPTH);
     let writer = spawn_writer(write_half, out_rx);
 
     let mut attached: AttachedMap = AttachedMap::new();
     let mut reader = BufReader::new(read_half);
-    let mut buf = String::new();
+    let mut buf: Vec<u8> = Vec::new();
 
     loop {
-        buf.clear();
+        let line = match read_frame(&mut reader, &mut buf).await {
+            Ok(Some(line)) => line,
+            Ok(None) | Err(_) => break,
+        };
 
-        match reader.read_line(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-
-        let Some(request) = decode_line(&buf, &out_tx).await else {
+        let Some(request) = decode_line(line, &out_tx).await else {
             continue;
         };
 
-        let outgoing = handle_request(&daemon, request, &out_tx, &mut attached).await;
-        let _ = out_tx.send(outgoing).await;
+        if let Some(outgoing) = handle_request(&daemon, request, &out_tx, &mut attached) {
+            let _ = out_tx.send(Outbound::Typed(outgoing)).await;
+        }
     }
 
+    // Detach first (that drops the forwarders' senders), then drop ours: the
+    // writer ends once the last sender is gone, having flushed everything
+    // already queued. Aborting instead would discard responses a client
+    // half-closing its stdin is still waiting to read.
     cleanup_connection(&mut attached);
-    writer.abort();
+    drop(out_tx);
+    let _ = writer.await;
 }
 
 fn spawn_writer(
     mut write_half: tokio::net::unix::OwnedWriteHalf,
-    mut out_rx: mpsc::Receiver<Outgoing>,
+    mut out_rx: mpsc::Receiver<Outbound>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        while let Some(outgoing) = out_rx.recv().await {
-            let mut line = serde_json::to_vec(&outgoing).expect("serializable");
+        let mut line: Vec<u8> = Vec::with_capacity(OUTGOING_LINE_BUFFER);
+
+        while let Some(outbound) = out_rx.recv().await {
+            line.clear();
+
+            match &outbound {
+                Outbound::Typed(outgoing) => {
+                    serde_json::to_writer(&mut line, outgoing).expect("serializable");
+                }
+                Outbound::Raw(bytes) => line.extend_from_slice(bytes),
+            }
+
             line.push(LF);
 
             if write_half.write_all(&line).await.is_err() {
@@ -62,44 +90,39 @@ fn spawn_writer(
     })
 }
 
-/// Strip framing, parse one request. `None` means "nothing to dispatch"
-/// (blank line, or a parse error already reported to the client).
-async fn decode_line(buf: &str, out_tx: &mpsc::Sender<Outgoing>) -> Option<Request> {
-    let line = buf
-        .trim_end_matches(LF as char)
-        .trim_end_matches(CR as char);
-
+/// Parse one stripped frame. `None` means "nothing to dispatch" (blank line,
+/// or a parse error already reported to the client).
+async fn decode_line(line: &[u8], out_tx: &mpsc::Sender<Outbound>) -> Option<Request> {
     if line.is_empty() {
         return None;
     }
 
-    match serde_json::from_str(line) {
+    match serde_json::from_slice(line) {
         Ok(request) => Some(request),
         Err(error) => {
             let outgoing = Outgoing::HarvesterResponse {
                 id: None,
                 response: HarvesterResponse::err(format!("parse error: {error}")),
             };
-            let _ = out_tx.send(outgoing).await;
+            let _ = out_tx.send(Outbound::Typed(outgoing)).await;
 
             None
         }
     }
 }
 
-async fn handle_request(
+/// Route one request. `None` means a spawned task owns the response — slow
+/// commands (pi passthroughs, list_models, list_sessions) must never
+/// head-of-line block this connection's loop.
+fn handle_request(
     daemon: &Daemon,
     request: Request,
-    out_tx: &mpsc::Sender<Outgoing>,
+    out_tx: &mpsc::Sender<Outbound>,
     attached: &mut AttachedMap,
-) -> Outgoing {
+) -> Option<Outgoing> {
     match request {
-        Request::Harvester { id, cmd } => {
-            let response = ops::dispatch(daemon, cmd, out_tx, attached).await;
-
-            Outgoing::HarvesterResponse { id, response }
-        }
-        Request::Pi { id, sid, cmd } => passthrough::pi_passthrough(daemon, id, sid, cmd).await,
+        Request::Harvester { id, cmd } => ops::dispatch(daemon, id, cmd, out_tx, attached),
+        Request::Pi { id, sid, cmd } => passthrough::pi_passthrough(daemon, id, sid, cmd, out_tx),
     }
 }
 

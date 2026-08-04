@@ -12,7 +12,7 @@ harvesterd is **stateless**. It persists nothing. Pi's own session files (docume
 - Daemon listens on a Unix socket: `~/.harvester/harvesterd.sock`.
 - Remote machines: the client forwards the socket over SSH (OpenSSH forwards Unix sockets natively). Local machine: the client spawns harvesterd as a child and connects to the socket directly. Same protocol either way.
 - Wire format: **newline-delimited JSON, pi's exact framing rules** — LF (`\n`) is the only record delimiter, strip a trailing `\r`, never split on Unicode separators (valid inside JSON strings).
-- Requests carry an optional `id`; the response echoes it. Events carry no `id`.
+- Requests carry an optional `id`; the response echoes it. Events carry no `id`. Responses may arrive **out of request order** — slow commands (pi passthroughs, `list_models`, `list_sessions`) answer from their own tasks so they never head-of-line block the connection; the `id` is the correlation, not arrival position.
 - **Multiple clients may connect concurrently** — this is a first-class guarantee, not an accident: a desktop client and a (future) mobile client can watch and drive the same session simultaneously. Responses go to the requester; events go to every client attached to that session; any late-joining client recovers full state via `get_entries {since}`. Mobile needs only transport plumbing (an SSH lib), zero protocol changes.
 - Socket auth is filesystem permissions (`0700` on `~/.harvester`). Sufficient for single-user VMs. **Future note**: if machines/infra are ever shared between users, revisit with per-user sockets or an auth token in `ping`.
 
@@ -51,7 +51,7 @@ pi --mode rpc \
 # stdin/stdout owned by harvesterd; stdin stays open for the process lifetime
 ```
 
-- **`--approve`**: project-local `.pi/` resources (settings, extensions, skills) load normally — the user's repo, the user's machine, the user's call. The hang risk that trust introduces (git package installs prompting for credentials at startup) is neutralized by `GIT_TERMINAL_PROMPT=0` + `GIT_SSH_COMMAND` batch mode: installs fail fast instead of blocking. After spawn, the client health-probes with passthrough `get_state` and treats the session as ready only when it answers.
+- **`--approve`**: project-local `.pi/` resources (settings, extensions, skills) load normally — the user's repo, the user's machine, the user's call. The hang risk that trust introduces (git package installs prompting for credentials at startup) is neutralized by `GIT_TERMINAL_PROMPT=0` + `GIT_SSH_COMMAND` batch mode: installs fail fast instead of blocking. No readiness probe follows the spawn: pi drains its stdin queue in order, so commands chained straight after `create_session` are answered once it is up (verified live — `HARNESS_RESEARCH.md` §Round 4).
 - **No `--session-dir`.** Pi's default per-cwd session dirs are kept; they make list-by-workspace free.
 - `PI_OFFLINE=1` disables update checks and telemetry on spawn (see open question 1 re: package installs).
 - Session ids are client-generated **uuidv7** — pi's own native session-id format (`session-manager.js` generates ids with `uuidv7()`), and canonical uuidv7 passes pi's id validation charset.
@@ -79,7 +79,7 @@ The client compares versions and re-bootstraps on mismatch (see Bootstrap).
 {"id": 2, "type": "harvester_response", "response": {"success": true, "data": {"sessions": [
   {"sid": "01H...", "name": "Refactor auth", "cwd": "/work/repo",
    "file": "/home/u/.pi/agent/sessions/--work-repo--/2026-..._01H....jsonl",
-   "mtime": "2026-08-01T12:00:00Z", "status": "running"}
+   "mtime_ms": 1754049600000, "status": "running"}
 ]}}}
 ```
 
@@ -92,7 +92,11 @@ Implemented by readdir over pi's session dirs: header line gives id/cwd/timestam
  "provider": "anthropic", "model": "sonnet", "name": "wip-a3f2"}}
 ```
 
-Spawns the launch line. `provider`/`model`/`name` optional (pi defaults apply). Resuming an exited session is the same call with the same `sid` — resume-or-create makes them indistinguishable. The response means "process spawned"; readiness is probed via passthrough `get_state`.
+Spawns the launch line. `provider`/`model`/`name` optional (pi defaults apply). Resuming an exited session is the same call with the same `sid` — resume-or-create makes them indistinguishable.
+
+**Idempotent**: a `sid` that is already running answers `{"sid": ..., "already": true}` rather than an error, and no second pi is spawned (the pid table is the guard, so one pi = one session file still holds). This is what lets a client open any session with an unconditional `create_session` → `attach` chain: only the daemon knows whether a session died while that client was detached, so a client-side "is it running" flag would just go stale. A `cwd` that disagrees with the running session is ignored — the session file on disk stays authoritative.
+
+The response means "process spawned"; there is no readiness probe (see the launch-line notes above).
 
 The "ghost chat" from the spec is purely client-side; `create_session` fires on the first prompt.
 
@@ -142,13 +146,16 @@ Every line pi emits on stdout is forwarded verbatim to attached clients, wrapped
 {"type": "event", "sid": "01H...", "event": {"type": "agent_settled"}}
 ```
 
-Plus one daemon-originated event:
+Plus two daemon-originated events:
 
 ```json
 {"type": "session_exit", "sid": "01H...", "exit_code": 0}
+{"type": "event_gap", "sid": "01H...", "skipped": 12}
 ```
 
 `exit_code` is `null` when pi was killed by a signal (e.g. the daemon's SIGKILL after the stop grace period). Exit-cause detail is not in the event — the client fetches `~/.harvester/log/<sid>.stderr.log` over plain SSH (`tail`) when it wants to show a reason.
+
+`event_gap` means the daemon dropped `skipped` events for *this* connection because it was reading too slowly (the per-session ring overflowed). It is a signal, not a recovery: the client must resync with passthrough `get_entries {since: <last seen entry id>}`, which is authoritative. Losing events silently is not an option — a dropped `extension_ui_request` would otherwise leave pi waiting on a dialog the client never saw, and a dropped `agent_settled` would leave a turn spinning forever.
 
 Ordering: events and responses travel independent paths inside the daemon (broadcast vs request), so an attached client may see `session_exit` *before* the `stop` response that caused it (observed live). Don't assume a sequence between the two.
 
@@ -159,8 +166,9 @@ Client-relevant pi semantics (details in `HARNESS_RESEARCH.md`): `agent_settled`
 Vanilla pi never asks questions — these only occur when extensions are loaded (auto-discovered from `~/.pi/agent/extensions/`, or project `.pi/extensions/` now that we launch with `--approve`). Policy:
 
 - Dialog methods (`select`, `confirm`, `input`, `editor`):
-  - ≥1 client attached → forwarded as a normal event; a client answers via passthrough `extension_ui_response`. First answer wins; the daemon drops responses for ids no longer pending.
+  - ≥1 client attached → forwarded as a normal event; a client answers via passthrough `extension_ui_response`. First answer wins; the daemon drops responses for ids no longer pending. The daemon holds the dialog's envelope until it is answered and **replays every pending dialog to a client that attaches later** — otherwise a handoff between clients (A holds a dialog, B attaches, A leaves) would strand pi on a dialog nobody can see. Clients must therefore treat a dialog id they already know as a duplicate, not a second question.
   - 0 clients attached → the daemon immediately writes `{"type": "extension_ui_response", "id": <id>, "cancelled": true}` to pi. To the extension this is identical to a human pressing Escape; the agent never hangs on an empty room.
+  - The last client detaching (or disconnecting) with dialogs still pending cancels them all the same way — an empty room never holds a dialog open, whichever order things emptied in.
 - Dialogs carrying a `timeout` auto-resolve inside pi; the daemon keeps no timers.
 - Fire-and-forget methods (`notify`, `setStatus`, `setWidget`, `setTitle`, `set_editor_text`): forwarded, never answered.
 - All dialog payloads are plain serializable data (pi disables TUI-only UI in RPC mode), so they map directly to gpui modals: `select` → list, `confirm` → yes/no, `input` → text field, `editor` → multiline.

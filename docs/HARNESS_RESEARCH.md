@@ -282,7 +282,7 @@ The docs nowhere state whether VMs **sleep/suspend when idle** or whether **deta
 Cutting to one harness and one platform deletes most of the earlier abstraction burden: no `HarnessAdapter` trait over contradictory stdin policies, no normalized event model, no approval-transport enum, no per-platform transport plugins. What remains:
 
 1. **One spawn contract.** `pi --mode rpc --session-id <id>` per session, stdin held open for its lifetime, stdout tee'd to a JSONL (or rely on pi's own session file). Terminate by closing stdin (SIGTERM may truncate the last stdout line).
-2. **DECIDED: `harvesterd`** (tiny daemon, bootstrapped over SSH). Pi RPC dies when stdin closes, so a session cannot live inside an SSH channel owned by the client — the daemon owns pi children's stdin pipes, journals events, answers `get_state`/`get_entries`, answers/forwards `extension_ui_request`, and serves reconnecting clients. One static musl binary uploaded over SSH on first connect.
+2. **DECIDED: `harvesterd`** (tiny daemon, bootstrapped over SSH). Pi RPC dies when stdin closes, so a session cannot live inside an SSH channel owned by the client — the daemon owns pi children's stdin pipes, broadcasts events to attached clients, passes `get_state`/`get_entries` through to pi, answers/forwards `extension_ui_request`, and serves reconnecting clients. (This point is a dated snapshot of the decision; the shipped daemon journals nothing — pi's session files are the only durable state, see `DAEMON.md` §What is deliberately NOT in the contract.) One static musl binary uploaded over SSH on first connect.
 3. **Persistence layer may come for free.** Pi's session `.jsonl` is documented, versioned (v3), and has a durable cursor API (`get_entries {since}`). Harvester's "source of truth on disk" can literally be pi's own session dir + a small `meta.json` per session for Harvester-level metadata (title, workspace ref). The tee'd `events.jsonl` is then just a raw wire log for live replay, or dropped entirely.
 4. **Machine CRUD goes through the provider contract** (see `PROVIDERS.md`): one-shot JSON-stdio executables in `~/.harvester/providers/`. The built-in `exe-dev` provider wraps `ssh exe.dev … --json`; session traffic stays on plain SSH (`vmname.exe.xyz`) regardless of provider. "local" machine remains a hardcoded direct-spawn special case, not a provider.
 5. **Workspace flow**: folder picker = `ssh vmname ls`-style execs (or SFTP); git validation = `ssh vmname 'git -C <path> rev-parse --git-dir'`.
@@ -323,6 +323,13 @@ Cutting to one harness and one platform deletes most of the earlier abstraction 
 `packages/protocol` on pi `main` defines an experimental **protocol v2**: length-prefixed CBOR frames, first message `hello {version, bearer token}`, correlated request/response + server event envelopes, "session and server snapshots are authoritative; progress events are transient UI hints". Explicitly experimental, no compatibility guarantees, NOT in released 0.83.0.
 
 Implications: this smells like a future pi server/daemon mode. If it ships, harvesterd may shrink to a bootstrapper and the Harvester envelope migrates to it — the client's pi-event rendering survives unchanged (we pass pi payloads through verbatim by design). Re-check on every pi release; do not adopt while experimental.
+
+## Watch: pi main wire changes (unreleased, WILL land in the next release)
+
+Verified 2026-08-04 against the pi checkout at `main` (= the 0.83.0 release plus ~212 unreleased commits; `packages/coding-agent/package.json` still reads 0.83.0):
+
+- **`message_update` loses its cumulative `partial`.** New `packages/coding-agent/src/modes/json-event.ts` strips the cumulative AssistantMessage from every streaming event (`const { partial: _partial, ...deltaEvent }`), and `rpc-mode.ts` now routes all stdout through `toJsonEvent(event)`. Our render contract ("each delta carries the whole partial message — replace, don't append") breaks the moment exeuntu ships the next pi: the chat must learn to accumulate from `message_start` + deltas (or treat `message_end` as authoritative) **before** any pi bump.
+- **`get_available_models`/`set_model` became snapshot-based.** `rpc-mode.ts` switched `await session.modelRuntime.getAvailable()` → `getAvailableSnapshot()`; early in process life the snapshot may be incomplete. Affects the throwaway `list_models` flow (it asks immediately after spawn) — likely needs a retry-until-nonempty guard after the bump.
 
 ## Smoke-test log — 2026-08-01, throwaway VM `harvester-smoke` (created and deleted for this)
 

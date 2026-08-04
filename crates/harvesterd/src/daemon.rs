@@ -3,11 +3,15 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use tokio::sync::Mutex;
+use crate::session::{Session, SpawnArgs};
 
-use crate::session::{Session, SessionOutput};
+/// Namespace for request ids the daemon injects into pi commands. The pump
+/// routes a response back to its waiter by this prefix, so the mint
+/// ([`Daemon::next_passthrough_id`]) and the match (`session.rs`) must agree —
+/// hence one const rather than a literal at each site.
+pub const PASSTHROUGH_ID_PREFIX: &str = "hv-";
 
 #[derive(Clone)]
 pub struct Daemon {
@@ -16,9 +20,12 @@ pub struct Daemon {
 
 pub struct DaemonInner {
     pub log_dir: PathBuf,
-    pub sessions: Mutex<HashMap<String, Arc<Session>>>,
-    /// Monotonic counter for injected pi request ids ("hv-<n>").
-    pub request_counter: std::sync::atomic::AtomicU64,
+    /// The pid table. std::sync on purpose: no guard is ever held across an
+    /// await, and lookups happen on every passthrough.
+    sessions: Mutex<HashMap<String, Arc<Session>>>,
+    /// Monotonic counter behind [`Daemon::next_passthrough_id`]; private so
+    /// the id format cannot be spelled a second way.
+    request_counter: std::sync::atomic::AtomicU64,
 }
 
 impl Daemon {
@@ -36,29 +43,58 @@ impl Daemon {
         &self.inner
     }
 
-    pub async fn session(&self, sid: &str) -> Option<Arc<Session>> {
-        self.inner.sessions.lock().await.get(sid).cloned()
+    /// The next `hv-<n>` id for a command the daemon injects into pi. Paired
+    /// with the pump's prefix match — see [`PASSTHROUGH_ID_PREFIX`].
+    pub fn next_passthrough_id(&self) -> String {
+        let request_number = self
+            .inner
+            .request_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        format!("{PASSTHROUGH_ID_PREFIX}{request_number}")
     }
 
-    pub async fn running_sids(&self) -> Vec<String> {
-        self.inner.sessions.lock().await.keys().cloned().collect()
+    pub fn session(&self, sid: &str) -> Option<Arc<Session>> {
+        self.lock_sessions().get(sid).cloned()
     }
 
-    /// Remove the session from the pid table when its pi process exits,
-    /// whatever the cause — `stop`, crash, or external kill. Attached clients
-    /// already got the `session_exit` event through their forwarders.
-    pub fn reap_on_exit(&self, session: Arc<Session>) {
-        let daemon = self.clone();
-        let mut events = session.output.subscribe();
-        let sid = session.sid.clone();
+    pub fn running_sids(&self) -> Vec<String> {
+        self.lock_sessions().keys().cloned().collect()
+    }
 
-        tokio::spawn(async move {
-            while let Ok(output) = events.recv().await {
-                if matches!(output, SessionOutput::Exit { .. }) {
-                    daemon.inner.sessions.lock().await.remove(&sid);
-                    break;
-                }
-            }
-        });
+    /// Check-and-spawn under one lock — the table is the per-sid single-
+    /// instance guard, so a second `create_session` for a live sid loses here.
+    pub fn spawn_session(&self, args: SpawnArgs) -> std::io::Result<Arc<Session>> {
+        let mut sessions = self.lock_sessions();
+
+        if sessions.contains_key(&args.sid) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("session '{}' already running", args.sid),
+            ));
+        }
+
+        let session = Session::spawn(args, self)?;
+        sessions.insert(session.sid.clone(), session.clone());
+
+        Ok(session)
+    }
+
+    /// Vacate `session`'s table entry — only if it is still the stored
+    /// generation (`Arc::ptr_eq`); a resumed successor is never evicted.
+    /// Called by the stdout pump *before* it broadcasts Exit.
+    pub fn remove_session_if_same(&self, session: &Arc<Session>) {
+        let mut sessions = self.lock_sessions();
+
+        if sessions
+            .get(&session.sid)
+            .is_some_and(|stored| Arc::ptr_eq(stored, session))
+        {
+            sessions.remove(&session.sid);
+        }
+    }
+
+    fn lock_sessions(&self) -> MutexGuard<'_, HashMap<String, Arc<Session>>> {
+        self.inner.sessions.lock().expect("sessions mutex")
     }
 }

@@ -1,50 +1,112 @@
 //! One pi child per session: spawn, stdin ownership, stdout pump, dialog policy.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
-use std::path::Path;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use harvester_proto::{CR, LF};
+use harvester_proto::{encode_frame, read_frame};
+use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot};
+
+use crate::daemon::{Daemon, PASSTHROUGH_ID_PREFIX};
 
 /// Events buffered per session for slow subscribers before they start lagging.
 const SESSION_EVENT_BUFFER: usize = 1024;
 
+/// Frames queued for pi's stdin before writers are told to back off. Only a pi
+/// that stopped draining its stdin can fill this, and then failing fast beats
+/// queueing without bound — the caller learns immediately instead of parking.
+const STDIN_QUEUE_DEPTH: usize = 64;
+
+/// Pump read buffer starting size; grows to the largest pi line seen.
+const PUMP_LINE_BUFFER: usize = 64 * 1024;
+
 const DIALOG_METHODS: [&str; 4] = ["select", "confirm", "input", "editor"];
 
-/// Fan-out line from a session to attached connections.
+/// Fan-out line from a session to attached connections. Events carry the
+/// complete pre-serialized wire envelope: built once in the pump, shared by
+/// refcount with every subscriber — never cloned or re-serialized per client.
 #[derive(Debug, Clone)]
 pub enum SessionOutput {
-    /// A pi response line matched to a passthrough request (by injected id).
-    Response {
-        request_key: String,
-        response: Value,
-    },
-    /// Any other pi stdout line — an event, forwarded verbatim.
-    Event(Value),
+    /// `{"type":"event","sid":…,"event":…}`, ready to write (no trailing LF).
+    Event(Arc<[u8]>),
     Exit {
         exit_code: Option<i32>,
     },
 }
 
+/// Serialize-only mirror of `Outgoing::Event` that embeds the original pi
+/// line verbatim (`&RawValue`). The shared read-side `Outgoing` cannot carry
+/// a borrowed `RawValue` (internally-tagged deserialization buffers through
+/// an owned tree), so the daemon serializes events through this instead.
+#[derive(Serialize)]
+struct EventEnvelope<'line> {
+    r#type: &'static str,
+    sid: &'line str,
+    event: &'line RawValue,
+}
+
+/// The only fields the pump routes on, borrowed straight out of the read
+/// buffer. Pi's `message_update` deltas each carry the whole partial message,
+/// so they are the largest and by far the most frequent lines — building an
+/// owned `Value` for every one of them, only to read `type`, would make the
+/// throwaway DOM the pump's dominant cost. The full tree is parsed in exactly
+/// one arm below, where a client is actually waiting for it.
+#[derive(Deserialize)]
+struct LineProbe<'line> {
+    #[serde(rename = "type", borrow, default)]
+    kind: Option<Cow<'line, str>>,
+    #[serde(borrow, default)]
+    id: Option<Cow<'line, str>>,
+    #[serde(borrow, default)]
+    method: Option<Cow<'line, str>>,
+}
+
 pub struct Session {
     pub sid: String,
     pub pid: Option<u32>,
-    /// Private on purpose: every write must go through `write_line`, the only
-    /// place that guarantees single-line framing + flush. `None` after
-    /// `close_stdin` — the pipe fd only closes when the handle is dropped
-    /// (`AsyncWriteExt::shutdown` is a mere flush for pipes; verified live:
-    /// pi never saw EOF and had to be SIGKILLed).
-    stdin: Mutex<Option<ChildStdin>>,
+    /// Frames bound for pi's stdin. Private on purpose: every write goes
+    /// through `write_line`, and [`pump_stdin`] is the only holder of the pipe
+    /// handle — so no caller ever awaits pi's stdin, and writes keep their
+    /// arrival order across every connection. `None` after `close_stdin`:
+    /// dropping the sender lets the pump drain what is queued and *then* drop
+    /// the handle, which is what actually delivers EOF (`AsyncWriteExt::
+    /// shutdown` is a mere flush for pipes; verified live: pi never saw EOF
+    /// and had to be SIGKILLed).
+    stdin_queue: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
     pub output: broadcast::Sender<SessionOutput>,
-    /// Dialog ids currently awaiting an `extension_ui_response` (first answer wins).
-    pub pending_dialogs: Mutex<HashMap<String, ()>>,
-    /// Number of attached client connections; drives the empty-room dialog policy.
-    pub attached: std::sync::atomic::AtomicUsize,
+    /// Who is watching and what is waiting on them — one lock, because the
+    /// dialog policy is a decision about both at once.
+    room: Mutex<DialogRoom>,
+    /// In-flight passthrough waiters by injected `hv-<n>` id. The pump
+    /// resolves them; dropping the map on exit fails every waiter (pi's own
+    /// reject-pending-requests-on-exit pattern).
+    pending_responses: Mutex<HashMap<String, oneshot::Sender<Value>>>,
+}
+
+/// The empty-room dialog policy's whole state. Counter and pending set live
+/// under one mutex on purpose: "is anybody attached, and if so remember this
+/// dialog" must be one atomic decision. Split across an atomic and a separate
+/// lock (as it once was), a detach landing between the load and the insert
+/// strands the dialog — nobody left to answer it, and nothing left to trigger
+/// the cancel.
+#[derive(Default)]
+struct DialogRoom {
+    /// Number of attached client connections.
+    attached: usize,
+    /// Dialogs awaiting an `extension_ui_response`, by dialog id, each holding
+    /// the pre-serialized wire envelope the pump already built. Keeping the
+    /// envelope (not just the id) is what lets a client attaching *after* the
+    /// dialog arrived still be shown it — otherwise a handoff between clients
+    /// strands pi on a dialog nobody can see. First answer wins; all of them
+    /// are cancelled when the room empties, because pi would otherwise wait
+    /// on an unanswered dialog forever.
+    pending: HashMap<String, Arc<[u8]>>,
 }
 
 pub struct SpawnArgs {
@@ -57,51 +119,65 @@ pub struct SpawnArgs {
 
 impl Session {
     /// The one launch line (docs/DAEMON.md). Resume-or-create via --session-id.
-    pub async fn spawn(args: SpawnArgs, log_dir: &Path) -> std::io::Result<Arc<Session>> {
-        let mut command = create_pi_command(&args, log_dir)?;
+    /// Callers go through `Daemon::spawn_session`, which owns the pid table.
+    pub(crate) fn spawn(args: SpawnArgs, daemon: &Daemon) -> std::io::Result<Arc<Session>> {
+        let mut command = create_pi_command(&args, daemon)?;
         let mut child = command.spawn()?;
 
         let pid = child.id();
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
         let (output, _) = broadcast::channel(SESSION_EVENT_BUFFER);
+        let (stdin_sender, stdin_receiver) = mpsc::channel(STDIN_QUEUE_DEPTH);
 
         let session = Arc::new(Session {
             sid: args.sid,
             pid,
-            stdin: Mutex::new(Some(stdin)),
+            stdin_queue: Mutex::new(Some(stdin_sender)),
             output,
-            pending_dialogs: Mutex::new(HashMap::new()),
-            attached: std::sync::atomic::AtomicUsize::new(0),
+            room: Mutex::new(DialogRoom::default()),
+            pending_responses: Mutex::new(HashMap::new()),
         });
 
-        tokio::spawn(pump_stdout(session.clone(), stdout, child));
+        tokio::spawn(pump_stdin(session.sid.clone(), stdin, stdin_receiver));
+        tokio::spawn(pump_stdout(session.clone(), daemon.clone(), stdout, child));
 
         Ok(session)
     }
 
-    /// Write one JSONL line to pi's stdin.
-    pub async fn write_line(&self, value: &Value) -> std::io::Result<()> {
-        let mut line = serde_json::to_vec(value).expect("serializable");
-        let mut guard = self.stdin.lock().await;
+    /// Queue one JSONL line for pi's stdin. Deliberately synchronous: the
+    /// queue absorbs the write so no caller — least of all the connection
+    /// loop — can be parked by a pi that stopped reading. A full queue means
+    /// exactly that, and says so instead of blocking.
+    pub fn write_line(&self, value: &Value) -> std::io::Result<()> {
+        let line = encode_frame(value).expect("serializable");
+        let guard = self.lock_stdin_queue();
 
-        let Some(stdin) = guard.as_mut() else {
+        let Some(sender) = guard.as_ref() else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "session stdin already closed",
             ));
         };
 
-        line.push(LF);
-        stdin.write_all(&line).await?;
-        stdin.flush().await
+        sender.try_send(line).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "session stdin queue is full — pi is not reading",
+            ),
+            mpsc::error::TrySendError::Closed(_) => std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "session stdin writer stopped",
+            ),
+        })
     }
 
-    /// Graceful stop: close stdin (pi's documented-by-source shutdown path).
-    /// Dropping the handle is what closes the pipe fd and delivers EOF.
-    /// The stdout pump observes the exit and broadcasts `Exit`.
-    pub async fn close_stdin(&self) {
-        drop(self.stdin.lock().await.take());
+    /// Graceful stop: drop the queue's sender. The pump drains what is already
+    /// queued (so a just-written `abort` still reaches pi), then drops the pipe
+    /// handle — that drop is what delivers EOF, pi's documented-by-source
+    /// shutdown path. The stdout pump observes the exit and broadcasts `Exit`.
+    pub fn close_stdin(&self) {
+        drop(self.lock_stdin_queue().take());
     }
 
     /// Last resort after the stop grace period. Boring on purpose: shelling out
@@ -121,10 +197,135 @@ impl Session {
             Err(error) => eprintln!("kill -9 {pid} failed to run: {error}"),
         }
     }
+
+    /// Register a waiter for the passthrough response keyed `hv-<n>`. Must be
+    /// called *before* the command is written so the response cannot race it.
+    pub fn register_response_waiter(&self, request_key: String) -> oneshot::Receiver<Value> {
+        let (sender, receiver) = oneshot::channel();
+
+        self.lock_pending_responses().insert(request_key, sender);
+
+        receiver
+    }
+
+    /// Join the room; returns the dialog envelopes already waiting, which the
+    /// caller's forwarder replays so a late attacher sees them too.
+    pub fn attach(&self) -> Vec<Arc<[u8]>> {
+        let mut room = self.lock_room();
+        room.attached += 1;
+
+        room.pending.values().cloned().collect()
+    }
+
+    /// Leave the room. When the last watcher goes, every still-pending dialog
+    /// is returned for cancellation — nothing could answer them anymore, and
+    /// pi would wait forever (docs/DAEMON.md: never leave a dialog unanswered).
+    pub fn detach(&self) -> Vec<String> {
+        let mut room = self.lock_room();
+        room.attached = room.attached.saturating_sub(1);
+
+        if room.attached > 0 {
+            return Vec::new();
+        }
+
+        room.pending
+            .drain()
+            .map(|(dialog_id, _)| dialog_id)
+            .collect()
+    }
+
+    /// Remove-and-return: true means the dialog was still pending and this
+    /// caller's answer is the winning one (first answer wins).
+    pub fn claim_pending_dialog(&self, dialog_id: &str) -> bool {
+        self.lock_room().pending.remove(dialog_id).is_some()
+    }
+
+    /// Remember a dialog (with the envelope to replay on a later attach).
+    /// `false` means the room is empty, so nobody will ever answer it and the
+    /// caller must cancel instead — checked under the same lock as the insert,
+    /// which is what keeps the two outcomes mutually exclusive.
+    fn remember_dialog(&self, dialog_id: &str, envelope: Arc<[u8]>) -> bool {
+        let mut room = self.lock_room();
+
+        if room.attached == 0 {
+            return false;
+        }
+
+        room.pending.insert(dialog_id.to_owned(), envelope);
+
+        true
+    }
+
+    fn resolve_response(&self, request_key: &str, response: Value) {
+        let Some(waiter) = self.lock_pending_responses().remove(request_key) else {
+            // No waiter can only mean its task died; worth a trace.
+            eprintln!("session {}: dropped response for {request_key}", self.sid);
+            return;
+        };
+
+        // A closed receiver means the requesting connection went away.
+        let _ = waiter.send(response);
+    }
+
+    /// Fail every in-flight passthrough: dropping the senders errors the
+    /// receivers, which report "session exited".
+    fn fail_pending_responses(&self) {
+        self.lock_pending_responses().clear();
+    }
+
+    fn lock_stdin_queue(&self) -> std::sync::MutexGuard<'_, Option<mpsc::Sender<Vec<u8>>>> {
+        self.stdin_queue.lock().expect("stdin_queue mutex")
+    }
+
+    fn lock_room(&self) -> std::sync::MutexGuard<'_, DialogRoom> {
+        self.room.lock().expect("dialog room mutex")
+    }
+
+    fn lock_pending_responses(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<String, oneshot::Sender<Value>>> {
+        self.pending_responses
+            .lock()
+            .expect("pending_responses mutex")
+    }
+}
+
+/// The only holder of pi's stdin: drains queued frames in order, one flush per
+/// frame, so every writer's lines stay whole and in arrival order. Ends when
+/// the last sender is gone (`close_stdin`) or the pipe breaks — dropping the
+/// handle on the way out is what delivers EOF.
+async fn pump_stdin(sid: String, mut stdin: ChildStdin, mut frames: mpsc::Receiver<Vec<u8>>) {
+    while let Some(frame) = frames.recv().await {
+        if let Err(error) = stdin.write_all(&frame).await {
+            eprintln!("session {sid}: stdin write failed: {error}");
+
+            return;
+        }
+
+        if let Err(error) = stdin.flush().await {
+            eprintln!("session {sid}: stdin flush failed: {error}");
+
+            return;
+        }
+    }
+}
+
+/// Answer a dialog with `cancelled: true` — to the extension, identical to a
+/// human pressing Escape. Used at arrival (empty room) and when the room empties.
+pub fn cancel_dialog(session: &Session, dialog_id: &str) {
+    let cancel = json!({"type": "extension_ui_response", "id": dialog_id, "cancelled": true});
+
+    if let Err(error) = session.write_line(&cancel) {
+        eprintln!(
+            "session {}: dialog {dialog_id} auto-cancel write failed: {error}",
+            session.sid
+        );
+    }
 }
 
 /// Build the launch line: env guards, mode flags, optional overrides, stderr log.
-fn create_pi_command(args: &SpawnArgs, log_dir: &Path) -> std::io::Result<Command> {
+fn create_pi_command(args: &SpawnArgs, daemon: &Daemon) -> std::io::Result<Command> {
+    let log_dir = &daemon.inner().log_dir;
     let stderr_log = std::fs::File::create(log_dir.join(format!("{}.stderr.log", args.sid)))?;
 
     let mut cli_args: Vec<&str> = vec!["--mode", "rpc", "--session-id", &args.sid, "--approve"];
@@ -158,118 +359,118 @@ fn create_pi_command(args: &SpawnArgs, log_dir: &Path) -> std::io::Result<Comman
     Ok(command)
 }
 
-/// Read pi stdout lines forever; route responses, apply the dialog policy,
-/// forward everything else. Ends by reaping the child and broadcasting Exit.
-async fn pump_stdout(session: Arc<Session>, stdout: tokio::process::ChildStdout, mut child: Child) {
-    // LF-only framing: read_until(LF), strip a trailing CR. Never a generic
-    // line reader that splits on other Unicode separators.
+/// Read pi stdout lines forever; resolve responses, apply the dialog policy,
+/// forward everything else. Ends by reaping the child, vacating the pid table,
+/// failing in-flight passthroughs, and broadcasting Exit — in that order, so a
+/// client reacting to `session_exit` with an immediate resume never races the
+/// table ("already running" is structurally impossible).
+async fn pump_stdout(
+    session: Arc<Session>,
+    daemon: Daemon,
+    stdout: tokio::process::ChildStdout,
+    mut child: Child,
+) {
     let mut reader = BufReader::new(stdout);
-    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let mut buf: Vec<u8> = Vec::with_capacity(PUMP_LINE_BUFFER);
 
     loop {
-        buf.clear();
+        let line = match read_frame(&mut reader, &mut buf).await {
+            Ok(Some(line)) => line,
+            Ok(None) | Err(_) => break,
+        };
 
-        match reader.read_until(LF, &mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-
-        let mut line = buf.as_slice();
-
-        if line.last() == Some(&LF) {
-            line = &line[..line.len() - 1];
-        }
-
-        if line.last() == Some(&CR) {
-            line = &line[..line.len() - 1];
-        }
-
-        // Deliberately after stripping: a bare "\n" line becomes empty here.
         if line.is_empty() {
             continue;
         }
 
-        let value: Value = match serde_json::from_slice(line) {
-            Ok(value) => value,
+        let probe: LineProbe = match serde_json::from_slice(line) {
+            Ok(probe) => probe,
             // Should never happen (pi guarantees stdout purity); don't die on it.
             Err(_) => continue,
         };
 
-        route_line(&session, value).await;
+        route_line(&session, line, probe);
     }
 
     let exit_code = child.wait().await.ok().and_then(|status| status.code());
+
+    daemon.remove_session_if_same(&session);
+    session.fail_pending_responses();
     let _ = session.output.send(SessionOutput::Exit { exit_code });
 }
 
-async fn route_line(session: &Arc<Session>, value: Value) {
-    if handle_response_line(session, &value) {
+/// Dialog policy (docs/DAEMON.md): a dialog that expects an answer is
+/// remembered and forwarded while anyone is attached (first client answer
+/// wins, and a client attaching later still gets shown it); with an empty room
+/// it is auto-cancelled instead of broadcast into the void.
+fn route_line(session: &Arc<Session>, line: &[u8], probe: LineProbe<'_>) {
+    if let Some(request_key) = passthrough_response_key(&probe) {
+        // The one arm that needs the whole tree: it hands pi's response object
+        // to the client waiting on it.
+        match serde_json::from_slice(line) {
+            Ok(response) => session.resolve_response(request_key, response),
+            Err(error) => eprintln!(
+                "session {}: response {request_key} did not parse: {error}",
+                session.sid
+            ),
+        }
+
         return;
     }
 
-    if handle_dialog_request(session, &value).await {
-        return;
+    let event = encode_event(session, line);
+
+    if let Some(dialog_id) = dialog_id_awaiting_answer(&probe) {
+        if !session.remember_dialog(dialog_id, event.clone()) {
+            cancel_dialog(session, dialog_id);
+
+            return;
+        }
     }
 
-    let _ = session.output.send(SessionOutput::Event(value));
+    let _ = session.output.send(SessionOutput::Event(event));
 }
 
-/// Passthrough responses carry the id we injected (see passthrough.rs).
-/// Returns true when the line was consumed as a response.
-fn handle_response_line(session: &Arc<Session>, value: &Value) -> bool {
-    if value.get("type").and_then(Value::as_str) != Some("response") {
-        return false;
+/// The `hv-<n>` id when the line is a response to an injected passthrough
+/// request (minted by `Daemon::next_passthrough_id`).
+fn passthrough_response_key<'probe>(probe: &'probe LineProbe<'_>) -> Option<&'probe str> {
+    if probe.kind.as_deref() != Some("response") {
+        return None;
     }
 
-    let Some(request_key) = value.get("id").and_then(Value::as_str) else {
-        return false;
+    let request_key = probe.id.as_deref()?;
+
+    request_key
+        .starts_with(PASSTHROUGH_ID_PREFIX)
+        .then_some(request_key)
+}
+
+/// Build the wire envelope exactly once; every subscriber shares the bytes,
+/// and a pending dialog keeps the same `Arc` for its later replay.
+fn encode_event(session: &Session, line: &[u8]) -> Arc<[u8]> {
+    // The line parsed as JSON above, so it is valid UTF-8 JSON text.
+    let raw_line = std::str::from_utf8(line).expect("parsed as JSON above");
+    let event: &RawValue = serde_json::from_str(raw_line).expect("parsed as JSON above");
+    let envelope = EventEnvelope {
+        r#type: "event",
+        sid: &session.sid,
+        event,
     };
 
-    if !request_key.starts_with("hv-") {
-        return false;
-    }
-
-    let _ = session.output.send(SessionOutput::Response {
-        request_key: request_key.to_owned(),
-        response: value.clone(),
-    });
-
-    true
+    Arc::from(serde_json::to_vec(&envelope).expect("serializable"))
 }
 
-/// Dialog policy (docs/DAEMON.md): dialogs get auto-cancelled when nobody is
-/// attached; otherwise they are marked pending and forwarded (first client
-/// answer wins). Returns true when the line was swallowed (auto-cancelled).
-async fn handle_dialog_request(session: &Arc<Session>, value: &Value) -> bool {
-    if value.get("type").and_then(Value::as_str) != Some("extension_ui_request") {
-        return false;
+/// The dialog id when this line is an `extension_ui_request` that blocks pi
+/// until it is answered. Fire-and-forget kinds (`notify`, `setStatus`) are
+/// forwarded like any other event, so they are not dialogs for policy purposes.
+fn dialog_id_awaiting_answer<'probe>(probe: &'probe LineProbe<'_>) -> Option<&'probe str> {
+    if probe.kind.as_deref() != Some("extension_ui_request") {
+        return None;
     }
 
-    let method = value
-        .get("method")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-
-    if !DIALOG_METHODS.contains(&method) {
-        // Fire-and-forget kinds are forwarded, never answered.
-        return false;
+    if !DIALOG_METHODS.contains(&probe.method.as_deref()?) {
+        return None;
     }
 
-    let dialog_id = value
-        .get("id")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let nobody_attached = session.attached.load(std::sync::atomic::Ordering::SeqCst) == 0;
-
-    if nobody_attached {
-        let cancel = json!({"type": "extension_ui_response", "id": dialog_id, "cancelled": true});
-        let _ = session.write_line(&cancel).await;
-
-        return true;
-    }
-
-    session.pending_dialogs.lock().await.insert(dialog_id, ());
-
-    false
+    probe.id.as_deref()
 }

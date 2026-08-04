@@ -12,11 +12,11 @@ use gpui::{
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::bridge::Command;
 use crate::input::{PromptSubmitted, TextInput};
 use crate::models::{self, ModelChoice, ModelsState};
 use crate::theme;
 use crate::ui;
+use harvester_client_core::bridge::Command;
 
 /// Who said a rendered message. Tool results render as `ToolBlock`s, not
 /// messages; system entries are skipped.
@@ -414,6 +414,13 @@ impl Chat {
             block.expanded = !block.expanded;
             cx.notify();
         }
+    }
+
+    /// Whether this chat's pi is still believed to be running. Based on the
+    /// `session_exit` events this chat actually received, so unlike a cached
+    /// list status it cannot claim "running" about a session that has died.
+    pub fn is_live(&self) -> bool {
+        self.exited_notice.is_none()
     }
 
     pub fn handle_session_exit(&mut self, exit_code: Option<i32>, cx: &mut Context<Self>) {

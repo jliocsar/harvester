@@ -54,6 +54,12 @@ pub fn load() -> Vec<Workspace> {
 
 /// Whole-list rewrite (the list is tiny). Errors go to the caller — the
 /// statusbar is the right place for them, not stderr.
+///
+/// Written to a sibling temp file and renamed into place, the same atomic swap
+/// the daemon install uses. Writing the real file directly would truncate it
+/// first, so a crash mid-write leaves torn JSON — which `load` reads as an
+/// empty list, and the next save then persists that emptiness over the user's
+/// whole configuration.
 pub fn save(workspaces: &[Workspace]) -> std::io::Result<()> {
     let Some(path) = store_path() else {
         return Err(std::io::Error::new(
@@ -67,6 +73,9 @@ pub fn save(workspaces: &[Workspace]) -> std::io::Result<()> {
     }
 
     let json = serde_json::to_vec_pretty(workspaces)?;
+    // Sibling, so the rename stays on one filesystem (where it is atomic).
+    let staged = path.with_extension("json.next");
 
-    std::fs::write(path, json)
+    std::fs::write(&staged, json)?;
+    std::fs::rename(&staged, &path)
 }

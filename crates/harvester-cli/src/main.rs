@@ -6,9 +6,10 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use harvester_client_core::{bootstrap_and_connect, DaemonConnection, SshTarget};
-use harvester_proto::{HarvesterCmd, Outgoing, Request};
-use serde_json::json;
+use harvester_client_core::{
+    bootstrap_and_connect, DaemonClient, DaemonConnection, Host, SshTarget,
+};
+use harvester_proto::HarvesterCmd;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 #[derive(Parser)]
@@ -60,7 +61,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         dest: cli.dest,
         port: None,
     };
-    let connected = bootstrap_and_connect(&target, &daemon_binary).await?;
+    let connected = bootstrap_and_connect(&Host::Ssh(target.clone()), &daemon_binary).await?;
     eprintln!(
         "harvesterd {} on {} ({:?})",
         connected.daemon_version, target.dest, connected.outcome
@@ -73,34 +74,29 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-async fn list_sessions(mut connection: DaemonConnection) -> Result<(), Box<dyn std::error::Error>> {
-    let request = Request::Harvester {
-        id: Some(json!(1)),
-        cmd: HarvesterCmd::ListSessions { cwd: None },
-    };
-    connection.send(&request).await?;
+async fn list_sessions(connection: DaemonConnection) -> Result<(), Box<dyn std::error::Error>> {
+    let (client, _events) = DaemonClient::start(connection);
+    let response = client
+        .harvester(HarvesterCmd::ListSessions { cwd: None })
+        .await?;
+    let data = response.into_result()?;
 
-    while let Some(outgoing) = connection.next().await? {
-        if let Outgoing::HarvesterResponse { response, .. } = outgoing {
-            if response.success {
-                println!("{}", serde_json::to_string_pretty(&response.data)?);
+    println!("{}", serde_json::to_string_pretty(&data)?);
 
-                return Ok(());
-            }
-
-            return Err(response
-                .error
-                .unwrap_or_else(|| "list_sessions failed".to_string())
-                .into());
-        }
-    }
-
-    Err("connection closed before list_sessions response".into())
+    Ok(())
 }
 
-/// Protocol REPL: each stdin line is one `Request` (validated locally so a
-/// typo errors here instead of desyncing the daemon); every daemon line is
-/// printed to stdout verbatim-as-JSON. Exits on stdin EOF.
+/// Protocol REPL and pipe: stdin lines go to the daemon as-is, daemon lines
+/// come back to stdout as-is. Deliberately a byte pump in both directions —
+/// decoding either side would hide exactly what this tool exists to inspect:
+/// a malformed frame must reach the daemon (its parse-error response is a
+/// documented path), and a line we cannot parse must still be printed rather
+/// than ending the stream.
+///
+/// On stdin EOF the write half is dropped, which half-closes the socket; the
+/// daemon then finishes its queued responses and closes, and the printer stops
+/// on that EOF. Scripted use (`echo ... | harvester-cli <dest> raw`) therefore
+/// sees every answer instead of racing the round trip.
 async fn raw(connection: DaemonConnection) -> Result<(), Box<dyn std::error::Error>> {
     let DaemonConnection {
         mut reader,
@@ -109,14 +105,12 @@ async fn raw(connection: DaemonConnection) -> Result<(), Box<dyn std::error::Err
 
     let printer = tokio::spawn(async move {
         loop {
-            match reader.next().await {
-                Ok(Some(outgoing)) => match serde_json::to_string(&outgoing) {
-                    Ok(line) => println!("{line}"),
-                    Err(error) => eprintln!("encode outgoing: {error}"),
-                },
+            match reader.next_raw().await {
+                Ok(Some(line)) => println!("{}", String::from_utf8_lossy(line)),
                 Ok(None) => break,
                 Err(error) => {
                     eprintln!("read from daemon: {error}");
+
                     break;
                 }
             }
@@ -129,13 +123,11 @@ async fn raw(connection: DaemonConnection) -> Result<(), Box<dyn std::error::Err
             continue;
         }
 
-        match serde_json::from_str::<Request>(&line) {
-            Ok(request) => writer.send(&request).await?,
-            Err(error) => eprintln!("invalid request line: {error}"),
-        }
+        writer.send_raw_line(line.as_bytes()).await?;
     }
 
-    printer.abort();
+    drop(writer);
+    let _ = printer.await;
 
     Ok(())
 }

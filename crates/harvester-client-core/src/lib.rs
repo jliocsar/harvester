@@ -1,24 +1,31 @@
-//! Client-side library for Harvester: bootstrap harvesterd on a machine over
-//! plain SSH, forward its Unix socket, and speak the docs/DAEMON.md envelope.
-//! Consumed by the gpui client and by the `harvester-cli` dev tool.
+//! The client backbone for Harvester: bootstrap harvesterd on a machine
+//! (plain SSH or the local shell — one exec boundary, `Host`), forward its
+//! Unix socket, and speak the docs/DAEMON.md envelope. Deliberately gpui-free:
+//! this crate plus its `bridge`/`machines` workers is the whole client any
+//! frontend (gpui today, mobile later) would reuse.
 //!
-//! The one entry point that matters is [`bootstrap_and_connect`]: it performs
-//! the whole first-connect contract (probe → install/upgrade → start → forward
-//! → ping version handshake) and hands back a live [`DaemonConnection`].
+//! Two entry points matter: [`bridge::start`] (one machine's full worker —
+//! bootstrap, connect, command flows, event fan-in) and, underneath it,
+//! [`bootstrap_and_connect`] + [`DaemonClient`] for anyone driving the
+//! protocol directly (the `harvester-cli` dev tool does).
 
 mod bootstrap;
+pub mod bridge;
+mod client;
 mod connection;
-mod local;
+mod host;
+pub mod machines;
 mod provider;
 mod ssh;
 mod workspace;
 
 pub use bootstrap::{bootstrap_and_connect, BootstrapOutcome, Connected};
+pub use client::{DaemonClient, SessionEvent};
 pub use connection::{DaemonConnection, DaemonReader, DaemonWriter};
-pub use local::{bootstrap_and_connect_local, list_directory_local, validate_git_workspace_local};
+pub use host::Host;
 pub use provider::{
     discover_providers, install_bundled_providers, MachineKey, MachineStatus, Provider,
-    ProviderInfo, ProviderMachine, SshInfo, SUPPORTED_PROVIDER_PROTOCOL,
+    ProviderMachine, SshInfo, SUPPORTED_PROVIDER_PROTOCOL,
 };
 pub use ssh::{probe_reachable, SshTarget};
 pub use workspace::{list_directory, validate_git_workspace, RemoteDirEntry};
@@ -29,13 +36,16 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     /// Local I/O: spawning ssh, the forwarded socket, serialization.
     Io(std::io::Error),
-    /// A remote exec over SSH failed (transport error or non-zero exit).
-    Ssh {
+    /// A control-plane exec failed (transport error or non-zero exit) —
+    /// over SSH or through the local shell, same boundary (`host.rs`).
+    Exec {
         context: &'static str,
         detail: String,
     },
-    /// The socket forward or the daemon handshake never came up.
-    Forward(String),
+    /// The daemon never became reachable: the socket forward failed to come
+    /// up, or the handshake went unanswered. Covers the local machine too,
+    /// where there is no forward at all.
+    DaemonConnect(String),
     /// The daemon still reports the wrong version after a forced reinstall —
     /// almost always a stale local daemon binary (rebuild the musl target).
     VersionMismatch { expected: String, actual: String },
@@ -48,8 +58,8 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Io(error) => write!(f, "{error}"),
-            Error::Ssh { context, detail } => write!(f, "{context}: {detail}"),
-            Error::Forward(detail) => write!(f, "socket forward: {detail}"),
+            Error::Exec { context, detail } => write!(f, "{context}: {detail}"),
+            Error::DaemonConnect(detail) => write!(f, "daemon connect: {detail}"),
             Error::VersionMismatch { expected, actual } => write!(
                 f,
                 "daemon reports version {actual} after reinstall (expected {expected}) — \

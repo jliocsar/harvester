@@ -1,14 +1,20 @@
-//! Workspace browsing over plain SSH (docs/SPEC.md §Workspace): directory
-//! listings for the folder picker and git validation. These are client
-//! business, never the daemon's (docs/DAEMON.md keeps path work out of the
-//! envelope) — one-shot execs, multiplexed over the ControlMaster connection
-//! so a per-click listing skips the handshake and costs about one network
-//! round trip.
+//! Workspace browsing (docs/SPEC.md §Workspace): directory listings for the
+//! folder picker and git validation. These are client business, never the
+//! daemon's (docs/DAEMON.md keeps path work out of the envelope) — one-shot
+//! execs against [`Host`], so the local machine and SSH machines browse with
+//! identical semantics (remote execs multiplex over the ControlMaster
+//! connection: a per-click listing costs about one network round trip).
 
-use crate::ssh::{exec, SshTarget};
+use std::time::Duration;
+
+use crate::host::{shell_quote, Host};
 use crate::{Error, Result};
 
-/// One entry from a remote directory listing.
+/// Ceiling on one picker exec — multiplexed listings take tens of ms; a
+/// wedged transport must not hang the picker forever.
+const WORKSPACE_EXEC_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// One entry from a directory listing.
 #[derive(Debug, Clone)]
 pub struct RemoteDirEntry {
     pub name: String,
@@ -19,23 +25,21 @@ pub struct RemoteDirEntry {
 /// entries included (dotdirs are legitimate workspace parents), a `/` suffix
 /// marking directories. Known limit: symlinked directories are listed
 /// undereferenced, so they read as plain entries — acceptable for a picker.
-pub async fn list_directory(target: &SshTarget, path: &str) -> Result<Vec<RemoteDirEntry>> {
+pub async fn list_directory(host: &Host, path: &str) -> Result<Vec<RemoteDirEntry>> {
     let script = format!("ls -1Ap -- {}", shell_quote(path));
-    let output = exec(target, &script, None).await?;
+    let output = host.exec(&script, None, WORKSPACE_EXEC_TIMEOUT).await?;
 
     if output.status.success() {
         Ok(parse_ls_entries(&output.stdout))
     } else {
-        Err(Error::Ssh {
+        Err(Error::Exec {
             context: "list directory",
             detail: output.describe_failure(),
         })
     }
 }
 
-/// `ls -1Ap` output → entries; shared with the local machine's picker so
-/// both browse with identical semantics.
-pub(crate) fn parse_ls_entries(stdout: &str) -> Vec<RemoteDirEntry> {
+fn parse_ls_entries(stdout: &str) -> Vec<RemoteDirEntry> {
     stdout
         .lines()
         .map(|line| match line.strip_suffix('/') {
@@ -53,22 +57,16 @@ pub(crate) fn parse_ls_entries(stdout: &str) -> Vec<RemoteDirEntry> {
 
 /// Checks that `path` is a git repository — the definition of a workspace
 /// (SPEC §Workspace). The error carries git's own explanation for the UI.
-pub async fn validate_git_workspace(target: &SshTarget, path: &str) -> Result<()> {
+pub async fn validate_git_workspace(host: &Host, path: &str) -> Result<()> {
     let script = format!("git -C {} rev-parse --git-dir", shell_quote(path));
-    let output = exec(target, &script, None).await?;
+    let output = host.exec(&script, None, WORKSPACE_EXEC_TIMEOUT).await?;
 
     if output.status.success() {
         Ok(())
     } else {
-        Err(Error::Ssh {
+        Err(Error::Exec {
             context: "validate workspace",
             detail: output.describe_failure(),
         })
     }
-}
-
-/// Single-quotes `value` for the remote POSIX shell (the `'\''` dance), so
-/// arbitrary path characters survive the ssh command-line round trip.
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', r"'\''"))
 }

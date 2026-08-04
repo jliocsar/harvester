@@ -6,20 +6,24 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use harvester_proto::{HarvesterCmd, Outgoing, Request, CR, LF, PROTOCOL_VERSION};
-use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use harvester_proto::{
+    encode_frame, read_frame, HarvesterCmd, Outgoing, PingData, Request, LF, PROTOCOL_VERSION,
+};
+use serde_json::json;
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 use tokio::process::Child;
 use tokio::time::Instant;
 
+use crate::host::Host;
 use crate::ssh::SshTarget;
 use crate::{Error, Result};
 
 /// The daemon's socket, relative to `$HOME` — the same path on remote
-/// machines (forwarded) and the local one (connected directly).
-pub(crate) const DAEMON_SOCKET: &str = ".harvester/harvesterd.sock";
+/// machines (forwarded) and the local one (connected directly). Shared with
+/// the daemon through `harvester-proto`, which is the rendezvous contract.
+pub(crate) use harvester_proto::DAEMON_SOCKET_PATH as DAEMON_SOCKET;
 /// How long to keep retrying connect+ping while a freshly started daemon
 /// binds its socket (covers slow VMs; normal case succeeds on try one).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -74,6 +78,14 @@ impl DaemonReader {
     pub async fn next(&mut self) -> std::io::Result<Option<Outgoing>> {
         read_outgoing(&mut self.reader, &mut self.line_buffer).await
     }
+
+    /// The next daemon line as raw bytes, undecoded. For tools that must see
+    /// exactly what the daemon sent — a typed read turns an unrecognised line
+    /// into an error and ends the stream, which is precisely the case a
+    /// protocol debugger needs to observe.
+    pub async fn next_raw(&mut self) -> std::io::Result<Option<&[u8]>> {
+        read_frame(&mut self.reader, &mut self.line_buffer).await
+    }
 }
 
 /// Write half: client → daemon requests. Holds the forward alive.
@@ -86,6 +98,16 @@ impl DaemonWriter {
     pub async fn send(&mut self, request: &Request) -> std::io::Result<()> {
         write_request(&mut self.writer, request).await
     }
+
+    /// Send `line` verbatim as one frame, without validating it. Lets a
+    /// protocol tool exercise the daemon's own error paths (a malformed frame
+    /// must produce a parse-error response, and that is untestable through a
+    /// typed send).
+    pub async fn send_raw_line(&mut self, line: &[u8]) -> std::io::Result<()> {
+        self.writer.write_all(line).await?;
+        self.writer.write_all(&[LF]).await?;
+        self.writer.flush().await
+    }
 }
 
 /// A pinged, version-checked connection. The halves are public so callers
@@ -96,24 +118,20 @@ pub struct DaemonConnection {
     pub writer: DaemonWriter,
 }
 
-impl DaemonConnection {
-    pub async fn send(&mut self, request: &Request) -> std::io::Result<()> {
-        self.writer.send(request).await
-    }
-
-    pub async fn next(&mut self) -> std::io::Result<Option<Outgoing>> {
-        self.reader.next().await
+/// The one place the host kinds actually differ: a remote daemon's socket is
+/// reached through an `ssh -L` forward, the local one directly. Both end in
+/// the same ping handshake and return the daemon's self-reported version —
+/// the mismatch policy is bootstrap's business, not ours.
+pub(crate) async fn connect_host(host: &Host, home: &str) -> Result<(DaemonConnection, String)> {
+    match host {
+        Host::Local => connect_local(home).await,
+        Host::Ssh(target) => connect(target, home).await,
     }
 }
 
 /// Forwards the daemon socket and completes the ping handshake, retrying
 /// until `CONNECT_TIMEOUT` (a just-started daemon needs a beat to bind).
-/// Returns the connection plus the daemon's self-reported version — the
-/// mismatch policy is bootstrap's business, not ours.
-pub(crate) async fn connect(
-    target: &SshTarget,
-    remote_home: &str,
-) -> Result<(DaemonConnection, String)> {
+async fn connect(target: &SshTarget, remote_home: &str) -> Result<(DaemonConnection, String)> {
     let local_socket = local_socket_path(&target.dest);
 
     // A stale file from a previous run makes ssh refuse the bind.
@@ -128,10 +146,10 @@ pub(crate) async fn connect(
 
     loop {
         if let Some(status) = child.try_wait()? {
-            return Err(Error::Forward(format!("ssh exited: {status}")));
+            return Err(Error::DaemonConnect(format!("ssh exited: {status}")));
         }
 
-        match handshake(&local_socket).await {
+        match bounded_handshake(&local_socket, deadline).await {
             Ok((reader, writer, daemon_version)) => {
                 let guard = ForwardGuard {
                     _child: Some(child),
@@ -142,7 +160,7 @@ pub(crate) async fn connect(
             }
             Err(error) => {
                 if Instant::now() >= deadline {
-                    return Err(Error::Forward(format!(
+                    return Err(Error::DaemonConnect(format!(
                         "daemon unreachable after {CONNECT_TIMEOUT:?}: {error}"
                     )));
                 }
@@ -153,15 +171,33 @@ pub(crate) async fn connect(
     }
 }
 
+/// One handshake attempt, capped at the connect deadline. Without the cap a
+/// daemon that accepts but never answers the ping would hang the bridge
+/// forever — the retry loop only checks the deadline on the error path.
+async fn bounded_handshake(
+    socket: &Path,
+    deadline: Instant,
+) -> std::io::Result<(BufReader<OwnedReadHalf>, OwnedWriteHalf, String)> {
+    let remaining = deadline.duration_since(Instant::now());
+
+    match tokio::time::timeout(remaining, handshake(socket)).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "ping went unanswered",
+        )),
+    }
+}
+
 /// The local-machine variant: the daemon's socket is on this filesystem, so
 /// connect directly — no forward process, no socket-file ownership. Same
 /// retry window (a just-started daemon needs a beat to bind).
-pub(crate) async fn connect_local(home: &str) -> Result<(DaemonConnection, String)> {
+async fn connect_local(home: &str) -> Result<(DaemonConnection, String)> {
     let socket = PathBuf::from(home).join(DAEMON_SOCKET);
     let deadline = Instant::now() + CONNECT_TIMEOUT;
 
     loop {
-        match handshake(&socket).await {
+        match bounded_handshake(&socket, deadline).await {
             Ok((reader, writer, daemon_version)) => {
                 return Ok((
                     assemble(reader, writer, ForwardGuard::none()),
@@ -170,7 +206,7 @@ pub(crate) async fn connect_local(home: &str) -> Result<(DaemonConnection, Strin
             }
             Err(error) => {
                 if Instant::now() >= deadline {
-                    return Err(Error::Forward(format!(
+                    return Err(Error::DaemonConnect(format!(
                         "local daemon unreachable after {CONNECT_TIMEOUT:?}: {error}"
                     )));
                 }
@@ -208,18 +244,11 @@ fn create_forward_command(
     remote_home: &str,
 ) -> tokio::process::Command {
     let forward_spec = format!("{}:{remote_home}/{DAEMON_SOCKET}", local_socket.display());
-    // StreamLocalBindUnlink makes ssh unlink an existing socket file before
-    // binding — a dying forward's leftover (respawn races its teardown) can
-    // otherwise fail the bind with "Address already in use".
-    let mut command = target.command(&[
-        "-N",
-        "-o",
-        "ExitOnForwardFailure=yes",
-        "-o",
-        "StreamLocalBindUnlink=yes",
-        "-L",
-        &forward_spec,
-    ]);
+    // Keepalives and StreamLocalBindUnlink live in SSH_BASE_ARGS: the master
+    // owns the connection and the forward's listener, so passing them here
+    // (as a mux client usually is) would have no effect.
+    let mut command =
+        target.command(&["-N", "-o", "ExitOnForwardFailure=yes", "-L", &forward_spec]);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -258,70 +287,58 @@ async fn handshake(
         ));
     };
 
-    let daemon_version = match outgoing {
-        Outgoing::HarvesterResponse { response, .. } if response.success => response
-            .data
-            .as_ref()
-            .and_then(|data| data.get("version"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        _ => None,
-    };
-    let Some(daemon_version) = daemon_version else {
+    let Outgoing::HarvesterResponse { response, .. } = outgoing else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "malformed ping response",
+            "ping answered with something other than a harvester response",
         ));
     };
+    let ping: PingData = response
+        .into_result()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        .and_then(|data| {
+            serde_json::from_value(data).map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("malformed ping response: {error}"),
+                )
+            })
+        })?;
 
-    Ok((reader, writer, daemon_version))
+    Ok((reader, writer, ping.version))
 }
 
 async fn write_request(writer: &mut OwnedWriteHalf, request: &Request) -> std::io::Result<()> {
-    let mut line = serde_json::to_vec(request)?;
-    line.push(LF);
+    let line = encode_frame(request)?;
     writer.write_all(&line).await?;
     writer.flush().await
 }
 
-/// LF-only framing (pi's rule, ours too): split on LF, strip one trailing CR.
 async fn read_outgoing(
     reader: &mut BufReader<OwnedReadHalf>,
     line_buffer: &mut Vec<u8>,
 ) -> std::io::Result<Option<Outgoing>> {
-    line_buffer.clear();
-
-    let bytes_read = reader.read_until(LF, line_buffer).await?;
-    if bytes_read == 0 {
+    let Some(line) = read_frame(reader, line_buffer).await? else {
         return Ok(None);
-    }
-
-    let mut line = line_buffer.as_slice();
-    if line.last() == Some(&LF) {
-        line = &line[..line.len() - 1];
-    }
-    if line.last() == Some(&CR) {
-        line = &line[..line.len() - 1];
-    }
+    };
 
     Ok(Some(serde_json::from_slice(line)?))
 }
 
-/// Cap on the sanitized-destination tag inside the local socket filename:
-/// Unix socket paths max out around 108 bytes (`sun_path`), and tempdir +
-/// prefix + pid must always fit alongside the tag.
-const LOCAL_SOCKET_DEST_TAG_MAX_CHARS: usize = 32;
-
-/// Short and per-process-unique: see `LOCAL_SOCKET_DEST_TAG_MAX_CHARS`.
+/// Per-process, per-destination, collision-free: a hash of the *full* dest
+/// (a readable sanitized tag proved collision-prone — `web_1` and `web.1`
+/// sanitized identically, and the second bridge would unlink and rebind over
+/// the first one's live forward, cross-wiring machines). Short by
+/// construction: Unix socket paths max out around 108 bytes (`sun_path`).
 fn local_socket_path(dest: &str) -> PathBuf {
-    let sanitized_dest: String = dest
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
-        .take(LOCAL_SOCKET_DEST_TAG_MAX_CHARS)
-        .collect();
+    use std::hash::{Hash, Hasher};
 
-    std::env::temp_dir().join(format!(
-        "harvester-{}-{sanitized_dest}.sock",
-        std::process::id()
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    dest.hash(&mut hasher);
+
+    crate::ssh::client_socket_dir().join(format!(
+        "harvester-{}-{:016x}.sock",
+        std::process::id(),
+        hasher.finish()
     ))
 }

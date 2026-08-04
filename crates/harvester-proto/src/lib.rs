@@ -8,13 +8,57 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
 pub const PROTOCOL_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The daemon's socket, relative to `$HOME`. The rendezvous point between the
+/// two binaries, so it is spelled once here rather than in each of them: drift
+/// would surface only as an unexplained connect timeout.
+pub const DAEMON_SOCKET_PATH: &str = ".harvester/harvesterd.sock";
 
 /// The only record delimiter in the protocol (and in pi's RPC framing).
 pub const LF: u8 = b'\n';
 /// Tolerated-and-stripped before `LF`; never emitted.
 pub const CR: u8 = b'\r';
+
+/// Read one frame into `buf` (reused across calls): split on `LF` only, strip
+/// it plus at most one trailing `CR`. `None` on EOF; a final unterminated line
+/// is still delivered (pi flushes one on shutdown). This is the only correct
+/// way to read the protocol — never a generic line reader, which would split
+/// on Unicode separators that are valid inside JSON strings.
+pub async fn read_frame<'buf, R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &'buf mut Vec<u8>,
+) -> std::io::Result<Option<&'buf [u8]>> {
+    buf.clear();
+
+    let bytes_read = reader.read_until(LF, buf).await?;
+
+    if bytes_read == 0 {
+        return Ok(None);
+    }
+
+    let mut frame = buf.as_slice();
+
+    if frame.last() == Some(&LF) {
+        frame = &frame[..frame.len() - 1];
+    }
+
+    if frame.last() == Some(&CR) {
+        frame = &frame[..frame.len() - 1];
+    }
+
+    Ok(Some(frame))
+}
+
+/// Serialize one value as a complete `LF`-terminated wire line.
+pub fn encode_frame<T: Serialize>(value: &T) -> serde_json::Result<Vec<u8>> {
+    let mut frame = serde_json::to_vec(value)?;
+    frame.push(LF);
+
+    Ok(frame)
+}
 
 /// A client → daemon request line.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,7 +107,7 @@ pub enum HarvesterCmd {
     Attach { sid: String },
     /// Unsubscribe.
     Detach { sid: String },
-    /// Close pi's stdin; 5s grace, then SIGKILL. Session stays resumable.
+    /// Close pi's stdin; 30s grace, then SIGKILL. Session stays resumable.
     Stop { sid: String },
 }
 
@@ -85,6 +129,11 @@ pub enum Outgoing {
     },
     /// One pi stdout line, verbatim.
     Event { sid: String, event: Value },
+    /// The daemon dropped `skipped` events for this connection because it was
+    /// reading too slowly. Daemon-originated, never a fabricated pi event: the
+    /// client has an authoritative recovery (passthrough `get_entries` from its
+    /// last seen entry), but only if it is told the gap happened.
+    EventGap { sid: String, skipped: u64 },
     /// The pi process for `sid` exited. Cause lives in its stderr log (SSH tail).
     SessionExit { sid: String, exit_code: Option<i32> },
 }
@@ -113,6 +162,29 @@ impl HarvesterResponse {
             error: Some(message.into()),
         }
     }
+
+    /// `data` on success (`Null` when absent), the error string otherwise.
+    pub fn into_result(self) -> Result<Value, String> {
+        if self.success {
+            Ok(self.data.unwrap_or(Value::Null))
+        } else {
+            Err(self.error.unwrap_or_else(|| "unknown error".to_string()))
+        }
+    }
+}
+
+/// `ping`'s `data`. Typing the daemon-native payloads (not pi's — those stay
+/// verbatim `Value`) means each wire field is modelled once instead of being
+/// hand-built with `json!` on one side and hand-dug with `.get()` on the other.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PingData {
+    pub version: String,
+}
+
+/// `list_sessions`' `data`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionsData {
+    pub sessions: Vec<SessionInfo>,
 }
 
 /// One entry in `list_sessions`.

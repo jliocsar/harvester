@@ -1,10 +1,15 @@
-//! Plain-SSH plumbing shared by bootstrap (one-shot execs) and connection
-//! (the long-lived socket forward).
+//! Plain-SSH plumbing: target addressing and the base invocation shared by
+//! one-shot execs (via `host.rs`) and the long-lived socket forward
+//! (`connection.rs`).
 
-use std::process::Stdio;
+use std::path::PathBuf;
+use std::time::Duration;
 
-use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
+use crate::host;
+
+/// Ceiling on the liveness probe: ConnectTimeout=10 bounds only the TCP
+/// connect, so auth/exec need their own stop.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// How to reach a machine. `dest` is handed to ssh verbatim, so both
 /// `user@host` and ssh-config aliases work.
@@ -25,6 +30,13 @@ pub struct SshTarget {
 /// multiplexed), which makes the folder picker's per-click `ls` affordable.
 /// `auto` degrades to a plain connection whenever the master is unusable, so
 /// this is pure speedup, never a new failure mode.
+///
+/// Everything transport-level belongs here rather than on an individual
+/// invocation, because whichever process becomes the *master* owns the
+/// connection: options a mux client passes about the transport (keepalives) or
+/// about a forward's listener (`StreamLocalBindUnlink`) are the master's to
+/// apply, and are silently ignored on the client. Both landed on the forward
+/// invocation once, where they could never fire.
 const SSH_BASE_ARGS: &[&str] = &[
     "-o",
     "BatchMode=yes",
@@ -38,19 +50,63 @@ const SSH_BASE_ARGS: &[&str] = &[
     // The master lingers this long past its last client, then exits on its
     // own — nothing for us to manage or clean up.
     "ControlPersist=60",
+    "-o",
+    // A dropped link that never sends a RST (laptop sleep, wifi switch, VM
+    // migration) is otherwise invisible: requests carry no deadline, so every
+    // pending one would hang until TCP gave up, with the machine still showing
+    // as connected. Three missed 15s probes end the connection, which EOFs the
+    // socket and surfaces as a real disconnect within ~45s.
+    "ServerAliveInterval=15",
+    "-o",
+    "ServerAliveCountMax=3",
+    "-o",
+    // Unlink a leftover socket file before binding a `-L` forward: a respawn
+    // racing a dying forward's teardown would otherwise fail with "Address
+    // already in use".
+    "StreamLocalBindUnlink=yes",
 ];
 
-/// Control-socket filename inside the temp dir. `%C` is ssh's own short hash
-/// of (local host, remote host, port, user) — distinct per target and well
-/// under the ~108-byte `sun_path` limit.
+/// Control-socket filename inside the client socket dir. `%C` is ssh's own
+/// short hash of (local host, remote host, port, user) — distinct per target
+/// and well under the ~108-byte `sun_path` limit.
 const CONTROL_SOCKET_TEMPLATE: &str = "harvester-ssh-%C";
+
+/// Client-owned socket directory (`~/.harvester/run`, 0700). Control sockets
+/// and forwards must never live in world-writable /tmp: a predictable path
+/// there could be squatted before we bind, and ssh's mux protocol is
+/// unauthenticated — a fake mux server would MITM every exec. Mirrors the
+/// daemon-side policy (docs/DAEMON.md: socket auth is filesystem permissions).
+/// Degrades to the temp dir (with a loud note) only when `$HOME` is unusable.
+pub(crate) fn client_socket_dir() -> PathBuf {
+    match try_client_socket_dir() {
+        Ok(dir) => dir,
+        Err(error) => {
+            eprintln!("~/.harvester/run unavailable ({error}); falling back to the temp dir");
+
+            std::env::temp_dir()
+        }
+    }
+}
+
+fn try_client_socket_dir() -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "$HOME unset"))?;
+    let dir = PathBuf::from(home).join(".harvester/run");
+
+    std::fs::create_dir_all(&dir)?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+
+    Ok(dir)
+}
 
 impl SshTarget {
     /// An ssh invocation against this target; `extra_args` land before the
     /// destination (ssh requires options first).
-    pub(crate) fn command(&self, extra_args: &[&str]) -> Command {
-        let control_path = std::env::temp_dir().join(CONTROL_SOCKET_TEMPLATE);
-        let mut command = Command::new("ssh");
+    pub(crate) fn command(&self, extra_args: &[&str]) -> tokio::process::Command {
+        let control_path = client_socket_dir().join(CONTROL_SOCKET_TEMPLATE);
+        let mut command = tokio::process::Command::new("ssh");
         command.args(SSH_BASE_ARGS);
         command
             .arg("-o")
@@ -71,58 +127,11 @@ impl SshTarget {
 /// multiplexed master when one is up, so a warm probe is one round trip.
 /// Errors collapse to unreachable — that is the answer the dot renders.
 pub async fn probe_reachable(target: &SshTarget) -> bool {
-    match exec(target, "true", None).await {
+    match host::Host::Ssh(target.clone())
+        .exec("true", None, PROBE_TIMEOUT)
+        .await
+    {
         Ok(output) => output.status.success(),
         Err(_) => false,
     }
-}
-
-pub(crate) struct ExecOutput {
-    pub status: std::process::ExitStatus,
-    pub stdout: String,
-    pub stderr: String,
-}
-
-impl ExecOutput {
-    /// One-line failure description for error messages.
-    pub(crate) fn describe_failure(&self) -> String {
-        format!("{} — {}", self.status, self.stderr.trim())
-    }
-}
-
-/// Runs `script` through the remote login shell, optionally piping
-/// `stdin_data` into it, and waits for completion.
-pub(crate) async fn exec(
-    target: &SshTarget,
-    script: &str,
-    stdin_data: Option<&[u8]>,
-) -> std::io::Result<ExecOutput> {
-    let mut command = target.command(&[]);
-    command.arg(script);
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    command.stdin(if stdin_data.is_some() {
-        Stdio::piped()
-    } else {
-        Stdio::null()
-    });
-
-    let mut child = command.spawn()?;
-
-    if let Some(data) = stdin_data {
-        let mut stdin = child.stdin.take().expect("stdin piped above");
-        stdin.write_all(data).await?;
-        stdin.shutdown().await?;
-
-        // EOF is only delivered when the handle is dropped, not on shutdown()
-        // (the same fact that bit harvesterd's stop path).
-        drop(stdin);
-    }
-
-    let output = child.wait_with_output().await?;
-
-    Ok(ExecOutput {
-        status: output.status,
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    })
 }
