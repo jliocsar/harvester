@@ -154,6 +154,10 @@ pub struct Workbench {
     /// Sid we asked a bridge to open, until `Attached` promotes it to a
     /// chat (also the "don't double-open" guard).
     opening: Option<String>,
+    /// Collapsed sidebar sections (all expanded at launch).
+    machines_collapsed: bool,
+    workspaces_collapsed: bool,
+    sessions_collapsed: bool,
     chat: Option<Entity<Chat>>,
     /// Last request failure; sticks in the statusbar until the next one.
     last_error: Option<String>,
@@ -197,6 +201,9 @@ impl Workbench {
             machine_picker_open: false,
             ghost: None,
             opening: None,
+            machines_collapsed: false,
+            workspaces_collapsed: false,
+            sessions_collapsed: false,
             chat: None,
             last_error: None,
         };
@@ -500,9 +507,27 @@ impl Workbench {
         };
         let commands = connection.commands.clone();
         let machine_label: SharedString = self.machine_label(machine).into();
+        // The session is in the list by now (a ghost start just inserted its
+        // row above); its cwd names the repository in the prompt box.
+        let workspace_label: SharedString = self
+            .sessions
+            .iter()
+            .find(|session| session.info.sid == sid)
+            .map(|session| folder_name(&session.info.cwd).to_string())
+            .unwrap_or_default()
+            .into();
 
-        self.chat =
-            Some(cx.new(|cx| Chat::new(sid, machine_label, &entries, first_prompt, commands, cx)));
+        self.chat = Some(cx.new(|cx| {
+            Chat::new(
+                sid,
+                workspace_label,
+                machine_label,
+                &entries,
+                first_prompt,
+                commands,
+                cx,
+            )
+        }));
     }
 
     fn handle_pi_event(&mut self, sid: String, event: Value, cx: &mut Context<Self>) {
@@ -577,18 +602,20 @@ impl Workbench {
             .cloned()
     }
 
-    /// How many distinct machines the session list spans.
-    fn session_machine_count(&self) -> usize {
-        let mut machines: Vec<&str> = self
-            .sessions
-            .iter()
-            .map(|session| session.machine.as_str())
-            .collect();
+    /// Remote machines list everything — their disk is the only source of
+    /// truth and there is nothing client-side to scope by. The local machine
+    /// is different: the daemon would surface every repo this computer ever
+    /// ran pi in, so its list is scoped to the added workspaces. The full
+    /// list stays in memory (`list_sessions` runs once per connect); adding
+    /// a workspace reveals its sessions without a refetch.
+    fn session_visible(&self, session: &MachineSession) -> bool {
+        if session.machine != LOCAL_MACHINE {
+            return true;
+        }
 
-        machines.sort();
-        machines.dedup();
-
-        machines.len()
+        self.workspaces.iter().any(|workspace| {
+            workspace.machine == LOCAL_MACHINE && workspace.path == session.info.cwd
+        })
     }
 
     fn set_session_status(&mut self, sid: &str, status: SessionStatus) {
@@ -599,12 +626,14 @@ impl Workbench {
         }
     }
 
-    fn open_session(&mut self, index: usize, cx: &mut Context<Self>) {
+    /// By sid, not index — the sidebar renders a filtered view of
+    /// `self.sessions`, so display positions don't map back to the list.
+    fn open_session(&mut self, sid: &str, cx: &mut Context<Self>) {
         if self.opening.is_some() {
             return;
         }
 
-        let Some(session) = self.sessions.get(index) else {
+        let Some(session) = self.sessions.iter().find(|session| session.info.sid == sid) else {
             return;
         };
         let machine = session.machine.clone();
@@ -1176,62 +1205,95 @@ impl Workbench {
             .bg(rgb(theme::PANEL_BG))
             .border_r_1()
             .border_color(rgb(theme::BORDER))
-            .child(ui::section_header("machines"))
-            .child(self.render_machine_list())
-            .child(self.render_workspaces_header(cx))
-            .child(self.render_workspace_list(cx))
-            .child(ui::section_header("sessions"))
             .child(
-                div()
-                    .id("sessions")
-                    .flex_1()
-                    .min_h(px(0.))
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .children(
-                        self.sessions
-                            .iter()
-                            .enumerate()
-                            .map(|(index, session)| self.render_session_row(index, session, cx)),
-                    )
-                    .when(self.sessions.is_empty(), |sidebar| {
-                        sidebar.child(
-                            div()
-                                .px_3()
-                                .py_1()
-                                .text_xs()
-                                .text_color(rgb(theme::TEXT_FAINT))
-                                .child("no sessions yet"),
-                        )
-                    }),
+                ui::section_header("machines-header", "machines")
+                    .child(ui::section_chevron(!self.machines_collapsed))
+                    .on_click(cx.listener(|workbench, _, _, cx| {
+                        workbench.machines_collapsed = !workbench.machines_collapsed;
+                        cx.notify();
+                    })),
             )
+            .when(!self.machines_collapsed, |sidebar| {
+                sidebar.child(self.render_machine_list())
+            })
+            .child(self.render_workspaces_header(cx))
+            .when(!self.workspaces_collapsed, |sidebar| {
+                sidebar.child(self.render_workspace_list(cx))
+            })
+            .child(
+                ui::section_header("sessions-header", "sessions")
+                    .child(ui::section_chevron(!self.sessions_collapsed))
+                    .on_click(cx.listener(|workbench, _, _, cx| {
+                        workbench.sessions_collapsed = !workbench.sessions_collapsed;
+                        cx.notify();
+                    })),
+            )
+            .when(!self.sessions_collapsed, |sidebar| {
+                sidebar.child(self.render_session_list(cx))
+            })
     }
 
-    /// "WORKSPACES" with a trailing "+" (SPEC §Flows "Add workspace");
-    /// enabled once at least one machine qualifies.
+    /// The sessions the sidebar shows: `self.sessions` through the
+    /// `session_visible` filter — which is why rows navigate by sid, never
+    /// by position.
+    fn render_session_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let visible: Vec<&MachineSession> = self
+            .sessions
+            .iter()
+            .filter(|session| self.session_visible(session))
+            .collect();
+        let empty = visible.is_empty();
+
+        div()
+            .id("sessions")
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .children(
+                visible
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, session)| self.render_session_row(index, session, cx)),
+            )
+            .when(empty, |list| {
+                list.child(
+                    div()
+                        .px_3()
+                        .py_1()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_FAINT))
+                        .child("no sessions yet"),
+                )
+            })
+    }
+
+    /// "WORKSPACES" with a "+" before the chevron (SPEC §Flows "Add
+    /// workspace"); the "+" enables once at least one machine qualifies and
+    /// stops propagation so adding doesn't also collapse the section.
     fn render_workspaces_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let can_add = !self.machine_candidates().is_empty()
             && self.picker.is_none()
             && !self.machine_picker_open;
 
-        div()
-            .flex()
-            .items_center()
-            .pr(px(6.))
-            .child(ui::section_header("workspaces"))
-            .child(div().flex_1())
+        ui::section_header("workspaces-header", "workspaces")
             .child(
-                ui::button("add-workspace", "+", ui::ButtonKind::Neutral, can_add)
-                    // Offset the header's pt_3/pb_1 asymmetry so the button
-                    // centers on the label text, not the padded box.
-                    .mt(px(8.))
-                    .when(can_add, |button| {
-                        button.on_click(
-                            cx.listener(|workbench, _, _, cx| workbench.open_add_workspace(cx)),
-                        )
-                    }),
+                ui::button("add-workspace", "+", ui::ButtonKind::Neutral, can_add).when(
+                    can_add,
+                    |button| {
+                        button.on_click(cx.listener(|workbench, _, _, cx| {
+                            cx.stop_propagation();
+                            workbench.open_add_workspace(cx)
+                        }))
+                    },
+                ),
             )
+            .child(ui::section_chevron(!self.workspaces_collapsed))
+            .on_click(cx.listener(|workbench, _, _, cx| {
+                workbench.workspaces_collapsed = !workbench.workspaces_collapsed;
+                cx.notify();
+            }))
     }
 
     /// Read-only rows; the per-row "+" is the one click target (ghost chat).
@@ -1277,7 +1339,7 @@ impl Workbench {
             .map(|row| {
                 ui::machine_row(
                     row.label.clone().into(),
-                    self.machine_detail(&row.key, &row.provider).into(),
+                    Some(row.provider.clone().into()),
                     self.machine_dot(&row.key),
                 )
             })
@@ -1288,7 +1350,7 @@ impl Workbench {
             .map(|machine| {
                 ui::machine_row(
                     machine.clone().into(),
-                    self.machine_detail(&machine, "ssh").into(),
+                    Some("ssh".into()),
                     self.machine_dot(&machine),
                 )
             })
@@ -1297,41 +1359,33 @@ impl Workbench {
         div()
             .flex()
             .flex_col()
+            // The local row has no subtitle — it comes from nowhere.
             .child(ui::machine_row(
                 LOCAL_MACHINE.into(),
-                self.machine_detail(LOCAL_MACHINE, "this computer").into(),
-                self.local_machine_dot(),
+                None,
+                self.machine_dot(LOCAL_MACHINE),
             ))
             .children(provider_rows)
             .children(ad_hoc_rows)
     }
 
-    /// The local host is reachable by definition — only a failed or lost
-    /// local daemon turns its dot red.
-    fn local_machine_dot(&self) -> u32 {
-        match self.connections.get(LOCAL_MACHINE).map(|c| &c.link) {
-            Some(Link::Failed { .. }) | Some(Link::Lost) => theme::STATUS_ERROR,
-            _ => theme::STATUS_RUNNING,
-        }
-    }
-
-    /// The dot tells reachability: a live bridge is proof, otherwise the
-    /// worker's `ssh <machine> true` verdict (never provider-reported
-    /// status). Unknown until the first probe answers.
+    /// The dot is the machine's whole story now that rows carry no link
+    /// text (SPEC §UI machine dots): green = daemon connected, yellow =
+    /// connecting/bootstrapping, red = connect failed/lost or the worker's
+    /// `ssh <machine> true` probe says unreachable, gray = no daemon link
+    /// yet (reachable or simply not probed — indistinguishable without
+    /// connecting). Never provider-reported status (SPEC §Machine).
     fn machine_dot(&self, key: &str) -> u32 {
-        let bridge_connected = self
-            .connections
-            .get(key)
-            .is_some_and(|connection| matches!(connection.link, Link::Connected { .. }));
-
-        if bridge_connected {
-            return theme::STATUS_RUNNING;
+        match self.connections.get(key).map(|connection| &connection.link) {
+            Some(Link::Connected { .. }) => return theme::STATUS_RUNNING,
+            Some(Link::Connecting) => return theme::STATUS_PENDING,
+            Some(Link::Failed { .. }) | Some(Link::Lost) => return theme::STATUS_ERROR,
+            None => {}
         }
 
         match self.probes.get(key) {
-            Some(true) => theme::STATUS_RUNNING,
             Some(false) => theme::STATUS_ERROR,
-            None => theme::TEXT_FAINT,
+            Some(true) | None => theme::TEXT_FAINT,
         }
     }
 
@@ -1347,25 +1401,6 @@ impl Workbench {
                 .map(|row| row.label.clone())
                 .unwrap_or(key.id),
             None => machine.to_string(),
-        }
-    }
-
-    /// The row's detail line: where the machine comes from, plus the bridge
-    /// state once one exists.
-    fn machine_detail(&self, key: &str, source: &str) -> String {
-        let link_state = self
-            .connections
-            .get(key)
-            .map(|connection| match &connection.link {
-                Link::Connecting => "connecting…".to_string(),
-                Link::Connected { daemon_version } => format!("harvesterd {daemon_version}"),
-                Link::Failed { .. } => "connect failed".to_string(),
-                Link::Lost => "connection lost".to_string(),
-            });
-
-        match link_state {
-            Some(state) => format!("{source} · {state}"),
-            None => source.to_string(),
         }
     }
 
@@ -1390,14 +1425,9 @@ impl Workbench {
             Some(name) => name.clone().into(),
             None => sid_preview(&session.sid).into(),
         };
-        // The machine joins the subtitle only once sessions span several
-        // machines — a single-machine list doesn't need the noise.
-        let multi_machine = self.session_machine_count() > 1;
-        let workspace_name: SharedString = if multi_machine {
-            format!("{} · {machine_label}", folder_name(&session.cwd)).into()
-        } else {
-            folder_name(&session.cwd).to_string().into()
-        };
+        let workspace_name: SharedString =
+            format!("{} · {machine_label}", folder_name(&session.cwd)).into();
+        let sid = session.sid.clone();
 
         ui::session_row(
             ("session", index),
@@ -1407,7 +1437,7 @@ impl Workbench {
             selected,
             opening,
         )
-        .on_click(cx.listener(move |workbench, _, _, cx| workbench.open_session(index, cx)))
+        .on_click(cx.listener(move |workbench, _, _, cx| workbench.open_session(&sid, cx)))
     }
 
     fn render_content(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1516,6 +1546,13 @@ impl Workbench {
                                         }))
                                     }),
                             )
+                            // Read-only: the repository is the workspace the
+                            // ghost was opened from.
+                            .child(ui::prompt_box_control(
+                                "ghost-repo",
+                                folder_name(&ghost.workspace.path).to_string().into(),
+                                false,
+                            ))
                             .child(
                                 ui::prompt_box_control(
                                     "ghost-machine",

@@ -25,6 +25,7 @@ const PALETTE: &[(&str, u32)] = &[
     ("ACCENT_ACTIVE", theme::ACCENT_ACTIVE),
     ("STATUS_RUNNING", theme::STATUS_RUNNING),
     ("STATUS_ERROR", theme::STATUS_ERROR),
+    ("STATUS_PENDING", theme::STATUS_PENDING),
     ("BUTTON_BG", theme::BUTTON_BG),
     ("BUTTON_HOVER", theme::BUTTON_HOVER),
     ("BUTTON_ACTIVE", theme::BUTTON_ACTIVE),
@@ -70,6 +71,7 @@ impl Render for Kitchen {
                     .child(section("typography", render_typography()))
                     .child(section("buttons", render_buttons()))
                     .child(section("status dots", render_status_dots()))
+                    .child(section("section headers", render_section_headers()))
                     .child(section("machine rows", render_machine_rows()))
                     .child(section("session rows", render_session_rows()))
                     .child(section("workspace rows", render_workspace_rows()))
@@ -109,7 +111,7 @@ fn render_prompt_box_samples(
         .gap_4()
         .w(px(560.))
         .child(labeled(
-            "model control + send (click to focus)",
+            "model · repo · machine controls + send (click to focus)",
             ui::prompt_box(prompt_focused)
                 .child(ui::prompt_box_input(prompt_input))
                 .child(
@@ -118,6 +120,16 @@ fn render_prompt_box_samples(
                             "kitchen-prompt-model",
                             "openai/gpt-5.6-sol (llm)".into(),
                             true,
+                        ))
+                        .child(ui::prompt_box_control(
+                            "kitchen-prompt-repo",
+                            "harvester".into(),
+                            false,
+                        ))
+                        .child(ui::prompt_box_control(
+                            "kitchen-prompt-machine",
+                            "egg-by-penguin".into(),
+                            false,
                         ))
                         .child(div().flex_1())
                         .child(ui::prompt_box_send("kitchen-prompt-send")),
@@ -303,9 +315,42 @@ fn render_status_dots() -> impl IntoElement {
         )
 }
 
+/// The sidebar's collapsible section headers, both disclosure states; the
+/// workspaces variant carries its "+" before the chevron. Chevrons are
+/// static here — the kitchen shows looks, the sidebar owns toggling.
+fn render_section_headers() -> impl IntoElement {
+    div()
+        .w(px(240.))
+        .bg(rgb(theme::PANEL_BG))
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .rounded_md()
+        .pb_2()
+        .flex()
+        .flex_col()
+        .child(
+            ui::section_header("kitchen-header-open", "sessions").child(ui::section_chevron(true)),
+        )
+        .child(
+            ui::section_header("kitchen-header-closed", "sessions")
+                .child(ui::section_chevron(false)),
+        )
+        .child(
+            ui::section_header("kitchen-header-plus", "workspaces")
+                .child(ui::button(
+                    "kitchen-header-add",
+                    "+",
+                    ui::ButtonKind::Neutral,
+                    true,
+                ))
+                .child(ui::section_chevron(true)),
+        )
+}
+
 fn render_machine_rows() -> impl IntoElement {
     // Sidebar-width container so ellipsis behavior shows realistically.
-    // Machine rows are read-only: no hover, no click target.
+    // Machine rows are read-only: no hover, no click target. One row per dot
+    // state (SPEC §UI machine dots); `local` has no subtitle.
     div()
         .w(px(240.))
         .bg(rgb(theme::PANEL_BG))
@@ -315,24 +360,25 @@ fn render_machine_rows() -> impl IntoElement {
         .py_1()
         .flex()
         .flex_col()
-        .child(ui::machine_row(
-            "local".into(),
-            "this computer".into(),
-            theme::STATUS_RUNNING,
-        ))
+        .child(ui::machine_row("local".into(), None, theme::TEXT_FAINT))
         .child(ui::machine_row(
             "bloggy".into(),
-            "exe-dev · harvesterd 1".into(),
+            Some("exe-dev".into()),
             theme::STATUS_RUNNING,
         ))
         .child(ui::machine_row(
             "vps-work".into(),
-            "exe-dev".into(),
+            Some("exe-dev".into()),
+            theme::STATUS_PENDING,
+        ))
+        .child(ui::machine_row(
+            "unreachable".into(),
+            Some("fly.io".into()),
             theme::STATUS_ERROR,
         ))
         .child(ui::machine_row(
             "a-machine-with-a-very-long-label.exe.xyz".into(),
-            "a-provider-with-a-long-name · connecting…".into(),
+            Some("a-provider-with-a-long-name".into()),
             theme::TEXT_FAINT,
         ))
 }
@@ -351,7 +397,7 @@ fn render_session_rows() -> impl IntoElement {
         .child(ui::session_row(
             "kitchen-row-selected",
             "Refactor auth".into(),
-            "bloggy".into(),
+            "bloggy · egg-by-penguin".into(),
             theme::STATUS_RUNNING,
             true,
             false,
@@ -359,7 +405,7 @@ fn render_session_rows() -> impl IntoElement {
         .child(ui::session_row(
             "kitchen-row-opening",
             "019fc40d".into(),
-            "harvester".into(),
+            "harvester · local".into(),
             theme::STATUS_RUNNING,
             false,
             true,

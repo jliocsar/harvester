@@ -208,8 +208,18 @@ fn create_forward_command(
     remote_home: &str,
 ) -> tokio::process::Command {
     let forward_spec = format!("{}:{remote_home}/{DAEMON_SOCKET}", local_socket.display());
-    let mut command =
-        target.command(&["-N", "-o", "ExitOnForwardFailure=yes", "-L", &forward_spec]);
+    // StreamLocalBindUnlink makes ssh unlink an existing socket file before
+    // binding — a dying forward's leftover (respawn races its teardown) can
+    // otherwise fail the bind with "Address already in use".
+    let mut command = target.command(&[
+        "-N",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-o",
+        "StreamLocalBindUnlink=yes",
+        "-L",
+        &forward_spec,
+    ]);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())

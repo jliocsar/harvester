@@ -15,17 +15,31 @@ pub const STATUSBAR_HEIGHT: f32 = 26.;
 /// Modal panel width — wide enough for a path, narrow enough to stay a dialog.
 pub const MODAL_WIDTH: f32 = 420.;
 
-/// Sidebar section label ("MACHINE", "SESSIONS", …) — Apple-sidebar style:
-/// small, semibold, faint.
-pub fn section_header(title: &'static str) -> Div {
+/// Sidebar section label ("MACHINES", "SESSIONS", …) — Apple-sidebar style:
+/// small, semibold, faint. Collapsible: the whole row is the toggle (caller
+/// chains `.on_click`); the caller adds optional extras (the workspaces "+")
+/// and then `section_chevron` so the disclosure sits rightmost.
+pub fn section_header(id: impl Into<ElementId>, title: &'static str) -> Stateful<Div> {
     div()
+        .id(id)
         .px_3()
         .pt_3()
         .pb_1()
+        .flex()
+        .items_center()
+        .gap_2()
         .text_xs()
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(rgb(theme::TEXT_FAINT))
+        .cursor_pointer()
+        .hover(|style| style.text_color(rgb(theme::TEXT_DIM)))
         .child(title.to_uppercase())
+        .child(div().flex_1())
+}
+
+/// The section header's trailing disclosure chevron.
+pub fn section_chevron(expanded: bool) -> Div {
+    div().flex_none().child(if expanded { "▾" } else { "▸" })
 }
 
 /// Session liveness indicator (`STATUS_RUNNING` green / `TEXT_FAINT` exited).
@@ -129,9 +143,11 @@ pub fn session_row(
 }
 
 /// One sidebar machine row — read-only by design (machines are listed, not
-/// clicked): reachability dot + label, detail line under it. The dot is
-/// Harvester's own SSH probe, never provider-reported status (SPEC §Machine).
-pub fn machine_row(label: SharedString, detail: SharedString, dot_color: u32) -> Div {
+/// clicked): status dot + label, the machine's source under it (`None` for
+/// the local row — it comes from nowhere). Dot semantics live with the
+/// caller (SPEC §UI machine dots); the probe is Harvester's own SSH check,
+/// never provider-reported status (SPEC §Machine).
+pub fn machine_row(label: SharedString, detail: Option<SharedString>, dot_color: u32) -> Div {
     div()
         // Same 6+6 inset as session_row, aligning with section_header text.
         .mx(px(6.))
@@ -147,15 +163,15 @@ pub fn machine_row(label: SharedString, detail: SharedString, dot_color: u32) ->
                 .child(status_dot(dot_color))
                 .child(div().overflow_hidden().text_ellipsis().child(label)),
         )
-        .child(
+        .children(detail.map(|detail| {
             div()
                 .pl(px(14.))
                 .text_xs()
                 .text_color(rgb(theme::TEXT_FAINT))
                 .overflow_hidden()
                 .text_ellipsis()
-                .child(detail),
-        )
+                .child(detail)
+        }))
 }
 
 /// One chat message: author label over the text; user messages get a bubble.

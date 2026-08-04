@@ -71,6 +71,9 @@ enum ChatItem {
 
 pub struct Chat {
     sid: String,
+    /// The session's repository (its cwd's folder name) — shown as a
+    /// read-only prompt-box control between the model and the machine.
+    workspace_label: SharedString,
     /// Display label of the machine this session runs on — shown as the
     /// prompt box's read-only machine control (the machine was picked while
     /// the chat was a ghost; a running session never moves).
@@ -109,6 +112,7 @@ impl Chat {
     /// with it rendered and the turn marked busy.
     pub fn new(
         sid: String,
+        workspace_label: SharedString,
         machine_label: SharedString,
         entries: &[Value],
         first_prompt: Option<String>,
@@ -134,6 +138,7 @@ impl Chat {
 
         Self {
             sid,
+            workspace_label,
             machine_label,
             items,
             streaming: None,
@@ -481,8 +486,14 @@ impl Chat {
                                 },
                             ),
                         )
-                        // Read-only: the machine was picked at ghost time; a
+                        // Read-only pair: the repository is the session's
+                        // cwd, the machine was picked at ghost time; a
                         // running session never moves.
+                        .child(ui::prompt_box_control(
+                            "chat-repo",
+                            self.workspace_label.clone(),
+                            false,
+                        ))
                         .child(ui::prompt_box_control(
                             "chat-machine",
                             self.machine_label.clone(),

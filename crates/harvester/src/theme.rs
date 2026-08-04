@@ -32,6 +32,9 @@ pub const SELECTION_RGBA: u32 = 0x0a84ff40;
 /// `systemGreen` / `systemRed`, dark mode.
 pub const STATUS_RUNNING: u32 = 0x30d158;
 pub const STATUS_ERROR: u32 = 0xff453a;
+/// `systemYellow`, dark mode — a machine whose bridge is still
+/// connecting/bootstrapping (SPEC §UI machine dots).
+pub const STATUS_PENDING: u32 = 0xffd60a;
 
 /// Diff line colors in tool-block bodies (edit/write). Same system green/red
 /// as the status pair, but named for what they mean here.
