@@ -2,21 +2,32 @@
 //! (plain SSH or the local shell — one exec boundary, `Host`), forward its
 //! Unix socket, and speak the docs/DAEMON.md envelope. Deliberately gpui-free.
 //!
-//! What lives here today is *one machine at a time*: `bridge` (that machine's
+//! Three layers, bottom up. *One machine at a time*: `bridge` (that machine's
 //! daemon connection, command flows and event fan-in) and `machines`
 //! (provider listing, reachability probes, and the daemon-free host ops the
-//! folder picker runs). Machine *identity* lives here too — [`MachineRef`] is
-//! the one place that decides what a stored machine string means. Fleet-level
-//! policy does not: the bridge pool, the machine table, probe verdicts and
-//! the connect policy (`ensure_connection`) still live in
-//! `crates/harvester/src/workbench.rs`, the gpui crate, so a second frontend
-//! would reimplement them. Moving them behind one owner here is decided and
-//! scheduled (docs/SPEC.md §Decisions on record, C3), not done.
+//! folder picker runs). *Machine identity*: [`MachineRef`], the one place
+//! that decides what a stored machine string means. *Across machines*:
+//! [`Fleet`], which owns the bridge pool, the machine table, the probe
+//! verdicts and the connect policy, and models a machine's reachability as
+//! one [`MachineState`] so a probe verdict and a daemon link cannot disagree.
 //!
-//! Two entry points matter: [`bridge::start`] (one machine's full worker —
-//! bootstrap, connect, command flows, event fan-in) and, underneath it,
-//! [`bootstrap_and_connect`] + [`DaemonClient`] for anyone driving the
-//! protocol directly (the `harvester-cli` dev tool does).
+//! So a second frontend gets the whole backbone: connect a machine, list and
+//! open sessions, stream a turn, browse folders, read every machine's state,
+//! and the two policies that are easy to get subtly wrong — when to start a
+//! bridge, and which of a probe and a link to believe. Everything it drives
+//! is synchronous and event-driven; nothing here needs a tokio reactor on the
+//! caller's side (see `fleet`'s module docs).
+//!
+//! What it does *not* get, and would still write itself: the workspace store
+//! (`~/.harvester/workspaces.json` lives in the gpui crate), the merged
+//! newest-first session list across machines, and every rendering decision —
+//! which colour a [`MachineState`] is, what a session row says, how the ghost
+//! chat behaves.
+//!
+//! Three entry points matter: [`Fleet::start`] (the whole client backbone),
+//! [`bridge::start`] (one machine's worker, if a frontend wants only that)
+//! and, underneath both, [`bootstrap_and_connect`] + [`DaemonClient`] for
+//! anyone driving the protocol directly (the `harvester-cli` dev tool does).
 
 mod bootstrap;
 pub mod bridge;
