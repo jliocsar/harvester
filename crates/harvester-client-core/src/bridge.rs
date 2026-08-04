@@ -25,9 +25,15 @@ use harvester_proto::{HarvesterCmd, SessionInfo, SessionsData};
 use crate::bootstrap::bootstrap_and_connect;
 use crate::client::{DaemonClient, SessionEvent};
 use crate::host::Host;
-use crate::workspace::{list_directory, validate_git_workspace, RemoteDirEntry};
+use crate::token::RequestToken;
 
 /// UI → bridge.
+///
+/// A command that is answered by one event carries the [`RequestToken`] that
+/// answer echoes (docs/SPEC.md §Decisions, C2). `Open`, `StartSession` and
+/// `Prompt` carry none: they have no reply — what they produce is the
+/// session's own event stream, which is keyed by sid and outlives the
+/// request that started it.
 #[derive(Debug)]
 pub enum Command {
     /// Open a session: `create_session` (resume-or-create, idempotent for an
@@ -60,17 +66,20 @@ pub enum Command {
     /// For a running session use `ListSessionModels` instead.
     ListModels {
         cwd: String,
+        token: RequestToken,
     },
     /// Fetch the models a running session offers (passthrough
     /// `get_available_models` — no throwaway pi). Answered by
     /// `Event::SessionModelsListed`.
     ListSessionModels {
         sid: String,
+        token: RequestToken,
     },
     /// Fetch a running session's state (passthrough `get_state`) — the chat
     /// reads its current model from it. Answered by `Event::SessionState`.
     GetSessionState {
         sid: String,
+        token: RequestToken,
     },
     /// Switch a running session's model (passthrough `set_model`). Answered
     /// by `Event::ModelSet`.
@@ -78,26 +87,20 @@ pub enum Command {
         sid: String,
         provider: String,
         model_id: String,
-    },
-    /// List a directory for the folder picker (a `Host` exec, multiplexed —
-    /// never the daemon). Answered by `Event::DirListed`.
-    ListDir {
-        path: String,
-    },
-    /// `git -C <path> rev-parse --git-dir` on the machine. Answered by
-    /// `Event::WorkspaceValidated`.
-    ValidateWorkspace {
-        path: String,
+        token: RequestToken,
     },
 }
 
 /// bridge → UI. Pi payloads stay verbatim `Value` — the client speaks Pi.
+///
+/// An event answering a command echoes that command's [`RequestToken`]; the
+/// `sid` a session-scoped answer also carries is routing (which chat renders
+/// it), not correlation. Everything else here is unsolicited — connection
+/// lifecycle and the session stream — and carries no token.
 #[derive(Debug)]
 pub enum Event {
     Connected {
         daemon_version: String,
-        /// The machine's `$HOME` — the folder picker's start directory.
-        remote_home: String,
     },
     ConnectFailed {
         detail: String,
@@ -124,41 +127,32 @@ pub enum Event {
         detail: String,
     },
     /// A `ListModels` answered; pi's `data` verbatim (the client speaks Pi —
-    /// the workbench extracts what its picker renders). `cwd` is echoed back
-    /// as the staleness guard, like `DirListed`'s `path`. Errors render
-    /// inside the ghost chat, not the statusbar.
+    /// the workbench extracts what its picker renders). Errors render inside
+    /// the ghost chat, not the statusbar.
     ModelsListed {
-        cwd: String,
+        token: RequestToken,
         result: Result<Value, String>,
     },
     /// A `ListSessionModels` answered; pi's `data` verbatim. Errors render
     /// in the owning chat, not the statusbar.
     SessionModelsListed {
         sid: String,
+        token: RequestToken,
         result: Result<Value, String>,
     },
     /// A `GetSessionState` answered; pi's `data` verbatim (`model` is the
     /// field the chat reads).
     SessionState {
         sid: String,
+        token: RequestToken,
         result: Result<Value, String>,
     },
     /// A `SetModel` answered; `Ok` carries pi's `data` — the full Model
     /// object now in effect.
     ModelSet {
         sid: String,
+        token: RequestToken,
         result: Result<Value, String>,
-    },
-    /// A `ListDir` answered; errors render inside the picker, not the
-    /// statusbar.
-    DirListed {
-        path: String,
-        result: Result<Vec<RemoteDirEntry>, String>,
-    },
-    /// A `ValidateWorkspace` answered; `None` means the path is a git repo.
-    WorkspaceValidated {
-        path: String,
-        error: Option<String>,
     },
     Disconnected,
 }
@@ -189,7 +183,6 @@ impl EventSender {
 struct BridgeContext {
     client: DaemonClient,
     events: EventSender,
-    host: Host,
     /// The one session this bridge is attached to (single chat pane). The
     /// async mutex also *serializes* attachment changes: a second Open waits
     /// out the first flow instead of interleaving with it.
@@ -266,14 +259,12 @@ async fn bridge_main(
     };
     events.send(Event::Connected {
         daemon_version: connected.daemon_version,
-        remote_home: connected.remote_home,
     });
 
     let (client, mut session_events) = DaemonClient::start(connected.connection);
     let context = BridgeContext {
         client,
         events,
-        host,
         attached: Arc::new(AsyncMutex::new(None)),
         attach_buffers: Arc::new(Mutex::new(AttachEventBuffers::default())),
         answered_dialogs: Arc::new(Mutex::new(HashSet::new())),
@@ -338,16 +329,19 @@ fn dispatch(command: Command, context: &BridgeContext) {
             first_prompt,
         )),
         Command::Prompt { sid, text } => spawn_flow(prompt_flow(context, sid, text)),
-        Command::ListModels { cwd } => spawn_flow(list_models_flow(context, cwd)),
-        Command::ListSessionModels { sid } => spawn_flow(session_models_flow(context, sid)),
-        Command::GetSessionState { sid } => spawn_flow(session_state_flow(context, sid)),
+        Command::ListModels { cwd, token } => spawn_flow(list_models_flow(context, cwd, token)),
+        Command::ListSessionModels { sid, token } => {
+            spawn_flow(session_models_flow(context, sid, token))
+        }
+        Command::GetSessionState { sid, token } => {
+            spawn_flow(session_state_flow(context, sid, token))
+        }
         Command::SetModel {
             sid,
             provider,
             model_id,
-        } => spawn_flow(set_model_flow(context, sid, provider, model_id)),
-        Command::ListDir { path } => spawn_flow(list_dir_flow(context, path)),
-        Command::ValidateWorkspace { path } => spawn_flow(validate_workspace_flow(context, path)),
+            token,
+        } => spawn_flow(set_model_flow(context, sid, provider, model_id, token)),
     }
 }
 
@@ -852,59 +846,46 @@ async fn prompt_flow(context: BridgeContext, sid: String, text: String) {
     }
 }
 
-async fn list_models_flow(context: BridgeContext, cwd: String) {
+async fn list_models_flow(context: BridgeContext, cwd: String, token: RequestToken) {
     let result = match context
         .client
-        .harvester(HarvesterCmd::ListModels { cwd: cwd.clone() })
+        .harvester(HarvesterCmd::ListModels { cwd })
         .await
     {
         Ok(response) => response.into_result(),
         Err(error) => Err(error.to_string()),
     };
 
-    context.events.send(Event::ModelsListed { cwd, result });
+    context.events.send(Event::ModelsListed { token, result });
 }
 
-async fn session_models_flow(context: BridgeContext, sid: String) {
+async fn session_models_flow(context: BridgeContext, sid: String, token: RequestToken) {
     let result = pi_flow_result(&context, &sid, json!({"type": "get_available_models"})).await;
 
     context
         .events
-        .send(Event::SessionModelsListed { sid, result });
+        .send(Event::SessionModelsListed { sid, token, result });
 }
 
-async fn session_state_flow(context: BridgeContext, sid: String) {
+async fn session_state_flow(context: BridgeContext, sid: String, token: RequestToken) {
     let result = pi_flow_result(&context, &sid, json!({"type": "get_state"})).await;
-
-    context.events.send(Event::SessionState { sid, result });
-}
-
-async fn set_model_flow(context: BridgeContext, sid: String, provider: String, model_id: String) {
-    let cmd = json!({"type": "set_model", "provider": provider, "modelId": model_id});
-    let result = pi_flow_result(&context, &sid, cmd).await;
-
-    context.events.send(Event::ModelSet { sid, result });
-}
-
-/// Path execs take tens of ms even multiplexed; they ride their own flow like
-/// everything else, so pi events keep pumping meanwhile.
-async fn list_dir_flow(context: BridgeContext, path: String) {
-    let result = list_directory(&context.host, &path)
-        .await
-        .map_err(|error| error.to_string());
-
-    context.events.send(Event::DirListed { path, result });
-}
-
-async fn validate_workspace_flow(context: BridgeContext, path: String) {
-    let error = validate_git_workspace(&context.host, &path)
-        .await
-        .err()
-        .map(|error| error.to_string());
 
     context
         .events
-        .send(Event::WorkspaceValidated { path, error });
+        .send(Event::SessionState { sid, token, result });
+}
+
+async fn set_model_flow(
+    context: BridgeContext,
+    sid: String,
+    provider: String,
+    model_id: String,
+    token: RequestToken,
+) {
+    let cmd = json!({"type": "set_model", "provider": provider, "modelId": model_id});
+    let result = pi_flow_result(&context, &sid, cmd).await;
+
+    context.events.send(Event::ModelSet { sid, token, result });
 }
 
 /// A pi command → the `Result` the picker/statusbar events carry: `data`

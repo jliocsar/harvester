@@ -4,10 +4,11 @@
 //!
 //! What lives here today is *one machine at a time*: `bridge` (that machine's
 //! daemon connection, command flows and event fan-in) and `machines`
-//! (provider listing + reachability probes). Fleet-level policy does not —
-//! the bridge pool, machine table, probe verdicts, connect policy
-//! (`ensure_connection`) and machine-identity resolution (`resolve_target`, a
-//! second implementation of [`MachineKey::parse`]) all still live in
+//! (provider listing, reachability probes, and the daemon-free host ops the
+//! folder picker runs). Machine *identity* lives here too — [`MachineRef`] is
+//! the one place that decides what a stored machine string means. Fleet-level
+//! policy does not: the bridge pool, the machine table, probe verdicts and
+//! the connect policy (`ensure_connection`) still live in
 //! `crates/harvester/src/workbench.rs`, the gpui crate, so a second frontend
 //! would reimplement them. Moving them behind one owner here is decided and
 //! scheduled (docs/SPEC.md §Decisions on record, C3), not done.
@@ -22,21 +23,25 @@ pub mod bridge;
 mod client;
 mod connection;
 mod host;
+mod machine;
 pub mod machines;
 mod provider;
 mod ssh;
+mod token;
 mod workspace;
 
 pub use bootstrap::{bootstrap_and_connect, BootstrapOutcome, Connected};
 pub use client::{DaemonClient, SessionEvent};
 pub use connection::{DaemonConnection, DaemonReader, DaemonWriter};
 pub use host::Host;
+pub use machine::{MachineRef, LOCAL_MACHINE};
 pub use provider::{
     discover_providers, install_bundled_providers, MachineKey, MachineStatus, Provider,
     ProviderMachine, SshInfo, SUPPORTED_PROVIDER_PROTOCOL,
 };
 pub use ssh::{probe_reachable, SshTarget};
-pub use workspace::{list_directory, validate_git_workspace, RemoteDirEntry};
+pub use token::{RequestToken, RequestTokens};
+pub use workspace::{list_directory, resolve_home, validate_git_workspace, RemoteDirEntry};
 
 pub type Result<T> = std::result::Result<T, Error>;
 

@@ -4,18 +4,22 @@
 //! lifetime: commands out synchronously to the right machine's sender,
 //! events in on one gpui task awaiting the shared machine-tagged channel.
 
+mod picker;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui::{
     div, prelude::*, px, rgb, Context, Entity, Focusable, SharedString, Subscription, Window,
 };
-use harvester_client_core::{Host, MachineKey, RemoteDirEntry, SshTarget};
+use harvester_client_core::{
+    Host, MachineRef, RequestToken, RequestTokens, SshTarget, LOCAL_MACHINE,
+};
 use harvester_proto::{SessionInfo, SessionStatus};
 use serde_json::Value;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
-use crate::chat::Chat;
+use crate::chat::{BridgeLink, Chat};
 use crate::input::{PromptSubmitted, TextInput};
 use crate::models::{self, ModelChoice, ModelsState};
 use crate::theme;
@@ -23,11 +27,9 @@ use crate::ui;
 use crate::workspaces::{self, Workspace};
 use harvester_client_core::bridge::{self, Command, Event as BridgeEvent};
 use harvester_client_core::machines::{self, MachineRow};
+use picker::FolderPicker;
 
 const SIDEBAR_WIDTH: f32 = 240.;
-/// The hardcoded local machine's key (SPEC §Machine): not a provider
-/// machine, never deletable — harvesterd runs as a detached child, no SSH.
-const LOCAL_MACHINE: &str = "local";
 /// Enough of a uuidv7 to tell sessions apart at a glance.
 const SID_PREVIEW_CHARS: usize = 8;
 /// Fixed height for modal lists (folder picker directories, model picker),
@@ -49,8 +51,6 @@ enum Link {
 struct MachineConnection {
     commands: UnboundedSender<Command>,
     link: Link,
-    /// Remote `$HOME`, from `Connected` — the folder picker's start directory.
-    remote_home: Option<String>,
 }
 
 /// One sidebar session row, tagged with the machine whose daemon reported it
@@ -58,32 +58,6 @@ struct MachineConnection {
 struct MachineSession {
     machine: String,
     info: SessionInfo,
-}
-
-/// The add-workspace modal's state (SPEC §Flows "Add workspace").
-struct FolderPicker {
-    /// The machine being browsed — where listings and validation run.
-    machine: String,
-    /// Directory whose entries are displayed — what "Add" would store.
-    path: String,
-    entries: Vec<RemoteDirEntry>,
-    /// A listing is in flight for this path; also the staleness guard —
-    /// only the response matching it is applied.
-    pending_path: Option<String>,
-    /// The machine's bridge is still bootstrapping; browsing starts when its
-    /// `Connected` delivers the remote `$HOME`.
-    waiting_for_home: bool,
-    validating: bool,
-    /// Listing or validation failure, rendered inside the modal.
-    error: Option<String>,
-}
-
-impl FolderPicker {
-    /// While busy, rows and the Add button ignore clicks — one in-flight
-    /// request at a time keeps responses unambiguous.
-    fn busy(&self) -> bool {
-        self.pending_path.is_some() || self.waiting_for_home || self.validating
-    }
 }
 
 /// Which surface the open model picker belongs to: the ghost chat (choice
@@ -101,6 +75,9 @@ struct GhostChat {
     /// Where the session will run; the path is the pi cwd.
     workspace: Workspace,
     models: ModelsState,
+    /// The `ListModels` this ghost is waiting on; an answer to any other
+    /// token was asked for by a ghost (or a machine) it has moved on from.
+    models_request: Option<RequestToken>,
     /// Index into the `Loaded` list; `None` = let pi pick its default.
     selected_model: Option<usize>,
     picker_open: bool,
@@ -133,6 +110,9 @@ pub struct Workbench {
     daemon_binary: Arc<Vec<u8>>,
     /// The shared machine-tagged event channel; cloned into each bridge.
     event_sender: UnboundedSender<(String, BridgeEvent)>,
+    /// Mints the tokens that correlate every worker answer with the request
+    /// that asked for it; cloned into each chat.
+    tokens: RequestTokens,
     /// Live bridges, one per machine (lazy — see `ensure_connection`).
     connections: HashMap<String, MachineConnection>,
     /// Provider machines, from the machines worker's last listing cycle.
@@ -191,6 +171,7 @@ impl Workbench {
             argv_machine: argv_machine.clone(),
             daemon_binary: Arc::new(daemon_binary),
             event_sender,
+            tokens: RequestTokens::default(),
             connections: HashMap::new(),
             machines: Vec::new(),
             probes: HashMap::new(),
@@ -240,7 +221,7 @@ impl Workbench {
         for machine in machines {
             let untouched = !self.connections.contains_key(&machine);
 
-            if untouched && self.resolve_target(&machine).is_some() {
+            if untouched && self.resolve_host(&machine).is_some() {
                 self.ensure_connection(&machine);
             }
         }
@@ -289,6 +270,13 @@ impl Workbench {
             machines::Event::Probed { key, reachable } => {
                 self.probes.insert(key, reachable);
             }
+            machines::Event::HomeResolved { token, result } => {
+                self.handle_home_resolved(token, result)
+            }
+            machines::Event::DirListed { token, result } => self.handle_dir_listed(token, result),
+            machines::Event::WorkspaceValidated { token, error } => {
+                self.handle_workspace_validated(token, error)
+            }
         }
 
         cx.notify();
@@ -309,14 +297,13 @@ impl Workbench {
         let mut machines: Vec<String> = self
             .argv_machine
             .iter()
-            .cloned()
-            .chain(self.workspaces.iter().filter_map(|workspace| {
-                match MachineKey::parse(&workspace.machine) {
-                    Some(_) => None,
-                    None => Some(workspace.machine.clone()),
-                }
-            }))
-            .filter(|machine| machine != LOCAL_MACHINE)
+            .chain(self.workspaces.iter().map(|workspace| &workspace.machine))
+            .filter_map(|machine| match MachineRef::parse(machine) {
+                // `local` has its own row and no SSH to probe; provider
+                // machines are probed off the worker's own listing.
+                MachineRef::Local | MachineRef::Provider(_) => None,
+                MachineRef::AdHoc(dest) => Some(dest),
+            })
             .collect();
 
         machines.sort();
@@ -329,6 +316,25 @@ impl Workbench {
         if let Some(commands) = &self.machine_commands {
             let _ = commands.send(machines::Command::SetAdHocMachines(self.ad_hoc_machines()));
         }
+    }
+
+    /// Routes a host op to the machines worker. `false` (with the reason in
+    /// `last_error`) when the worker never started — without it there is no
+    /// runtime to exec on, and the caller has nothing to wait for.
+    fn send_host_command(&mut self, command: machines::Command) -> bool {
+        let Some(commands) = &self.machine_commands else {
+            self.last_error = Some("machines worker is not running".to_string());
+
+            return false;
+        };
+
+        if commands.send(command).is_err() {
+            self.last_error = Some("machines worker stopped".to_string());
+
+            return false;
+        }
+
+        true
     }
 
     /// Lazily connects: reuses a live bridge, respawns a failed or lost one
@@ -345,7 +351,7 @@ impl Workbench {
             return true;
         }
 
-        let Some(target) = self.resolve_target(machine) else {
+        let Some(host) = self.resolve_host(machine) else {
             self.last_error = Some(format!("machine {machine} is not connectable"));
 
             return false;
@@ -353,7 +359,7 @@ impl Workbench {
 
         match bridge::start(
             machine.to_string(),
-            target,
+            host,
             self.daemon_binary.clone(),
             self.event_sender.clone(),
         ) {
@@ -363,7 +369,6 @@ impl Workbench {
                     MachineConnection {
                         commands: handle.commands,
                         link: Link::Connecting,
-                        remote_home: None,
                     },
                 );
 
@@ -383,10 +388,9 @@ impl Workbench {
     /// alone — sids are uuids, unique across machines.
     fn handle_bridge_event(&mut self, machine: &str, event: BridgeEvent, cx: &mut Context<Self>) {
         match event {
-            BridgeEvent::Connected {
-                daemon_version,
-                remote_home,
-            } => self.handle_connected(machine, daemon_version, remote_home),
+            BridgeEvent::Connected { daemon_version } => {
+                self.handle_connected(machine, daemon_version)
+            }
             BridgeEvent::ConnectFailed { detail } => self.handle_connect_failed(machine, detail),
             BridgeEvent::Sessions(sessions) => self.handle_sessions_listed(machine, sessions),
             BridgeEvent::Attached { sid, entries } => {
@@ -397,19 +401,15 @@ impl Workbench {
                 self.handle_session_exit(sid, exit_code, cx)
             }
             BridgeEvent::RequestFailed { detail } => self.handle_request_failed(machine, detail),
-            BridgeEvent::ModelsListed { cwd, result } => {
-                self.handle_models_listed(machine, cwd, result)
+            BridgeEvent::ModelsListed { token, result } => self.handle_models_listed(token, result),
+            BridgeEvent::SessionModelsListed { sid, token, result } => {
+                self.handle_session_models_listed(sid, token, result, cx)
             }
-            BridgeEvent::SessionModelsListed { sid, result } => {
-                self.handle_session_models_listed(sid, result, cx)
+            BridgeEvent::SessionState { sid, token, result } => {
+                self.handle_session_state(sid, token, result, cx)
             }
-            BridgeEvent::SessionState { sid, result } => self.handle_session_state(sid, result, cx),
-            BridgeEvent::ModelSet { sid, result } => self.handle_model_set(sid, result, cx),
-            BridgeEvent::DirListed { path, result } => {
-                self.handle_dir_listed(machine, path, result)
-            }
-            BridgeEvent::WorkspaceValidated { path, error } => {
-                self.handle_workspace_validated(machine, path, error)
+            BridgeEvent::ModelSet { sid, token, result } => {
+                self.handle_model_set(sid, token, result, cx)
             }
             BridgeEvent::Disconnected => self.handle_disconnected(machine),
         }
@@ -417,30 +417,10 @@ impl Workbench {
         cx.notify();
     }
 
-    fn handle_connected(&mut self, machine: &str, daemon_version: String, remote_home: String) {
+    fn handle_connected(&mut self, machine: &str, daemon_version: String) {
         if let Some(connection) = self.connections.get_mut(machine) {
             connection.link = Link::Connected { daemon_version };
-            connection.remote_home = Some(remote_home.clone());
         }
-
-        self.start_waiting_picker(machine, remote_home);
-    }
-
-    /// A folder picker opened on a machine that was still bootstrapping
-    /// starts browsing the moment the connection delivers the remote home.
-    fn start_waiting_picker(&mut self, machine: &str, remote_home: String) {
-        let Some(picker) = &mut self.picker else {
-            return;
-        };
-
-        if !picker.waiting_for_home || picker.machine != machine {
-            return;
-        }
-
-        picker.waiting_for_home = false;
-        picker.path = remote_home.clone();
-        picker.pending_path = Some(remote_home.clone());
-        self.send_command(machine, Command::ListDir { path: remote_home });
     }
 
     fn handle_connect_failed(&mut self, machine: &str, detail: String) {
@@ -505,7 +485,10 @@ impl Workbench {
         let Some(connection) = self.connections.get(machine) else {
             return;
         };
-        let commands = connection.commands.clone();
+        let bridge = BridgeLink {
+            commands: connection.commands.clone(),
+            tokens: self.tokens.clone(),
+        };
         let machine_label: SharedString = self.machine_label(machine).into();
         // The session is in the list by now (a ghost start just inserted its
         // row above); its cwd names the repository in the prompt box.
@@ -524,7 +507,7 @@ impl Workbench {
                 machine_label,
                 &entries,
                 first_prompt,
-                commands,
+                bridge,
                 cx,
             )
         }));
@@ -559,35 +542,38 @@ impl Workbench {
     fn handle_session_models_listed(
         &mut self,
         sid: String,
+        token: RequestToken,
         result: Result<Value, String>,
         cx: &mut Context<Self>,
     ) {
         if let Some(chat) = self.chat_for(&sid, cx) {
-            chat.update(cx, |chat, cx| chat.handle_session_models(result, cx));
+            chat.update(cx, |chat, cx| chat.handle_session_models(token, result, cx));
         }
     }
 
     fn handle_session_state(
         &mut self,
         sid: String,
+        token: RequestToken,
         result: Result<Value, String>,
         cx: &mut Context<Self>,
     ) {
         if let Some(chat) = self.chat_for(&sid, cx) {
-            chat.update(cx, |chat, cx| chat.handle_session_state(result, cx));
+            chat.update(cx, |chat, cx| chat.handle_session_state(token, result, cx));
         }
     }
 
     fn handle_model_set(
         &mut self,
         sid: String,
+        token: RequestToken,
         result: Result<Value, String>,
         cx: &mut Context<Self>,
     ) {
         match result {
             Ok(data) => {
                 if let Some(chat) = self.chat_for(&sid, cx) {
-                    chat.update(cx, |chat, cx| chat.handle_model_set(&data, cx));
+                    chat.update(cx, |chat, cx| chat.handle_model_set(token, &data, cx));
                 }
             }
             // The session keeps its previous model; statusbar material.
@@ -675,83 +661,21 @@ impl Workbench {
         cx.notify();
     }
 
-    /// A `list_dir` answered. A response that doesn't match the pending
-    /// machine + path is stale (the picker was closed and reopened
-    /// meanwhile) — dropped.
-    fn handle_dir_listed(
-        &mut self,
-        machine: &str,
-        path: String,
-        result: Result<Vec<RemoteDirEntry>, String>,
-    ) {
-        let Some(picker) = &mut self.picker else {
-            return;
-        };
-
-        if picker.machine != machine || picker.pending_path.as_deref() != Some(path.as_str()) {
-            return;
-        }
-
-        picker.pending_path = None;
-
-        match result {
-            Ok(entries) => {
-                picker.path = path;
-                picker.entries = entries;
-                picker.error = None;
-            }
-            // Listing failed (permissions, vanished dir): keep showing the
-            // previous directory, surface the reason.
-            Err(detail) => picker.error = Some(detail),
-        }
-    }
-
-    fn handle_workspace_validated(&mut self, machine: &str, path: String, error: Option<String>) {
-        let Some(picker) = &mut self.picker else {
-            return;
-        };
-
-        if picker.machine != machine || !picker.validating || picker.path != path {
-            return;
-        }
-
-        picker.validating = false;
-
-        match error {
-            // Not a git repo: clear error in the modal, user re-picks.
-            Some(detail) => picker.error = Some(detail),
-            None => {
-                let machine = picker.machine.clone();
-
-                self.picker = None;
-                self.add_workspace(machine, path);
-            }
-        }
-    }
-
-    /// Machine string → host. `local` is the hardcoded no-SSH machine;
-    /// `<provider>/<id>` keys resolve through the worker's machine list;
-    /// anything else is an ad-hoc ssh destination used verbatim (argv
-    /// machines, legacy workspaces.json entries). `None` when the key is
-    /// unknown or the machine uses the unsupported argv ssh form.
-    fn resolve_target(&self, machine: &str) -> Option<Host> {
-        if machine == LOCAL_MACHINE {
-            return Some(Host::Local);
-        }
-
-        if MachineKey::parse(machine).is_some() {
-            return self
+    /// Machine string → the host its execs run on, through the one place that
+    /// decides what a machine string means. A provider machine resolves
+    /// through the worker's last listing, so `None` means the key is unknown
+    /// (not listed yet) or the machine uses the unsupported argv ssh form.
+    fn resolve_host(&self, machine: &str) -> Option<Host> {
+        match MachineRef::parse(machine) {
+            MachineRef::Local => Some(Host::Local),
+            MachineRef::Provider(_) => self
                 .machines
                 .iter()
                 .find(|row| row.key == machine)
                 .and_then(|row| row.target.clone())
-                .map(Host::Ssh);
+                .map(Host::Ssh),
+            MachineRef::AdHoc(dest) => Some(Host::Ssh(SshTarget { dest, port: None })),
         }
-
-        Some(Host::Ssh(SshTarget {
-            dest: machine.to_string(),
-            port: None,
-        }))
     }
 
     fn add_workspace(&mut self, machine: String, path: String) {
@@ -764,6 +688,12 @@ impl Workbench {
         self.workspaces.push(workspace);
         // A new ad-hoc machine may have entered the probe set.
         self.publish_ad_hoc_machines();
+        // The picker no longer connects the machine it browses (its execs
+        // need no daemon), so this is where a machine that just earned a
+        // workspace gets its bridge — same rule as at launch: a machine with
+        // stored workspaces connects in the background so its sessions show
+        // up (SPEC §Flows "Reopen client").
+        self.auto_connect_workspace_machines();
 
         if let Err(error) = workspaces::save(&self.workspaces) {
             self.last_error = Some(format!("save workspaces: {error}"));
@@ -808,17 +738,19 @@ impl Workbench {
         Some(started.first_prompt)
     }
 
-    /// A `list_models` answered. A ghost for a different workspace than the
-    /// one that asked (closed and reopened meanwhile) ignores it.
-    fn handle_models_listed(&mut self, machine: &str, cwd: String, result: Result<Value, String>) {
+    /// A `list_models` answered. A ghost that has since been retargeted (or
+    /// closed and reopened) is waiting on a different token, so the answer to
+    /// the abandoned request is dropped.
+    fn handle_models_listed(&mut self, token: RequestToken, result: Result<Value, String>) {
         let Some(ghost) = &mut self.ghost else {
             return;
         };
 
-        if ghost.workspace.machine != machine || ghost.workspace.path != cwd {
+        if ghost.models_request != Some(token) {
             return;
         }
 
+        ghost.models_request = None;
         ghost.models = match result {
             Ok(data) => ModelsState::Loaded(models::extract_model_choices(&data)),
             Err(detail) => ModelsState::Failed(detail),
@@ -857,16 +789,19 @@ impl Workbench {
 
         let input = cx.new(|cx| TextInput::new("Message pi — Enter to send", cx));
         let input_subscription = cx.subscribe(&input, Self::handle_ghost_prompt);
+        let models_token = self.tokens.mint();
 
         self.send_command(
             &workspace.machine,
             Command::ListModels {
                 cwd: workspace.path.clone(),
+                token: models_token,
             },
         );
         self.ghost = Some(GhostChat {
             workspace,
             models: ModelsState::Loading,
+            models_request: Some(models_token),
             selected_model: None,
             picker_open: false,
             machine_picker_open: false,
@@ -997,6 +932,7 @@ impl Workbench {
             return;
         }
 
+        let models_token = self.tokens.mint();
         let Some(ghost) = &mut self.ghost else {
             return;
         };
@@ -1004,8 +940,15 @@ impl Workbench {
 
         ghost.workspace.machine = machine.clone();
         ghost.models = ModelsState::Loading;
+        ghost.models_request = Some(models_token);
         ghost.selected_model = None;
-        self.send_command(&machine, Command::ListModels { cwd });
+        self.send_command(
+            &machine,
+            Command::ListModels {
+                cwd,
+                token: models_token,
+            },
+        );
         cx.notify();
     }
 
@@ -1090,110 +1033,6 @@ impl Workbench {
 
     fn close_machine_picker(&mut self, cx: &mut Context<Self>) {
         self.machine_picker_open = false;
-        cx.notify();
-    }
-
-    /// Opens the folder picker on `machine`, connecting it lazily: with a
-    /// known remote home browsing starts immediately, otherwise the picker
-    /// waits for the bridge's `Connected`.
-    fn open_picker(&mut self, machine: String) {
-        if !self.ensure_connection(&machine) {
-            return;
-        }
-
-        let known_home = self
-            .connections
-            .get(&machine)
-            .and_then(|connection| connection.remote_home.clone());
-
-        match known_home {
-            Some(home) => {
-                self.picker = Some(FolderPicker {
-                    machine: machine.clone(),
-                    path: home.clone(),
-                    entries: Vec::new(),
-                    pending_path: Some(home.clone()),
-                    waiting_for_home: false,
-                    validating: false,
-                    error: None,
-                });
-                self.send_command(&machine, Command::ListDir { path: home });
-            }
-            None => {
-                self.picker = Some(FolderPicker {
-                    machine,
-                    path: String::new(),
-                    entries: Vec::new(),
-                    pending_path: None,
-                    waiting_for_home: true,
-                    validating: false,
-                    error: None,
-                });
-            }
-        }
-    }
-
-    fn close_picker(&mut self, cx: &mut Context<Self>) {
-        self.picker = None;
-        cx.notify();
-    }
-
-    fn picker_open_dir(&mut self, entry_index: usize, cx: &mut Context<Self>) {
-        let Some(picker) = &mut self.picker else {
-            return;
-        };
-
-        if picker.busy() {
-            return;
-        }
-
-        let Some(entry) = picker.entries.get(entry_index) else {
-            return;
-        };
-        let machine = picker.machine.clone();
-        let target_path = join_remote_path(&picker.path, &entry.name);
-
-        picker.pending_path = Some(target_path.clone());
-        picker.error = None;
-        self.send_command(&machine, Command::ListDir { path: target_path });
-        cx.notify();
-    }
-
-    fn picker_go_up(&mut self, cx: &mut Context<Self>) {
-        let Some(picker) = &mut self.picker else {
-            return;
-        };
-
-        if picker.busy() {
-            return;
-        }
-
-        let machine = picker.machine.clone();
-        let target_path = parent_remote_path(&picker.path);
-
-        picker.pending_path = Some(target_path.clone());
-        picker.error = None;
-        self.send_command(&machine, Command::ListDir { path: target_path });
-        cx.notify();
-    }
-
-    /// "Add" — validate the displayed directory; the store write happens on
-    /// `WorkspaceValidated` success.
-    fn picker_confirm(&mut self, cx: &mut Context<Self>) {
-        let Some(picker) = &mut self.picker else {
-            return;
-        };
-
-        if picker.busy() {
-            return;
-        }
-
-        picker.validating = true;
-        picker.error = None;
-        let machine = picker.machine.clone();
-        let path = picker.path.clone();
-
-        self.send_command(&machine, Command::ValidateWorkspace { path });
         cx.notify();
     }
 
@@ -1404,14 +1243,14 @@ impl Workbench {
     /// label when listed, the key's id half as a fallback, the string itself
     /// for ad-hoc destinations.
     fn machine_label(&self, machine: &str) -> String {
-        match MachineKey::parse(machine) {
-            Some(key) => self
+        match MachineRef::parse(machine) {
+            MachineRef::Provider(key) => self
                 .machines
                 .iter()
                 .find(|row| row.key == machine)
                 .map(|row| row.label.clone())
                 .unwrap_or(key.id),
-            None => machine.to_string(),
+            MachineRef::Local | MachineRef::AdHoc(_) => machine.to_string(),
         }
     }
 
@@ -1782,124 +1621,6 @@ impl Workbench {
             )
     }
 
-    fn render_picker(&self, picker: &FolderPicker, cx: &mut Context<Self>) -> impl IntoElement {
-        // Directories before files, both in ls's alphabetical order.
-        let directory_rows: Vec<_> = picker
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| entry.is_dir)
-            .map(|(entry_index, entry)| {
-                ui::picker_dir_row(("picker-dir", entry_index), entry.name.clone().into()).on_click(
-                    cx.listener(move |workbench, _, _, cx| {
-                        workbench.picker_open_dir(entry_index, cx)
-                    }),
-                )
-            })
-            .collect();
-        let file_rows: Vec<_> = picker
-            .entries
-            .iter()
-            .filter(|entry| !entry.is_dir)
-            .map(|entry| ui::picker_file_row(entry.name.clone().into()))
-            .collect();
-        let can_submit = !picker.busy();
-
-        ui::modal_scrim("picker-scrim")
-            .on_click(cx.listener(|workbench, _, _, cx| workbench.close_picker(cx)))
-            .child(
-                ui::modal_frame("Add workspace")
-                    // Keeps clicks inside the dialog from reaching the
-                    // scrim's dismiss handler.
-                    .occlude()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(theme::TEXT_DIM))
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .child(format!(
-                                "on {} — {}",
-                                self.machine_label(&picker.machine),
-                                picker.path
-                            )),
-                    )
-                    .child(
-                        div()
-                            .id("picker-entries")
-                            .h(px(MODAL_LIST_HEIGHT))
-                            .overflow_y_scroll()
-                            .flex()
-                            .flex_col()
-                            .when(!picker.waiting_for_home && picker.path != "/", |list| {
-                                list.child(ui::picker_dir_row("picker-up", "..".into()).on_click(
-                                    cx.listener(|workbench, _, _, cx| workbench.picker_go_up(cx)),
-                                ))
-                            })
-                            .children(directory_rows)
-                            .children(file_rows)
-                            .when(picker.waiting_for_home, |list| {
-                                list.child(
-                                    div()
-                                        .px_2()
-                                        .py_1()
-                                        .text_xs()
-                                        .text_color(rgb(theme::TEXT_FAINT))
-                                        .child("connecting…"),
-                                )
-                            })
-                            .when(picker.pending_path.is_some(), |list| {
-                                list.child(
-                                    div()
-                                        .px_2()
-                                        .py_1()
-                                        .text_xs()
-                                        .text_color(rgb(theme::TEXT_FAINT))
-                                        .child("loading…"),
-                                )
-                            }),
-                    )
-                    .children(picker.error.clone().map(|error| {
-                        div()
-                            .text_xs()
-                            .text_color(rgb(theme::STATUS_ERROR))
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .child(error)
-                    }))
-                    .child(
-                        div()
-                            .flex()
-                            .justify_end()
-                            .gap_2()
-                            .child(
-                                ui::button(
-                                    "picker-cancel",
-                                    "Cancel",
-                                    ui::ButtonKind::Neutral,
-                                    true,
-                                )
-                                .on_click(
-                                    cx.listener(|workbench, _, _, cx| workbench.close_picker(cx)),
-                                ),
-                            )
-                            .child(
-                                ui::button(
-                                    "picker-add",
-                                    "Add",
-                                    ui::ButtonKind::Primary,
-                                    can_submit,
-                                )
-                                .when(can_submit, |button| {
-                                    button.on_click(cx.listener(|workbench, _, _, cx| {
-                                        workbench.picker_confirm(cx)
-                                    }))
-                                }),
-                            ),
-                    ),
-            )
-    }
-
     fn render_statusbar(&self) -> impl IntoElement {
         let (link_text, link_color) = self.statusbar_link();
 
@@ -2023,20 +1744,6 @@ fn sid_preview(sid: &str) -> String {
 /// Last path component; whole path if there is no separator.
 fn folder_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
-}
-
-/// Appends one entry name; `path` is always absolute (the walk starts at the
-/// remote `$HOME`), so the only special case is the root's trailing slash.
-fn join_remote_path(path: &str, name: &str) -> String {
-    format!("{}/{name}", path.trim_end_matches('/'))
-}
-
-/// One step up; the root is its own parent.
-fn parent_remote_path(path: &str) -> String {
-    match path.trim_end_matches('/').rfind('/') {
-        Some(0) | None => "/".to_string(),
-        Some(separator_index) => path[..separator_index].to_string(),
-    }
 }
 
 /// Session name from the first prompt: its first non-blank line, capped.

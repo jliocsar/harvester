@@ -8,17 +8,44 @@
 use std::time::Duration;
 
 use crate::host::{shell_quote, Host};
-use crate::Result;
+use crate::{Error, Result};
 
 /// Ceiling on one picker exec — multiplexed listings take tens of ms; a
 /// wedged transport must not hang the picker forever.
 const WORKSPACE_EXEC_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Prints the machine's home directory and nothing else. `printf` rather than
+/// `echo` for the same reason the bootstrap probe uses it: `echo`'s handling
+/// of backslashes is shell-dependent.
+const HOME_SCRIPT: &str = r#"printf '%s\n' "$HOME""#;
 
 /// One entry from a directory listing.
 #[derive(Debug, Clone)]
 pub struct RemoteDirEntry {
     pub name: String,
     pub is_dir: bool,
+}
+
+/// The machine's `$HOME` — where the folder picker starts its walk
+/// (SPEC §Workspace). One exec, never a bootstrap: path work is client
+/// business, so the picker must not wait on a daemon it does not use.
+pub async fn resolve_home(host: &Host) -> Result<String> {
+    let output = host.exec(HOME_SCRIPT, None, WORKSPACE_EXEC_TIMEOUT).await?;
+
+    output.require_success("resolve home")?;
+
+    let home = output.stdout.lines().next().unwrap_or_default().to_string();
+
+    // An empty or relative `$HOME` would send the picker walking from
+    // nowhere; fail with the exec's own diagnosis instead.
+    if !home.starts_with('/') {
+        return Err(Error::Exec {
+            context: "resolve home",
+            detail: output.describe_failure(),
+        });
+    }
+
+    Ok(home)
 }
 
 /// Lists `path` on the machine via `ls -1Ap`: one name per line, hidden

@@ -17,6 +17,7 @@ use crate::models::{self, ModelChoice, ModelsState};
 use crate::theme;
 use crate::ui;
 use harvester_client_core::bridge::Command;
+use harvester_client_core::{RequestToken, RequestTokens};
 
 /// Who said a rendered message. Tool results render as `ToolBlock`s, not
 /// messages; system entries are skipped.
@@ -97,13 +98,52 @@ pub struct Chat {
     /// The model picker modal is open. Rendered by the workbench — the
     /// scrim has to cover the whole window, not just this pane.
     picker_open: bool,
+    /// The request each of this chat's three answers is expected from; an
+    /// answer carrying any other token belongs to a request this chat has
+    /// already superseded (two `set_model`s from a fast double-pick are the
+    /// live case) and is dropped.
+    outstanding: OutstandingRequests,
     /// Focus the prompt input on the next frame (set at creation; render has
     /// the `Window` that focusing needs).
     focus_input: bool,
     input: Entity<TextInput>,
     scroll: ScrollHandle,
     commands: UnboundedSender<Command>,
+    tokens: RequestTokens,
     _input_subscription: Subscription,
+}
+
+/// How a chat reaches its machine's bridge: the command channel plus the
+/// token source that labels the requests it sends. They always travel
+/// together — a command minted from any other source could not be matched to
+/// its answer.
+#[derive(Clone)]
+pub struct BridgeLink {
+    pub commands: UnboundedSender<Command>,
+    pub tokens: RequestTokens,
+}
+
+/// One slot per answer this chat can be waiting on (docs/SPEC.md §Decisions,
+/// C2). `None` = nothing outstanding, so any answer of that kind is stale.
+#[derive(Default)]
+struct OutstandingRequests {
+    session_models: Option<RequestToken>,
+    session_state: Option<RequestToken>,
+    set_model: Option<RequestToken>,
+}
+
+impl OutstandingRequests {
+    /// Consumes the slot: an answer settles the request it answers, so a
+    /// duplicate of it is stale too.
+    fn settles(slot: &mut Option<RequestToken>, token: RequestToken) -> bool {
+        if *slot != Some(token) {
+            return false;
+        }
+
+        *slot = None;
+
+        true
+    }
 }
 
 impl Chat {
@@ -116,9 +156,10 @@ impl Chat {
         machine_label: SharedString,
         entries: &[Value],
         first_prompt: Option<String>,
-        commands: UnboundedSender<Command>,
+        bridge: BridgeLink,
         cx: &mut Context<Self>,
     ) -> Self {
+        let BridgeLink { commands, tokens } = bridge;
         let input = cx.new(|cx| TextInput::new("Message pi — Enter to send", cx));
         let input_subscription = cx.subscribe(&input, Self::handle_prompt_submitted);
         let mut items = items_from_entries(entries);
@@ -133,8 +174,22 @@ impl Chat {
 
         // The model control needs the list and the current model; both queue
         // on pi's in-order stdin. A dead bridge is handled by `Disconnected`.
-        let _ = commands.send(Command::ListSessionModels { sid: sid.clone() });
-        let _ = commands.send(Command::GetSessionState { sid: sid.clone() });
+        let session_models = tokens.mint();
+        let session_state = tokens.mint();
+        let outstanding = OutstandingRequests {
+            session_models: Some(session_models),
+            session_state: Some(session_state),
+            set_model: None,
+        };
+
+        let _ = commands.send(Command::ListSessionModels {
+            sid: sid.clone(),
+            token: session_models,
+        });
+        let _ = commands.send(Command::GetSessionState {
+            sid: sid.clone(),
+            token: session_state,
+        });
 
         Self {
             sid,
@@ -147,10 +202,12 @@ impl Chat {
             models: ModelsState::Loading,
             current_model: None,
             picker_open: false,
+            outstanding,
             focus_input: true,
             input,
             scroll: ScrollHandle::new(),
             commands,
+            tokens,
             _input_subscription: input_subscription,
         }
     }
@@ -161,7 +218,16 @@ impl Chat {
 
     /// A `ListSessionModels` answered. On failure the control just stays
     /// disabled — the session keeps running on its current model.
-    pub fn handle_session_models(&mut self, result: Result<Value, String>, cx: &mut Context<Self>) {
+    pub fn handle_session_models(
+        &mut self,
+        token: RequestToken,
+        result: Result<Value, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if !OutstandingRequests::settles(&mut self.outstanding.session_models, token) {
+            return;
+        }
+
         self.models = match result {
             Ok(data) => ModelsState::Loaded(models::extract_model_choices(&data)),
             Err(detail) => {
@@ -175,7 +241,16 @@ impl Chat {
 
     /// A `GetSessionState` answered; the current model labels the control.
     /// Failure is cosmetic (generic label), so it is only logged.
-    pub fn handle_session_state(&mut self, result: Result<Value, String>, cx: &mut Context<Self>) {
+    pub fn handle_session_state(
+        &mut self,
+        token: RequestToken,
+        result: Result<Value, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if !OutstandingRequests::settles(&mut self.outstanding.session_state, token) {
+            return;
+        }
+
         match result {
             Ok(data) => {
                 self.current_model = data.get("model").and_then(models::model_choice_from_value);
@@ -187,7 +262,11 @@ impl Chat {
 
     /// A `set_model` succeeded; pi's `data` is the full Model object now in
     /// effect (failures surface in the statusbar, workbench-side).
-    pub fn handle_model_set(&mut self, data: &Value, cx: &mut Context<Self>) {
+    pub fn handle_model_set(&mut self, token: RequestToken, data: &Value, cx: &mut Context<Self>) {
+        if !OutstandingRequests::settles(&mut self.outstanding.set_model, token) {
+            return;
+        }
+
         if let Some(choice) = models::model_choice_from_value(data) {
             self.current_model = Some(choice);
             cx.notify();
@@ -217,6 +296,12 @@ impl Chat {
         let Some(choice) = model_choices.get(index) else {
             return;
         };
+        // A second pick supersedes the first: only the answer to this token
+        // may move the label, so a slow reply for the abandoned model cannot
+        // land on top of a newer one.
+        let token = self.tokens.mint();
+
+        self.outstanding.set_model = Some(token);
 
         if self
             .commands
@@ -224,6 +309,7 @@ impl Chat {
                 sid: self.sid.clone(),
                 provider: choice.provider.clone(),
                 model_id: choice.id.clone(),
+                token,
             })
             .is_err()
         {

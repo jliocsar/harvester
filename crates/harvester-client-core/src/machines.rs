@@ -1,17 +1,29 @@
 //! The machines worker: one background thread (same tokio-on-a-thread shape
-//! as `bridge.rs`) that owns everything provider- and probe-related — the
-//! one-shot provider executables and the SSH probes are tokio-process work,
-//! which gpui's executor cannot run.
+//! as `bridge.rs`) that owns everything that execs on a machine *without* a
+//! daemon — the one-shot provider executables, the SSH probes and the folder
+//! picker's path work are all tokio-process work, which gpui's executor
+//! cannot run.
 //!
 //! It enumerates `~/.harvester/providers/` (docs/PROVIDERS.md), lists each
 //! provider's machines on a slow cycle, and drives the sidebar dots with
 //! Harvester's own `ssh <machine> true` probe on a faster cycle — never with
 //! provider-reported status (docs/SPEC.md §Machine).
+//!
+//! It also answers the host ops the add-workspace flow needs (`$HOME`, `ls`,
+//! `git rev-parse`). Those are plain [`Host`] execs — docs/SPEC.md §Workspace:
+//! "no daemon or provider involvement" — so they are keyed by `Host`, not by
+//! machine key, and correlate their replies with a [`RequestToken`] rather
+//! than by echoing the path back. Routing them through a machine's bridge is
+//! what used to make adding a workspace on a fresh machine wait out a full
+//! harvesterd bootstrap.
 
+use crate::host::Host;
 use crate::provider::{
     discover_providers, install_bundled_providers, MachineKey, Provider, ProviderMachine,
 };
 use crate::ssh::{probe_reachable, SshTarget};
+use crate::token::RequestToken;
+use crate::workspace::{list_directory, resolve_home, validate_git_workspace, RemoteDirEntry};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 /// Probe cadence for the sidebar dots. A warm multiplexed probe is one
@@ -21,15 +33,35 @@ const PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 /// costs one control-plane exec per provider (exe-dev: an `ssh exe.dev ls`).
 const LIST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// UI → worker.
+/// UI → worker. Every command that is answered carries the token its answer
+/// echoes; `SetAdHocMachines` has no answer, so it carries none.
 #[derive(Debug)]
 pub enum Command {
     /// The full set of ad-hoc machines (argv destination + legacy workspace
     /// dests) the worker should probe alongside provider machines.
     SetAdHocMachines(Vec<String>),
+    /// The machine's `$HOME` — the folder picker's start directory. Answered
+    /// by [`Event::HomeResolved`].
+    ResolveHome { host: Host, token: RequestToken },
+    /// List a directory for the folder picker. Answered by
+    /// [`Event::DirListed`].
+    ListDir {
+        host: Host,
+        path: String,
+        token: RequestToken,
+    },
+    /// `git -C <path> rev-parse --git-dir` on the machine. Answered by
+    /// [`Event::WorkspaceValidated`].
+    ValidateWorkspace {
+        host: Host,
+        path: String,
+        token: RequestToken,
+    },
 }
 
-/// worker → UI.
+/// worker → UI. The three host-op answers carry the token of the request
+/// that asked for them and nothing else identifying: a frontend applies the
+/// answer only while that token is the one it still has outstanding.
 #[derive(Debug)]
 pub enum Event {
     /// One full provider-machine listing cycle finished; replaces the
@@ -39,6 +71,22 @@ pub enum Event {
     ProviderFailed { provider: String, detail: String },
     /// One machine's probe answered.
     Probed { key: String, reachable: bool },
+    /// A `ResolveHome` answered.
+    HomeResolved {
+        token: RequestToken,
+        result: Result<String, String>,
+    },
+    /// A `ListDir` answered; errors render inside the picker, not the
+    /// statusbar.
+    DirListed {
+        token: RequestToken,
+        result: Result<Vec<RemoteDirEntry>, String>,
+    },
+    /// A `ValidateWorkspace` answered; `None` means the path is a git repo.
+    WorkspaceValidated {
+        token: RequestToken,
+        error: Option<String>,
+    },
 }
 
 /// One provider machine as the sidebar needs it.
@@ -120,6 +168,15 @@ async fn worker_main(mut commands: UnboundedReceiver<Command>, events: Unbounded
                     ad_hoc_machines = machines;
                     probe_ad_hoc(&ad_hoc_machines, &events);
                 }
+                Some(Command::ResolveHome { host, token }) => {
+                    spawn_resolve_home(host, token, &events);
+                }
+                Some(Command::ListDir { host, path, token }) => {
+                    spawn_list_dir(host, path, token, &events);
+                }
+                Some(Command::ValidateWorkspace { host, path, token }) => {
+                    spawn_validate_workspace(host, path, token, &events);
+                }
             },
             _ = list_tick.tick() => {
                 spawn_list_cycle(provider_rows.clone(), events.clone(), listed_sender.clone());
@@ -146,6 +203,57 @@ async fn worker_main(mut commands: UnboundedReceiver<Command>, events: Unbounded
             }
         }
     }
+}
+
+/// Every host op rides its own task and reports as it lands: a `$HOME` on a
+/// cold machine costs a full SSH handshake, and the loop must keep probing,
+/// listing and answering commands meanwhile. Concurrent ops are fine — they
+/// are one-shot execs that share nothing, and each answer carries the token
+/// that tells them apart.
+fn spawn_host_op(
+    events: &UnboundedSender<Event>,
+    op: impl std::future::Future<Output = Event> + Send + 'static,
+) {
+    let events = events.clone();
+
+    tokio::spawn(async move {
+        // A dropped receiver just means the window closed.
+        let _ = events.send(op.await);
+    });
+}
+
+fn spawn_resolve_home(host: Host, token: RequestToken, events: &UnboundedSender<Event>) {
+    spawn_host_op(events, async move {
+        let result = resolve_home(&host).await.map_err(|error| error.to_string());
+
+        Event::HomeResolved { token, result }
+    });
+}
+
+fn spawn_list_dir(host: Host, path: String, token: RequestToken, events: &UnboundedSender<Event>) {
+    spawn_host_op(events, async move {
+        let result = list_directory(&host, &path)
+            .await
+            .map_err(|error| error.to_string());
+
+        Event::DirListed { token, result }
+    });
+}
+
+fn spawn_validate_workspace(
+    host: Host,
+    path: String,
+    token: RequestToken,
+    events: &UnboundedSender<Event>,
+) {
+    spawn_host_op(events, async move {
+        let error = validate_git_workspace(&host, &path)
+            .await
+            .err()
+            .map(|error| error.to_string());
+
+        Event::WorkspaceValidated { token, error }
+    });
 }
 
 /// Run one listing cycle detached. A provider executable that hangs is bounded
