@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use harvester_proto::{
-    encode_frame, read_frame, HarvesterCmd, Outgoing, PingData, Request, LF, PROTOCOL_VERSION,
+    decode_outgoing, encode_frame, read_frame, HarvesterCmd, Outgoing, PingData, Request, LF,
+    PROTOCOL_VERSION,
 };
 use serde_json::json;
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -329,7 +330,7 @@ async fn read_outgoing(
         return Ok(None);
     };
 
-    Ok(Some(serde_json::from_slice(line)?))
+    Ok(Some(decode_outgoing(line)?))
 }
 
 /// Per-process, per-destination, collision-free: a hash of the *full* dest

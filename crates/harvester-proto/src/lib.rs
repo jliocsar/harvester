@@ -184,7 +184,14 @@ pub enum HarvesterCmd {
 }
 
 /// A daemon → client line: response to a request, or an unsolicited event.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Adding a variant is a three-place edit, deliberately: the variant, a `kind`
+/// arm in [`OutgoingWire::into_outgoing`] directly below, and a sample in this
+/// module's `every_outgoing_variant_round_trips_through_the_decoder`. The
+/// `wire_tag` match in that test is the tripwire — it stops compiling until the
+/// new variant is spelled out, which is what pays for the exhaustiveness the
+/// hand-written decoder gives up.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Outgoing {
     HarvesterResponse {
@@ -210,7 +217,114 @@ pub enum Outgoing {
     SessionExit { sid: String, exit_code: Option<i32> },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Decode one daemon → client line into [`Outgoing`].
+///
+/// Why not just `serde_json::from_slice::<Outgoing>`: `Outgoing` is
+/// internally tagged (`#[serde(tag = "type")]`), and serde implements that by
+/// buffering the *entire* document into its private `Content` tree, reading
+/// the tag, then re-deserializing the variant out of the buffer. Every event
+/// therefore pays two allocations and two traversals — on `message_update`
+/// deltas, which carry the whole partial message and are the highest-volume
+/// line in the protocol. Decoding through a flat borrowed struct pays once and
+/// hands pi's payload straight over as a `Value`.
+///
+/// This is a micro-optimisation on a local GUI reading over an SSH forward,
+/// not a measured win — it is here because the round-trip tests below make it
+/// safe, and it should be reverted rather than patched if they ever stop
+/// covering every variant. It is emphatically **not** here for
+/// forward-compatibility: the bootstrap refuses to proceed unless the daemon
+/// reports an exact protocol match, so an unknown tag cannot reach this
+/// function in the first place.
+pub fn decode_outgoing(line: &[u8]) -> std::io::Result<Outgoing> {
+    let wire: OutgoingWire = serde_json::from_slice(line)?;
+
+    wire.into_outgoing()
+}
+
+/// The flat, borrowed shape of every [`Outgoing`] line. Kept adjacent to the
+/// enum on purpose: the two must be read together, and a variant added over
+/// there without an arm over here is the failure this arrangement exists to
+/// make obvious.
+///
+/// `type` and `sid` borrow from the input — both are fixed ASCII or a session
+/// id (pi's charset has no escapable character), so serde never has to
+/// allocate for them.
+#[derive(Deserialize)]
+struct OutgoingWire<'line> {
+    #[serde(rename = "type")]
+    kind: &'line str,
+    #[serde(default)]
+    id: Option<Value>,
+    #[serde(default, borrow)]
+    sid: Option<&'line str>,
+    #[serde(default)]
+    event: Option<Value>,
+    #[serde(default)]
+    response: Option<Value>,
+    #[serde(default)]
+    skipped: Option<u64>,
+    #[serde(default)]
+    exit_code: Option<i32>,
+}
+
+impl OutgoingWire<'_> {
+    fn into_outgoing(self) -> std::io::Result<Outgoing> {
+        let OutgoingWire {
+            kind,
+            id,
+            sid,
+            event,
+            response,
+            skipped,
+            exit_code,
+        } = self;
+
+        match kind {
+            "harvester_response" => Ok(Outgoing::HarvesterResponse {
+                id,
+                response: serde_json::from_value(require(response, kind, "response")?)?,
+            }),
+            "pi_response" => Ok(Outgoing::PiResponse {
+                id,
+                sid: require(sid, kind, "sid")?.to_string(),
+                // Fire-and-forget pi commands answer `response: null`, which
+                // serde cannot tell from an absent key. Both mean Null, and
+                // the daemon only ever emits the explicit form.
+                response: response.unwrap_or(Value::Null),
+            }),
+            "event" => Ok(Outgoing::Event {
+                sid: require(sid, kind, "sid")?.to_string(),
+                event: require(event, kind, "event")?,
+            }),
+            "event_gap" => Ok(Outgoing::EventGap {
+                sid: require(sid, kind, "sid")?.to_string(),
+                skipped: require(skipped, kind, "skipped")?,
+            }),
+            "session_exit" => Ok(Outgoing::SessionExit {
+                sid: require(sid, kind, "sid")?.to_string(),
+                // Present-and-null is the signal-kill case, and absent is a
+                // daemon bug; neither carries an exit code.
+                exit_code,
+            }),
+            unknown => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unknown daemon line type `{unknown}`"),
+            )),
+        }
+    }
+}
+
+/// A field the variant named by `kind` cannot do without.
+fn require<T>(value: Option<T>, kind: &str, field: &str) -> std::io::Result<T> {
+    value.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("daemon line `{kind}` is missing `{field}`"),
+        )
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HarvesterResponse {
     pub success: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -935,6 +1049,159 @@ mod tests {
         let bytes = vec![3_u8; 4096];
 
         assert_ne!(fingerprint_bytes(&bytes), fingerprint_bytes(&bytes[..2048]));
+    }
+
+    // --- decode_outgoing: the borrowed decoder -----------------------------
+
+    /// The exhaustiveness the hand-written decoder gives up, bought back from
+    /// the compiler: this match must name every [`Outgoing`] variant, so a new
+    /// one cannot be added without landing in this module — where the sample
+    /// list below is the next thing an author reads.
+    fn wire_tag(outgoing: &Outgoing) -> &'static str {
+        match outgoing {
+            Outgoing::HarvesterResponse { .. } => "harvester_response",
+            Outgoing::PiResponse { .. } => "pi_response",
+            Outgoing::Event { .. } => "event",
+            Outgoing::EventGap { .. } => "event_gap",
+            Outgoing::SessionExit { .. } => "session_exit",
+        }
+    }
+
+    /// One sample per variant. Adding a variant means adding a line here.
+    fn every_outgoing_variant() -> Vec<Outgoing> {
+        vec![
+            Outgoing::HarvesterResponse {
+                id: Some(json!(1)),
+                response: HarvesterResponse::ok(json!({"sessions": []})),
+            },
+            Outgoing::PiResponse {
+                id: Some(json!(2)),
+                sid: "01H".to_string(),
+                response: json!({"type": "response", "command": "prompt", "success": true}),
+            },
+            Outgoing::Event {
+                sid: "01H".to_string(),
+                event: json!({"type": "message_update", "message": {"role": "assistant"}}),
+            },
+            Outgoing::EventGap {
+                sid: "01H".to_string(),
+                skipped: 12,
+            },
+            Outgoing::SessionExit {
+                sid: "01H".to_string(),
+                exit_code: Some(0),
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn every_outgoing_variant_round_trips_through_the_decoder() {
+        // The decoder must agree with the derive on every variant, or the
+        // client silently mis-reads a line the daemon sent correctly.
+        for sample in every_outgoing_variant() {
+            let (_, encoded) = round_trip(&sample).await;
+            let line = &encoded[..encoded.len() - 1];
+
+            let decoded = decode_outgoing(line).expect("a line serde produced must decode");
+
+            assert_eq!(decoded, sample, "tag `{}`", wire_tag(&sample));
+        }
+    }
+
+    #[test]
+    fn the_sample_list_covers_every_variant() {
+        // Guards the guard: if a variant is added to `wire_tag` (which the
+        // compiler forces) but not to the sample list, the round-trip test
+        // above would pass without ever exercising the new decode arm.
+        let samples = every_outgoing_variant();
+        let tags: std::collections::HashSet<&str> = samples.iter().map(wire_tag).collect();
+
+        assert_eq!(
+            tags.len(),
+            samples.len(),
+            "each sample must be a distinct variant"
+        );
+        assert_eq!(
+            tags.len(),
+            5,
+            "a variant was added without a sample — add one to every_outgoing_variant"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_null_pi_response_survives_the_decoder() {
+        // docs/DAEMON.md §The pi passthrough: fire-and-forget commands answer
+        // `response: null`, and the client distinguishes that from an error.
+        let sample = Outgoing::PiResponse {
+            id: None,
+            sid: "01H".to_string(),
+            response: Value::Null,
+        };
+        let (_, encoded) = round_trip(&sample).await;
+
+        let decoded = decode_outgoing(&encoded[..encoded.len() - 1]).expect("decodes");
+
+        assert_eq!(decoded, sample);
+    }
+
+    #[tokio::test]
+    async fn a_signal_killed_session_exit_survives_the_decoder() {
+        let sample = Outgoing::SessionExit {
+            sid: "01H".to_string(),
+            exit_code: None,
+        };
+        let (_, encoded) = round_trip(&sample).await;
+
+        let decoded = decode_outgoing(&encoded[..encoded.len() - 1]).expect("decodes");
+
+        assert_eq!(decoded, sample);
+    }
+
+    #[test]
+    fn a_pi_payload_reaches_the_client_verbatim() {
+        // The invariant the whole decoder exists to serve: pi's event is
+        // handed over untouched, not normalized on the way through.
+        let event = json!({
+            "type": "tool_execution_end",
+            "toolCallId": "call_1",
+            "details": {"diff": " 1 ctx\n-2 old\n+2 new", "nested": [1, 2, {"deep": true}]},
+        });
+        let line = format!(
+            r#"{{"type":"event","sid":"01H","event":{event}}}"#,
+            event = serde_json::to_string(&event).expect("serializes")
+        );
+
+        let decoded = decode_outgoing(line.as_bytes()).expect("decodes");
+
+        match decoded {
+            Outgoing::Event { event: decoded, .. } => assert_eq!(decoded, event),
+            other => panic!("expected an event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_line_missing_a_required_field_is_an_error_not_a_default() {
+        // Leniency here would turn a daemon bug into a session that renders
+        // wrong, which is far harder to diagnose than a failed read.
+        for line in [
+            r#"{"type":"event","sid":"01H"}"#,
+            r#"{"type":"event","event":{"type":"agent_settled"}}"#,
+            r#"{"type":"event_gap","sid":"01H"}"#,
+            r#"{"type":"harvester_response","id":1}"#,
+        ] {
+            assert!(
+                decode_outgoing(line.as_bytes()).is_err(),
+                "must reject: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_line_type_is_rejected_by_name() {
+        let error = decode_outgoing(br#"{"type":"telepathy","sid":"01H"}"#)
+            .expect_err("an unknown tag cannot be decoded");
+
+        assert!(error.to_string().contains("telepathy"), "{error}");
     }
 
     // --- HarvesterResponse::into_result ------------------------------------
