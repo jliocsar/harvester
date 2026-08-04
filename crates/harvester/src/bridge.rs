@@ -1,13 +1,17 @@
-//! The tokio ↔ gpui bridge: one background thread runs a current-thread tokio
-//! runtime that owns the daemon connection (harvester-client-core is tokio;
-//! gpui's executor has no tokio reactor). The UI talks to it over tokio mpsc
-//! channels, which are reactor-independent and therefore awaitable straight
-//! from gpui tasks.
+//! The tokio ↔ gpui bridge: one background thread per machine runs a
+//! current-thread tokio runtime that owns that machine's daemon connection
+//! (harvester-client-core is tokio; gpui's executor has no tokio reactor).
+//! The UI talks to bridges over tokio mpsc channels, which are
+//! reactor-independent and therefore awaitable straight from gpui tasks:
+//! commands go down each bridge's own sender, events from every bridge come
+//! back tagged with the machine key on one shared channel.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use harvester_client_core::{
-    bootstrap_and_connect, list_directory, validate_git_workspace, DaemonConnection, DaemonWriter,
+    bootstrap_and_connect, bootstrap_and_connect_local, list_directory, list_directory_local,
+    validate_git_workspace, validate_git_workspace_local, DaemonConnection, DaemonWriter,
     RemoteDirEntry, SshTarget,
 };
 use harvester_proto::{HarvesterCmd, HarvesterResponse, Outgoing, Request, SessionInfo};
@@ -148,9 +152,34 @@ pub enum Event {
     Disconnected,
 }
 
-pub struct Bridge {
+/// Where a bridge's daemon lives: the hardcoded local machine (harvesterd as
+/// a detached child, Unix socket, no SSH — SPEC §Machine) or an SSH
+/// destination (bootstrap + socket forward).
+#[derive(Debug, Clone)]
+pub enum BridgeTarget {
+    Local,
+    Ssh(SshTarget),
+}
+
+/// Handle to one machine's bridge thread. Its events arrive on the shared
+/// channel passed to [`start`], tagged with the machine key.
+pub struct BridgeHandle {
     pub commands: UnboundedSender<Command>,
-    pub events: UnboundedReceiver<Event>,
+}
+
+/// The shared event channel's sender, bound to one machine key so bridge
+/// internals stay machine-agnostic.
+#[derive(Clone)]
+struct EventSender {
+    machine: String,
+    sender: UnboundedSender<(String, Event)>,
+}
+
+impl EventSender {
+    fn send(&self, event: Event) {
+        // A dropped receiver just means the window closed.
+        let _ = self.sender.send((self.machine.clone(), event));
+    }
 }
 
 /// What an in-flight request id was for; the follow-up on its response
@@ -189,25 +218,32 @@ enum Pending {
     },
 }
 
-pub fn start(dest: String, daemon_binary: Vec<u8>) -> std::io::Result<Bridge> {
+pub fn start(
+    machine: String,
+    target: BridgeTarget,
+    daemon_binary: Arc<Vec<u8>>,
+    events: UnboundedSender<(String, Event)>,
+) -> std::io::Result<BridgeHandle> {
     let (command_sender, command_receiver) = unbounded_channel();
-    let (event_sender, event_receiver) = unbounded_channel();
+    let events = EventSender {
+        machine,
+        sender: events,
+    };
 
     std::thread::Builder::new()
         .name("harvester-bridge".to_string())
-        .spawn(move || run_bridge_thread(dest, daemon_binary, command_receiver, event_sender))?;
+        .spawn(move || run_bridge_thread(target, daemon_binary, command_receiver, events))?;
 
-    Ok(Bridge {
+    Ok(BridgeHandle {
         commands: command_sender,
-        events: event_receiver,
     })
 }
 
 fn run_bridge_thread(
-    dest: String,
-    daemon_binary: Vec<u8>,
+    target: BridgeTarget,
+    daemon_binary: Arc<Vec<u8>>,
     commands: UnboundedReceiver<Command>,
-    events: UnboundedSender<Event>,
+    events: EventSender,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -215,7 +251,7 @@ fn run_bridge_thread(
     {
         Ok(runtime) => runtime,
         Err(error) => {
-            let _ = events.send(Event::ConnectFailed {
+            events.send(Event::ConnectFailed {
                 detail: format!("tokio runtime: {error}"),
             });
 
@@ -223,34 +259,37 @@ fn run_bridge_thread(
         }
     };
 
-    runtime.block_on(bridge_main(dest, daemon_binary, commands, events));
+    runtime.block_on(bridge_main(target, daemon_binary, commands, events));
 }
 
 async fn bridge_main(
-    dest: String,
-    daemon_binary: Vec<u8>,
+    target: BridgeTarget,
+    daemon_binary: Arc<Vec<u8>>,
     mut commands: UnboundedReceiver<Command>,
-    events: UnboundedSender<Event>,
+    events: EventSender,
 ) {
-    let target = SshTarget { dest, port: None };
-    let connected = match bootstrap_and_connect(&target, &daemon_binary).await {
+    let bootstrap_result = match &target {
+        BridgeTarget::Local => bootstrap_and_connect_local(&daemon_binary).await,
+        BridgeTarget::Ssh(ssh_target) => bootstrap_and_connect(ssh_target, &daemon_binary).await,
+    };
+    let connected = match bootstrap_result {
         Ok(connected) => connected,
         Err(error) => {
-            let _ = events.send(Event::ConnectFailed {
+            events.send(Event::ConnectFailed {
                 detail: error.to_string(),
             });
 
             return;
         }
     };
-    let _ = events.send(Event::Connected {
+    events.send(Event::Connected {
         daemon_version: connected.daemon_version,
         remote_home: connected.remote_home,
     });
 
     let DaemonConnection { mut reader, writer } = connected.connection;
     let mut link = Link {
-        ssh_target: target,
+        target,
         writer,
         events,
         pending: HashMap::new(),
@@ -299,12 +338,12 @@ async fn bridge_main(
                 Some(Ok(outgoing)) => handle_daemon_line(outgoing, &mut link).await,
                 Some(Err(error)) => {
                     eprintln!("harvester: read from daemon: {error}");
-                    let _ = link.events.send(Event::Disconnected);
+                    link.events.send(Event::Disconnected);
 
                     break;
                 }
                 None => {
-                    let _ = link.events.send(Event::Disconnected);
+                    link.events.send(Event::Disconnected);
 
                     break;
                 }
@@ -446,40 +485,46 @@ async fn detach_previous(link: &mut Link, next_sid: &str) {
     }
 }
 
-/// SSH execs ride their own task: even multiplexed they take tens of ms, and
-/// the select loop must keep pumping pi events meanwhile.
+/// Path execs (SSH or local) ride their own task: even multiplexed they take
+/// tens of ms, and the select loop must keep pumping pi events meanwhile.
 fn handle_list_dir(path: String, link: &Link) {
-    let target = link.ssh_target.clone();
+    let target = link.target.clone();
     let events = link.events.clone();
 
     tokio::spawn(async move {
-        let result = list_directory(&target, &path)
-            .await
-            .map_err(|error| error.to_string());
-        let _ = events.send(Event::DirListed { path, result });
+        let result = match &target {
+            BridgeTarget::Local => list_directory_local(&path).await,
+            BridgeTarget::Ssh(ssh_target) => list_directory(ssh_target, &path).await,
+        }
+        .map_err(|error| error.to_string());
+
+        events.send(Event::DirListed { path, result });
     });
 }
 
 fn handle_validate_workspace(path: String, link: &Link) {
-    let target = link.ssh_target.clone();
+    let target = link.target.clone();
     let events = link.events.clone();
 
     tokio::spawn(async move {
-        let error = validate_git_workspace(&target, &path)
-            .await
-            .err()
-            .map(|error| error.to_string());
-        let _ = events.send(Event::WorkspaceValidated { path, error });
+        let error = match &target {
+            BridgeTarget::Local => validate_git_workspace_local(&path).await,
+            BridgeTarget::Ssh(ssh_target) => validate_git_workspace(ssh_target, &path).await,
+        }
+        .err()
+        .map(|error| error.to_string());
+
+        events.send(Event::WorkspaceValidated { path, error });
     });
 }
 
 async fn handle_daemon_line(outgoing: Outgoing, link: &mut Link) {
     match outgoing {
         Outgoing::Event { sid, event } => {
-            let _ = link.events.send(Event::Pi { sid, event });
+            link.events.send(Event::Pi { sid, event });
         }
         Outgoing::SessionExit { sid, exit_code } => {
-            let _ = link.events.send(Event::SessionExit { sid, exit_code });
+            link.events.send(Event::SessionExit { sid, exit_code });
         }
         Outgoing::HarvesterResponse { id, response } => {
             let Some(purpose) = link.take_pending(id.as_ref()) else {
@@ -514,19 +559,19 @@ async fn handle_daemon_line(outgoing: Outgoing, link: &mut Link) {
                 Pending::Entries { sid } => handle_entries_response(link, sid, &response),
                 Pending::Prompt => handle_prompt_response(link, &response),
                 Pending::SessionModels { sid } => {
-                    let _ = link.events.send(Event::SessionModelsListed {
+                    link.events.send(Event::SessionModelsListed {
                         sid,
                         result: pi_result(&response),
                     });
                 }
                 Pending::SessionState { sid } => {
-                    let _ = link.events.send(Event::SessionState {
+                    link.events.send(Event::SessionState {
                         sid,
                         result: pi_result(&response),
                     });
                 }
                 Pending::SetModel { sid } => {
-                    let _ = link.events.send(Event::ModelSet {
+                    link.events.send(Event::ModelSet {
                         sid,
                         result: pi_result(&response),
                     });
@@ -559,7 +604,7 @@ fn handle_list_models_response(link: &mut Link, cwd: String, response: Harvester
             .error
             .unwrap_or_else(|| "unknown error".to_string()))
     };
-    let _ = link.events.send(Event::ModelsListed { cwd, result });
+    link.events.send(Event::ModelsListed { cwd, result });
 }
 
 /// A `create_session` answered (resume or ghost-chat start); chain into attach.
@@ -602,7 +647,7 @@ async fn handle_attach_response(
                     Pending::Prompt,
                 )
                 .await;
-                let _ = link.events.send(Event::Attached {
+                link.events.send(Event::Attached {
                     sid,
                     entries: Vec::new(),
                 });
@@ -637,7 +682,7 @@ fn handle_entries_response(link: &mut Link, sid: String, response: &Value) {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let _ = link.events.send(Event::Attached { sid, entries });
+        link.events.send(Event::Attached { sid, entries });
     } else {
         link.report_failure("get_entries", pi_error(response));
     }
@@ -676,10 +721,10 @@ fn pi_error(response: &Value) -> Option<String> {
 }
 
 struct Link {
-    /// The machine this bridge serves; cloned into spawned SSH exec tasks.
-    ssh_target: SshTarget,
+    /// The machine this bridge serves; cloned into spawned path-exec tasks.
+    target: BridgeTarget,
     writer: DaemonWriter,
-    events: UnboundedSender<Event>,
+    events: EventSender,
     pending: HashMap<u64, Pending>,
     last_request_id: u64,
     /// The one session this client is attached to (single chat pane); the
@@ -712,7 +757,7 @@ impl Link {
     async fn write(&mut self, request: &Request, id: u64) {
         if let Err(error) = self.writer.send(request).await {
             self.pending.remove(&id);
-            let _ = self.events.send(Event::RequestFailed {
+            self.events.send(Event::RequestFailed {
                 detail: format!("send to daemon: {error}"),
             });
         }
@@ -735,10 +780,10 @@ impl Link {
 
         match sessions {
             Some(sessions) => {
-                let _ = self.events.send(Event::Sessions(sessions));
+                self.events.send(Event::Sessions(sessions));
             }
             None => {
-                let _ = self.events.send(Event::RequestFailed {
+                self.events.send(Event::RequestFailed {
                     detail: "malformed list_sessions response".to_string(),
                 });
             }
@@ -750,6 +795,6 @@ impl Link {
             "{context}: {}",
             error.unwrap_or_else(|| "unknown error".to_string())
         );
-        let _ = self.events.send(Event::RequestFailed { detail });
+        self.events.send(Event::RequestFailed { detail });
     }
 }

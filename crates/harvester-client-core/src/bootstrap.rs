@@ -8,11 +8,11 @@ use crate::connection::{self, DaemonConnection};
 use crate::ssh::{exec, ExecOutput, SshTarget};
 use crate::{Error, Result};
 
-/// Install location on the machine, relative to the remote `$HOME`
-/// (tilde-expanded by the remote shell).
-const REMOTE_BINARY: &str = ".harvester/bin/harvesterd";
+/// Install location, relative to `$HOME` (tilde-expanded by the remote
+/// shell; joined locally by the local-machine bootstrap).
+pub(crate) const DAEMON_BINARY_PATH: &str = ".harvester/bin/harvesterd";
 /// Daemon stdout/stderr land here — appended, so logs survive upgrades.
-const REMOTE_LOG: &str = ".harvester/log/harvesterd.log";
+pub(crate) const DAEMON_LOG_PATH: &str = ".harvester/log/harvesterd.log";
 
 /// Whether the install must displace a live daemon first. A dedicated type
 /// (not a bool) so call sites read as what they do.
@@ -110,7 +110,7 @@ struct Probe {
 /// (the socket forward needs an absolute remote path — ssh does not expand
 /// `~` in `-L`), and what harvesterd version is on disk, if any.
 async fn probe(target: &SshTarget) -> Result<Probe> {
-    let script = format!(r#"printf '%s\n' "$HOME"; exec ~/{REMOTE_BINARY} version"#);
+    let script = format!(r#"printf '%s\n' "$HOME"; exec ~/{DAEMON_BINARY_PATH} version"#);
     let output = exec(target, &script, None).await?;
 
     // The home line prints even when the binary is missing (exec fails with
@@ -147,7 +147,7 @@ async fn probe(target: &SshTarget) -> Result<Probe> {
 /// stdin from /dev/null — which silently truncated the `cat` upload to zero
 /// bytes when this script is appended to the install chain (found live).
 fn start_script() -> String {
-    format!("mkdir -p ~/.harvester/log && (setsid ~/{REMOTE_BINARY} < /dev/null >> ~/{REMOTE_LOG} 2>&1 &)")
+    format!("mkdir -p ~/.harvester/log && (setsid ~/{DAEMON_BINARY_PATH} < /dev/null >> ~/{DAEMON_LOG_PATH} 2>&1 &)")
 }
 
 /// Receives the binary on stdin. The `.next` + `mv` dance swaps atomically and
@@ -158,9 +158,9 @@ fn start_script() -> String {
 fn install_script(kill_running_daemon: KillRunningDaemon) -> String {
     let replace = format!(
         "mkdir -p ~/.harvester/bin ~/.harvester/log \
-         && cat > ~/{REMOTE_BINARY}.next \
-         && chmod +x ~/{REMOTE_BINARY}.next \
-         && mv ~/{REMOTE_BINARY}.next ~/{REMOTE_BINARY}"
+         && cat > ~/{DAEMON_BINARY_PATH}.next \
+         && chmod +x ~/{DAEMON_BINARY_PATH}.next \
+         && mv ~/{DAEMON_BINARY_PATH}.next ~/{DAEMON_BINARY_PATH}"
     );
     let kill = match kill_running_daemon {
         KillRunningDaemon::Yes => {

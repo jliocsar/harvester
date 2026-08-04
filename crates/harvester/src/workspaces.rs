@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Workspace {
+    /// Machine key `<provider>/<id>`, resolved to ssh info through the
+    /// provider list at use time. A string without the separator is an
+    /// ad-hoc ssh destination used verbatim (legacy entries, argv machines).
     pub machine: String,
     pub path: String,
 }

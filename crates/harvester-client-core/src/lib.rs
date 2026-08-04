@@ -8,12 +8,19 @@
 
 mod bootstrap;
 mod connection;
+mod local;
+mod provider;
 mod ssh;
 mod workspace;
 
 pub use bootstrap::{bootstrap_and_connect, BootstrapOutcome, Connected};
 pub use connection::{DaemonConnection, DaemonReader, DaemonWriter};
-pub use ssh::SshTarget;
+pub use local::{bootstrap_and_connect_local, list_directory_local, validate_git_workspace_local};
+pub use provider::{
+    discover_providers, install_bundled_providers, MachineKey, MachineStatus, Provider,
+    ProviderInfo, ProviderMachine, SshInfo, SUPPORTED_PROVIDER_PROTOCOL,
+};
+pub use ssh::{probe_reachable, SshTarget};
 pub use workspace::{list_directory, validate_git_workspace, RemoteDirEntry};
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -32,6 +39,9 @@ pub enum Error {
     /// The daemon still reports the wrong version after a forced reinstall —
     /// almost always a stale local daemon binary (rebuild the musl target).
     VersionMismatch { expected: String, actual: String },
+    /// A provider executable misbehaved: contract violation, timeout, or its
+    /// own `{"error"}` object (surfaced verbatim, docs/PROVIDERS.md).
+    Provider { provider: String, detail: String },
 }
 
 impl std::fmt::Display for Error {
@@ -45,6 +55,7 @@ impl std::fmt::Display for Error {
                 "daemon reports version {actual} after reinstall (expected {expected}) — \
                  is the daemon binary you are shipping stale?"
             ),
+            Error::Provider { provider, detail } => write!(f, "provider {provider}: {detail}"),
         }
     }
 }

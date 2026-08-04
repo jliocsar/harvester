@@ -66,6 +66,17 @@ impl SshTarget {
     }
 }
 
+/// Harvester's own machine-liveness probe (docs/SPEC.md §Machine): a plain
+/// `ssh <machine> true`, reachable iff it round-trips with exit 0. Rides the
+/// multiplexed master when one is up, so a warm probe is one round trip.
+/// Errors collapse to unreachable — that is the answer the dot renders.
+pub async fn probe_reachable(target: &SshTarget) -> bool {
+    match exec(target, "true", None).await {
+        Ok(output) => output.status.success(),
+        Err(_) => false,
+    }
+}
+
 pub(crate) struct ExecOutput {
     pub status: std::process::ExitStatus,
     pub stdout: String,

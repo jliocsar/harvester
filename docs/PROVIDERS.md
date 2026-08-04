@@ -158,5 +158,5 @@ The SDK owns arg parsing, stdin/stdout JSON, exit codes, and protocol versioning
 ## Open decisions
 
 1. Windows story (no executable bit; `.exe`/`.cmd` suffix resolution) — deferred, target is Linux/macOS first.
-2. Should `list` results be cached between polls, and for how long? (Implementation detail, not contract — but affects perceived snappiness of the sidebar.)
+2. ~~Should `list` results be cached between polls, and for how long?~~ — resolved in the client: `list` polls every 300s, the SSH probe every 30s, and the last listing is displayed between polls. Still not contract.
 3. `secret` field type: where do secret values live between modal and `create` call (memory only, never persisted by Harvester)? Leaning: pass-through only, providers own their own credential storage.

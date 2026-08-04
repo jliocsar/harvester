@@ -17,8 +17,9 @@ use tokio::time::Instant;
 use crate::ssh::SshTarget;
 use crate::{Error, Result};
 
-/// The daemon's socket, relative to the remote `$HOME`.
-const REMOTE_SOCKET: &str = ".harvester/harvesterd.sock";
+/// The daemon's socket, relative to `$HOME` — the same path on remote
+/// machines (forwarded) and the local one (connected directly).
+pub(crate) const DAEMON_SOCKET: &str = ".harvester/harvesterd.sock";
 /// How long to keep retrying connect+ping while a freshly started daemon
 /// binds its socket (covers slow VMs; normal case succeeds on try one).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -28,19 +29,33 @@ const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const HANDSHAKE_PING_ID: u64 = 0;
 
 /// Keeps the ssh forward process alive (killed on drop via `kill_on_drop`)
-/// and owns the local socket file.
+/// and owns the forward's local socket file. The local (no-SSH) machine
+/// needs neither: `ForwardGuard::none()` — the daemon owns its socket.
 struct ForwardGuard {
-    _child: Child,
-    local_socket: PathBuf,
+    _child: Option<Child>,
+    local_socket: Option<PathBuf>,
+}
+
+impl ForwardGuard {
+    fn none() -> Self {
+        ForwardGuard {
+            _child: None,
+            local_socket: None,
+        }
+    }
 }
 
 impl Drop for ForwardGuard {
     fn drop(&mut self) {
-        if let Err(error) = std::fs::remove_file(&self.local_socket) {
+        let Some(local_socket) = &self.local_socket else {
+            return;
+        };
+
+        if let Err(error) = std::fs::remove_file(local_socket) {
             if error.kind() != std::io::ErrorKind::NotFound {
                 eprintln!(
                     "failed to remove local socket {}: {error}",
-                    self.local_socket.display()
+                    local_socket.display()
                 );
             }
         }
@@ -118,23 +133,12 @@ pub(crate) async fn connect(
 
         match handshake(&local_socket).await {
             Ok((reader, writer, daemon_version)) => {
-                let guard = Arc::new(ForwardGuard {
-                    _child: child,
-                    local_socket,
-                });
-                let connection = DaemonConnection {
-                    reader: DaemonReader {
-                        reader,
-                        line_buffer: Vec::new(),
-                        _forward: guard.clone(),
-                    },
-                    writer: DaemonWriter {
-                        writer,
-                        _forward: guard,
-                    },
+                let guard = ForwardGuard {
+                    _child: Some(child),
+                    local_socket: Some(local_socket),
                 };
 
-                return Ok((connection, daemon_version));
+                return Ok((assemble(reader, writer, guard), daemon_version));
             }
             Err(error) => {
                 if Instant::now() >= deadline {
@@ -149,13 +153,61 @@ pub(crate) async fn connect(
     }
 }
 
+/// The local-machine variant: the daemon's socket is on this filesystem, so
+/// connect directly — no forward process, no socket-file ownership. Same
+/// retry window (a just-started daemon needs a beat to bind).
+pub(crate) async fn connect_local(home: &str) -> Result<(DaemonConnection, String)> {
+    let socket = PathBuf::from(home).join(DAEMON_SOCKET);
+    let deadline = Instant::now() + CONNECT_TIMEOUT;
+
+    loop {
+        match handshake(&socket).await {
+            Ok((reader, writer, daemon_version)) => {
+                return Ok((
+                    assemble(reader, writer, ForwardGuard::none()),
+                    daemon_version,
+                ));
+            }
+            Err(error) => {
+                if Instant::now() >= deadline {
+                    return Err(Error::Forward(format!(
+                        "local daemon unreachable after {CONNECT_TIMEOUT:?}: {error}"
+                    )));
+                }
+
+                tokio::time::sleep(CONNECT_RETRY_INTERVAL).await;
+            }
+        }
+    }
+}
+
+fn assemble(
+    reader: BufReader<OwnedReadHalf>,
+    writer: OwnedWriteHalf,
+    guard: ForwardGuard,
+) -> DaemonConnection {
+    let guard = Arc::new(guard);
+
+    DaemonConnection {
+        reader: DaemonReader {
+            reader,
+            line_buffer: Vec::new(),
+            _forward: guard.clone(),
+        },
+        writer: DaemonWriter {
+            writer,
+            _forward: guard,
+        },
+    }
+}
+
 /// The long-lived `ssh -N -L` process carrying the socket forward.
 fn create_forward_command(
     target: &SshTarget,
     local_socket: &Path,
     remote_home: &str,
 ) -> tokio::process::Command {
-    let forward_spec = format!("{}:{remote_home}/{REMOTE_SOCKET}", local_socket.display());
+    let forward_spec = format!("{}:{remote_home}/{DAEMON_SOCKET}", local_socket.display());
     let mut command =
         target.command(&["-N", "-o", "ExitOnForwardFailure=yes", "-L", &forward_spec]);
     command

@@ -31,6 +31,10 @@ struct ChatMessage {
 
 pub struct Chat {
     sid: String,
+    /// Display label of the machine this session runs on — shown as the
+    /// prompt box's read-only machine control (the machine was picked while
+    /// the chat was a ghost; a running session never moves).
+    machine_label: SharedString,
     messages: Vec<ChatMessage>,
     /// The in-flight assistant message, replaced wholesale on every
     /// `message_update` (the event's `partial` is the full message so far).
@@ -65,6 +69,7 @@ impl Chat {
     /// with it rendered and the turn marked busy.
     pub fn new(
         sid: String,
+        machine_label: SharedString,
         entries: &[Value],
         first_prompt: Option<String>,
         commands: UnboundedSender<Command>,
@@ -89,6 +94,7 @@ impl Chat {
 
         Self {
             sid,
+            machine_label,
             messages,
             streaming: None,
             busy,
@@ -365,6 +371,13 @@ impl Chat {
                                 },
                             ),
                         )
+                        // Read-only: the machine was picked at ghost time; a
+                        // running session never moves.
+                        .child(ui::prompt_box_control(
+                            "chat-machine",
+                            self.machine_label.clone(),
+                            false,
+                        ))
                         .child(div().flex_1())
                         .child(
                             ui::prompt_box_send("chat-send")

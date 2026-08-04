@@ -70,6 +70,7 @@ impl Render for Kitchen {
                     .child(section("typography", render_typography()))
                     .child(section("buttons", render_buttons()))
                     .child(section("status dots", render_status_dots()))
+                    .child(section("machine rows", render_machine_rows()))
                     .child(section("session rows", render_session_rows()))
                     .child(section("workspace rows", render_workspace_rows()))
                     .child(section("chat header", render_chat_header_sample()))
@@ -301,6 +302,40 @@ fn render_status_dots() -> impl IntoElement {
         )
 }
 
+fn render_machine_rows() -> impl IntoElement {
+    // Sidebar-width container so ellipsis behavior shows realistically.
+    // Machine rows are read-only: no hover, no click target.
+    div()
+        .w(px(240.))
+        .bg(rgb(theme::PANEL_BG))
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .rounded_md()
+        .py_1()
+        .flex()
+        .flex_col()
+        .child(ui::machine_row(
+            "local".into(),
+            "this computer".into(),
+            theme::STATUS_RUNNING,
+        ))
+        .child(ui::machine_row(
+            "bloggy".into(),
+            "exe-dev · harvesterd 1".into(),
+            theme::STATUS_RUNNING,
+        ))
+        .child(ui::machine_row(
+            "vps-work".into(),
+            "exe-dev".into(),
+            theme::STATUS_ERROR,
+        ))
+        .child(ui::machine_row(
+            "a-machine-with-a-very-long-label.exe.xyz".into(),
+            "a-provider-with-a-long-name · connecting…".into(),
+            theme::TEXT_FAINT,
+        ))
+}
+
 fn render_session_rows() -> impl IntoElement {
     // Sidebar-width container so ellipsis behavior shows realistically.
     div()
@@ -339,8 +374,8 @@ fn render_session_rows() -> impl IntoElement {
 }
 
 fn render_workspace_rows() -> impl IntoElement {
-    // Sidebar-width container, like the session-row samples. The whole row is
-    // the ghost-chat click target; the trailing "+" is the affordance.
+    // Sidebar-width container, like the session-row samples. Rows are
+    // read-only; the trailing "+" is the one click target (ghost chat).
     div()
         .w(px(240.))
         .bg(rgb(theme::PANEL_BG))
@@ -350,16 +385,17 @@ fn render_workspace_rows() -> impl IntoElement {
         .py_1()
         .flex()
         .flex_col()
-        .child(ui::workspace_row(
-            "kitchen-workspace-1",
-            "bloggy".into(),
-            "egg-by-penguin".into(),
-        ))
-        .child(ui::workspace_row(
-            "kitchen-workspace-2",
-            "a-very-long-workspace-folder-name".into(),
-            "some-machine-with-a-long-label.exe.xyz".into(),
-        ))
+        .child(
+            ui::workspace_row("bloggy".into(), "egg-by-penguin".into())
+                .child(ui::workspace_row_add("kitchen-workspace-add-1")),
+        )
+        .child(
+            ui::workspace_row(
+                "a-very-long-workspace-folder-name".into(),
+                "some-machine-with-a-long-label.exe.xyz".into(),
+            )
+            .child(ui::workspace_row_add("kitchen-workspace-add-2")),
+        )
 }
 
 /// The ghost chat's model picker as it composes in production: modal frame,

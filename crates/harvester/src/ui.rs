@@ -126,6 +126,36 @@ pub fn session_row(
         )
 }
 
+/// One sidebar machine row — read-only by design (machines are listed, not
+/// clicked): reachability dot + label, detail line under it. The dot is
+/// Harvester's own SSH probe, never provider-reported status (SPEC §Machine).
+pub fn machine_row(label: SharedString, detail: SharedString, dot_color: u32) -> Div {
+    div()
+        // Same 6+6 inset as session_row, aligning with section_header text.
+        .mx(px(6.))
+        .px(px(6.))
+        .py_1()
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(status_dot(dot_color))
+                .child(div().overflow_hidden().text_ellipsis().child(label)),
+        )
+        .child(
+            div()
+                .pl(px(14.))
+                .text_xs()
+                .text_color(rgb(theme::TEXT_FAINT))
+                .overflow_hidden()
+                .text_ellipsis()
+                .child(detail),
+        )
+}
+
 /// One chat message: author label over the text; user messages get a bubble.
 pub fn chat_message(
     author: &'static str,
@@ -227,23 +257,15 @@ pub fn prompt_box_send(id: impl Into<ElementId>) -> Stateful<Div> {
         .child("↑")
 }
 
-/// One sidebar workspace row: `folder_name in machine_label`, trailing "+"
-/// affordance — the whole row is the click target for starting a ghost chat
-/// there (SPEC §Flows "Start session"). Caller chains `.on_click`.
-pub fn workspace_row(
-    id: impl Into<ElementId>,
-    name: SharedString,
-    machine: SharedString,
-) -> Stateful<Div> {
+/// One sidebar workspace row: `folder_name in machine_label` — read-only by
+/// design (workspaces are listed, not clicked). Compose with
+/// `workspace_row_add` for the trailing "+" that starts a ghost chat there.
+pub fn workspace_row(name: SharedString, machine: SharedString) -> Div {
     div()
-        .id(id)
         // Same 6+6 inset as session_row, aligning with section_header text.
         .mx(px(6.))
         .px(px(6.))
         .py_1()
-        .rounded_md()
-        .cursor_pointer()
-        .hover(|style| style.bg(rgb(theme::ROW_HOVER)))
         .flex()
         .items_baseline()
         .gap_1()
@@ -266,12 +288,21 @@ pub fn workspace_row(
                 .child(format!("in {machine}")),
         )
         .child(div().flex_1())
-        .child(
-            div()
-                .flex_none()
-                .text_color(rgb(theme::TEXT_FAINT))
-                .child("+"),
-        )
+}
+
+/// The workspace row's "+" — the one click target on the row (SPEC §Flows
+/// "Start session"): starts a ghost chat in that workspace. Caller chains
+/// `.on_click`.
+pub fn workspace_row_add(id: impl Into<ElementId>) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex_none()
+        .px_1()
+        .rounded_md()
+        .text_color(rgb(theme::TEXT_FAINT))
+        .cursor_pointer()
+        .hover(|style| style.text_color(rgb(theme::TEXT)).bg(rgb(theme::ROW_HOVER)))
+        .child("+")
 }
 
 /// One model in the ghost chat's picker; the selected one carries a leading

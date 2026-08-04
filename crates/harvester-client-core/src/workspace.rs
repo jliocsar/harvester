@@ -24,28 +24,31 @@ pub async fn list_directory(target: &SshTarget, path: &str) -> Result<Vec<Remote
     let output = exec(target, &script, None).await?;
 
     if output.status.success() {
-        let entries = output
-            .stdout
-            .lines()
-            .map(|line| match line.strip_suffix('/') {
-                Some(name) => RemoteDirEntry {
-                    name: name.to_string(),
-                    is_dir: true,
-                },
-                None => RemoteDirEntry {
-                    name: line.to_string(),
-                    is_dir: false,
-                },
-            })
-            .collect();
-
-        Ok(entries)
+        Ok(parse_ls_entries(&output.stdout))
     } else {
         Err(Error::Ssh {
             context: "list directory",
             detail: output.describe_failure(),
         })
     }
+}
+
+/// `ls -1Ap` output → entries; shared with the local machine's picker so
+/// both browse with identical semantics.
+pub(crate) fn parse_ls_entries(stdout: &str) -> Vec<RemoteDirEntry> {
+    stdout
+        .lines()
+        .map(|line| match line.strip_suffix('/') {
+            Some(name) => RemoteDirEntry {
+                name: name.to_string(),
+                is_dir: true,
+            },
+            None => RemoteDirEntry {
+                name: line.to_string(),
+                is_dir: false,
+            },
+        })
+        .collect()
 }
 
 /// Checks that `path` is a git repository — the definition of a workspace

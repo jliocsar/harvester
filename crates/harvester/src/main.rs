@@ -1,16 +1,17 @@
-//! Harvester — the desktop client (docs/SPEC.md). Slice 4: connect to one
-//! machine, list its sessions, attach, render one streaming turn.
+//! Harvester — the desktop client (docs/SPEC.md).
 //!
-//! `harvester <ssh-destination>`, or `harvester kitchen` for the design-system
-//! catalog. The machine list UI (providers, add-machine)
-//! is a later slice; until then the destination comes from argv, like
-//! harvester-cli. Argument parsing stays manual — clap lives in harvester-cli
-//! only, and one positional argument does not earn it here either.
+//! `harvester` is the normal launch (machines come from providers and the
+//! workspace list); `harvester <ssh-destination>` adds that destination as an
+//! ad-hoc machine (the dev workflow); `harvester kitchen` opens the
+//! design-system catalog. Argument parsing stays manual — clap lives in
+//! harvester-cli only, and one positional argument does not earn it here
+//! either.
 
 mod bridge;
 mod chat;
 mod input;
 mod kitchen;
+mod machines;
 mod models;
 mod theme;
 mod ui;
@@ -34,13 +35,10 @@ const EMBEDDED_DAEMON: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/harvest
 const DEV_DAEMON_PATH: &str = "target/x86_64-unknown-linux-musl/release/harvesterd";
 
 fn main() {
-    let Some(dest) = std::env::args().nth(1) else {
-        eprintln!("usage: harvester <ssh-destination> | harvester kitchen");
-        std::process::exit(2);
-    };
+    let argv_machine = std::env::args().nth(1);
 
     // The design-system catalog: pure rendering, no bridge, no daemon.
-    if dest == "kitchen" {
+    if argv_machine.as_deref() == Some("kitchen") {
         run_kitchen();
         return;
     }
@@ -53,29 +51,25 @@ fn main() {
         }
     };
 
-    let bridge = match bridge::start(dest.clone(), daemon_binary) {
-        Ok(bridge) => bridge,
-        Err(error) => {
-            eprintln!("harvester: start bridge thread: {error}");
-            std::process::exit(1);
-        }
-    };
-
     Application::new().run(move |cx: &mut App| {
         bind_keys(cx);
         cx.on_action(|_: &Quit, cx| cx.quit());
 
+        let title = match &argv_machine {
+            Some(machine) => format!("Harvester — {machine}"),
+            None => "Harvester".to_string(),
+        };
         let bounds = Bounds::centered(None, size(px(1100.), px(720.)), cx);
         let open_result = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
-                    title: Some(format!("Harvester — {dest}").into()),
+                    title: Some(title.into()),
                     ..Default::default()
                 }),
                 ..Default::default()
             },
-            |_, cx| cx.new(|cx| Workbench::new(dest.clone(), bridge, cx)),
+            |_, cx| cx.new(|cx| Workbench::new(argv_machine, daemon_binary, cx)),
         );
 
         match open_result {
