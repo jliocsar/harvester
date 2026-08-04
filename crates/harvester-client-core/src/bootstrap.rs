@@ -191,11 +191,22 @@ fn start_script() -> String {
 /// two of them upgrading the same machine at once would otherwise interleave
 /// their writes into one path and `mv` a corrupt binary into place. Whoever
 /// finishes last still wins, but with a complete binary.
-fn install_script(kill_running_daemon: KillRunningDaemon) -> String {
+///
+/// The `wc -c` assertion is what makes "complete" true. `cat` cannot tell a
+/// finished upload from a broken stdin pipe — both are EOF, both exit 0 — and
+/// a failed stdin write is non-fatal on our side ([`Host::exec`]), so without
+/// the size check a truncated binary would be `chmod +x`'d and `mv`'d into
+/// place exactly like a whole one. The swap is atomic against ETXTBSY; it was
+/// never atomic against a short write.
+fn install_script(kill_running_daemon: KillRunningDaemon, binary_len: usize) -> String {
     let replace = format!(
         "mkdir -p ~/.harvester/bin ~/.harvester/log \
          && chmod 700 ~/.harvester \
          && cat > ~/{DAEMON_BINARY_PATH}.next.$$ \
+         && {{ [ \"$(wc -c < ~/{DAEMON_BINARY_PATH}.next.$$)\" -eq {binary_len} ] \
+               || {{ rm -f ~/{DAEMON_BINARY_PATH}.next.$$; \
+                     echo 'harvesterd install: upload truncated ({binary_len} bytes expected)' >&2; \
+                     exit 1; }}; }} \
          && chmod +x ~/{DAEMON_BINARY_PATH}.next.$$ \
          && mv ~/{DAEMON_BINARY_PATH}.next.$$ ~/{DAEMON_BINARY_PATH}"
     );
@@ -223,7 +234,7 @@ async fn install_and_start(
 ) -> Result<()> {
     let output = host
         .exec(
-            &install_script(kill_running_daemon),
+            &install_script(kill_running_daemon, daemon_binary.len()),
             Some(daemon_binary),
             INSTALL_TIMEOUT,
         )
@@ -238,4 +249,70 @@ async fn start(host: &Host) -> Result<()> {
         .await?;
 
     output.require_success("start harvesterd")
+}
+
+/// The bootstrap scripts are the least verifiable code in the client — they
+/// only ever run inside someone else's shell, and a broken one bricks every
+/// machine at once. These tests are the part that can be checked locally:
+/// the shell parses them, and the guards that must be in the chain are.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Hands the script to a real `/bin/sh` in no-execute mode — the same
+    /// check `sh -n providers/exe-dev` performs, for a string built at runtime.
+    fn assert_shell_parses(script: &str) {
+        let status = std::process::Command::new("sh")
+            .args(["-n", "-c", script])
+            .status()
+            .expect("spawning sh");
+
+        assert!(status.success(), "sh rejected the script:\n{script}");
+    }
+
+    #[test]
+    fn every_bootstrap_script_is_valid_shell() {
+        assert_shell_parses(&start_script());
+        assert_shell_parses(&install_script(KillRunningDaemon::No, 1234));
+        assert_shell_parses(&install_script(KillRunningDaemon::Yes, 1234));
+    }
+
+    #[test]
+    fn the_install_asserts_the_uploaded_byte_count() {
+        // `cat` reports EOF and exit 0 for a broken stdin pipe exactly as it
+        // does for a finished upload, so the size is the only evidence the
+        // remote side has that it received the whole binary.
+        let script = install_script(KillRunningDaemon::No, 4096);
+
+        assert!(
+            script.contains("-eq 4096"),
+            "the expected length must reach the remote shell:\n{script}"
+        );
+    }
+
+    #[test]
+    fn the_size_assertion_gates_the_swap_into_place() {
+        let script = install_script(KillRunningDaemon::No, 4096);
+        let assertion = script.find("wc -c").expect("size assertion");
+        let chmod = script.find("chmod +x").expect("chmod");
+        let swap = script.find("mv ").expect("swap");
+
+        assert!(
+            assertion < chmod && chmod < swap,
+            "a truncated upload must never be made executable or installed:\n{script}"
+        );
+    }
+
+    #[test]
+    fn a_failed_size_assertion_stops_the_chain_before_the_daemon_starts() {
+        let script = install_script(KillRunningDaemon::Yes, 4096);
+        let assertion = script.find("wc -c").expect("size assertion");
+        let start = script.find("setsid").expect("start");
+
+        assert!(assertion < start);
+        assert!(
+            script[assertion..start].contains("exit 1"),
+            "the guard must exit, not just report:\n{script}"
+        );
+    }
 }
