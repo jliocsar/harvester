@@ -12,6 +12,12 @@ set -eu
 # BatchMode: providers must never prompt (stdin is closed after the args object).
 EXE_SSH="ssh -o BatchMode=yes -o ConnectTimeout=10 exe.dev"
 
+# Reaching a *freshly created* VM needs accept-new: its host key has never been
+# seen, and BatchMode alone hard-fails on an unknown key. Still hard-fails if a
+# known key changes (exe.dev's fleet shares one key, so this is first contact
+# only). Used for the VM itself, never for the control plane.
+VM_SSH="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10"
+
 # Maps one exe.dev vm object to a Harvester machine object. `status` is
 # advisory by contract — the UI dot comes from Harvester's own SSH probe.
 MACHINE_JQ='{
@@ -56,6 +62,41 @@ exe_ssh_capture() {
     if ! out=$($EXE_SSH "$@"); then
         printf '{"error": "exe.dev control plane unreachable (ssh %s failed)"}\n' "$1"
         exit 1
+    fi
+}
+
+# Turns on the VM image's keyless LLM gateway (docs/SPEC.md §Auth & model
+# routing): the bundled pi extension only registers the gateway's models when
+# ~/.pi/agent/exe-dev-llm-integration.json says so — otherwise it pops a
+# startup `select` dialog and, unanswered, silently skips the integration.
+#
+# It lives here rather than in harvesterd's bootstrap because only this
+# provider knows the machine is an exe.dev VM; the bootstrap's start script
+# also runs for the `local` machine, where writing into the user's own ~/.pi
+# would be a trespass.
+#
+# Advisory: a VM that is still booting is not a create failure, so a failed
+# seed is a stderr diagnostic and nothing more. Idempotent and never
+# destructive — an existing file is the user's, whatever it says.
+seed_llm_integration() {
+    if ! $VM_SSH "exedev@$1" sh -s >&2 <<'SEED_SCRIPT'
+set -eu
+seed=$HOME/.pi/agent/exe-dev-llm-integration.json
+
+if [ -e "$seed" ]; then
+    if ! grep -q '"useExeIntegration"[[:space:]]*:[[:space:]]*true' "$seed"; then
+        echo "harvester: $seed exists and does not enable the exe.dev LLM integration; left as is" >&2
+    fi
+
+    exit 0
+fi
+
+mkdir -p "$(dirname "$seed")"
+printf '%s\n' '{"version":1,"useExeIntegration":true}' > "$seed.harvester.$$"
+mv "$seed.harvester.$$" "$seed"
+SEED_SCRIPT
+    then
+        printf 'harvester: could not seed the exe.dev LLM integration on %s (still booting?); pi will ask about it at startup\n' "$1" >&2
     fi
 }
 
@@ -105,7 +146,14 @@ create)
 
     # `new --json` returns the vm object (tolerate a {vm: ...} wrapper too).
     exe_ssh_capture "$@"
-    printf '%s' "$out" | jq "{machine: ((.vm // .) | $MACHINE_JQ)}"
+    machine=$(printf '%s' "$out" | jq "{machine: ((.vm // .) | $MACHINE_JQ)}")
+
+    host=$(printf '%s' "$machine" | jq -r '.machine.ssh.host // empty')
+    if [ -n "$host" ]; then
+        seed_llm_integration "$host"
+    fi
+
+    printf '%s' "$machine"
     ;;
 
 delete)
