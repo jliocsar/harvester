@@ -14,6 +14,15 @@ use crate::sid::Sid;
 /// hence one const rather than a literal at each site.
 pub const PASSTHROUGH_ID_PREFIX: &str = "hv-";
 
+/// What [`Daemon::spawn_session`] did. Both arms hand back the live session, so
+/// the caller never has to reconstruct the sid it just moved in.
+pub enum SpawnOutcome {
+    Spawned(Arc<Session>),
+    /// The sid was already in the pid table; no second pi was spawned, which is
+    /// what keeps "one pi process = one session file" true.
+    AlreadyRunning(Arc<Session>),
+}
+
 #[derive(Clone)]
 pub struct Daemon {
     inner: Arc<DaemonInner>,
@@ -65,20 +74,20 @@ impl Daemon {
 
     /// Check-and-spawn under one lock — the table is the per-sid single-
     /// instance guard, so a second `create_session` for a live sid loses here.
-    pub fn spawn_session(&self, args: SpawnArgs) -> std::io::Result<Arc<Session>> {
+    /// `Err` is reserved for a genuine spawn failure; "it was already running"
+    /// is a domain outcome and says so in the type instead of being smuggled
+    /// through `io::ErrorKind::AlreadyExists` for the caller to sniff.
+    pub fn spawn_session(&self, args: SpawnArgs) -> std::io::Result<SpawnOutcome> {
         let mut sessions = self.lock_sessions();
 
-        if sessions.contains_key(args.sid.as_str()) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                format!("session '{}' already running", args.sid),
-            ));
+        if let Some(running) = sessions.get(args.sid.as_str()) {
+            return Ok(SpawnOutcome::AlreadyRunning(running.clone()));
         }
 
         let session = Session::spawn(args, self)?;
         sessions.insert(session.sid.clone(), session.clone());
 
-        Ok(session)
+        Ok(SpawnOutcome::Spawned(session))
     }
 
     /// Vacate `session`'s table entry — only if it is still the stored

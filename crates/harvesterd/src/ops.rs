@@ -14,9 +14,9 @@ use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
-use crate::daemon::Daemon;
+use crate::daemon::{Daemon, SpawnOutcome};
 use crate::fslist;
-use crate::server::Outbound;
+use crate::server::{answer_later, Outbound};
 use crate::session::{self, Session, SessionOutput, SpawnArgs};
 use crate::sid::Sid;
 
@@ -53,15 +53,20 @@ pub struct Attachment {
 /// Connection-local state the attach/detach commands operate on: sid → attachment.
 pub type AttachedMap = HashMap<Sid, Attachment>;
 
-/// The single place an attachment is torn down: abort the forwarder, then
-/// leave the room on the same session object `attach` joined. Leaving returns
-/// the dialogs to cancel — non-empty only when this was the last watcher, so
-/// no dialog is ever left unanswered (docs/DAEMON.md).
-pub fn release_attachment(attachment: Attachment) {
-    attachment.forwarder.abort();
+/// Teardown is the type's own job: abort the forwarder, then leave the room on
+/// the same session object `attach` joined. Leaving returns the dialogs to
+/// cancel — non-empty only when this was the last watcher, so no dialog is ever
+/// left unanswered (docs/DAEMON.md). As a `Drop` impl rather than a function
+/// every caller must remember, dropping an `Attachment` *anywhere* — an
+/// explicit `remove`, a `clear` on disconnect, an overwriting `insert` — is the
+/// release, and forgetting it is unrepresentable.
+impl Drop for Attachment {
+    fn drop(&mut self) {
+        self.forwarder.abort();
 
-    for dialog_id in attachment.session.detach() {
-        session::cancel_dialog(&attachment.session, &dialog_id);
+        for dialog_id in self.session.detach() {
+            session::cancel_dialog(&self.session, &dialog_id);
+        }
     }
 }
 
@@ -135,6 +140,17 @@ fn ping(_client_version: String) -> HarvesterResponse {
     })
 }
 
+/// The one wording for "that sid is not in the pid table", shared by every
+/// command that looks a session up — including the pi passthrough, which wraps
+/// the same message in pi's own response shape.
+pub fn no_such_session_message(sid: &Sid) -> String {
+    format!("no running session '{sid}'")
+}
+
+fn no_such_session(sid: &Sid) -> HarvesterResponse {
+    HarvesterResponse::err(no_such_session_message(sid))
+}
+
 /// Answer with a typed daemon-native payload. The payloads are our own types,
 /// so serialization cannot fail for any reason worth a runtime branch.
 fn data_response(data: impl serde::Serialize) -> HarvesterResponse {
@@ -151,18 +167,16 @@ fn spawn_list_sessions(
     out_tx: &mpsc::Sender<Outbound>,
 ) {
     let running = daemon.running_sids();
-    let out_tx = out_tx.clone();
 
-    tokio::spawn(async move {
+    answer_later(out_tx, async move {
         let scan =
             tokio::task::spawn_blocking(move || fslist::list_sessions(cwd.as_deref(), &running));
         let response = match scan.await {
             Ok(sessions) => data_response(SessionsData { sessions }),
             Err(join_error) => HarvesterResponse::err(format!("list_sessions: {join_error}")),
         };
-        let outgoing = Outgoing::HarvesterResponse { id, response };
 
-        let _ = out_tx.send(Outbound::Typed(outgoing)).await;
+        Outgoing::HarvesterResponse { id, response }
     });
 }
 
@@ -174,12 +188,10 @@ fn spawn_list_sessions(
 /// spawned: the pid table check inside `spawn_session` is what answers here,
 /// so one pi = one session file still holds.
 fn create_session(daemon: &Daemon, args: SpawnArgs) -> HarvesterResponse {
-    let sid = args.sid.clone();
-
     match daemon.spawn_session(args) {
-        Ok(session) => HarvesterResponse::ok(json!({"sid": session.sid})),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            HarvesterResponse::ok(json!({"sid": sid, "already": true}))
+        Ok(SpawnOutcome::Spawned(session)) => HarvesterResponse::ok(json!({"sid": session.sid})),
+        Ok(SpawnOutcome::AlreadyRunning(session)) => {
+            HarvesterResponse::ok(json!({"sid": session.sid, "already": true}))
         }
         Err(error) => HarvesterResponse::err(format!("spawn failed: {error}")),
     }
@@ -192,13 +204,10 @@ fn create_session(daemon: &Daemon, args: SpawnArgs) -> HarvesterResponse {
 /// startup (worst case `LIST_MODELS_TIMEOUT`) must not block sibling requests
 /// on this connection.
 fn spawn_list_models(id: Option<Value>, cwd: String, out_tx: &mpsc::Sender<Outbound>) {
-    let out_tx = out_tx.clone();
-
-    tokio::spawn(async move {
+    answer_later(out_tx, async move {
         let response = list_models(cwd).await;
-        let outgoing = Outgoing::HarvesterResponse { id, response };
 
-        let _ = out_tx.send(Outbound::Typed(outgoing)).await;
+        Outgoing::HarvesterResponse { id, response }
     });
 }
 
@@ -292,18 +301,20 @@ fn attach(
     attached: &mut AttachedMap,
 ) -> HarvesterResponse {
     let Some(session) = daemon.session(sid.as_str()) else {
-        return HarvesterResponse::err(format!("no running session '{sid}'"));
+        return no_such_session(&sid);
     };
 
-    if let Some(existing) = attached.get(sid.as_str()) {
-        if Arc::ptr_eq(&existing.session, &session) {
-            return HarvesterResponse::ok(json!({"already": true}));
-        }
+    // Attaching twice to the same session object is a no-op; an entry for an
+    // *older* generation of this sid (stopped and resumed since) is not, and
+    // needs no handling of its own — the `insert` below overwrites it, and the
+    // overwritten value's `Drop` leaves the room on the session object it
+    // actually joined.
+    let already_attached_to_this_generation = attached
+        .get(sid.as_str())
+        .is_some_and(|existing| Arc::ptr_eq(&existing.session, &session));
 
-        // Different generation: the sid was stopped and resumed since this
-        // attachment was made. Release the stale one, attach to the new one.
-        let stale = attached.remove(sid.as_str()).expect("checked above");
-        release_attachment(stale);
+    if already_attached_to_this_generation {
+        return HarvesterResponse::ok(json!({"already": true}));
     }
 
     // Subscribe before joining the room, never the other way round. A dialog
@@ -381,10 +392,10 @@ fn spawn_forwarder(
     })
 }
 
+/// Removing the entry *is* the release — `Attachment::drop` aborts the
+/// forwarder and leaves the room.
 fn detach(sid: Sid, attached: &mut AttachedMap) -> HarvesterResponse {
-    if let Some(attachment) = attached.remove(sid.as_str()) {
-        release_attachment(attachment);
-    }
+    attached.remove(sid.as_str());
 
     HarvesterResponse::ok(json!({}))
 }
@@ -399,7 +410,7 @@ fn detach(sid: Sid, attached: &mut AttachedMap) -> HarvesterResponse {
 /// backstop first keeps that guarantee independent of the queue's behaviour.
 fn stop(daemon: &Daemon, sid: Sid) -> HarvesterResponse {
     let Some(session) = daemon.session(sid.as_str()) else {
-        return HarvesterResponse::err(format!("no running session '{sid}'"));
+        return no_such_session(&sid);
     };
 
     tokio::spawn(kill_backstop(daemon.clone(), session.clone()));

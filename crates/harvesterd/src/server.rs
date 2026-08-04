@@ -1,6 +1,7 @@
 //! The controller layer: JSONL framing, decode, route, encode. Command logic
 //! lives in `ops.rs` (harvester) and `passthrough.rs` (pi).
 
+use std::future::Future;
 use std::sync::Arc;
 
 use harvester_proto::{read_frame, HarvesterResponse, Outgoing, Request, LF};
@@ -58,8 +59,10 @@ pub async fn serve_connection(daemon: Daemon, stream: UnixStream) {
     // Detach first (that drops the forwarders' senders), then drop ours: the
     // writer ends once the last sender is gone, having flushed everything
     // already queued. Aborting instead would discard responses a client
-    // half-closing its stdin is still waiting to read.
-    cleanup_connection(&mut attached);
+    // half-closing its stdin is still waiting to read. Clearing the map is the
+    // detach: each dropped `Attachment` leaves its session's room, so the
+    // empty-room dialog policy kicks in (docs/DAEMON.md).
+    attached.clear();
     drop(out_tx);
     let _ = writer.await;
 }
@@ -88,6 +91,23 @@ fn spawn_writer(
             }
         }
     })
+}
+
+/// Answer from a spawned task instead of from the connection loop. The three
+/// slow commands (pi passthroughs, `list_models`, `list_sessions`) all need
+/// this shape: they must not head-of-line block the loop, and the envelope
+/// `id` — not arrival order — is what correlates the answer. The future yields
+/// the whole `Outgoing` because the answer's *variant* differs per caller
+/// (`harvester_response` vs `pi_response`).
+pub fn answer_later(
+    out_tx: &mpsc::Sender<Outbound>,
+    answer: impl Future<Output = Outgoing> + Send + 'static,
+) {
+    let out_tx = out_tx.clone();
+
+    tokio::spawn(async move {
+        let _ = out_tx.send(Outbound::Typed(answer.await)).await;
+    });
 }
 
 /// Parse one stripped frame. `None` means "nothing to dispatch" (blank line,
@@ -123,12 +143,5 @@ fn handle_request(
     match request {
         Request::Harvester { id, cmd } => ops::dispatch(daemon, id, cmd, out_tx, attached),
         Request::Pi { id, sid, cmd } => passthrough::pi_passthrough(daemon, id, sid, cmd, out_tx),
-    }
-}
-
-/// Connection gone: detach everywhere so the empty-room dialog policy kicks in.
-fn cleanup_connection(attached: &mut AttachedMap) {
-    for (_sid, attachment) in attached.drain() {
-        ops::release_attachment(attachment);
     }
 }

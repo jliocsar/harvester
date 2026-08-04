@@ -5,7 +5,8 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::daemon::Daemon;
-use crate::server::Outbound;
+use crate::ops::no_such_session_message;
+use crate::server::{answer_later, Outbound};
 use crate::session::Session;
 use crate::sid::Sid;
 
@@ -37,11 +38,9 @@ pub fn pi_passthrough(
     };
 
     let Some(session) = daemon.session(sid.as_str()) else {
-        return Some(error_response(
-            id,
-            sid.to_string(),
-            "no running session".into(),
-        ));
+        let message = no_such_session_message(&sid);
+
+        return Some(error_response(id, sid.into(), message));
     };
 
     if cmd.get("type").and_then(Value::as_str) == Some("extension_ui_response") {
@@ -74,22 +73,19 @@ pub fn pi_passthrough(
         ));
     }
 
-    let out_tx = out_tx.clone();
-
-    tokio::spawn(async move {
+    answer_later(out_tx, async move {
         let response = match response_rx.await {
             Ok(response) => response,
             // Sender dropped: the session exited before answering.
             Err(_closed) => json!({"type": "response", "success": false,
                                    "error": "session exited before responding"}),
         };
-        let outgoing = Outgoing::PiResponse {
+
+        Outgoing::PiResponse {
             id,
             sid: sid.into(),
             response,
-        };
-
-        let _ = out_tx.send(Outbound::Typed(outgoing)).await;
+        }
     });
 
     None
