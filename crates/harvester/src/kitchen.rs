@@ -81,6 +81,7 @@ impl Render for Kitchen {
                     .child(section("model picker", render_model_picker_sample()))
                     .child(section("folder picker", render_folder_picker_sample()))
                     .child(section("chat messages", render_chat_messages()))
+                    .child(section("tool blocks", render_tool_blocks()))
                     .child(section("modal", render_modal_sample()))
                     .child(section("statusbar", render_statusbar_sample())),
             )
@@ -527,7 +528,7 @@ fn render_chat_messages() -> impl IntoElement {
         .child(ui::chat_message(
             "pi",
             theme::TEXT_DIM,
-            "Running the deploy now.\n\n[bash]",
+            "Running the deploy now.",
             false,
         ))
         .child(ui::chat_message(
@@ -535,6 +536,177 @@ fn render_chat_messages() -> impl IntoElement {
             theme::TEXT_DIM,
             "Streaming a partial answer▍",
             false,
+        ))
+}
+
+/// Tool-call blocks in every state (SPEC §Rendering pi): collapsed/expanded,
+/// running/ok/error, the per-tool label forms, edit's colored diff, write's
+/// all-added body, and the truncation notice. Chevrons here are static — the
+/// kitchen shows looks, the chat owns toggling.
+fn render_tool_blocks() -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap_4()
+        .w(px(560.))
+        .child(labeled(
+            "read, done, collapsed",
+            ui::tool_block().child(ui::tool_block_header(
+                "kitchen-tool-read",
+                theme::TEXT_FAINT,
+                ui::tool_block_label()
+                    .child(ui::tool_block_verb("Read"))
+                    .child(ui::tool_block_subject("main.rs".into(), false)),
+                false,
+            )),
+        ))
+        .child(labeled(
+            "bash, running, expanded with live output snapshot",
+            ui::tool_block()
+                .child(ui::tool_block_header(
+                    "kitchen-tool-bash-running",
+                    theme::ACCENT,
+                    ui::tool_block_label()
+                        .child(ui::tool_block_verb("$"))
+                        .child(ui::tool_block_subject(
+                            "cargo build --release --target x86_64-unknown-linux-musl".into(),
+                            true,
+                        )),
+                    true,
+                ))
+                .child(
+                    ui::tool_block_body()
+                        .child(ui::tool_block_context(
+                            "cargo build --release --target x86_64-unknown-linux-musl".into(),
+                        ))
+                        .child(ui::tool_block_output(
+                            "   Compiling harvester-proto v0.1.0\n   Compiling harvesterd v0.1.0"
+                                .into(),
+                        )),
+                ),
+        ))
+        .child(labeled(
+            "edit, done, expanded: pi's numbered diff + label stats",
+            ui::tool_block()
+                .child(ui::tool_block_header(
+                    "kitchen-tool-edit",
+                    theme::TEXT_FAINT,
+                    ui::tool_block_label()
+                        .child(ui::tool_block_verb("Edit"))
+                        .child(ui::tool_block_subject("demo.txt".into(), false))
+                        .child(ui::tool_block_stats(1, 1)),
+                    true,
+                ))
+                .child(
+                    ui::tool_block_body()
+                        .child(ui::tool_block_context("/home/exedev/demo.txt".into()))
+                        .child(ui::tool_block_diff_line(
+                            ui::DiffLineKind::Context,
+                            " 1 line one".into(),
+                        ))
+                        .child(ui::tool_block_diff_line(
+                            ui::DiffLineKind::Removed,
+                            "-2 line two".into(),
+                        ))
+                        .child(ui::tool_block_diff_line(
+                            ui::DiffLineKind::Added,
+                            "+2 LINE TWO EDITED".into(),
+                        ))
+                        .child(ui::tool_block_diff_line(
+                            ui::DiffLineKind::Context,
+                            " 3 line three".into(),
+                        )),
+                ),
+        ))
+        .child(labeled(
+            "write, done, expanded: all-added body",
+            ui::tool_block()
+                .child(ui::tool_block_header(
+                    "kitchen-tool-write",
+                    theme::TEXT_FAINT,
+                    ui::tool_block_label()
+                        .child(ui::tool_block_verb("Write"))
+                        .child(ui::tool_block_subject("fresh.txt".into(), false))
+                        .child(ui::tool_block_stats(3, 0)),
+                    true,
+                ))
+                .child(
+                    ui::tool_block_body()
+                        .child(ui::tool_block_context("/home/exedev/fresh.txt".into()))
+                        .child(ui::tool_block_diff_line(
+                            ui::DiffLineKind::Added,
+                            "+1 alpha".into(),
+                        ))
+                        .child(ui::tool_block_diff_line(
+                            ui::DiffLineKind::Added,
+                            "+2 beta".into(),
+                        ))
+                        .child(ui::tool_block_diff_line(
+                            ui::DiffLineKind::Added,
+                            "+3 gamma".into(),
+                        )),
+                ),
+        ))
+        .child(labeled(
+            "bash, error, expanded",
+            ui::tool_block()
+                .child(ui::tool_block_header(
+                    "kitchen-tool-bash-error",
+                    theme::STATUS_ERROR,
+                    ui::tool_block_label()
+                        .child(ui::tool_block_verb("$"))
+                        .child(ui::tool_block_subject("grep beta fresh.txt".into(), true)),
+                    true,
+                ))
+                .child(
+                    ui::tool_block_body()
+                        .child(ui::tool_block_context("grep beta fresh.txt".into()))
+                        .child(ui::tool_block_output(
+                            "grep: fresh.txt: No such file or directory\n\nCommand exited with code 2"
+                                .into(),
+                        )),
+                ),
+        ))
+        .child(labeled(
+            "truncated output + long command ellipsizes",
+            ui::tool_block()
+                .child(ui::tool_block_header(
+                    "kitchen-tool-truncated",
+                    theme::TEXT_FAINT,
+                    ui::tool_block_label().child(ui::tool_block_verb("$")).child(
+                        ui::tool_block_subject(
+                            "cat a-file-with-an-unreasonably-long-name-that-should-ellipsize-cleanly-in-the-header.log"
+                                .into(),
+                            true,
+                        ),
+                    ),
+                    true,
+                ))
+                .child(
+                    ui::tool_block_body()
+                        .child(ui::tool_block_context(
+                            "cat a-file-with-an-unreasonably-long-name-that-should-ellipsize-cleanly-in-the-header.log"
+                                .into(),
+                        ))
+                        .child(ui::tool_block_truncation_notice())
+                        .child(ui::tool_block_output(
+                            "…the last 64 KiB of output ends here".into(),
+                        )),
+                ),
+        ))
+        .child(labeled(
+            "unknown tool: name + compact args",
+            ui::tool_block().child(ui::tool_block_header(
+                "kitchen-tool-unknown",
+                theme::TEXT_FAINT,
+                ui::tool_block_label()
+                    .child(ui::tool_block_verb("browser_navigate"))
+                    .child(ui::tool_block_subject(
+                        "{\"url\":\"https://example.com\"}".into(),
+                        true,
+                    )),
+                false,
+            )),
         ))
 }
 

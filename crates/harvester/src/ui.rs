@@ -4,6 +4,8 @@
 //! chaining (`.on_click`, extra children); behavior stays with the caller,
 //! looks stay here.
 
+use std::sync::OnceLock;
+
 use gpui::{div, prelude::*, px, rgb, rgba, Div, ElementId, FontWeight, SharedString, Stateful};
 
 use crate::theme;
@@ -383,6 +385,174 @@ pub fn picker_file_row(name: SharedString) -> Div {
         .overflow_hidden()
         .text_ellipsis()
         .child(name)
+}
+
+/// The system monospace family for tool-block bodies. gpui matches font
+/// families by exact name — there is no generic "monospace" resolution — so
+/// ask fontconfig once and cache the answer for the process's lifetime.
+pub fn mono_font_family() -> SharedString {
+    static FAMILY: OnceLock<SharedString> = OnceLock::new();
+
+    FAMILY
+        .get_or_init(|| {
+            let fontconfig_match = std::process::Command::new("fc-match")
+                .args(["--format", "%{family}", "monospace"])
+                .output();
+
+            match fontconfig_match {
+                Ok(output) if output.status.success() && !output.stdout.is_empty() => {
+                    String::from_utf8_lossy(&output.stdout)
+                        .trim()
+                        .to_string()
+                        .into()
+                }
+                // No fontconfig (macOS) or it failed: a family every macOS
+                // ships; on Linux a miss falls back to gpui's default font.
+                _ => "Menlo".into(),
+            }
+        })
+        .clone()
+}
+
+/// A tool-call block (SPEC §Rendering pi): rounded bordered card holding a
+/// `tool_block_header` and, when expanded, a `tool_block_body`. Sits on the
+/// chat background; the panel fill sets it apart from message bubbles.
+pub fn tool_block() -> Div {
+    div()
+        .rounded_lg()
+        .bg(rgb(theme::PANEL_BG))
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .flex()
+        .flex_col()
+        .overflow_hidden()
+}
+
+/// The block's clickable one-liner: status dot, the caller-composed label
+/// (`tool_block_label`), trailing chevron. Caller chains `.on_click` to
+/// toggle expansion. Dot color: accent = running, faint = done, red = error.
+pub fn tool_block_header(
+    id: impl Into<ElementId>,
+    dot_color: u32,
+    label: Div,
+    expanded: bool,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .px_3()
+        .py(px(6.))
+        .flex()
+        .items_center()
+        .gap_2()
+        .cursor_pointer()
+        .hover(|style| style.bg(rgb(theme::ROW_HOVER)))
+        .child(status_dot(dot_color))
+        .child(label.flex_1().min_w(px(0.)))
+        .child(
+            div()
+                .flex_none()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_FAINT))
+                .child(if expanded { "▾" } else { "▸" }),
+        )
+}
+
+/// The header label row; compose with `tool_block_verb`, `tool_block_subject`
+/// and `tool_block_stats`.
+pub fn tool_block_label() -> Div {
+    div()
+        .flex()
+        .items_baseline()
+        .gap_2()
+        .overflow_hidden()
+        .text_sm()
+}
+
+/// The label's dim leading verb ("Read", "Edit", "$").
+pub fn tool_block_verb(text: impl Into<SharedString>) -> Div {
+    div()
+        .flex_none()
+        .text_color(rgb(theme::TEXT_DIM))
+        .child(text.into())
+}
+
+/// The label's subject: file basename, pattern, or the bash command line
+/// (`mono` for command text).
+pub fn tool_block_subject(text: SharedString, mono: bool) -> Div {
+    div()
+        .overflow_hidden()
+        .text_ellipsis()
+        .when(mono, |subject| subject.font_family(mono_font_family()))
+        .child(text)
+}
+
+/// "+N −N" line stats for edit/write labels.
+pub fn tool_block_stats(added: usize, removed: usize) -> Div {
+    div()
+        .flex_none()
+        .flex()
+        .gap_1()
+        .text_xs()
+        .child(
+            div()
+                .text_color(rgb(theme::DIFF_ADDED))
+                .child(format!("+{added}")),
+        )
+        .child(
+            div()
+                .text_color(rgb(theme::DIFF_REMOVED))
+                .child(format!("−{removed}")),
+        )
+}
+
+/// The expanded body under the header: monospace, small, separated by a
+/// hairline. Compose with `tool_block_context`, `tool_block_output`,
+/// `tool_block_diff_line` and `tool_block_truncation_notice`.
+pub fn tool_block_body() -> Div {
+    div()
+        .border_t_1()
+        .border_color(rgb(theme::BORDER))
+        .px_3()
+        .py_2()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .text_xs()
+        .font_family(mono_font_family())
+}
+
+/// The body's faint context line (full path, full command, raw args).
+pub fn tool_block_context(text: SharedString) -> Div {
+    div().text_color(rgb(theme::TEXT_FAINT)).child(text)
+}
+
+/// The body's output text (tool result or live partial snapshot).
+pub fn tool_block_output(text: SharedString) -> Div {
+    div().text_color(rgb(theme::TEXT_DIM)).child(text)
+}
+
+/// One line of an edit/write diff body.
+pub enum DiffLineKind {
+    Context,
+    Added,
+    Removed,
+}
+
+pub fn tool_block_diff_line(kind: DiffLineKind, text: SharedString) -> Div {
+    let color = match kind {
+        DiffLineKind::Context => theme::TEXT_DIM,
+        DiffLineKind::Added => theme::DIFF_ADDED,
+        DiffLineKind::Removed => theme::DIFF_REMOVED,
+    };
+
+    div().text_color(rgb(color)).child(text)
+}
+
+/// Shown above capped output — the head was dropped, the tail is live.
+pub fn tool_block_truncation_notice() -> Div {
+    div()
+        .text_color(rgb(theme::TEXT_FAINT))
+        .child("… output truncated")
 }
 
 /// Full-window backdrop that centers its child (the modal). Caller chains

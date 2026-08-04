@@ -3,9 +3,11 @@
 //! whole partial message — replace, never append. `agent_settled` (not
 //! `agent_end`) ends the turn.
 
+use std::collections::HashMap;
+
 use gpui::{
-    div, prelude::*, px, rgb, Context, Entity, Focusable, ScrollHandle, SharedString, Subscription,
-    Window,
+    div, prelude::*, px, rgb, AnyElement, Context, Div, Entity, Focusable, ScrollHandle,
+    SharedString, Subscription, Window,
 };
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
@@ -16,8 +18,8 @@ use crate::models::{self, ModelChoice, ModelsState};
 use crate::theme;
 use crate::ui;
 
-/// Who said a rendered message — only what slice 4 draws. Tool-result and
-/// system entries are skipped, tool calls render as placeholders.
+/// Who said a rendered message. Tool results render as `ToolBlock`s, not
+/// messages; system entries are skipped.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Role {
     User,
@@ -29,13 +31,51 @@ struct ChatMessage {
     text: String,
 }
 
+/// Cap on kept tool output per block, tail-kept (`tool_execution_update`
+/// snapshots are replaced wholesale, so capping bounds client memory only —
+/// the full output lives in the session file on the machine).
+const TOOL_OUTPUT_MAX_BYTES: usize = 64 * 1024;
+
+/// Where a tool call is in its lifecycle; drives the header dot. A history
+/// `toolCall` without a matching `toolResult` stays `Running` — either the
+/// tool is genuinely in flight (attach mid-turn) or the session died with it.
+enum ToolStatus {
+    Running,
+    Ok,
+    Error,
+}
+
+/// One tool call rendered as a collapsible block (SPEC §Rendering pi),
+/// correlated by `toolCallId` — pi runs tool executions in parallel and ends
+/// arrive out of order (verified live against pi 0.83.0).
+struct ToolBlock {
+    tool_call_id: String,
+    tool_name: String,
+    args: Value,
+    /// Latest output snapshot, tail-capped at `TOOL_OUTPUT_MAX_BYTES`.
+    output: String,
+    output_truncated: bool,
+    /// Edit's pre-rendered numbered diff (`result.details.diff`).
+    diff: Option<String>,
+    status: ToolStatus,
+    expanded: bool,
+}
+
+/// The conversation in render order: messages interleaved with tool blocks
+/// (pi emits the assistant `message_end` before its tool executions start,
+/// so plain push order is the true order).
+enum ChatItem {
+    Message(ChatMessage),
+    Tool(ToolBlock),
+}
+
 pub struct Chat {
     sid: String,
     /// Display label of the machine this session runs on — shown as the
     /// prompt box's read-only machine control (the machine was picked while
     /// the chat was a ghost; a running session never moves).
     machine_label: SharedString,
-    messages: Vec<ChatMessage>,
+    items: Vec<ChatItem>,
     /// The in-flight assistant message, replaced wholesale on every
     /// `message_update` (the event's `partial` is the full message so far).
     streaming: Option<String>,
@@ -77,14 +117,14 @@ impl Chat {
     ) -> Self {
         let input = cx.new(|cx| TextInput::new("Message pi — Enter to send", cx));
         let input_subscription = cx.subscribe(&input, Self::handle_prompt_submitted);
-        let mut messages: Vec<ChatMessage> = entries.iter().filter_map(entry_message).collect();
+        let mut items = items_from_entries(entries);
         let busy = first_prompt.is_some();
 
         if let Some(text) = first_prompt {
-            messages.push(ChatMessage {
+            items.push(ChatItem::Message(ChatMessage {
                 role: Role::User,
                 text,
-            });
+            }));
         }
 
         // The model control needs the list and the current model; both queue
@@ -95,7 +135,7 @@ impl Chat {
         Self {
             sid,
             machine_label,
-            messages,
+            items,
             streaming: None,
             busy,
             exited_notice: None,
@@ -218,10 +258,10 @@ impl Chat {
             return;
         }
 
-        self.messages.push(ChatMessage {
+        self.items.push(ChatItem::Message(ChatMessage {
             role: Role::User,
             text: event.0.clone(),
-        });
+        }));
         self.busy = true;
 
         if self
@@ -265,26 +305,110 @@ impl Chat {
                         let text = message_text(message);
 
                         if !text.is_empty() {
-                            self.messages.push(ChatMessage {
+                            self.items.push(ChatItem::Message(ChatMessage {
                                 role: Role::Assistant,
                                 text,
-                            });
+                            }));
                         }
                     }
                 }
                 self.streaming = None;
             }
+            "tool_execution_start" => self.handle_tool_start(event),
+            "tool_execution_update" => self.handle_tool_update(event),
+            "tool_execution_end" => self.handle_tool_end(event),
             "agent_settled" => {
                 self.busy = false;
                 self.streaming = None;
             }
-            // Everything else (tool executions, retries, compaction, queue)
-            // is later-slice material.
+            // Everything else (retries, compaction, queue) is later-slice
+            // material.
             _ => return,
         }
 
         self.scroll.scroll_to_bottom();
         cx.notify();
+    }
+
+    /// `tool_execution_start`: a new running block. Pi emits the assistant
+    /// `message_end` first, so the block lands after its announcing text.
+    fn handle_tool_start(&mut self, event: &Value) {
+        let Some(tool_call_id) = event.get("toolCallId").and_then(Value::as_str) else {
+            return;
+        };
+        let tool_name = event
+            .get("toolName")
+            .and_then(Value::as_str)
+            .unwrap_or("tool");
+
+        self.items.push(ChatItem::Tool(ToolBlock {
+            tool_call_id: tool_call_id.to_string(),
+            tool_name: tool_name.to_string(),
+            args: event.get("args").cloned().unwrap_or(Value::Null),
+            output: String::new(),
+            output_truncated: false,
+            diff: None,
+            status: ToolStatus::Running,
+            expanded: false,
+        }));
+    }
+
+    /// `tool_execution_update`: `partialResult` is the accumulated snapshot —
+    /// replace the block's output, never append.
+    fn handle_tool_update(&mut self, event: &Value) {
+        let Some(partial_result) = event.get("partialResult") else {
+            return;
+        };
+        let (output, truncated) = capped_content_text(partial_result);
+
+        if let Some(block) = self.find_tool_block(event) {
+            block.output = output;
+            block.output_truncated = truncated;
+        }
+    }
+
+    /// `tool_execution_end`: final output, error flag, and (for edit) the
+    /// pre-rendered numbered diff in `result.details.diff`.
+    fn handle_tool_end(&mut self, event: &Value) {
+        let is_error = event
+            .get("isError")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let result = event.get("result");
+
+        let Some(block) = self.find_tool_block(event) else {
+            return;
+        };
+
+        block.status = if is_error {
+            ToolStatus::Error
+        } else {
+            ToolStatus::Ok
+        };
+
+        if let Some(result) = result {
+            (block.output, block.output_truncated) = capped_content_text(result);
+            block.diff = extract_diff(result);
+        }
+    }
+
+    /// The block a tool event belongs to, by `toolCallId` — searched from the
+    /// back since live events concern recent blocks.
+    fn find_tool_block(&mut self, event: &Value) -> Option<&mut ToolBlock> {
+        let tool_call_id = event.get("toolCallId").and_then(Value::as_str)?;
+
+        self.items.iter_mut().rev().find_map(|item| match item {
+            ChatItem::Tool(block) if block.tool_call_id == tool_call_id => Some(block),
+            _ => None,
+        })
+    }
+
+    /// A tool block's header was clicked: toggle its body.
+    fn toggle_tool_block(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(ChatItem::Tool(block)) = self.items.get_mut(index) {
+            block.expanded = !block.expanded;
+            cx.notify();
+        }
     }
 
     pub fn handle_session_exit(&mut self, exit_code: Option<i32>, cx: &mut Context<Self>) {
@@ -298,20 +422,6 @@ impl Chat {
             "session exited{code_text} — click it in the sidebar to resume"
         ));
         cx.notify();
-    }
-
-    fn render_message(message: &ChatMessage) -> impl IntoElement {
-        let (label, label_color) = match message.role {
-            Role::User => ("you", theme::ACCENT),
-            Role::Assistant => ("pi", theme::TEXT_DIM),
-        };
-
-        ui::chat_message(
-            label,
-            label_color,
-            message.text.clone(),
-            message.role == Role::User,
-        )
     }
 
     fn render_streaming(&self) -> Option<impl IntoElement> {
@@ -412,7 +522,12 @@ impl Render for Chat {
                             .flex_col()
                             .gap_3()
                             .p_3()
-                            .children(self.messages.iter().map(Self::render_message))
+                            .children(
+                                self.items
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(index, item)| render_item(index, item, cx)),
+                            )
                             .children(self.render_streaming()),
                     ),
             )
@@ -420,26 +535,358 @@ impl Render for Chat {
     }
 }
 
-/// One `get_entries` entry → a rendered message, if it is one.
-fn entry_message(entry: &Value) -> Option<ChatMessage> {
-    let message = entry.get("message")?;
-    let role = match message.get("role").and_then(Value::as_str)? {
-        "user" => Role::User,
-        "assistant" => Role::Assistant,
-        _ => return None,
-    };
-    let text = message_text(message);
-
-    if text.is_empty() {
-        return None;
+/// One rendered conversation item; tool blocks carry their item index so
+/// their click listeners can find them again.
+fn render_item(index: usize, item: &ChatItem, cx: &mut Context<Chat>) -> AnyElement {
+    match item {
+        ChatItem::Message(message) => render_message(message).into_any_element(),
+        ChatItem::Tool(block) => render_tool_block(index, block, cx).into_any_element(),
     }
-
-    Some(ChatMessage { role, text })
 }
 
-/// Slice-4 text extraction from a pi message: text blocks verbatim, tool
-/// calls as one-line placeholders, thinking skipped. Rich blocks are a later
-/// slice.
+fn render_message(message: &ChatMessage) -> impl IntoElement {
+    let (label, label_color) = match message.role {
+        Role::User => ("you", theme::ACCENT),
+        Role::Assistant => ("pi", theme::TEXT_DIM),
+    };
+
+    ui::chat_message(
+        label,
+        label_color,
+        message.text.clone(),
+        message.role == Role::User,
+    )
+}
+
+fn render_tool_block(index: usize, block: &ToolBlock, cx: &mut Context<Chat>) -> impl IntoElement {
+    let dot_color = match block.status {
+        ToolStatus::Running => theme::ACCENT,
+        ToolStatus::Ok => theme::TEXT_FAINT,
+        ToolStatus::Error => theme::STATUS_ERROR,
+    };
+    let header = ui::tool_block_header(
+        ("tool-block", index),
+        dot_color,
+        tool_block_label(block),
+        block.expanded,
+    )
+    .on_click(cx.listener(move |chat, _, _, cx| chat.toggle_tool_block(index, cx)));
+
+    ui::tool_block()
+        .child(header)
+        .when(block.expanded, |container| {
+            container.child(render_tool_body(block))
+        })
+}
+
+/// Cap on the compact-args summary in unknown-tool labels; the full args
+/// render in the expanded body.
+const ARGS_SUMMARY_MAX_CHARS: usize = 80;
+
+/// The header one-liner per tool (built-ins verified against pi 0.83.0:
+/// read/bash/edit/write/grep/find/ls). Bash gets a `$ command` form — pi has
+/// no human titles for calls, the command itself is the best label.
+fn tool_block_label(block: &ToolBlock) -> Div {
+    let label = ui::tool_block_label();
+
+    match block.tool_name.as_str() {
+        "bash" => {
+            let command = arg_str(&block.args, "command").unwrap_or_default();
+            let first_line = command.lines().next().unwrap_or_default().to_string();
+
+            label
+                .child(ui::tool_block_verb("$"))
+                .child(ui::tool_block_subject(first_line.into(), true))
+        }
+        "read" | "write" | "edit" => {
+            let verb = match block.tool_name.as_str() {
+                "read" => "Read",
+                "write" => "Write",
+                _ => "Edit",
+            };
+            let path = arg_str(&block.args, "path").unwrap_or_default();
+            let label = label
+                .child(ui::tool_block_verb(verb))
+                .child(ui::tool_block_subject(
+                    basename(path).to_string().into(),
+                    false,
+                ));
+
+            match line_stats(block) {
+                Some((added, removed)) => label.child(ui::tool_block_stats(added, removed)),
+                None => label,
+            }
+        }
+        "grep" | "find" => {
+            let verb = if block.tool_name == "grep" {
+                "Grep"
+            } else {
+                "Find"
+            };
+            let pattern = arg_str(&block.args, "pattern").unwrap_or_default();
+
+            label
+                .child(ui::tool_block_verb(verb))
+                .child(ui::tool_block_subject(pattern.to_string().into(), true))
+        }
+        "ls" => {
+            let path = arg_str(&block.args, "path").unwrap_or(".");
+
+            label
+                .child(ui::tool_block_verb("List"))
+                .child(ui::tool_block_subject(path.to_string().into(), false))
+        }
+        _ => label
+            .child(ui::tool_block_verb(block.tool_name.clone()))
+            .child(ui::tool_block_subject(
+                compact_args(&block.args).into(),
+                true,
+            )),
+    }
+}
+
+/// The expanded body: context line, then a diff (edit/write) or the output
+/// snapshot. Errors always show the output — that is where the message is.
+fn render_tool_body(block: &ToolBlock) -> Div {
+    let mut body = ui::tool_block_body().child(ui::tool_block_context(context_line(block).into()));
+
+    if !matches!(block.status, ToolStatus::Error) {
+        // Edit: pi's pre-rendered numbered diff (`details.diff`).
+        if let Some(diff) = &block.diff {
+            return body.children(diff.lines().map(diff_line));
+        }
+
+        // Write: synthesize the all-added diff from the content argument.
+        if block.tool_name == "write" {
+            if let Some(content) = arg_str(&block.args, "content") {
+                return body.children(content.lines().enumerate().map(|(line_index, line)| {
+                    ui::tool_block_diff_line(
+                        ui::DiffLineKind::Added,
+                        format!("+{} {line}", line_index + 1).into(),
+                    )
+                }));
+            }
+        }
+    }
+
+    if block.output_truncated {
+        body = body.child(ui::tool_block_truncation_notice());
+    }
+
+    if block.output.is_empty() {
+        let placeholder = match block.status {
+            ToolStatus::Running => "running…",
+            _ => "(no output)",
+        };
+
+        return body.child(ui::tool_block_output(placeholder.into()));
+    }
+
+    body.child(ui::tool_block_output(block.output.clone().into()))
+}
+
+/// The body's faint first line: enough to identify the call in full.
+fn context_line(block: &ToolBlock) -> String {
+    match block.tool_name.as_str() {
+        "read" | "write" | "edit" => arg_str(&block.args, "path").unwrap_or_default().to_string(),
+        "bash" => arg_str(&block.args, "command")
+            .unwrap_or_default()
+            .to_string(),
+        _ => block.args.to_string(),
+    }
+}
+
+/// One line of pi's numbered diff format (" 1 ctx" / "-2 old" / "+2 new").
+fn diff_line(line: &str) -> Div {
+    let kind = match line.as_bytes().first() {
+        Some(b'+') => ui::DiffLineKind::Added,
+        Some(b'-') => ui::DiffLineKind::Removed,
+        _ => ui::DiffLineKind::Context,
+    };
+
+    ui::tool_block_diff_line(kind, line.to_string().into())
+}
+
+/// "+N −N" for the label: write counts its content argument (known from the
+/// start), edit counts its diff's +/− lines (known once the result lands).
+fn line_stats(block: &ToolBlock) -> Option<(usize, usize)> {
+    match block.tool_name.as_str() {
+        "write" => {
+            let content = arg_str(&block.args, "content")?;
+
+            Some((content.lines().count(), 0))
+        }
+        "edit" => {
+            let diff = block.diff.as_deref()?;
+            let added = diff.lines().filter(|line| line.starts_with('+')).count();
+            let removed = diff.lines().filter(|line| line.starts_with('-')).count();
+
+            Some((added, removed))
+        }
+        _ => None,
+    }
+}
+
+fn arg_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
+    args.get(key).and_then(Value::as_str)
+}
+
+fn basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Unknown-tool label summary: the raw args JSON, capped (full args live in
+/// the expanded body's context line).
+fn compact_args(args: &Value) -> String {
+    let json = args.to_string();
+
+    if json.chars().count() <= ARGS_SUMMARY_MAX_CHARS {
+        return json;
+    }
+
+    let truncated: String = json.chars().take(ARGS_SUMMARY_MAX_CHARS).collect();
+
+    format!("{truncated}…")
+}
+
+/// `get_entries` history → render items: user/assistant text plus tool
+/// blocks rebuilt from assistant `toolCall` blocks matched to their
+/// `toolResult` messages — the same data the live events carry (verified
+/// against pi 0.83.0 session captures).
+fn items_from_entries(entries: &[Value]) -> Vec<ChatItem> {
+    // toolCallId → toolResult message, collected ahead of the walk (results
+    // land in later entries than their calls).
+    let mut tool_results: HashMap<&str, &Value> = HashMap::new();
+
+    for entry in entries {
+        let Some(message) = entry.get("message") else {
+            continue;
+        };
+
+        if message.get("role").and_then(Value::as_str) == Some("toolResult") {
+            if let Some(tool_call_id) = message.get("toolCallId").and_then(Value::as_str) {
+                tool_results.insert(tool_call_id, message);
+            }
+        }
+    }
+
+    let mut items = Vec::new();
+
+    for entry in entries {
+        let Some(message) = entry.get("message") else {
+            continue;
+        };
+        let role = match message.get("role").and_then(Value::as_str) {
+            Some("user") => Role::User,
+            Some("assistant") => Role::Assistant,
+            _ => continue,
+        };
+        let text = message_text(message);
+
+        if !text.is_empty() {
+            items.push(ChatItem::Message(ChatMessage { role, text }));
+        }
+
+        if role == Role::Assistant {
+            let Some(Value::Array(blocks)) = message.get("content") else {
+                continue;
+            };
+
+            for block in blocks {
+                if block.get("type").and_then(Value::as_str) == Some("toolCall") {
+                    if let Some(tool_block) = tool_block_from_history(block, &tool_results) {
+                        items.push(ChatItem::Tool(tool_block));
+                    }
+                }
+            }
+        }
+    }
+
+    items
+}
+
+/// One history `toolCall {id, name, arguments}` → a finished block, filled
+/// from its `toolResult` when one exists. Without a result the block stays
+/// `Running`: either the tool is genuinely in flight (attach mid-turn — the
+/// live `tool_execution_*` events will find this block by id) or the session
+/// died with it (the exited notice tells that story).
+fn tool_block_from_history(
+    block: &Value,
+    tool_results: &HashMap<&str, &Value>,
+) -> Option<ToolBlock> {
+    let tool_call_id = block.get("id").and_then(Value::as_str)?;
+    let tool_name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
+    let mut tool_block = ToolBlock {
+        tool_call_id: tool_call_id.to_string(),
+        tool_name: tool_name.to_string(),
+        args: block.get("arguments").cloned().unwrap_or(Value::Null),
+        output: String::new(),
+        output_truncated: false,
+        diff: None,
+        status: ToolStatus::Running,
+        expanded: false,
+    };
+
+    if let Some(result) = tool_results.get(tool_call_id) {
+        let is_error = result
+            .get("isError")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        tool_block.status = if is_error {
+            ToolStatus::Error
+        } else {
+            ToolStatus::Ok
+        };
+        (tool_block.output, tool_block.output_truncated) = capped_content_text(result);
+        tool_block.diff = extract_diff(result);
+    }
+
+    Some(tool_block)
+}
+
+/// The joined text of a result-like object's `content` blocks (live results
+/// and history `toolResult` messages share the shape), tail-capped at
+/// `TOOL_OUTPUT_MAX_BYTES`.
+fn capped_content_text(container: &Value) -> (String, bool) {
+    let mut text = String::new();
+
+    if let Some(Value::Array(blocks)) = container.get("content") {
+        for block in blocks {
+            if block.get("type").and_then(Value::as_str) == Some("text") {
+                if let Some(piece) = block.get("text").and_then(Value::as_str) {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(piece);
+                }
+            }
+        }
+    }
+
+    if text.len() <= TOOL_OUTPUT_MAX_BYTES {
+        return (text, false);
+    }
+
+    let cut_start = text.len() - TOOL_OUTPUT_MAX_BYTES;
+    let boundary = (cut_start..text.len())
+        .find(|index| text.is_char_boundary(*index))
+        .unwrap_or(text.len());
+
+    (text[boundary..].to_string(), true)
+}
+
+/// Edit's pre-rendered numbered diff, when the result carries one.
+fn extract_diff(result: &Value) -> Option<String> {
+    result
+        .get("details")?
+        .get("diff")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Text extraction from a pi message: text blocks verbatim, thinking and
+/// tool calls skipped (tool calls render as blocks, not inline text).
 fn message_text(message: &Value) -> String {
     let mut pieces: Vec<String> = Vec::new();
 
@@ -447,19 +894,12 @@ fn message_text(message: &Value) -> String {
         Some(Value::String(text)) => pieces.push(text.clone()),
         Some(Value::Array(blocks)) => {
             for block in blocks {
-                match block.get("type").and_then(Value::as_str) {
-                    Some("text") => {
-                        if let Some(text) = block.get("text").and_then(Value::as_str) {
-                            if !text.is_empty() {
-                                pieces.push(text.to_string());
-                            }
+                if block.get("type").and_then(Value::as_str) == Some("text") {
+                    if let Some(text) = block.get("text").and_then(Value::as_str) {
+                        if !text.is_empty() {
+                            pieces.push(text.to_string());
                         }
                     }
-                    Some("toolCall") => {
-                        let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
-                        pieces.push(format!("[{name}]"));
-                    }
-                    _ => {}
                 }
             }
         }

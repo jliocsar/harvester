@@ -33,6 +33,11 @@ pub const SELECTION_RGBA: u32 = 0x0a84ff40;
 pub const STATUS_RUNNING: u32 = 0x30d158;
 pub const STATUS_ERROR: u32 = 0xff453a;
 
+/// Diff line colors in tool-block bodies (edit/write). Same system green/red
+/// as the status pair, but named for what they mean here.
+pub const DIFF_ADDED: u32 = 0x30d158;
+pub const DIFF_REMOVED: u32 = 0xff453a;
+
 /// Neutral button fill (`systemGray5` dark) and its press states.
 pub const BUTTON_BG: u32 = 0x3a3a3c;
 pub const BUTTON_HOVER: u32 = 0x48484a;
