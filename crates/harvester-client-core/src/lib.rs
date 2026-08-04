@@ -1,8 +1,16 @@
 //! The client backbone for Harvester: bootstrap harvesterd on a machine
 //! (plain SSH or the local shell — one exec boundary, `Host`), forward its
-//! Unix socket, and speak the docs/DAEMON.md envelope. Deliberately gpui-free:
-//! this crate plus its `bridge`/`machines` workers is the whole client any
-//! frontend (gpui today, mobile later) would reuse.
+//! Unix socket, and speak the docs/DAEMON.md envelope. Deliberately gpui-free.
+//!
+//! What lives here today is *one machine at a time*: `bridge` (that machine's
+//! daemon connection, command flows and event fan-in) and `machines`
+//! (provider listing + reachability probes). Fleet-level policy does not —
+//! the bridge pool, machine table, probe verdicts, connect policy
+//! (`ensure_connection`) and machine-identity resolution (`resolve_target`, a
+//! second implementation of [`MachineKey::parse`]) all still live in
+//! `crates/harvester/src/workbench.rs`, the gpui crate, so a second frontend
+//! would reimplement them. Moving them behind one owner here is decided and
+//! scheduled (docs/SPEC.md §Decisions on record, C3), not done.
 //!
 //! Two entry points matter: [`bridge::start`] (one machine's full worker —
 //! bootstrap, connect, command flows, event fan-in) and, underneath it,

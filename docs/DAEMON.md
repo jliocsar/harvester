@@ -56,7 +56,7 @@ pi --mode rpc \
 - `PI_OFFLINE=1` disables update checks and telemetry on spawn (see open question 1 re: package installs).
 - Session ids are client-generated **uuidv7** — pi's own native session-id format (`session-manager.js` generates ids with `uuidv7()`), and canonical uuidv7 passes pi's id validation charset.
 - **Terminate by closing stdin, never SIGTERM** (SIGTERM skips the final stdout flush and may truncate the last line).
-- **The stderr log is appended, never truncated** (`2>>`), and each run is preceded by a `--- harvesterd: spawning pi for <sid> at <unix seconds> ---` banner. Spawn *is* resume, so truncating would destroy the record of why the previous run died — exactly what the user is asking for when they resume a crashed session.
+- **The stderr log is appended, never truncated** (`2>>`), and each run is preceded by a `--- harvesterd: spawning pi for <sid> at <n> (unix seconds) ---` banner. Spawn *is* resume, so truncating would destroy the record of why the previous run died — exactly what the user is asking for when they resume a crashed session.
 
 ## Operations (`type: "harvester"`)
 
@@ -71,7 +71,7 @@ First command on every connection.
 {"id": 1, "type": "harvester_response", "response": {"success": true, "data": {"version": "0.1.0"}}}
 ```
 
-The client compares versions and re-bootstraps on mismatch (see Bootstrap).
+The client compares versions and re-bootstraps on mismatch (see Bootstrap). The string is `env!("CARGO_PKG_VERSION")` on both sides today, which is a **known hazard**: rebuilding harvesterd without bumping the workspace version leaves every bootstrapped machine on the stale binary forever (the probe sees a match and skips the upload), and a client-only bump force-upgrades every daemon, killing every running pi child for a change the wire never saw. The fix is decided — see §Decisions on record (C4).
 
 ### `list_sessions`
 
@@ -115,7 +115,7 @@ For the ghost-chat model picker, which needs answers before any session exists. 
 {"id": 5, "type": "harvester", "cmd": {"type": "attach", "sid": "01H..."}}
 ```
 
-Subscribes this connection to the session's live event stream. A connection may attach to any number of sessions. Reconnect/replay is NOT a daemon feature — after attaching, the client sends passthrough `get_entries {since: <last seen entry id>}` to recover history from pi's durable cursor, then renders live events. The verbose delta stream is never replayed.
+Subscribes this connection to the session's live event stream. A connection may attach to any number of sessions. The daemon guarantee stands as written, but **no client exercises it today**: the gpui client's bridge holds exactly one attachment per machine (one chat pane — `bridge.rs`'s `attached`), detaching from the previous session before attaching to the next. Reconnect/replay is NOT a daemon feature — after attaching, the client sends passthrough `get_entries {since: <last seen entry id>}` to recover history from pi's durable cursor, then renders live events. The verbose delta stream is never replayed.
 
 ### `stop`
 
@@ -167,7 +167,7 @@ Client-relevant pi semantics (details in `HARNESS_RESEARCH.md`): `agent_settled`
 Vanilla pi never asks questions — these only occur when extensions are loaded (auto-discovered from `~/.pi/agent/extensions/`, or project `.pi/extensions/` now that we launch with `--approve`). Policy:
 
 - Dialog methods (`select`, `confirm`, `input`, `editor`):
-  - ≥1 client attached → forwarded as a normal event; a client answers via passthrough `extension_ui_response`. First answer wins; the daemon drops responses for ids no longer pending. The daemon holds the dialog's envelope until it is answered and **replays every pending dialog to a client that attaches later** — otherwise a handoff between clients (A holds a dialog, B attaches, A leaves) would strand pi on a dialog nobody can see. Clients must therefore treat a dialog id they already know as a duplicate, not a second question.
+  - ≥1 client attached → forwarded as a normal event; a client answers via passthrough `extension_ui_response`. First answer wins; the daemon drops responses for ids no longer pending. The daemon holds the dialog's envelope until it is answered and **replays every pending dialog to a client that attaches later** — otherwise a handoff between clients (A holds a dialog, B attaches, A leaves) would strand pi on a dialog nobody can see. Clients must therefore treat a dialog id they already know as a duplicate, not a second question. **Answering or cancelling a forwarded dialog is a client obligation whenever the room is non-empty** — the daemon's auto-cancel below is an empty-room safety net only, so an attached client that ignores a dialog leaves pi blocked indefinitely. No client meets that obligation today (`extension_ui_request`/`extension_ui_response` appear nowhere in `crates/harvester` or `crates/harvester-client-core`); the interim fix is decided, see §Decisions on record (C5).
   - 0 clients attached → the daemon immediately writes `{"type": "extension_ui_response", "id": <id>, "cancelled": true}` to pi. To the extension this is identical to a human pressing Escape; the agent never hangs on an empty room.
   - The last client detaching (or disconnecting) with dialogs still pending cancels them all the same way — an empty room never holds a dialog open, whichever order things emptied in.
 - Dialogs carrying a `timeout` auto-resolve inside pi; the daemon keeps no timers.
@@ -193,6 +193,16 @@ Implemented in `harvester-client-core::bootstrap_and_connect` (driveable via the
 - **No workspace/git/file-picker ops.** Those are plain SSH execs by the client (`ls`, `git rev-parse`), not daemon business.
 - **No machine CRUD.** That's the provider contract (`PROVIDERS.md`).
 - **Future, not v1**: "Update dependencies" machine action — plain `ssh <machine> 'exeuntu update pi && pi update --all'` from the client, no daemon involvement (`pi update` documentedly never prompts for trust).
+
+## Decisions on record
+
+Settled in the 2026-08-04 backend review; none is built yet. Recorded so the next round starts from the verdict.
+
+- **C1 — the session-swapping denylist is enforced in the daemon**, not by client politeness: `pi_passthrough` rejects `new_session`, `switch_session`, `fork` and `clone` with `success: false` naming the invariant, before the pi-level id is injected. "Multiple clients are first-class" means the trusted client is not the only client, and the failure it prevents — a session file swapped under a live pi — is unrecoverable. The daemon already inspects `type` for the dialog policy, so the precedent for looking at a pi payload exists. *Decided, not built: `passthrough.rs` enforces nothing today.*
+- **C4 — protocol version and build identity are two things and get split.** `PROTOCOL_VERSION` becomes an integer bumped only when the envelope changes (that is what `ping` exchanges and what `VersionMismatch` tests); build identity becomes separate — harvesterd hashes `/proc/self/exe` at startup, reports it in `PingData`, and the client installs iff it differs from the binary it ships. Answers both real questions (*is the file on disk the one I ship*, *is the running daemon that file*) with no remote dependency. *Decided, not built — see the hazard under §`ping`.*
+- **C5 — until dialog modals exist, the client's bridge auto-cancels forwarded dialogs** (passthrough `extension_ui_response` with `cancelled: true`, plus a visible failure note), idempotently, since the daemon replays a pending dialog to every attaching client and the same id arrives twice by design. The obligation it discharges is stated in §Dialogs. Deleted wholesale when the modal slice lands. *Decided, not built.*
+
+Architectural decisions from the same review (bridge reply tokens, the `Fleet` extraction, the client-side transcript replica) are recorded in `SPEC.md` §Decisions on record.
 
 ## Open questions
 
