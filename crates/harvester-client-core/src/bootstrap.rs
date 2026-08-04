@@ -59,7 +59,7 @@ pub struct Connected {
 pub async fn bootstrap_and_connect(host: &Host, daemon_binary: &[u8]) -> Result<Connected> {
     let probe = probe(host).await?;
 
-    let outcome = match probe.installed_version.as_deref() {
+    let outcome = match probe.installed_version {
         Some(PROTOCOL_VERSION) => {
             start(host).await?;
 
@@ -82,7 +82,7 @@ pub async fn bootstrap_and_connect(host: &Host, daemon_binary: &[u8]) -> Result<
     if daemon_version == PROTOCOL_VERSION {
         return Ok(Connected {
             connection,
-            daemon_version,
+            daemon_version: daemon_version.to_string(),
             outcome,
             remote_home: probe.home,
         });
@@ -99,21 +99,21 @@ pub async fn bootstrap_and_connect(host: &Host, daemon_binary: &[u8]) -> Result<
     if daemon_version == PROTOCOL_VERSION {
         Ok(Connected {
             connection,
-            daemon_version,
+            daemon_version: daemon_version.to_string(),
             outcome: BootstrapOutcome::Upgraded,
             remote_home: probe.home,
         })
     } else {
         Err(Error::VersionMismatch {
             expected: PROTOCOL_VERSION.to_string(),
-            actual: daemon_version,
+            actual: daemon_version.to_string(),
         })
     }
 }
 
 struct Probe {
     home: String,
-    installed_version: Option<String>,
+    installed_version: Option<u32>,
 }
 
 /// One round trip answering both bootstrap questions: where is `$HOME`
@@ -134,11 +134,11 @@ async fn probe(host: &Host) -> Result<Probe> {
         });
     };
 
+    // Unparseable reads as "no daemon installed", which reinstalls — the
+    // self-healing direction. That is also how a pre-C4 binary is retired:
+    // it prints a crate version string ("0.1.0"), which is not a `u32`.
     let installed_version = if output.status.success() {
-        stdout_lines
-            .next()
-            .map(str::to_string)
-            .filter(|version| !version.is_empty())
+        stdout_lines.next().and_then(|version| version.parse().ok())
     } else {
         None
     };

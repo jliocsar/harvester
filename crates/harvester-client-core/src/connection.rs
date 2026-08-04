@@ -128,7 +128,7 @@ pub struct DaemonConnection {
 /// reached through an `ssh -L` forward, the local one directly. Both end in
 /// the same ping handshake and return the daemon's self-reported version —
 /// the mismatch policy is bootstrap's business, not ours.
-pub(crate) async fn connect_host(host: &Host, home: &str) -> Result<(DaemonConnection, String)> {
+pub(crate) async fn connect_host(host: &Host, home: &str) -> Result<(DaemonConnection, u32)> {
     match host {
         Host::Local => connect_local(home).await,
         Host::Ssh(target) => connect(target, home).await,
@@ -137,7 +137,7 @@ pub(crate) async fn connect_host(host: &Host, home: &str) -> Result<(DaemonConne
 
 /// Forwards the daemon socket and completes the ping handshake, retrying
 /// until `CONNECT_TIMEOUT` (a just-started daemon needs a beat to bind).
-async fn connect(target: &SshTarget, remote_home: &str) -> Result<(DaemonConnection, String)> {
+async fn connect(target: &SshTarget, remote_home: &str) -> Result<(DaemonConnection, u32)> {
     let local_socket = local_socket_path(&target.dest);
 
     // A stale file from a previous run makes ssh refuse the bind.
@@ -186,7 +186,7 @@ async fn connect(target: &SshTarget, remote_home: &str) -> Result<(DaemonConnect
 async fn bounded_handshake(
     socket: &Path,
     deadline: Instant,
-) -> std::io::Result<(BufReader<OwnedReadHalf>, OwnedWriteHalf, String)> {
+) -> std::io::Result<(BufReader<OwnedReadHalf>, OwnedWriteHalf, u32)> {
     let remaining = deadline.duration_since(Instant::now());
 
     match tokio::time::timeout(remaining, handshake(socket)).await {
@@ -201,7 +201,7 @@ async fn bounded_handshake(
 /// The local-machine variant: the daemon's socket is on this filesystem, so
 /// connect directly — no forward process, no socket-file ownership. Same
 /// retry window (a just-started daemon needs a beat to bind).
-async fn connect_local(home: &str) -> Result<(DaemonConnection, String)> {
+async fn connect_local(home: &str) -> Result<(DaemonConnection, u32)> {
     let socket = PathBuf::from(home).join(DAEMON_SOCKET);
     let deadline = Instant::now() + CONNECT_TIMEOUT;
 
@@ -273,7 +273,7 @@ fn create_forward_command(
 /// the response. Fails (for retry) while the forward or daemon is not up yet.
 async fn handshake(
     local_socket: &Path,
-) -> std::io::Result<(BufReader<OwnedReadHalf>, OwnedWriteHalf, String)> {
+) -> std::io::Result<(BufReader<OwnedReadHalf>, OwnedWriteHalf, u32)> {
     let stream = UnixStream::connect(local_socket).await?;
     let (read_half, mut writer) = stream.into_split();
     let mut reader = BufReader::new(read_half);
@@ -281,7 +281,7 @@ async fn handshake(
     let ping = Request::Harvester {
         id: Some(json!(HANDSHAKE_PING_ID)),
         cmd: HarvesterCmd::Ping {
-            version: PROTOCOL_VERSION.to_string(),
+            version: PROTOCOL_VERSION,
         },
     };
     write_request(&mut writer, &ping).await?;
