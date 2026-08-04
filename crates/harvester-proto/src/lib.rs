@@ -36,6 +36,63 @@ pub const LF: u8 = b'\n';
 /// Tolerated-and-stripped before `LF`; never emitted.
 pub const CR: u8 = b'\r';
 
+/// Bytes hashed per read by [`fingerprint_reader`]. A tunable, so it gets a
+/// name; it cannot change the result (see the chunk-independence test).
+const FINGERPRINT_CHUNK_BYTES: usize = 64 * 1024;
+
+/// FNV-1a, 64-bit — the reference constants.
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// The build fingerprint of a harvesterd binary: `fnv1a64-<byte count>-<hash>`,
+/// FNV-1a-64 over the file's bytes with the hash in lowercase 16-digit hex.
+///
+/// **This lives in the protocol crate because the string is wire-visible.** It
+/// travels in [`PingData::build`], and the client computes the identical value
+/// over the binary it ships in order to decide "install iff mine differs from
+/// yours" (docs/DAEMON.md §Bootstrap). Two implementations of a value that must
+/// compare equal across a network is a drift bug with a vicious failure mode:
+/// every machine either never upgrades or upgrades on every connect. So there
+/// is exactly one implementation, here, next to the framing it is peer to.
+///
+/// The byte count is free to carry and makes two deploys comparable by eye; the
+/// `fnv1a64` tag names the algorithm so a future change to it is visible in the
+/// value instead of silent.
+///
+/// **Not a security boundary.** Non-cryptographic on purpose — a static musl
+/// binary shipped over SSH on every deploy earns no crypto dependency for a
+/// staleness check, and anything that can answer on the socket at all can
+/// answer with any string it likes. It detects the deploy failure that actually
+/// happens (a rebuild that never reached the machine), not a hostile one.
+pub fn fingerprint_reader<R: std::io::Read>(reader: &mut R) -> std::io::Result<String> {
+    let mut buf = vec![0_u8; FINGERPRINT_CHUNK_BYTES];
+    let mut hash = FNV_OFFSET_BASIS;
+    let mut byte_count: u64 = 0;
+
+    loop {
+        let filled = reader.read(&mut buf)?;
+
+        if filled == 0 {
+            break;
+        }
+
+        byte_count += filled as u64;
+
+        for byte in &buf[..filled] {
+            hash = (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME);
+        }
+    }
+
+    Ok(format!("fnv1a64-{byte_count}-{hash:016x}"))
+}
+
+/// [`fingerprint_reader`] for a binary already in memory — which is how the
+/// client holds the daemon it ships (`bootstrap_and_connect`'s `daemon_binary`).
+/// Infallible: reading from a slice cannot fail.
+pub fn fingerprint_bytes(bytes: &[u8]) -> String {
+    fingerprint_reader(&mut &bytes[..]).expect("reading from a slice cannot fail")
+}
+
 /// Read one frame into `buf` (reused across calls): split on `LF` only, strip
 /// it plus at most one trailing `CR`. `None` on EOF; a final unterminated line
 /// is still delivered (pi flushes one on shutdown). This is the only correct
@@ -810,6 +867,74 @@ mod tests {
             parsed,
             json!({"success": false, "error": "no such session"})
         );
+    }
+
+    // --- the build fingerprint: a value two crates must agree on -----------
+
+    /// The published FNV-1a-64 test vectors. These pin the exact output of a
+    /// function the daemon and the client compute independently and compare for
+    /// equality — an unpinned rewrite would silently make every machine either
+    /// never upgrade or upgrade on every connect.
+    #[test]
+    fn the_fingerprint_matches_the_reference_fnv1a64_vectors() {
+        for (input, expected_hash) in [
+            ("", 0xcbf2_9ce4_8422_2325_u64),
+            ("a", 0xaf63_dc4c_8601_ec8c),
+            ("foobar", 0x8594_4171_f739_67e8),
+        ] {
+            assert_eq!(
+                fingerprint_bytes(input.as_bytes()),
+                format!("fnv1a64-{}-{expected_hash:016x}", input.len()),
+                "input {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_fingerprint_is_stable_across_calls() {
+        let bytes = vec![7_u8; FINGERPRINT_CHUNK_BYTES * 3 + 11];
+
+        assert_eq!(fingerprint_bytes(&bytes), fingerprint_bytes(&bytes));
+    }
+
+    #[test]
+    fn chunking_does_not_change_the_fingerprint() {
+        // The chunk loop is the only place a rewrite could corrupt state; an
+        // independent single-pass fold over the same bytes is the check. It
+        // also proves the reader and slice entry points agree.
+        let bytes: Vec<u8> = (0..FINGERPRINT_CHUNK_BYTES * 2 + 3)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let single_pass = bytes.iter().fold(FNV_OFFSET_BASIS, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+        });
+
+        let from_reader = fingerprint_reader(&mut bytes.as_slice()).expect("no io error");
+
+        assert_eq!(
+            from_reader,
+            format!("fnv1a64-{}-{single_pass:016x}", bytes.len())
+        );
+        assert_eq!(from_reader, fingerprint_bytes(&bytes));
+    }
+
+    #[test]
+    fn one_flipped_byte_changes_the_fingerprint() {
+        // The whole job: a rebuilt binary of the same size must not compare
+        // equal to the old one.
+        let mut bytes = vec![0_u8; FINGERPRINT_CHUNK_BYTES + 64];
+        let unchanged = fingerprint_bytes(&bytes);
+        bytes[FINGERPRINT_CHUNK_BYTES] = 1;
+
+        assert_ne!(unchanged, fingerprint_bytes(&bytes));
+    }
+
+    #[test]
+    fn a_truncated_binary_does_not_match_the_whole_one() {
+        // The failure mode the client's install guard exists for.
+        let bytes = vec![3_u8; 4096];
+
+        assert_ne!(fingerprint_bytes(&bytes), fingerprint_bytes(&bytes[..2048]));
     }
 
     // --- HarvesterResponse::into_result ------------------------------------
