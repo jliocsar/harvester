@@ -10,7 +10,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
-pub const PROTOCOL_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Envelope compatibility, and nothing else: bumped **only** when the wire
+/// shape changes in a way that makes an older peer wrong. It is what `ping`
+/// exchanges and what a version-mismatch check tests.
+///
+/// Deliberately *not* the crate version (which it was, via
+/// `env!("CARGO_PKG_VERSION")`, with one workspace version across all five
+/// crates). That conflated two unrelated questions and failed in both
+/// directions: rebuilding harvesterd without bumping the workspace left every
+/// bootstrapped machine on the stale binary forever (the probe saw a match and
+/// skipped the upload), and a UI-only bump force-upgraded every daemon —
+/// killing every running pi child — for a change the wire never saw.
+///
+/// "Is the daemon out there the binary I ship?" is the *other* question, and it
+/// is answered by the build fingerprint in [`PingData::build`], not here.
+pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The daemon's socket, relative to `$HOME`. The rendezvous point between the
 /// two binaries, so it is spelled once here rather than in each of them: drift
@@ -83,8 +97,9 @@ pub enum Request {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HarvesterCmd {
-    /// First command on every connection; version handshake.
-    Ping { version: String },
+    /// First command on every connection; protocol-version handshake. The
+    /// client sends its [`PROTOCOL_VERSION`]; the daemon answers with its own.
+    Ping { version: u32 },
     /// List sessions from pi's session dirs + the daemon pid table.
     ListSessions {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -178,7 +193,21 @@ impl HarvesterResponse {
 /// hand-built with `json!` on one side and hand-dug with `.get()` on the other.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PingData {
-    pub version: String,
+    /// The daemon's [`PROTOCOL_VERSION`]. Compare for envelope compatibility.
+    pub version: u32,
+    /// A fingerprint of the **running daemon's own executable image**, computed
+    /// by harvesterd at startup. This is the answer to "is the daemon running
+    /// over there the binary I ship?", which the protocol version cannot give:
+    /// two builds of the same protocol are interchangeable on the wire and
+    /// completely different code.
+    ///
+    /// Opaque to everyone but the producer: a client compares it for equality
+    /// against the fingerprint of the binary it is about to install (obtained
+    /// from the same binary via `harvesterd build`) and installs iff they
+    /// differ. It is a staleness check, **not a security boundary** — the hash
+    /// is non-cryptographic and trivially forgeable by anything that can answer
+    /// on the socket at all.
+    pub build: String,
 }
 
 /// `list_sessions`' `data`.
@@ -488,10 +517,8 @@ mod tests {
         // docs/DAEMON.md §Operations names every command; the tag is the name.
         let cases = vec![
             (
-                HarvesterCmd::Ping {
-                    version: "0.1.0".to_string(),
-                },
-                json!({"type": "ping", "version": "0.1.0"}),
+                HarvesterCmd::Ping { version: 1 },
+                json!({"type": "ping", "version": 1}),
             ),
             (
                 HarvesterCmd::ListSessions {
@@ -658,12 +685,14 @@ mod tests {
     #[tokio::test]
     async fn ping_data_matches_the_documented_response() {
         // docs/DAEMON.md §ping:
-        // {"id": 1, "type": "harvester_response", "response": {"success": true, "data": {"version": "0.1.0"}}}
+        // {"id": 1, "type": "harvester_response",
+        //  "response": {"success": true, "data": {"version": 1, "build": "fnv1a64-…"}}}
         let outgoing = Outgoing::HarvesterResponse {
             id: Some(json!(1)),
             response: HarvesterResponse::ok(
                 serde_json::to_value(PingData {
-                    version: "0.1.0".to_string(),
+                    version: PROTOCOL_VERSION,
+                    build: "fnv1a64-852768-1f0c3a7b9d2e4c55".to_string(),
                 })
                 .expect("PingData serializes"),
             ),
@@ -676,9 +705,37 @@ mod tests {
             json!({
                 "id": 1,
                 "type": "harvester_response",
-                "response": {"success": true, "data": {"version": "0.1.0"}},
+                "response": {"success": true, "data": {
+                    "version": 1,
+                    "build": "fnv1a64-852768-1f0c3a7b9d2e4c55",
+                }},
             })
         );
+    }
+
+    #[tokio::test]
+    async fn ping_data_round_trips_back_into_the_typed_struct() {
+        // The version is a *number* on the wire, not a version string: a client
+        // that still sends `"1"` must fail loudly here rather than compare
+        // strings that happen to look right.
+        let decoded: PingData =
+            serde_json::from_value(json!({"version": 2, "build": "fnv1a64-1-0"}))
+                .expect("PingData decodes");
+
+        assert_eq!(decoded.version, 2);
+        assert_eq!(decoded.build, "fnv1a64-1-0");
+
+        assert!(
+            serde_json::from_value::<PingData>(json!({"version": "1", "build": "x"})).is_err(),
+            "a string version must not decode as a protocol version"
+        );
+    }
+
+    #[test]
+    fn the_protocol_version_is_the_envelope_version_not_the_crate_version() {
+        // The whole point of C4: these two are allowed to disagree, and the
+        // build identity — not this — is what tracks the binary.
+        assert_eq!(PROTOCOL_VERSION, 1);
     }
 
     #[tokio::test]

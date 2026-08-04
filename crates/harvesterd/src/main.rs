@@ -2,6 +2,7 @@
 //! Contract: docs/DAEMON.md (protocol v1). Stateless by design: pi's session
 //! files are the only source of truth; we hold pids, pipes and subscribers.
 
+mod build_identity;
 mod daemon;
 mod fslist;
 mod ops;
@@ -78,19 +79,41 @@ fn remove_stale_socket(sock_path: &Path) {
     }
 }
 
+/// `harvesterd build`: the fingerprint of the binary that was just started —
+/// i.e. of the file on disk. Fails loudly rather than printing the daemon's
+/// degraded sentinel: a client comparing an unreadable answer against a real
+/// fingerprint would reinstall on every single connect, forever.
+fn print_build_fingerprint() {
+    match build_identity::read_running_executable_fingerprint() {
+        Ok(fingerprint) => println!("{fingerprint}"),
+        Err(error) => {
+            eprintln!("cannot fingerprint this binary: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    // CLI surface is exactly two forms: `harvesterd` (run) and
-    // `harvesterd version` (bootstrap handshake). An arg parser arrives with
-    // the third form, not before.
+    // CLI surface is exactly three forms: `harvesterd` (run),
+    // `harvesterd version` (the protocol handshake the bootstrap probe reads)
+    // and `harvesterd build` (this binary's fingerprint, for install-iff-it-
+    // differs). Still a match on one argument — an arg parser would be a
+    // dependency bought for nothing.
     match std::env::args().nth(1) {
         None => {}
         Some(arg) if arg == "version" => {
             println!("{}", harvester_proto::PROTOCOL_VERSION);
+
+            return;
+        }
+        Some(arg) if arg == "build" => {
+            print_build_fingerprint();
+
             return;
         }
         Some(arg) => {
-            eprintln!("unknown argument '{arg}' (usage: harvesterd [version])");
+            eprintln!("unknown argument '{arg}' (usage: harvesterd [version|build])");
             std::process::exit(2);
         }
     }
@@ -118,7 +141,10 @@ async fn main() {
         sock_path.display()
     );
 
-    let daemon = daemon::Daemon::new(log_dir);
+    // Once, at startup: this is the identity of the *running image*, so it
+    // stays true after an upgrade replaces the file underneath us — which is
+    // precisely the case the client needs to detect.
+    let daemon = daemon::Daemon::new(log_dir, build_identity::running_executable_fingerprint());
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {

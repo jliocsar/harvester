@@ -80,7 +80,7 @@ pub fn dispatch(
     attached: &mut AttachedMap,
 ) -> Option<Outgoing> {
     let response = match cmd {
-        HarvesterCmd::Ping { version } => ping(version),
+        HarvesterCmd::Ping { version } => ping(daemon, version),
         HarvesterCmd::ListSessions { cwd } => {
             spawn_list_sessions(daemon, id, cwd, out_tx);
 
@@ -133,10 +133,13 @@ fn with_checked_sid(
     }
 }
 
-fn ping(_client_version: String) -> HarvesterResponse {
-    // The client decides what to do on mismatch; we just report ours.
+/// Two independent answers, deliberately not one: `version` is envelope
+/// compatibility, `build` identifies this exact running image (docs/DAEMON.md
+/// §ping). The client decides what to do with either; we just report ours.
+fn ping(daemon: &Daemon, _client_version: u32) -> HarvesterResponse {
     data_response(PingData {
-        version: harvester_proto::PROTOCOL_VERSION.to_string(),
+        version: harvester_proto::PROTOCOL_VERSION,
+        build: daemon.inner().build_fingerprint.clone(),
     })
 }
 
