@@ -5,6 +5,9 @@ edition.workspace = true
 
 [dependencies]
 harvester-proto = { path = "../harvester-proto" }
+# Substring prefilter for the session-file scan. Free in binary size: already in
+# the tree transitively via serde_json.
+memchr = "2"
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 tokio.workspace = true

@@ -2491,6 +2491,7 @@ name = "harvesterd"
 version = "0.1.0"
 dependencies = [
  "harvester-proto",
+ "memchr",
  "serde",
  "serde_json",
  "tempfile",

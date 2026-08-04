@@ -169,8 +169,12 @@ fn spawn_list_sessions(
     let running = daemon.running_sids();
 
     answer_later(out_tx, async move {
-        let scan =
-            tokio::task::spawn_blocking(move || fslist::list_sessions(cwd.as_deref(), &running));
+        let scan = tokio::task::spawn_blocking(move || {
+            // Borrowed only for the scan: the owned copy stays on this task.
+            let running_sids = running.iter().map(String::as_str).collect();
+
+            fslist::list_sessions(cwd.as_deref(), &running_sids)
+        });
         let response = match scan.await {
             Ok(sessions) => data_response(SessionsData { sessions }),
             Err(join_error) => HarvesterResponse::err(format!("list_sessions: {join_error}")),

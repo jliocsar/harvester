@@ -4,12 +4,18 @@
 //! Blocking std IO on purpose — the caller runs this on the blocking pool
 //! (`spawn_blocking`); the daemon's single runtime thread never waits on disk.
 
+use std::collections::HashSet;
 use std::io::BufRead;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
-use harvester_proto::{SessionInfo, SessionStatus};
+use harvester_proto::{SessionInfo, SessionStatus, LF};
 use serde_json::Value;
+
+/// The substring every `session_info` entry must contain. Matched on raw bytes
+/// before anything is UTF-8-validated or parsed — the overwhelming majority of
+/// lines in a conversation log are messages and never match.
+const SESSION_INFO_MARKER: &[u8] = br#""session_info""#;
 
 fn pi_sessions_root() -> std::path::PathBuf {
     let home = std::env::var("HOME").expect("HOME must be set");
@@ -18,10 +24,10 @@ fn pi_sessions_root() -> std::path::PathBuf {
 
 /// Scan all per-cwd dirs (optionally filtered to one cwd). `running` contains
 /// the sids with a live pi child, provided by the caller.
-pub fn list_sessions(cwd_filter: Option<&str>, running: &[String]) -> Vec<SessionInfo> {
+pub fn list_sessions(cwd_filter: Option<&str>, running: &HashSet<&str>) -> Vec<SessionInfo> {
     let mut sessions = Vec::new();
     // Reused across files: line reads allocate once, not per line.
-    let mut line_buffer = String::new();
+    let mut line_buffer = Vec::new();
 
     let Ok(dirs) = std::fs::read_dir(pi_sessions_root()) else {
         return sessions;
@@ -69,20 +75,26 @@ fn entry_mtime_ms(entry: &std::fs::DirEntry) -> u64 {
 /// Stream the file line by line instead of slurping it — session files are
 /// full conversation logs and can run to many MB; only the header and the
 /// last `session_info` entry matter. A cwd-filter miss costs one line.
+///
+/// Read as **bytes** (`read_until(LF, …)`, pi's LF-only framing), never as
+/// text: `read_line` would UTF-8-validate every byte of the whole log just to
+/// find two lines, and its `Err(InvalidData)` on one non-UTF-8 byte is
+/// indistinguishable from EOF here — which used to truncate the name scan
+/// silently. Bytes make a corrupt line just a line that fails the prefilter.
 fn read_session_file(
     path: &Path,
     mtime_ms: u64,
     cwd_filter: Option<&str>,
-    running: &[String],
-    line_buffer: &mut String,
+    running: &HashSet<&str>,
+    line_buffer: &mut Vec<u8>,
 ) -> Option<SessionInfo> {
     let file = std::fs::File::open(path).ok()?;
     let mut reader = std::io::BufReader::new(file);
 
     // Line 1: `{"type":"session","version":3,"id":...,"cwd":...}`
     line_buffer.clear();
-    reader.read_line(line_buffer).ok()?;
-    let header: Value = serde_json::from_str(line_buffer).ok()?;
+    reader.read_until(LF, line_buffer).ok()?;
+    let header: Value = serde_json::from_slice(line_buffer).ok()?;
 
     if header.get("type")?.as_str()? != "session" {
         return None;
@@ -97,30 +109,9 @@ fn read_session_file(
         }
     }
 
-    // Display name: the LAST session_info entry wins (rename history is append-only).
-    let mut name: Option<String> = None;
+    let name = scan_for_last_name(&mut reader, path, line_buffer);
 
-    loop {
-        line_buffer.clear();
-
-        match reader.read_line(line_buffer) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-
-        // Cheap pre-filter before parsing.
-        if !line_buffer.contains("\"session_info\"") {
-            continue;
-        }
-
-        if let Ok(entry) = serde_json::from_str::<Value>(line_buffer) {
-            if entry.get("type").and_then(Value::as_str) == Some("session_info") {
-                name = entry.get("name").and_then(Value::as_str).map(str::to_owned);
-            }
-        }
-    }
-
-    let status = if running.contains(&sid) {
+    let status = if running.contains(sid.as_str()) {
         SessionStatus::Running
     } else {
         SessionStatus::Exited
@@ -134,6 +125,60 @@ fn read_session_file(
         mtime_ms,
         status,
     })
+}
+
+/// The display name: the LAST `session_info` entry wins (rename history is
+/// append-only). Every other line is rejected by a byte-level substring
+/// prefilter, so only a candidate is ever UTF-8-validated and parsed.
+fn scan_for_last_name(
+    reader: &mut impl BufRead,
+    path: &Path,
+    line_buffer: &mut Vec<u8>,
+) -> Option<String> {
+    let finder = memchr::memmem::Finder::new(SESSION_INFO_MARKER);
+    let mut name = None;
+
+    loop {
+        line_buffer.clear();
+
+        match reader.read_until(LF, line_buffer) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!(
+                    "list_sessions: {} became unreadable: {error}",
+                    path.display()
+                );
+
+                break;
+            }
+        }
+
+        if finder.find(line_buffer).is_none() {
+            continue;
+        }
+
+        if let Ok(entry) = serde_json::from_slice::<Value>(line_buffer) {
+            if entry.get("type").and_then(Value::as_str) == Some("session_info") {
+                name = entry_display_name(&entry);
+            }
+        }
+    }
+
+    name
+}
+
+/// Pi's own rule (`session-manager.ts:713-714`, "use latest, including explicit
+/// clears"): the name is trimmed, and an empty or whitespace-only one is an
+/// explicit *clear*, not a blank title.
+fn entry_display_name(entry: &Value) -> Option<String> {
+    let name = entry.get("name")?.as_str()?.trim();
+
+    if name.is_empty() {
+        return None;
+    }
+
+    Some(name.to_owned())
 }
 
 #[cfg(test)]
@@ -174,10 +219,10 @@ mod tests {
         dir: &tempfile::TempDir,
         contents: &[u8],
         cwd_filter: Option<&str>,
-        running: &[String],
+        running: &HashSet<&str>,
     ) -> Option<SessionInfo> {
         let path = dir.path().join("fixture.jsonl");
-        let mut line_buffer = String::new();
+        let mut line_buffer = Vec::new();
 
         std::fs::write(&path, contents).expect("fixture file must be writable");
 
@@ -194,9 +239,14 @@ mod tests {
         dir: &tempfile::TempDir,
         contents: &str,
         cwd_filter: Option<&str>,
-        running: &[String],
+        running: &HashSet<&str>,
     ) -> Option<SessionInfo> {
         read_fixture_bytes(dir, contents.as_bytes(), cwd_filter, running)
+    }
+
+    /// The common case: nothing is running.
+    fn nothing_running() -> HashSet<&'static str> {
+        HashSet::new()
     }
 
     fn temp_dir() -> tempfile::TempDir {
@@ -211,7 +261,8 @@ mod tests {
             session_info_entry("first draft"),
         ]);
 
-        let info = read_fixture(&dir, &contents, None, &[]).expect("valid file must parse");
+        let info =
+            read_fixture(&dir, &contents, None, &nothing_running()).expect("valid file must parse");
 
         assert_eq!(info.sid, FIXTURE_SID);
         assert_eq!(info.cwd, FIXTURE_CWD);
@@ -234,7 +285,8 @@ mod tests {
             session_info_entry("third name"),
         ]);
 
-        let info = read_fixture(&dir, &contents, None, &[]).expect("valid file must parse");
+        let info =
+            read_fixture(&dir, &contents, None, &nothing_running()).expect("valid file must parse");
 
         assert_eq!(info.name.as_deref(), Some("third name"));
     }
@@ -247,7 +299,8 @@ mod tests {
             json!({ "type": "message", "role": "user", "text": "hello" }),
         ]);
 
-        let info = read_fixture(&dir, &contents, None, &[]).expect("valid file must parse");
+        let info =
+            read_fixture(&dir, &contents, None, &nothing_running()).expect("valid file must parse");
 
         assert!(info.name.is_none());
     }
@@ -260,7 +313,8 @@ mod tests {
             json!({ "type": "session_info" }),
         ]);
 
-        let info = read_fixture(&dir, &contents, None, &[]).expect("valid file must parse");
+        let info =
+            read_fixture(&dir, &contents, None, &nothing_running()).expect("valid file must parse");
 
         assert!(info.name.is_none());
     }
@@ -276,7 +330,8 @@ mod tests {
             json!({ "type": "session_info" }),
         ]);
 
-        let info = read_fixture(&dir, &contents, None, &[]).expect("valid file must parse");
+        let info =
+            read_fixture(&dir, &contents, None, &nothing_running()).expect("valid file must parse");
 
         assert!(info.name.is_none());
     }
@@ -289,8 +344,8 @@ mod tests {
             session_info_entry("in scope"),
         ]);
 
-        let info =
-            read_fixture(&dir, &contents, Some(FIXTURE_CWD), &[]).expect("matching cwd must parse");
+        let info = read_fixture(&dir, &contents, Some(FIXTURE_CWD), &nothing_running())
+            .expect("matching cwd must parse");
 
         assert_eq!(info.cwd, FIXTURE_CWD);
     }
@@ -303,7 +358,9 @@ mod tests {
             session_info_entry("out of scope"),
         ]);
 
-        assert!(read_fixture(&dir, &contents, Some("/some/other/dir"), &[]).is_none());
+        assert!(
+            read_fixture(&dir, &contents, Some("/some/other/dir"), &nothing_running()).is_none()
+        );
     }
 
     #[test]
@@ -314,7 +371,7 @@ mod tests {
             session_info_entry("ignored"),
         ]);
 
-        assert!(read_fixture(&dir, &contents, None, &[]).is_none());
+        assert!(read_fixture(&dir, &contents, None, &nothing_running()).is_none());
     }
 
     #[test]
@@ -322,7 +379,7 @@ mod tests {
         let dir = temp_dir();
         let contents = jsonl(&[json!({ "type": "session", "version": 3, "cwd": FIXTURE_CWD })]);
 
-        assert!(read_fixture(&dir, &contents, None, &[]).is_none());
+        assert!(read_fixture(&dir, &contents, None, &nothing_running()).is_none());
     }
 
     #[test]
@@ -330,7 +387,7 @@ mod tests {
         let dir = temp_dir();
         let contents = jsonl(&[json!({ "type": "session", "version": 3, "id": FIXTURE_SID })]);
 
-        assert!(read_fixture(&dir, &contents, None, &[]).is_none());
+        assert!(read_fixture(&dir, &contents, None, &nothing_running()).is_none());
     }
 
     #[test]
@@ -338,28 +395,30 @@ mod tests {
         let dir = temp_dir();
         let contents = jsonl(&[json!({ "version": 3, "id": FIXTURE_SID, "cwd": FIXTURE_CWD })]);
 
-        assert!(read_fixture(&dir, &contents, None, &[]).is_none());
+        assert!(read_fixture(&dir, &contents, None, &nothing_running()).is_none());
     }
 
     #[test]
     fn unparseable_header_yields_nothing() {
         let dir = temp_dir();
 
-        assert!(read_fixture(&dir, "this is not json at all\n", None, &[]).is_none());
+        assert!(
+            read_fixture(&dir, "this is not json at all\n", None, &nothing_running()).is_none()
+        );
     }
 
     #[test]
     fn empty_file_yields_nothing() {
         let dir = temp_dir();
 
-        assert!(read_fixture(&dir, "", None, &[]).is_none());
+        assert!(read_fixture(&dir, "", None, &nothing_running()).is_none());
     }
 
     #[test]
     fn running_sid_reports_running_status() {
         let dir = temp_dir();
         let contents = jsonl(&[session_header(FIXTURE_SID, FIXTURE_CWD)]);
-        let running = vec![FIXTURE_SID.to_owned()];
+        let running = HashSet::from([FIXTURE_SID]);
 
         let info = read_fixture(&dir, &contents, None, &running).expect("valid file must parse");
 
@@ -370,7 +429,7 @@ mod tests {
     fn absent_sid_reports_exited_status() {
         let dir = temp_dir();
         let contents = jsonl(&[session_header(FIXTURE_SID, FIXTURE_CWD)]);
-        let running = vec!["some-other-sid".to_owned()];
+        let running = HashSet::from(["some-other-sid"]);
 
         let info = read_fixture(&dir, &contents, None, &running).expect("valid file must parse");
 
@@ -390,7 +449,8 @@ mod tests {
         contents.push('\n');
         contents.push_str(&jsonl(&[session_info_entry("after garbage")]));
 
-        let info = read_fixture(&dir, &contents, None, &[]).expect("valid file must parse");
+        let info =
+            read_fixture(&dir, &contents, None, &nothing_running()).expect("valid file must parse");
 
         assert_eq!(info.name.as_deref(), Some("after garbage"));
     }
@@ -411,17 +471,17 @@ mod tests {
             }),
         ]);
 
-        let info = read_fixture(&dir, &contents, None, &[]).expect("valid file must parse");
+        let info =
+            read_fixture(&dir, &contents, None, &nothing_running()).expect("valid file must parse");
 
         assert_eq!(info.name.as_deref(), Some("real name"));
     }
 
-    /// KNOWN DEFECT (fslist.rs:106): `read_line` returns `Err(InvalidData)` on a
-    /// non-UTF-8 byte, and the match treats that identically to `Ok(0)` (EOF), so
-    /// one bad byte silently truncates the name scan. Correct behavior — asserted
-    /// here — is that the last `session_info` still wins.
+    /// A non-UTF-8 byte mid-file must not end the name scan. It used to:
+    /// `read_line` returns `Err(InvalidData)` there and the match treated that
+    /// identically to `Ok(0)` (EOF). Reading bytes makes it just another line
+    /// that fails the prefilter, so the last `session_info` still wins.
     #[test]
-    #[ignore = "known defect: read_line Err is treated as EOF, truncating the scan; fixed in the fslist slice"]
     fn invalid_utf8_line_does_not_truncate_the_name_scan() {
         let dir = temp_dir();
         let mut contents = jsonl(&[
@@ -433,9 +493,75 @@ mod tests {
         contents.extend_from_slice(&[0xFF, 0xFE, b'\n']);
         contents.extend_from_slice(jsonl(&[session_info_entry("after bad bytes")]).as_bytes());
 
-        let info =
-            read_fixture_bytes(&dir, &contents, None, &[]).expect("valid header must still parse");
+        let info = read_fixture_bytes(&dir, &contents, None, &nothing_running())
+            .expect("valid header must still parse");
 
         assert_eq!(info.name.as_deref(), Some("after bad bytes"));
+    }
+
+    /// Pi treats an empty name as an explicit clear (`session-manager.ts:713`),
+    /// so the sidebar must show an unnamed session, not a blank title.
+    #[test]
+    fn an_empty_name_clears_the_name() {
+        let dir = temp_dir();
+        let contents = jsonl(&[
+            session_header(FIXTURE_SID, FIXTURE_CWD),
+            session_info_entry("named"),
+            session_info_entry(""),
+        ]);
+
+        let info =
+            read_fixture(&dir, &contents, None, &nothing_running()).expect("valid file must parse");
+
+        assert!(info.name.is_none());
+    }
+
+    #[test]
+    fn a_whitespace_only_name_clears_the_name() {
+        let dir = temp_dir();
+        let contents = jsonl(&[
+            session_header(FIXTURE_SID, FIXTURE_CWD),
+            session_info_entry("named"),
+            session_info_entry("   \t "),
+        ]);
+
+        let info =
+            read_fixture(&dir, &contents, None, &nothing_running()).expect("valid file must parse");
+
+        assert!(info.name.is_none());
+    }
+
+    /// Pi trims before storing, so surrounding whitespace is never part of the
+    /// displayed name.
+    #[test]
+    fn a_padded_name_is_trimmed() {
+        let dir = temp_dir();
+        let contents = jsonl(&[
+            session_header(FIXTURE_SID, FIXTURE_CWD),
+            session_info_entry("  padded name  "),
+        ]);
+
+        let info =
+            read_fixture(&dir, &contents, None, &nothing_running()).expect("valid file must parse");
+
+        assert_eq!(info.name.as_deref(), Some("padded name"));
+    }
+
+    /// The last entry wins even when the file's final line has no LF — bytes
+    /// are read with `read_until`, which yields the unterminated tail too.
+    #[test]
+    fn a_final_line_without_a_trailing_newline_is_still_scanned() {
+        let dir = temp_dir();
+        let mut contents = jsonl(&[session_header(FIXTURE_SID, FIXTURE_CWD)]);
+
+        contents.push_str(
+            &serde_json::to_string(&session_info_entry("unterminated"))
+                .expect("fixture value must serialize"),
+        );
+
+        let info =
+            read_fixture(&dir, &contents, None, &nothing_running()).expect("valid file must parse");
+
+        assert_eq!(info.name.as_deref(), Some("unterminated"));
     }
 }

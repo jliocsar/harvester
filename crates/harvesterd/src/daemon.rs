@@ -1,7 +1,7 @@
 //! Shared daemon state: the pid table and nothing else (docs/DAEMON.md:
 //! harvesterd is stateless — pi's session files are the only source of truth).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -68,7 +68,11 @@ impl Daemon {
         self.lock_sessions().get(sid).cloned()
     }
 
-    pub fn running_sids(&self) -> Vec<String> {
+    /// The sids with a live pi child, copied out from under the lock (no guard
+    /// may cross the `spawn_blocking` boundary the caller is headed for). A set,
+    /// not a list: `list_sessions` asks "is this sid running?" once per session
+    /// file on disk.
+    pub fn running_sids(&self) -> HashSet<String> {
         self.lock_sessions().keys().map(Sid::to_string).collect()
     }
 
