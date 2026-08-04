@@ -4,7 +4,8 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Write;
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use harvester_proto::{encode_frame, read_frame};
 use serde::Deserialize;
@@ -29,6 +30,14 @@ const STDIN_QUEUE_DEPTH: usize = 64;
 const PUMP_LINE_BUFFER: usize = 64 * 1024;
 
 const DIALOG_METHODS: [&str; 4] = ["select", "confirm", "input", "editor"];
+
+/// Added to a dialog's own `timeout` before the daemon forgets it. Pi's timer
+/// and ours start at different moments (pi arms its before writing the request;
+/// ours starts when the line is read), so the slack is what keeps the daemon
+/// from forgetting a dialog that pi is still genuinely waiting on — an answer
+/// arriving after eviction would never be forwarded. Generous on purpose: being
+/// late costs nothing (the entry is already dead), being early costs an answer.
+const DIALOG_TIMEOUT_EVICTION_SLACK: Duration = Duration::from_secs(5);
 
 /// Fan-out line from a session to attached connections. Events carry the
 /// complete pre-serialized wire envelope: built once in the pump, shared by
@@ -60,6 +69,14 @@ struct LineProbe<'line> {
     id: Option<Cow<'line, str>>,
     #[serde(borrow, default)]
     method: Option<Cow<'line, str>>,
+    /// Milliseconds, and only ever on a dialog request: pi puts the
+    /// extension's `opts.timeout` straight on the wire for `select`, `confirm`
+    /// and `input` (pi 0.83.0 `modes/rpc/rpc-mode.ts:137,142,147`, typed at
+    /// `modes/rpc/rpc-types.ts:239-241,247`). `editor` never carries one
+    /// (`rpc-mode.ts:253-269`). Its presence means pi will resolve the dialog
+    /// on its own — see [`spawn_dialog_eviction`].
+    #[serde(default)]
+    timeout: Option<u64>,
 }
 
 pub struct Session {
@@ -143,6 +160,21 @@ impl DialogRoom {
     /// Remove-and-return: true means the dialog was still pending and this
     /// caller's answer is the winning one (first answer wins).
     fn claim_pending(&mut self, dialog_id: &str) -> bool {
+        self.remove_pending(dialog_id)
+    }
+
+    /// Forget a dialog pi resolved on its own when the `timeout` it published
+    /// fired. Deliberately *not* a cancel: pi has already dropped the entry, so
+    /// an `extension_ui_response` would answer a dialog that no longer exists
+    /// (pi silently discards it — `rpc-mode.ts:768-776`). Returns whether
+    /// anything was still remembered, which is the eviction's only signal.
+    fn evict_timed_out(&mut self, dialog_id: &str) -> bool {
+        self.remove_pending(dialog_id)
+    }
+
+    /// The one removal path, so "answered" and "evicted" cannot drift apart in
+    /// what they do to the room — only in what they mean.
+    fn remove_pending(&mut self, dialog_id: &str) -> bool {
         self.pending.remove(dialog_id).is_some()
     }
 
@@ -287,6 +319,12 @@ impl Session {
     /// which is what keeps the two outcomes mutually exclusive.
     fn remember_dialog(&self, dialog_id: &str, envelope: Arc<[u8]>) -> bool {
         self.lock_room().remember(dialog_id, envelope)
+    }
+
+    /// Forget a dialog pi already resolved through its own `timeout` — never
+    /// cancel it (see [`DialogRoom::evict_timed_out`]).
+    fn evict_timed_out_dialog(&self, dialog_id: &str) -> bool {
+        self.lock_room().evict_timed_out(dialog_id)
     }
 
     fn resolve_response(&self, request_key: &str, response: Value) {
@@ -514,9 +552,51 @@ fn route_line(session: &Arc<Session>, line: &[u8], probe: LineProbe<'_>) {
 
             return;
         }
+
+        // Pi treats `timeout: 0` as no timeout at all (`if (opts?.timeout)` —
+        // rpc-mode.ts:114), so neither do we; an eviction timer pi has no
+        // matching timer for would forget a live dialog.
+        if let Some(timeout_ms) = probe.timeout.filter(|milliseconds| *milliseconds > 0) {
+            spawn_dialog_eviction(session, dialog_id, timeout_ms);
+        }
     }
 
     let _ = session.output.send(SessionOutput::Event(event));
+}
+
+/// Forget a `timeout`-carrying dialog once pi has resolved it internally.
+///
+/// Pi resolves such a dialog itself and emits **nothing** on stdout (pi 0.83.0
+/// `modes/rpc/rpc-mode.ts:114-119`: the `setTimeout` callback runs `cleanup()`
+/// and `resolve(defaultValue)`, with no `output(...)`), and afterwards drops any
+/// response for that id silently (`:768-776`). Nothing on the wire announces it,
+/// so a timer is the only way to learn about it. Without one the daemon's entry
+/// is stale for the rest of the process's life: replayed to every later
+/// attacher, unanswerable, and cancelled for nothing at the last detach.
+///
+/// **Weak, never `Arc`**: a dialog may publish a timeout of hours, and the timer
+/// must not keep the `Session` — and with it the broadcast channel every
+/// subscriber holds — alive past the pi process it belongs to.
+fn spawn_dialog_eviction(session: &Arc<Session>, dialog_id: &str, timeout_ms: u64) {
+    let weak_session: Weak<Session> = Arc::downgrade(session);
+    let dialog_id = dialog_id.to_owned();
+    let evict_after =
+        Duration::from_millis(timeout_ms).saturating_add(DIALOG_TIMEOUT_EVICTION_SLACK);
+
+    tokio::spawn(async move {
+        tokio::time::sleep(evict_after).await;
+
+        let Some(session) = weak_session.upgrade() else {
+            return;
+        };
+
+        if session.evict_timed_out_dialog(&dialog_id) {
+            eprintln!(
+                "session {}: dialog {dialog_id} resolved inside pi after {timeout_ms}ms, evicted",
+                session.sid
+            );
+        }
+    });
 }
 
 /// The `hv-<n>` id when the line is a response to an injected passthrough
@@ -751,6 +831,98 @@ mod tests {
 
         assert!(room.detach().is_empty());
         assert_eq!(room.attached, 0);
+    }
+
+    #[test]
+    fn evicting_a_timed_out_dialog_removes_it_from_the_room() {
+        let mut room = DialogRoom::default();
+        room.attach();
+        room.remember("d1", envelope("d1"));
+
+        assert!(room.evict_timed_out("d1"));
+        assert!(room.pending.is_empty());
+    }
+
+    #[test]
+    fn an_evicted_dialog_is_never_replayed_to_a_later_attacher() {
+        let mut room = DialogRoom::default();
+        room.attach();
+        room.remember("d1", envelope("d1"));
+        room.evict_timed_out("d1");
+
+        assert!(room.attach().is_empty());
+    }
+
+    #[test]
+    fn an_evicted_dialog_is_not_cancelled_when_the_room_empties() {
+        // The whole point of evicting rather than cancelling: pi already
+        // resolved this dialog, so the cancel would answer a dialog that no
+        // longer exists.
+        let mut room = DialogRoom::default();
+        room.attach();
+        room.remember("timed_out", envelope("timed_out"));
+        room.remember("still_open", envelope("still_open"));
+        room.evict_timed_out("timed_out");
+
+        let to_cancel = room.detach();
+
+        assert_eq!(to_cancel, vec!["still_open".to_owned()]);
+    }
+
+    #[test]
+    fn evicting_an_already_answered_dialog_reports_nothing_to_evict() {
+        // The ordinary race: a client answers just before the timer fires.
+        let mut room = DialogRoom::default();
+        room.attach();
+        room.remember("d1", envelope("d1"));
+
+        assert!(room.claim_pending("d1"));
+        assert!(!room.evict_timed_out("d1"));
+    }
+
+    #[test]
+    fn answering_an_evicted_dialog_is_refused() {
+        let mut room = DialogRoom::default();
+        room.attach();
+        room.remember("d1", envelope("d1"));
+        room.evict_timed_out("d1");
+
+        assert!(!room.claim_pending("d1"));
+    }
+
+    #[test]
+    fn evicting_an_unknown_dialog_is_a_no_op() {
+        let mut room = DialogRoom::default();
+        room.attach();
+
+        assert!(!room.evict_timed_out("nope"));
+    }
+
+    /// The wire field the eviction timer keys on, straight off pi's own
+    /// `extension_ui_request` shape (`rpc-mode.ts:137,142,147`).
+    fn probe(line: &str) -> LineProbe<'_> {
+        serde_json::from_str(line).expect("fixture line must fit the probe")
+    }
+
+    #[test]
+    fn a_dialog_timeout_is_read_off_the_wire() {
+        let parsed = probe(
+            r#"{"type":"extension_ui_request","id":"d1","method":"confirm",
+                "title":"Deploy?","message":"to prod","timeout":30000}"#,
+        );
+
+        assert_eq!(parsed.timeout, Some(30_000));
+        assert_eq!(dialog_id_awaiting_answer(&parsed), Some("d1"));
+    }
+
+    #[test]
+    fn a_dialog_without_a_timeout_probes_as_none() {
+        // `editor` never carries one (rpc-mode.ts:253-269), and neither does a
+        // dialog whose extension passed no `opts.timeout`.
+        let parsed =
+            probe(r#"{"type":"extension_ui_request","id":"d1","method":"editor","title":"t"}"#);
+
+        assert_eq!(parsed.timeout, None);
     }
 
     #[test]
