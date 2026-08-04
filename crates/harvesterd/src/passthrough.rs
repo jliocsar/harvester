@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 use crate::daemon::Daemon;
 use crate::server::Outbound;
 use crate::session::Session;
+use crate::sid::Sid;
 
 /// Inject a correlation id, queue the command for pi's stdin, then hand the
 /// wait to its own task — the connection loop must never head-of-line block
@@ -27,12 +28,24 @@ pub fn pi_passthrough(
     mut cmd: Value,
     out_tx: &mpsc::Sender<Outbound>,
 ) -> Option<Outgoing> {
-    let Some(session) = daemon.session(&sid) else {
-        return Some(error_response(id, sid, "no running session".into()));
+    // Validate before anything else touches it: the sid is a remote string
+    // that becomes a pid-table key here and a path component downstream. The
+    // rejected sid is echoed back verbatim so the client can see what it sent.
+    let sid = match Sid::parse(&sid) {
+        Ok(sid) => sid,
+        Err(rejection) => return Some(error_response(id, sid, rejection)),
+    };
+
+    let Some(session) = daemon.session(sid.as_str()) else {
+        return Some(error_response(
+            id,
+            sid.to_string(),
+            "no running session".into(),
+        ));
     };
 
     if cmd.get("type").and_then(Value::as_str) == Some("extension_ui_response") {
-        return Some(forward_dialog_answer(&session, id, sid, &cmd));
+        return Some(forward_dialog_answer(&session, id, sid.to_string(), &cmd));
     }
 
     // Reject before registering anything: a non-object command cannot carry
@@ -41,7 +54,7 @@ pub fn pi_passthrough(
     let Some(cmd_object) = cmd.as_object_mut() else {
         return Some(error_response(
             id,
-            sid,
+            sid.to_string(),
             "pi cmd must be a JSON object".into(),
         ));
     };
@@ -56,7 +69,7 @@ pub fn pi_passthrough(
     if let Err(error) = session.write_line(&cmd) {
         return Some(error_response(
             id,
-            sid,
+            sid.to_string(),
             format!("write to pi failed: {error}"),
         ));
     }
@@ -70,7 +83,11 @@ pub fn pi_passthrough(
             Err(_closed) => json!({"type": "response", "success": false,
                                    "error": "session exited before responding"}),
         };
-        let outgoing = Outgoing::PiResponse { id, sid, response };
+        let outgoing = Outgoing::PiResponse {
+            id,
+            sid: sid.into(),
+            response,
+        };
 
         let _ = out_tx.send(Outbound::Typed(outgoing)).await;
     });

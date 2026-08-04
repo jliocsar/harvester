@@ -18,6 +18,7 @@ use crate::daemon::Daemon;
 use crate::fslist;
 use crate::server::Outbound;
 use crate::session::{self, Session, SessionOutput, SpawnArgs};
+use crate::sid::Sid;
 
 /// Backstop between stdin EOF and SIGKILL on `stop`. Not a correctness knob:
 /// EOF triggers pi's immediate shutdown path — verified in rpc-mode.js, it
@@ -50,7 +51,7 @@ pub struct Attachment {
 }
 
 /// Connection-local state the attach/detach commands operate on: sid → attachment.
-pub type AttachedMap = HashMap<String, Attachment>;
+pub type AttachedMap = HashMap<Sid, Attachment>;
 
 /// The single place an attachment is torn down: abort the forwarder, then
 /// leave the room on the same session object `attach` joined. Leaving returns
@@ -86,27 +87,45 @@ pub fn dispatch(
             provider,
             model,
             name,
-        } => create_session(
-            daemon,
-            SpawnArgs {
-                sid,
-                cwd,
-                provider,
-                model,
-                name,
-            },
-        ),
+        } => with_checked_sid(&sid, |sid| {
+            create_session(
+                daemon,
+                SpawnArgs {
+                    sid,
+                    cwd,
+                    provider,
+                    model,
+                    name,
+                },
+            )
+        }),
         HarvesterCmd::ListModels { cwd } => {
             spawn_list_models(id, cwd, out_tx);
 
             return None;
         }
-        HarvesterCmd::Attach { sid } => attach(daemon, sid, out_tx, attached),
-        HarvesterCmd::Detach { sid } => detach(sid, attached),
-        HarvesterCmd::Stop { sid } => stop(daemon, sid),
+        HarvesterCmd::Attach { sid } => {
+            with_checked_sid(&sid, |sid| attach(daemon, sid, out_tx, attached))
+        }
+        HarvesterCmd::Detach { sid } => with_checked_sid(&sid, |sid| detach(sid, attached)),
+        HarvesterCmd::Stop { sid } => with_checked_sid(&sid, |sid| stop(daemon, sid)),
     };
 
     Some(Outgoing::HarvesterResponse { id, response })
+}
+
+/// The gate every sid-carrying command passes through: a session id off the
+/// wire is a remote string, and it goes on to be a pid-table key, a path
+/// component and an argv element. Rejecting here means no handler below ever
+/// sees an unchecked one.
+fn with_checked_sid(
+    raw_sid: &str,
+    handle: impl FnOnce(Sid) -> HarvesterResponse,
+) -> HarvesterResponse {
+    match Sid::parse(raw_sid) {
+        Ok(sid) => handle(sid),
+        Err(rejection) => HarvesterResponse::err(rejection),
+    }
 }
 
 fn ping(_client_version: String) -> HarvesterResponse {
@@ -268,22 +287,22 @@ async fn query_available_models(cwd: &str) -> Result<Value, String> {
 
 fn attach(
     daemon: &Daemon,
-    sid: String,
+    sid: Sid,
     out_tx: &mpsc::Sender<Outbound>,
     attached: &mut AttachedMap,
 ) -> HarvesterResponse {
-    let Some(session) = daemon.session(&sid) else {
+    let Some(session) = daemon.session(sid.as_str()) else {
         return HarvesterResponse::err(format!("no running session '{sid}'"));
     };
 
-    if let Some(existing) = attached.get(&sid) {
+    if let Some(existing) = attached.get(sid.as_str()) {
         if Arc::ptr_eq(&existing.session, &session) {
             return HarvesterResponse::ok(json!({"already": true}));
         }
 
         // Different generation: the sid was stopped and resumed since this
         // attachment was made. Release the stale one, attach to the new one.
-        let stale = attached.remove(&sid).expect("checked above");
+        let stale = attached.remove(sid.as_str()).expect("checked above");
         release_attachment(stale);
     }
 
@@ -307,7 +326,7 @@ fn attach(
 fn spawn_forwarder(
     mut events: broadcast::Receiver<SessionOutput>,
     pending_dialogs: Vec<Arc<[u8]>>,
-    sid: String,
+    sid: Sid,
     out_tx: mpsc::Sender<Outbound>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -328,7 +347,7 @@ fn spawn_forwarder(
                     eprintln!("forwarder {sid}: skipped {skipped} events (slow connection)");
 
                     let gap = Outgoing::EventGap {
-                        sid: sid.clone(),
+                        sid: sid.to_string(),
                         skipped,
                     };
 
@@ -350,7 +369,7 @@ fn spawn_forwarder(
                 // Exit is terminal: deliver it and end the forwarder.
                 SessionOutput::Exit { exit_code } => {
                     let outgoing = Outgoing::SessionExit {
-                        sid: sid.clone(),
+                        sid: sid.to_string(),
                         exit_code,
                     };
                     let _ = out_tx.send(Outbound::Typed(outgoing)).await;
@@ -362,8 +381,8 @@ fn spawn_forwarder(
     })
 }
 
-fn detach(sid: String, attached: &mut AttachedMap) -> HarvesterResponse {
-    if let Some(attachment) = attached.remove(&sid) {
+fn detach(sid: Sid, attached: &mut AttachedMap) -> HarvesterResponse {
+    if let Some(attachment) = attached.remove(sid.as_str()) {
         release_attachment(attachment);
     }
 
@@ -378,8 +397,8 @@ fn detach(sid: String, attached: &mut AttachedMap) -> HarvesterResponse {
 /// no rung may depend on that pi cooperating. Both rungs below only touch the
 /// stdin queue (never the pipe), so neither can block — but ordering the
 /// backstop first keeps that guarantee independent of the queue's behaviour.
-fn stop(daemon: &Daemon, sid: String) -> HarvesterResponse {
-    let Some(session) = daemon.session(&sid) else {
+fn stop(daemon: &Daemon, sid: Sid) -> HarvesterResponse {
+    let Some(session) = daemon.session(sid.as_str()) else {
         return HarvesterResponse::err(format!("no running session '{sid}'"));
     };
 
@@ -413,7 +432,7 @@ async fn kill_backstop(daemon: Daemon, session: Arc<Session>) {
     tokio::time::sleep(STOP_KILL_BACKSTOP).await;
 
     let still_running = daemon
-        .session(&session.sid)
+        .session(session.sid.as_str())
         .is_some_and(|stored| Arc::ptr_eq(&stored, &session));
 
     if still_running {

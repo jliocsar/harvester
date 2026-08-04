@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::io::Write;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
@@ -14,6 +15,7 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::daemon::{Daemon, PASSTHROUGH_ID_PREFIX};
+use crate::sid::Sid;
 
 /// Events buffered per session for slow subscribers before they start lagging.
 const SESSION_EVENT_BUFFER: usize = 1024;
@@ -68,7 +70,7 @@ struct LineProbe<'line> {
 }
 
 pub struct Session {
-    pub sid: String,
+    pub sid: Sid,
     pub pid: Option<u32>,
     /// Frames bound for pi's stdin. Private on purpose: every write goes
     /// through `write_line`, and [`pump_stdin`] is the only holder of the pipe
@@ -158,7 +160,7 @@ impl DialogRoom {
 }
 
 pub struct SpawnArgs {
-    pub sid: String,
+    pub sid: Sid,
     pub cwd: String,
     pub provider: Option<String>,
     pub model: Option<String>,
@@ -321,7 +323,7 @@ impl Session {
 /// frame, so every writer's lines stay whole and in arrival order. Ends when
 /// the last sender is gone (`close_stdin`) or the pipe breaks — dropping the
 /// handle on the way out is what delivers EOF.
-async fn pump_stdin(sid: String, mut stdin: ChildStdin, mut frames: mpsc::Receiver<Vec<u8>>) {
+async fn pump_stdin(sid: Sid, mut stdin: ChildStdin, mut frames: mpsc::Receiver<Vec<u8>>) {
     while let Some(frame) = frames.recv().await {
         if let Err(error) = stdin.write_all(&frame).await {
             eprintln!("session {sid}: stdin write failed: {error}");
@@ -350,12 +352,42 @@ pub fn cancel_dialog(session: &Session, dialog_id: &str) {
     }
 }
 
+/// Open a session's stderr log for the run that is about to start. **Append,
+/// never truncate**: spawn is also resume, so truncating would destroy the
+/// record of why the previous run died — the very thing the user is looking at
+/// when they click resume, and the sole exit-diagnosis channel the contract
+/// gives clients (docs/DAEMON.md §Events). The banner is what makes appended
+/// runs separable in a `tail`.
+fn open_stderr_log(log_dir: &std::path::Path, sid: &Sid) -> std::io::Result<std::fs::File> {
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join(format!("{sid}.stderr.log")))?;
+    let started_at_unix_seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since_epoch| since_epoch.as_secs())
+        .unwrap_or_default();
+
+    writeln!(
+        log,
+        "--- harvesterd: spawning pi for {sid} at {started_at_unix_seconds} (unix seconds) ---"
+    )?;
+
+    Ok(log)
+}
+
 /// Build the launch line: env guards, mode flags, optional overrides, stderr log.
 fn create_pi_command(args: &SpawnArgs, daemon: &Daemon) -> std::io::Result<Command> {
     let log_dir = &daemon.inner().log_dir;
-    let stderr_log = std::fs::File::create(log_dir.join(format!("{}.stderr.log", args.sid)))?;
+    let stderr_log = open_stderr_log(log_dir, &args.sid)?;
 
-    let mut cli_args: Vec<&str> = vec!["--mode", "rpc", "--session-id", &args.sid, "--approve"];
+    let mut cli_args: Vec<&str> = vec![
+        "--mode",
+        "rpc",
+        "--session-id",
+        args.sid.as_str(),
+        "--approve",
+    ];
 
     if let Some(provider) = &args.provider {
         cli_args.extend(["--provider", provider]);
@@ -480,7 +512,7 @@ fn encode_event(session: &Session, line: &[u8]) -> Arc<[u8]> {
     let event: &RawValue = serde_json::from_str(raw_line).expect("parsed as JSON above");
     let envelope = EventEnvelope {
         r#type: "event",
-        sid: &session.sid,
+        sid: session.sid.as_str(),
         event,
     };
 

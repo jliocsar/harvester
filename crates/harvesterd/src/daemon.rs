@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::session::{Session, SpawnArgs};
+use crate::sid::Sid;
 
 /// Namespace for request ids the daemon injects into pi commands. The pump
 /// routes a response back to its waiter by this prefix, so the mint
@@ -22,7 +23,7 @@ pub struct DaemonInner {
     pub log_dir: PathBuf,
     /// The pid table. std::sync on purpose: no guard is ever held across an
     /// await, and lookups happen on every passthrough.
-    sessions: Mutex<HashMap<String, Arc<Session>>>,
+    sessions: Mutex<HashMap<Sid, Arc<Session>>>,
     /// Monotonic counter behind [`Daemon::next_passthrough_id`]; private so
     /// the id format cannot be spelled a second way.
     request_counter: std::sync::atomic::AtomicU64,
@@ -59,7 +60,7 @@ impl Daemon {
     }
 
     pub fn running_sids(&self) -> Vec<String> {
-        self.lock_sessions().keys().cloned().collect()
+        self.lock_sessions().keys().map(Sid::to_string).collect()
     }
 
     /// Check-and-spawn under one lock — the table is the per-sid single-
@@ -67,7 +68,7 @@ impl Daemon {
     pub fn spawn_session(&self, args: SpawnArgs) -> std::io::Result<Arc<Session>> {
         let mut sessions = self.lock_sessions();
 
-        if sessions.contains_key(&args.sid) {
+        if sessions.contains_key(args.sid.as_str()) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 format!("session '{}' already running", args.sid),
@@ -87,14 +88,14 @@ impl Daemon {
         let mut sessions = self.lock_sessions();
 
         if sessions
-            .get(&session.sid)
+            .get(session.sid.as_str())
             .is_some_and(|stored| Arc::ptr_eq(stored, session))
         {
             sessions.remove(&session.sid);
         }
     }
 
-    fn lock_sessions(&self) -> MutexGuard<'_, HashMap<String, Arc<Session>>> {
+    fn lock_sessions(&self) -> MutexGuard<'_, HashMap<Sid, Arc<Session>>> {
         self.inner.sessions.lock().expect("sessions mutex")
     }
 }
