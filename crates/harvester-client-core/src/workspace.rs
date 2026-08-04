@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use crate::host::{shell_quote, Host};
-use crate::{Error, Result};
+use crate::Result;
 
 /// Ceiling on one picker exec — multiplexed listings take tens of ms; a
 /// wedged transport must not hang the picker forever.
@@ -29,14 +29,9 @@ pub async fn list_directory(host: &Host, path: &str) -> Result<Vec<RemoteDirEntr
     let script = format!("ls -1Ap -- {}", shell_quote(path));
     let output = host.exec(&script, None, WORKSPACE_EXEC_TIMEOUT).await?;
 
-    if output.status.success() {
-        Ok(parse_ls_entries(&output.stdout))
-    } else {
-        Err(Error::Exec {
-            context: "list directory",
-            detail: output.describe_failure(),
-        })
-    }
+    output.require_success("list directory")?;
+
+    Ok(parse_ls_entries(&output.stdout))
 }
 
 fn parse_ls_entries(stdout: &str) -> Vec<RemoteDirEntry> {
@@ -61,12 +56,5 @@ pub async fn validate_git_workspace(host: &Host, path: &str) -> Result<()> {
     let script = format!("git -C {} rev-parse --git-dir", shell_quote(path));
     let output = host.exec(&script, None, WORKSPACE_EXEC_TIMEOUT).await?;
 
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(Error::Exec {
-            context: "validate workspace",
-            detail: output.describe_failure(),
-        })
-    }
+    output.require_success("validate workspace")
 }

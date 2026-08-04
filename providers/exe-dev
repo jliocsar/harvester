@@ -33,13 +33,30 @@ require_jq() {
 # Machine ids travel into a remote shell command line; refuse anything that
 # is not a plain exe.dev vm name rather than trying to quote it.
 require_safe_name() {
-    case "$1" in
+    require_safe_value "machine name" "$1"
+}
+
+# The gate itself: every value that reaches the remote command line goes
+# through it, not just names (`--cpu`/`--memory` travel exactly as far).
+require_safe_value() {
+    case "$2" in
     *[!A-Za-z0-9-]* | "")
-        printf '{"error": "invalid machine name: %s"}\n' "$1" >&2
-        echo '{"error": "invalid machine name"}'
+        printf '{"error": "invalid %s: %s"}\n' "$1" "$2" >&2
+        printf '{"error": "invalid %s"}\n' "$1"
         exit 1
         ;;
     esac
+}
+
+# `set -e` cannot see a failure at the HEAD of a pipeline (POSIX sh has no
+# pipefail), so a down control plane would exit 0 with empty stdout and
+# Harvester would blame this script for invalid JSON. Capture first (into
+# `$out` — POSIX sh has no locals either), then transform.
+exe_ssh_capture() {
+    if ! out=$($EXE_SSH "$@"); then
+        printf '{"error": "exe.dev control plane unreachable (ssh %s failed)"}\n' "$1"
+        exit 1
+    fi
 }
 
 case "${1:-}" in
@@ -60,7 +77,8 @@ EOF
 
 list)
     require_jq
-    $EXE_SSH ls --json | jq "{machines: [.vms[] | $MACHINE_JQ]}"
+    exe_ssh_capture ls --json
+    printf '%s' "$out" | jq "{machines: [.vms[] | $MACHINE_JQ]}"
     ;;
 
 create)
@@ -76,15 +94,18 @@ create)
     set -- new --json --name "$name"
     cpu=$(printf '%s' "$args" | jq -r '.cpu // empty')
     if [ -n "$cpu" ]; then
+        require_safe_value "cpu" "$cpu"
         set -- "$@" --cpu "$cpu"
     fi
     memory=$(printf '%s' "$args" | jq -r '.memory // empty')
     if [ -n "$memory" ]; then
+        require_safe_value "memory" "$memory"
         set -- "$@" --memory "$memory"
     fi
 
     # `new --json` returns the vm object (tolerate a {vm: ...} wrapper too).
-    $EXE_SSH "$@" | jq "{machine: ((.vm // .) | $MACHINE_JQ)}"
+    exe_ssh_capture "$@"
+    printf '%s' "$out" | jq "{machine: ((.vm // .) | $MACHINE_JQ)}"
     ;;
 
 delete)

@@ -9,7 +9,7 @@ use std::time::Duration;
 use harvester_proto::PROTOCOL_VERSION;
 
 use crate::connection::{self, DaemonConnection};
-use crate::host::{ExecOutput, Host};
+use crate::host::Host;
 use crate::{Error, Result};
 
 /// Ceiling on the probe and start execs (each about one round trip).
@@ -229,7 +229,7 @@ async fn install_and_start(
         )
         .await?;
 
-    require_success(&output, "install harvesterd")
+    output.require_success("install harvesterd")
 }
 
 async fn start(host: &Host) -> Result<()> {
@@ -237,16 +237,5 @@ async fn start(host: &Host) -> Result<()> {
         .exec(&start_script(), None, BOOTSTRAP_EXEC_TIMEOUT)
         .await?;
 
-    require_success(&output, "start harvesterd")
-}
-
-fn require_success(output: &ExecOutput, context: &'static str) -> Result<()> {
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(Error::Exec {
-            context,
-            detail: output.describe_failure(),
-        })
-    }
+    output.require_success("start harvesterd")
 }

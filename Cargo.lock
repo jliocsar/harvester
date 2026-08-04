@@ -2472,6 +2472,7 @@ name = "harvester-client-core"
 version = "0.1.0"
 dependencies = [
  "harvester-proto",
+ "serde",
  "serde_json",
  "tokio",
 ]

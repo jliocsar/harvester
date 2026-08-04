@@ -80,6 +80,21 @@ pub(crate) struct ExecOutput {
 }
 
 impl ExecOutput {
+    /// The one "did this exec work?" answer: `Ok(())` on exit 0, otherwise the
+    /// crate's `Exec` error carrying `context` and the child's own diagnosis.
+    /// Every non-zero exit in the crate is reported this way, so the shape of
+    /// an exec failure cannot drift between call sites.
+    pub(crate) fn require_success(&self, context: &'static str) -> crate::Result<()> {
+        if self.status.success() {
+            return Ok(());
+        }
+
+        Err(crate::Error::Exec {
+            context,
+            detail: self.describe_failure(),
+        })
+    }
+
     /// One-line failure description for error messages.
     pub(crate) fn describe_failure(&self) -> String {
         format!("{} — {}", self.status, self.stderr.trim())
