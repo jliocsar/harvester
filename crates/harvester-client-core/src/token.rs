@@ -88,6 +88,13 @@ impl<T> Pending<T> {
         matches!(&self.outstanding, Some((outstanding, _)) if *outstanding == token)
     }
 
+    /// Whether any answer is still wanted. For a surface that gates its input
+    /// while a request is out — a modal with one answer to reconcile — rather
+    /// than one correlating a specific answer it already holds the token for.
+    pub fn is_waiting(&self) -> bool {
+        self.outstanding.is_some()
+    }
+
     /// Stop waiting without an answer: the surface that asked went away, so
     /// whatever arrives later has nowhere to land.
     pub fn cancel(&mut self) {
@@ -177,5 +184,32 @@ mod tests {
         pending.cancel();
 
         assert_eq!(pending.accept(token), None);
+    }
+
+    #[test]
+    fn waiting_spans_exactly_the_time_an_answer_is_wanted() {
+        // What a modal gates its input on: it holds no token, only the question
+        // "is an answer still coming?".
+        let tokens = RequestTokens::default();
+        let mut pending = Pending::default();
+
+        assert!(!pending.is_waiting());
+
+        let token = pending.ask(&tokens, "/work/repo");
+
+        assert!(pending.is_waiting());
+        assert_eq!(pending.accept(token), Some("/work/repo"));
+        assert!(!pending.is_waiting());
+    }
+
+    #[test]
+    fn a_cancelled_request_stops_being_waited_for() {
+        let tokens = RequestTokens::default();
+        let mut pending = Pending::default();
+
+        pending.ask(&tokens, ());
+        pending.cancel();
+
+        assert!(!pending.is_waiting());
     }
 }
