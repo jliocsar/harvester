@@ -270,6 +270,42 @@ pub struct PingData {
     pub build: String,
 }
 
+/// `create_session`'s `data` (docs/DAEMON.md §create_session).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateSessionData {
+    pub sid: String,
+    /// The sid was already in the pid table, so no second pi was spawned —
+    /// which is what keeps "one pi process = one session file" true. Not an
+    /// error: it is what lets a client open any session with an unconditional
+    /// `create_session` → `attach` chain.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub already: bool,
+}
+
+/// `attach`'s `data`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachData {
+    /// This connection was already attached to *this generation* of the session
+    /// object. A session that exited and respawned is a new generation, so the
+    /// attach is real even for a sid the client believes it holds.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub already: bool,
+}
+
+/// `detach`'s `data` — deliberately empty: the acknowledgement is the whole
+/// payload. A type rather than a bare `{}` so the operation has somewhere to
+/// grow, and so no call site hand-builds an object.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetachData {}
+
+/// `stop`'s `data`. Always true, and it means "shutdown initiated" — never
+/// "done": `session_exit` is the authoritative completion signal and may arrive
+/// before or after this response (docs/DAEMON.md §stop).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StopData {
+    pub stopping: bool,
+}
+
 /// `list_sessions`' `data`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionsData {
@@ -796,6 +832,65 @@ mod tests {
         // The whole point of C4: these two are allowed to disagree, and the
         // build identity — not this — is what tracks the binary.
         assert_eq!(PROTOCOL_VERSION, 1);
+    }
+
+    /// These four replace hand-built `json!` objects on the daemon side, so
+    /// the bytes they emit must not move: a client that reads `already` or
+    /// `stopping` is talking to a daemon that may be older or newer than it.
+    #[tokio::test]
+    async fn the_operation_payloads_match_the_bytes_they_replace() {
+        let cases = vec![
+            (
+                serde_json::to_value(CreateSessionData {
+                    sid: "01H".to_string(),
+                    already: false,
+                })
+                .expect("serializes"),
+                json!({"sid": "01H"}),
+            ),
+            (
+                serde_json::to_value(CreateSessionData {
+                    sid: "01H".to_string(),
+                    already: true,
+                })
+                .expect("serializes"),
+                json!({"sid": "01H", "already": true}),
+            ),
+            (
+                serde_json::to_value(AttachData { already: false }).expect("serializes"),
+                json!({}),
+            ),
+            (
+                serde_json::to_value(AttachData { already: true }).expect("serializes"),
+                json!({"already": true}),
+            ),
+            (
+                serde_json::to_value(DetachData {}).expect("serializes"),
+                json!({}),
+            ),
+            (
+                serde_json::to_value(StopData { stopping: true }).expect("serializes"),
+                json!({"stopping": true}),
+            ),
+        ];
+
+        for (encoded, expected) in cases {
+            assert_eq!(encoded, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_absent_already_decodes_as_false() {
+        // The elided key and an explicit `false` must mean the same thing, or a
+        // client reading a field the daemon skipped would fail the whole
+        // response instead of seeing "no, this was a fresh spawn".
+        let created: CreateSessionData =
+            serde_json::from_value(json!({"sid": "01H"})).expect("decodes");
+        let attached: AttachData = serde_json::from_value(json!({})).expect("decodes");
+
+        assert_eq!(created.sid, "01H");
+        assert!(!created.already);
+        assert!(!attached.already);
     }
 
     #[tokio::test]
