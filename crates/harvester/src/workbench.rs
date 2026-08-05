@@ -7,6 +7,7 @@
 //! [`MachineState`] and renders it, routes commands by machine key, and keeps
 //! the surfaces (ghost chat, chat, pickers) the user actually touches.
 
+mod ghost;
 mod picker;
 
 use gpui::{
@@ -20,11 +21,11 @@ use serde_json::Value;
 
 use crate::chat::{Chat, ChatRequest, ChatSession};
 use crate::input::{PromptSubmitted, TextInput};
-use crate::model_control::ModelControl;
-use crate::models::{ModelChoice, ModelsState};
+use crate::models::ModelChoice;
 use crate::theme;
 use crate::ui;
 use crate::workspaces::{self, Workspace};
+use ghost::{GhostChat, GhostRequest, MachineCandidate};
 use harvester_client_core::bridge::{Command, Event as BridgeEvent};
 use harvester_client_core::machines;
 use picker::FolderPicker;
@@ -32,9 +33,6 @@ use picker::FolderPicker;
 const SIDEBAR_WIDTH: f32 = 240.;
 /// Enough of a uuidv7 to tell sessions apart at a glance.
 const SID_PREVIEW_CHARS: usize = 8;
-/// Cap on the session name derived from the first prompt's first line —
-/// enough to recognize, short enough for pi's session list and the sidebar.
-const SESSION_NAME_MAX_CHARS: usize = 48;
 /// The empty content pane when there is no argv machine to report on — the
 /// workspace rows are the way in.
 const NO_ARGV_MACHINE_HINT: &str = "open a workspace to begin";
@@ -46,42 +44,11 @@ struct MachineSession {
     info: SessionInfo,
 }
 
-/// A chat that exists only client-side (SPEC §Flows "Start session (ghost
-/// chat)"): opened from a workspace row, becomes a real session on the first
-/// prompt. Dropped without a trace if navigated away from.
-struct GhostChat {
-    /// Where the session will run; the path is the pi cwd.
-    workspace: Workspace,
-    /// The model list, its request and its modal — the same control the live
-    /// chat has, with a different command behind it (see `model_control`).
-    model: ModelControl,
-    /// Index into the loaded list; `None` = let pi pick its default.
-    selected_model: Option<usize>,
-    /// The prompt box's machine picker is open (only offered while ≥2 stored
-    /// workspaces share this path — the control lists those machines).
-    machine_picker_open: bool,
-    /// Set once the first prompt fired the create → attach chain; cleared by
-    /// `Attached` (ghost becomes a chat) or `RequestFailed` (retryable).
-    started: Option<StartedSession>,
-    /// Focus the prompt input on the next frame (same trick as `Chat`).
-    focus_input: bool,
-    input: Entity<TextInput>,
-    _input_subscription: Subscription,
-}
-
 /// A session opening on a machine: what the sidebar spinner reads, and what a
 /// failure has to match before it may give up on it.
 struct OpeningSession {
     machine: String,
     sid: String,
-}
-
-/// What `Attached` needs to finish a ghost start: the sid to match on, the
-/// name for the synthesized sidebar row, the prompt to seed the chat with.
-struct StartedSession {
-    sid: String,
-    name: String,
-    first_prompt: String,
 }
 
 pub struct Workbench {
@@ -321,9 +288,8 @@ impl Workbench {
         self.abandon_open_on(machine);
 
         if let Some(ghost) = &mut self.ghost {
-            if ghost.workspace.machine == machine {
-                ghost.started = None;
-                ghost.model.fail(detail.to_string());
+            if ghost.workspace().machine == machine {
+                ghost.fail_models(detail.to_string());
             }
         }
     }
@@ -508,7 +474,7 @@ impl Workbench {
         // A failed ghost start returns the ghost to editable so the user can
         // retry (a fresh sid is minted on the next submit).
         if let Some(ghost) = &mut self.ghost {
-            ghost.started = None;
+            ghost.abandon_start();
         }
 
         self.last_error = Some(format!("{machine}: {detail}"));
@@ -662,18 +628,11 @@ impl Workbench {
     /// new session to the sidebar, hand back the first prompt for seeding
     /// the chat. `None` for plain opens/resumes.
     fn take_started_ghost(&mut self, sid: &str) -> Option<String> {
-        let started_matches = self
-            .ghost
-            .as_ref()
-            .and_then(|ghost| ghost.started.as_ref())
-            .is_some_and(|started| started.sid == sid);
-
-        if !started_matches {
+        if self.ghost.as_ref().and_then(GhostChat::started_sid) != Some(sid) {
             return None;
         }
 
-        let ghost = self.ghost.take().expect("checked above");
-        let started = ghost.started.expect("checked above");
+        let (workspace, started) = self.ghost.take()?.into_started()?;
 
         // Synthesized sidebar row, newest-first (uuidv7 now is the maximum).
         // `file`/`mtime_ms` are placeholders: display state only, replaced
@@ -681,11 +640,11 @@ impl Workbench {
         self.sessions.insert(
             0,
             MachineSession {
-                machine: ghost.workspace.machine,
+                machine: workspace.machine,
                 info: SessionInfo {
                     sid: started.sid,
                     name: Some(started.name),
-                    cwd: ghost.workspace.path,
+                    cwd: workspace.path,
                     file: String::new(),
                     mtime_ms: 0,
                     status: SessionStatus::Running,
@@ -700,34 +659,66 @@ impl Workbench {
     /// closed and reopened) is waiting on a different token, so the answer to
     /// the abandoned request is dropped.
     fn handle_models_listed(&mut self, token: RequestToken, result: Result<Value, String>) {
-        let Some(ghost) = &mut self.ghost else {
-            return;
-        };
+        if let Some(ghost) = &mut self.ghost {
+            ghost.accept_models(token, result);
+        }
+    }
 
-        ghost.model.accept(token, result);
+    /// Act on the open ghost and redraw. The one door the ghost's own
+    /// listeners come back through: the state is the workbench's, every
+    /// decision about it is the ghost's (see `ghost`).
+    pub(in crate::workbench) fn with_ghost(
+        &mut self,
+        cx: &mut Context<Self>,
+        act: impl FnOnce(&mut GhostChat),
+    ) {
+        if let Some(ghost) = &mut self.ghost {
+            act(ghost);
+            cx.notify();
+        }
+    }
+
+    /// Carry out what the ghost cannot: reach a machine's bridge, and register
+    /// the open guard against the session it just minted.
+    fn send_ghost_request(&mut self, request: GhostRequest, cx: &mut Context<Self>) {
+        match request {
+            GhostRequest::ListModels {
+                machine,
+                cwd,
+                token,
+            } => self.send_command(&machine, Command::ListModels { cwd, token }),
+            GhostRequest::Start {
+                machine,
+                sid,
+                command,
+            } => {
+                self.opening = Some(OpeningSession {
+                    machine: machine.clone(),
+                    sid,
+                });
+                self.send_command(&machine, command);
+            }
+        }
+
+        cx.notify();
     }
 
     /// A workspace row was clicked: open a ghost chat there (SPEC §Flows
-    /// "Start session") and fetch the models behind it — the seconds the
-    /// uncached `list_models` costs hide behind the user typing the prompt.
-    /// The workspace's machine connects lazily here; commands queue in the
-    /// bridge channel while the bootstrap runs, so no readiness gate.
+    /// "Start session"). The workspace's machine connects lazily here;
+    /// commands queue in the bridge channel while the bootstrap runs, so no
+    /// readiness gate.
     fn open_ghost(&mut self, workspace_index: usize, cx: &mut Context<Self>) {
         let Some(workspace) = self.workspaces.get(workspace_index).cloned() else {
             return;
         };
 
-        if self.opening.is_some() {
-            return;
-        }
-
         // Re-clicking the current ghost's row keeps it (and any typed text).
         let same_ghost = self
             .ghost
             .as_ref()
-            .is_some_and(|ghost| ghost.workspace == workspace);
+            .is_some_and(|ghost| ghost.workspace() == &workspace);
 
-        if same_ghost {
+        if self.opening.is_some() || same_ghost {
             return;
         }
 
@@ -739,90 +730,49 @@ impl Workbench {
 
         let input = cx.new(|cx| TextInput::new("Message pi — Enter to send", cx));
         let input_subscription = cx.subscribe(&input, Self::handle_ghost_prompt);
-        let mut model = ModelControl::default();
-        let models_token = model.fetching(&self.tokens);
+        let (ghost, request) = GhostChat::new(workspace, input, input_subscription, &self.tokens);
 
-        self.send_command(
-            &workspace.machine,
-            Command::ListModels {
-                cwd: workspace.path.clone(),
-                token: models_token,
-            },
-        );
-        self.ghost = Some(GhostChat {
-            workspace,
-            model,
-            selected_model: None,
-            machine_picker_open: false,
-            started: None,
-            focus_input: true,
-            input,
-            _input_subscription: input_subscription,
-        });
-        cx.notify();
+        self.ghost = Some(ghost);
+        self.send_ghost_request(request, cx);
     }
 
-    /// The ghost's first prompt: mint the sid, derive the name, fire the
-    /// create → attach → prompt chain. The ghost stays visible (input
-    /// replaced by "starting…") until `Attached` swaps it for the real chat.
     fn handle_ghost_prompt(
         &mut self,
         _input: Entity<TextInput>,
         event: &PromptSubmitted,
         cx: &mut Context<Self>,
     ) {
-        if event.0.trim().is_empty() {
-            return;
-        }
-
-        let Some(ghost) = &mut self.ghost else {
+        let Some(request) = self
+            .ghost
+            .as_mut()
+            .and_then(|ghost| ghost.start(event.0.clone()))
+        else {
             return;
         };
 
-        if ghost.started.is_some() {
+        self.send_ghost_request(request, cx);
+    }
+
+    /// The send button's path; Enter inside the input reaches the same
+    /// `PromptSubmitted` through the `Submit` action.
+    pub(super) fn submit_ghost_prompt(&mut self, cx: &mut Context<Self>) {
+        let Some(input) = self.ghost.as_ref().map(GhostChat::input) else {
             return;
-        }
-
-        let sid = uuid::Uuid::now_v7().to_string();
-        let name = session_name_from_prompt(&event.0);
-        let (provider, model) = match (ghost.model.state(), ghost.selected_model) {
-            (ModelsState::Loaded(models), Some(index)) => match models.get(index) {
-                Some(choice) => (Some(choice.provider.clone()), Some(choice.id.clone())),
-                None => (None, None),
-            },
-            // No selection (or no list): pi launches with its own default.
-            _ => (None, None),
-        };
-        let machine = ghost.workspace.machine.clone();
-        let command = Command::StartSession {
-            sid: sid.clone(),
-            cwd: ghost.workspace.path.clone(),
-            provider,
-            model,
-            name: name.clone(),
-            first_prompt: event.0.clone(),
         };
 
-        ghost.started = Some(StartedSession {
-            sid: sid.clone(),
-            name,
-            first_prompt: event.0.clone(),
-        });
-        self.opening = Some(OpeningSession {
-            machine: machine.clone(),
-            sid,
-        });
-        self.send_command(&machine, command);
-        cx.notify();
+        input.update(cx, |input, cx| input.submit_prompt(cx));
     }
 
     /// Machines the ghost could spawn on: the stored workspaces sharing its
-    /// path, as (machine key, display label) pairs. The control is offered
-    /// only when there are at least two.
-    fn ghost_machine_candidates(&self, path: &str) -> Vec<(String, String)> {
+    /// path, as (machine key, display label) pairs.
+    pub(super) fn ghost_machine_candidates(&self) -> Vec<MachineCandidate> {
+        let Some(ghost) = &self.ghost else {
+            return Vec::new();
+        };
+
         self.workspaces
             .iter()
-            .filter(|workspace| workspace.path == path)
+            .filter(|workspace| workspace.path == ghost.workspace().path)
             .map(|workspace| {
                 (
                     workspace.machine.clone(),
@@ -832,51 +782,24 @@ impl Workbench {
             .collect()
     }
 
-    fn ghost_open_machine_picker(&mut self, cx: &mut Context<Self>) {
-        let Some(ghost) = &self.ghost else {
-            return;
-        };
-
-        if ghost.started.is_none()
-            && self.ghost_machine_candidates(&ghost.workspace.path).len() >= 2
-        {
-            if let Some(ghost) = &mut self.ghost {
-                ghost.machine_picker_open = true;
-                cx.notify();
-            }
-        }
-    }
-
-    fn ghost_close_machine_picker(&mut self, cx: &mut Context<Self>) {
-        if let Some(ghost) = &mut self.ghost {
-            ghost.machine_picker_open = false;
-            cx.notify();
-        }
-    }
-
-    /// A machine was picked for the ghost: retarget the workspace, connect
-    /// the new machine lazily, and refetch its model list (the stale
-    /// `ModelsListed` from the old machine is dropped by the machine+cwd
-    /// guard). The typed prompt survives — only the destination changes.
-    fn ghost_pick_machine(&mut self, candidate_index: usize, cx: &mut Context<Self>) {
-        let Some(ghost) = &self.ghost else {
-            return;
-        };
-        let candidates = self.ghost_machine_candidates(&ghost.workspace.path);
-        let Some((machine, _)) = candidates.get(candidate_index).cloned() else {
-            return;
-        };
-        let same_machine = ghost.workspace.machine == machine;
-
-        if let Some(ghost) = &mut self.ghost {
-            ghost.machine_picker_open = false;
-        }
-
-        if same_machine {
+    /// A machine was picked for the ghost: retarget it, connect the new
+    /// machine lazily, and refetch its model list.
+    pub(super) fn ghost_pick_machine(&mut self, candidate_index: usize, cx: &mut Context<Self>) {
+        let candidates = self.ghost_machine_candidates();
+        let tokens = self.tokens.clone();
+        let Some(request) = self
+            .ghost
+            .as_mut()
+            .and_then(|ghost| ghost.pick_machine(candidate_index, &candidates, &tokens))
+        else {
             cx.notify();
 
             return;
-        }
+        };
+        let GhostRequest::ListModels { machine, .. } = &request else {
+            return;
+        };
+        let machine = machine.clone();
 
         if !self.ensure_connection(&machine) {
             cx.notify();
@@ -884,50 +807,7 @@ impl Workbench {
             return;
         }
 
-        let tokens = self.tokens.clone();
-        let Some(ghost) = &mut self.ghost else {
-            return;
-        };
-        let cwd = ghost.workspace.path.clone();
-        let models_token = ghost.model.fetching(&tokens);
-
-        ghost.workspace.machine = machine.clone();
-        ghost.selected_model = None;
-        self.send_command(
-            &machine,
-            Command::ListModels {
-                cwd,
-                token: models_token,
-            },
-        );
-        cx.notify();
-    }
-
-    fn ghost_open_model_picker(&mut self, cx: &mut Context<Self>) {
-        let Some(ghost) = &mut self.ghost else {
-            return;
-        };
-
-        if ghost.started.is_none() {
-            ghost.model.open();
-            cx.notify();
-        }
-    }
-
-    fn ghost_close_model_picker(&mut self, cx: &mut Context<Self>) {
-        if let Some(ghost) = &mut self.ghost {
-            ghost.model.close();
-            cx.notify();
-        }
-    }
-
-    /// `None` selects pi's default model.
-    fn ghost_select_model(&mut self, choice: Option<usize>, cx: &mut Context<Self>) {
-        if let Some(ghost) = &mut self.ghost {
-            ghost.selected_model = choice;
-            ghost.model.close();
-            cx.notify();
-        }
+        self.send_ghost_request(request, cx);
     }
 
     /// The workspaces-header "+": one qualifying machine goes straight to
@@ -1215,7 +1095,10 @@ impl Workbench {
         // The ghost wins over an open chat: the user just asked for a new
         // session; the chat comes back when they navigate to it.
         if let Some(ghost) = &self.ghost {
-            return content.child(self.render_ghost(ghost, window, cx));
+            let machine_label: SharedString = self.fleet.label(&ghost.workspace().machine).into();
+            let candidates = self.ghost_machine_candidates();
+
+            return content.child(ghost.render(machine_label, &candidates, window, cx));
         }
 
         if let Some(chat) = &self.chat {
@@ -1255,121 +1138,6 @@ impl Workbench {
         }
     }
 
-    /// The send button's path; Enter inside the input reaches the same
-    /// `PromptSubmitted` through the `Submit` action.
-    fn ghost_submit_prompt(&mut self, cx: &mut Context<Self>) {
-        let Some(input) = self.ghost.as_ref().map(|ghost| ghost.input.clone()) else {
-            return;
-        };
-
-        input.update(cx, |input, cx| input.submit_prompt(cx));
-    }
-
-    /// The ghost chat pane: header (title + folder), empty body, the prompt
-    /// box (model control lives inside it) — or "starting…" once the first
-    /// prompt fired.
-    fn render_ghost(
-        &self,
-        ghost: &GhostChat,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let subtitle = format!(
-            "{} on {}",
-            folder_name(&ghost.workspace.path),
-            self.fleet.label(&ghost.workspace.machine)
-        );
-        // The prompt box only renders before the start fires, so `Loaded`
-        // alone decides whether the model control is clickable.
-        let (model_label, model_enabled): (SharedString, bool) = match ghost.model.state() {
-            ModelsState::Loading => ("loading models…".into(), false),
-            ModelsState::Failed(_) => ("default model".into(), false),
-            ModelsState::Loaded(models) => (
-                match ghost.selected_model.and_then(|index| models.get(index)) {
-                    Some(choice) => choice.name.clone(),
-                    None => "default model".into(),
-                },
-                true,
-            ),
-        };
-        let input_focused = ghost.input.read(cx).focus_handle(cx).is_focused(window);
-        let bottom_row = div().flex_none().px_3().pb_3();
-        let bottom_row = if ghost.started.is_some() {
-            bottom_row.child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(theme::TEXT_FAINT))
-                    .child("starting session…"),
-            )
-        } else {
-            // The machine control is live only while ≥2 stored workspaces
-            // share this path; otherwise it reads as the fixed destination.
-            let machine_enabled = self.ghost_machine_candidates(&ghost.workspace.path).len() >= 2;
-            let machine_label: SharedString = self.fleet.label(&ghost.workspace.machine).into();
-
-            bottom_row.child(
-                ui::prompt_box(input_focused)
-                    .child(ui::prompt_box_input(ghost.input.clone()))
-                    .child(
-                        ui::prompt_box_controls()
-                            .child(
-                                ui::prompt_box_control("ghost-model", model_label, model_enabled)
-                                    .when(model_enabled, |control| {
-                                        control.on_click(cx.listener(|workbench, _, _, cx| {
-                                            workbench.ghost_open_model_picker(cx)
-                                        }))
-                                    }),
-                            )
-                            // Read-only: the repository is the workspace the
-                            // ghost was opened from.
-                            .child(ui::prompt_box_control(
-                                "ghost-repo",
-                                folder_name(&ghost.workspace.path).to_string().into(),
-                                false,
-                            ))
-                            .child(
-                                ui::prompt_box_control(
-                                    "ghost-machine",
-                                    machine_label,
-                                    machine_enabled,
-                                )
-                                .when(machine_enabled, |control| {
-                                    control.on_click(cx.listener(|workbench, _, _, cx| {
-                                        workbench.ghost_open_machine_picker(cx)
-                                    }))
-                                }),
-                            )
-                            .child(div().flex_1())
-                            .child(ui::prompt_box_send("ghost-send").on_click(cx.listener(
-                                |workbench, _, _, cx| workbench.ghost_submit_prompt(cx),
-                            ))),
-                    ),
-            )
-        };
-
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .child(ui::chat_header("New session".into(), subtitle.into()))
-            .child(
-                div().flex_1().min_h(px(0.)).p_3().children(
-                    // Model failure is informational, not blocking: pi still
-                    // launches with its default.
-                    match ghost.model.state() {
-                        ModelsState::Failed(detail) => Some(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(theme::STATUS_ERROR))
-                                .child(format!("{detail} — pi will use its default model")),
-                        ),
-                        _ => None,
-                    },
-                ),
-            )
-            .child(bottom_row)
-    }
-
     /// A picker row was clicked (`None` = the ghost's "default" row). Which
     /// surface it belongs to is *derived* from which one has its modal open —
     /// the ghost first, the same precedence the content pane renders with. A
@@ -1377,7 +1145,7 @@ impl Workbench {
     /// with the state it described.
     fn model_picked(&mut self, choice: Option<usize>, cx: &mut Context<Self>) {
         if self.ghost_model_picker_open() {
-            self.ghost_select_model(choice, cx);
+            self.with_ghost(cx, |ghost| ghost.select_model(choice));
 
             return;
         }
@@ -1391,7 +1159,7 @@ impl Workbench {
 
     fn model_picker_closed(&mut self, cx: &mut Context<Self>) {
         if self.ghost_model_picker_open() {
-            self.ghost_close_model_picker(cx);
+            self.with_ghost(cx, GhostChat::close_model_picker);
 
             return;
         }
@@ -1404,7 +1172,7 @@ impl Workbench {
     fn ghost_model_picker_open(&self) -> bool {
         self.ghost
             .as_ref()
-            .is_some_and(|ghost| ghost.model.is_open())
+            .is_some_and(GhostChat::model_picker_open)
     }
 
     /// One render for both surfaces. Only the ghost offers the "default (pi
@@ -1471,42 +1239,6 @@ impl Workbench {
         .on_click(cx.listener(|workbench, _, _, cx| workbench.close_machine_picker(cx)))
     }
 
-    /// The ghost's prompt-box machine picker: the workspaces sharing its
-    /// path, the current destination checked.
-    fn render_ghost_machine_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (path, current_machine) = match &self.ghost {
-            Some(ghost) => (
-                ghost.workspace.path.clone(),
-                ghost.workspace.machine.clone(),
-            ),
-            None => (String::new(), String::new()),
-        };
-        let candidate_rows: Vec<_> = self
-            .ghost_machine_candidates(&path)
-            .into_iter()
-            .enumerate()
-            .map(|(index, (machine, label))| {
-                ui::model_row(
-                    ("ghost-machine-choice", index),
-                    label.into(),
-                    machine == current_machine,
-                )
-                .on_click(
-                    cx.listener(move |workbench, _, _, cx| workbench.ghost_pick_machine(index, cx)),
-                )
-                .into_any_element()
-            })
-            .collect();
-
-        ui::modal_list(
-            "ghost-machine",
-            "Choose machine",
-            ui::ModalListHeight::FitContent,
-            candidate_rows,
-        )
-        .on_click(cx.listener(|workbench, _, _, cx| workbench.ghost_close_machine_picker(cx)))
-    }
-
     fn render_statusbar(&self) -> impl IntoElement {
         let (link_text, link_color) = self.statusbar_link();
 
@@ -1566,9 +1298,8 @@ impl Workbench {
 impl Render for Workbench {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(ghost) = &mut self.ghost {
-            if ghost.focus_input {
-                window.focus(&ghost.input.read(cx).focus_handle(cx));
-                ghost.focus_input = false;
+            if ghost.take_focus_request() {
+                window.focus(&ghost.input().read(cx).focus_handle(cx));
             }
         }
 
@@ -1577,16 +1308,21 @@ impl Render for Workbench {
         // the entity borrows don't fight the `&mut cx` the listeners need; the
         // bool is "offer the default row", which is the only thing the two
         // surfaces render differently.
-        let model_picker: Option<(Vec<ModelChoice>, Option<usize>, bool)> =
-            if let Some(ghost) = self.ghost.as_ref().filter(|ghost| ghost.model.is_open()) {
-                Some((ghost.model.choices().to_vec(), ghost.selected_model, true))
-            } else if let Some(chat) = &self.chat {
-                chat.read(cx)
-                    .picker_contents()
-                    .map(|(models, current_index)| (models, current_index, false))
-            } else {
-                None
-            };
+        let model_picker: Option<(Vec<ModelChoice>, Option<usize>, bool)> = if let Some(ghost) =
+            self.ghost
+                .as_ref()
+                .filter(|ghost| ghost.model_picker_open())
+        {
+            let (models, selected) = ghost.picker_contents();
+
+            Some((models, selected, true))
+        } else if let Some(chat) = &self.chat {
+            chat.read(cx)
+                .picker_contents()
+                .map(|(models, current_index)| (models, current_index, false))
+        } else {
+            None
+        };
 
         div()
             .size_full()
@@ -1612,8 +1348,15 @@ impl Render for Workbench {
             .children(
                 self.ghost
                     .as_ref()
-                    .is_some_and(|ghost| ghost.machine_picker_open)
-                    .then(|| self.render_ghost_machine_picker(cx)),
+                    .is_some_and(GhostChat::machine_picker_open)
+                    .then(|| {
+                        let candidates = self.ghost_machine_candidates();
+
+                        self.ghost
+                            .as_ref()
+                            .map(|ghost| ghost.render_machine_picker(&candidates, cx))
+                    })
+                    .flatten(),
             )
             .children(
                 self.picker
@@ -1633,16 +1376,4 @@ fn sid_preview(sid: &str) -> String {
 /// Last path component; whole path if there is no separator.
 fn folder_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
-}
-
-/// Session name from the first prompt: its first non-blank line, capped.
-fn session_name_from_prompt(prompt: &str) -> String {
-    prompt
-        .trim()
-        .lines()
-        .next()
-        .unwrap_or("")
-        .chars()
-        .take(SESSION_NAME_MAX_CHARS)
-        .collect()
 }
