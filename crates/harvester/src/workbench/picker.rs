@@ -10,7 +10,7 @@
 
 use gpui::{div, prelude::*, rgb, Context};
 use harvester_client_core::machines;
-use harvester_client_core::{Host, Pending, RemoteDirEntry, RequestToken};
+use harvester_client_core::{Host, Pending, RemoteDirEntry, RequestToken, RequestTokens};
 
 use super::Workbench;
 use crate::theme;
@@ -20,15 +20,15 @@ use crate::ui;
 /// order to be applied. One at a time: the rows and the Add button ignore
 /// clicks while a request is out, so the modal never has two answers to
 /// reconcile. The correlating token is [`Pending`]'s, not this enum's.
+#[derive(Clone)]
 enum PickerRequest {
     /// The machine's `$HOME`, which starts the walk — one exec, no daemon.
     Home,
     /// The directory the answer would move the picker to. The request's, never
     /// the answer's: nothing is echoed back over the wire for it to trust.
-    Listing {
-        path: String,
-    },
-    Validation,
+    Listing { path: String },
+    /// The displayed directory, as it was when "Add" was clicked.
+    Validation { path: String },
 }
 
 /// The add-workspace modal's state (SPEC §Flows "Add workspace"). Its execs
@@ -46,7 +46,192 @@ pub(super) struct FolderPicker {
     error: Option<String>,
 }
 
+/// What the picker needs run on its machine. The picker decides *what* to ask
+/// for and correlates the answer; the workbench resolves the [`Host`] and owns
+/// the machines worker, so it does the asking (mirrors `ghost`'s split).
+pub(super) struct PickerCommand {
+    request: PickerRequest,
+    token: RequestToken,
+}
+
+impl PickerCommand {
+    /// The worker's own vocabulary, once the workbench has resolved the host.
+    fn into_machines_command(self, host: Host) -> machines::Command {
+        match self.request {
+            PickerRequest::Home => machines::Command::ResolveHome {
+                host,
+                token: self.token,
+            },
+            PickerRequest::Listing { path } => machines::Command::ListDir {
+                host,
+                path,
+                token: self.token,
+            },
+            PickerRequest::Validation { path } => machines::Command::ValidateWorkspace {
+                host,
+                path,
+                token: self.token,
+            },
+        }
+    }
+}
+
 impl FolderPicker {
+    /// A picker on `machine`, already asking for the `$HOME` its walk starts
+    /// from. No connection involved: the walk is plain host execs (SPEC
+    /// §Workspace, "no daemon or provider involvement"), so browsing a machine
+    /// Harvester never bootstrapped costs one round trip, not an install.
+    pub fn opening(machine: String, tokens: &RequestTokens) -> (FolderPicker, PickerCommand) {
+        let mut picker = FolderPicker {
+            machine,
+            path: String::new(),
+            entries: Vec::new(),
+            pending: Pending::default(),
+            error: None,
+        };
+        let command = picker.ask(PickerRequest::Home, tokens);
+
+        (picker, command)
+    }
+
+    pub fn machine(&self) -> &str {
+        &self.machine
+    }
+
+    /// Records what the picker is waiting on and hands back the command to
+    /// send. Every request goes through here, so "one at a time, matched by its
+    /// token" holds by construction.
+    fn ask(&mut self, request: PickerRequest, tokens: &RequestTokens) -> PickerCommand {
+        self.error = None;
+
+        // The context stays in the `Pending` until its answer arrives, so the
+        // copy the workbench needs to build the command is made here.
+        PickerCommand {
+            token: self.pending.ask(tokens, request.clone()),
+            request,
+        }
+    }
+
+    /// The command never reached the worker, so no answer is coming. Without
+    /// this the modal would stay gated on a request that does not exist.
+    pub fn request_failed(&mut self) {
+        self.pending.cancel();
+    }
+
+    /// The reason a host op could not even be started, shown in the modal
+    /// rather than the statusbar — the user is looking at the picker.
+    pub fn fail(&mut self, detail: String) {
+        self.pending.cancel();
+        self.error = Some(detail);
+    }
+
+    /// `$HOME` answered: the walk starts there, so the answer is immediately a
+    /// listing request. `None` means the answer was stale or the exec failed
+    /// (the reason is in the modal).
+    pub fn accept_home(
+        &mut self,
+        token: RequestToken,
+        result: Result<String, String>,
+        tokens: &RequestTokens,
+    ) -> Option<PickerCommand> {
+        self.pending.accept(token)?;
+
+        match result {
+            Ok(home) => {
+                self.path = home.clone();
+
+                Some(self.ask(PickerRequest::Listing { path: home }, tokens))
+            }
+            // Nothing to browse without a start directory; the user cancels and
+            // retries (or picks another machine).
+            Err(detail) => {
+                self.error = Some(detail);
+
+                None
+            }
+        }
+    }
+
+    pub fn accept_listing(
+        &mut self,
+        token: RequestToken,
+        result: Result<Vec<RemoteDirEntry>, String>,
+    ) {
+        let Some(PickerRequest::Listing { path }) = self.pending.accept(token) else {
+            return;
+        };
+
+        match result {
+            Ok(entries) => {
+                self.path = path;
+                self.entries = entries;
+                self.error = None;
+            }
+            // Listing failed (permissions, vanished dir): keep showing the
+            // previous directory, surface the reason.
+            Err(detail) => self.error = Some(detail),
+        }
+    }
+
+    /// Validation answered. `Some` is the workspace to store — the picker is
+    /// spent at that point and the workbench drops it.
+    pub fn accept_validation(
+        &mut self,
+        token: RequestToken,
+        error: Option<String>,
+    ) -> Option<(String, String)> {
+        self.pending.accept(token)?;
+
+        match error {
+            // Not a git repo: clear error in the modal, user re-picks.
+            Some(detail) => {
+                self.error = Some(detail);
+
+                None
+            }
+            None => Some((self.machine.clone(), self.path.clone())),
+        }
+    }
+
+    /// Walk into a listed directory. `None` while a request is out — the rows
+    /// ignore clicks then, so the modal never has two answers to reconcile.
+    pub fn open_dir(
+        &mut self,
+        entry_index: usize,
+        tokens: &RequestTokens,
+    ) -> Option<PickerCommand> {
+        if self.busy() {
+            return None;
+        }
+
+        let entry = self.entries.get(entry_index)?;
+        let path = join_remote_path(&self.path, &entry.name);
+
+        Some(self.ask(PickerRequest::Listing { path }, tokens))
+    }
+
+    pub fn go_up(&mut self, tokens: &RequestTokens) -> Option<PickerCommand> {
+        if self.busy() {
+            return None;
+        }
+
+        let path = parent_remote_path(&self.path);
+
+        Some(self.ask(PickerRequest::Listing { path }, tokens))
+    }
+
+    /// "Add": validate the displayed directory. The store write happens when
+    /// the answer lands.
+    pub fn confirm(&mut self, tokens: &RequestTokens) -> Option<PickerCommand> {
+        if self.busy() || self.path.is_empty() {
+            return None;
+        }
+
+        let path = self.path.clone();
+
+        Some(self.ask(PickerRequest::Validation { path }, tokens))
+    }
+
     fn busy(&self) -> bool {
         self.pending.is_waiting()
     }
@@ -54,8 +239,8 @@ impl FolderPicker {
     /// The modal's progress note, or `None` when nothing is in flight. Which
     /// note is a question about the walk, not about the request: an empty path
     /// means `$HOME` has not landed yet, and that is the only state the user
-    /// needs named. Everything else — a listing, and now the `git rev-parse`
-    /// behind "Add", which used to show nothing at all — is "loading…".
+    /// needs named. Everything else — a listing, and the `git rev-parse` behind
+    /// "Add", which used to show nothing at all — is "loading…".
     fn waiting_note(&self) -> Option<&'static str> {
         if !self.busy() {
             return None;
@@ -70,101 +255,110 @@ impl FolderPicker {
 }
 
 impl Workbench {
-    /// The machine's `$HOME` answered: the walk starts there. A picker closed
-    /// and reopened meanwhile has a different token outstanding, so the late
-    /// answer is dropped.
-    pub(super) fn handle_home_resolved(
+    /// Act on the open picker and redraw — the ghost's `with_ghost` door, for
+    /// the picker's own state.
+    pub(in crate::workbench) fn with_picker(
         &mut self,
-        token: RequestToken,
-        result: Result<String, String>,
+        cx: &mut Context<Self>,
+        act: impl FnOnce(&mut FolderPicker),
     ) {
-        let Some(picker) = &mut self.picker else {
+        if let Some(picker) = &mut self.picker {
+            act(picker);
+            cx.notify();
+        }
+    }
+
+    /// Run what the picker asked for on the machine it is browsing. The host
+    /// is resolved here because it is the fleet's answer, and a machine that
+    /// resolves to none puts its reason in the modal rather than the statusbar
+    /// — the user is looking at the dialog.
+    fn send_picker_request(&mut self, command: Option<PickerCommand>, cx: &mut Context<Self>) {
+        let Some(command) = command else {
+            cx.notify();
+
             return;
         };
-
-        if picker.pending.accept(token).is_none() {
-            return;
-        }
-
-        let home = match result {
-            Ok(home) => home,
-            // Nothing to browse without a start directory; the user cancels
-            // and retries (or picks another machine).
+        let host = match self.picker_host() {
+            Ok(host) => host,
             Err(detail) => {
-                picker.error = Some(detail);
+                self.with_picker(cx, |picker| picker.fail(detail));
 
                 return;
             }
         };
+        let sent = self.send_host_command(command.into_machines_command(host));
 
-        picker.path = home.clone();
-        self.request_listing(home);
+        if !sent {
+            self.with_picker(cx, FolderPicker::request_failed);
+        }
+
+        cx.notify();
     }
 
-    /// A listing answered.
+    /// The host the open picker browses.
+    fn picker_host(&self) -> Result<Host, String> {
+        let Some(picker) = &self.picker else {
+            return Err("no picker open".to_string());
+        };
+
+        // The fleet's own sentence, carried verbatim.
+        self.fleet
+            .host_for(picker.machine())
+            .map_err(|error| error.to_string())
+    }
+
+    pub(super) fn handle_home_resolved(
+        &mut self,
+        token: RequestToken,
+        result: Result<String, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let tokens = self.tokens.clone();
+        let next = self
+            .picker
+            .as_mut()
+            .and_then(|picker| picker.accept_home(token, result, &tokens));
+
+        self.send_picker_request(next, cx);
+    }
+
     pub(super) fn handle_dir_listed(
         &mut self,
         token: RequestToken,
         result: Result<Vec<RemoteDirEntry>, String>,
+        cx: &mut Context<Self>,
     ) {
-        let Some(picker) = &mut self.picker else {
-            return;
-        };
-        let Some(PickerRequest::Listing { path }) = picker.pending.accept(token) else {
-            return;
-        };
-
-        match result {
-            Ok(entries) => {
-                picker.path = path;
-                picker.entries = entries;
-                picker.error = None;
-            }
-            // Listing failed (permissions, vanished dir): keep showing the
-            // previous directory, surface the reason.
-            Err(detail) => picker.error = Some(detail),
-        }
+        self.with_picker(cx, |picker| picker.accept_listing(token, result));
     }
 
+    /// A validated workspace is stored and the picker is spent.
     pub(super) fn handle_workspace_validated(
         &mut self,
         token: RequestToken,
         error: Option<String>,
+        cx: &mut Context<Self>,
     ) {
-        let Some(picker) = &mut self.picker else {
+        let stored = self
+            .picker
+            .as_mut()
+            .and_then(|picker| picker.accept_validation(token, error));
+
+        let Some((machine, path)) = stored else {
+            cx.notify();
+
             return;
         };
 
-        if picker.pending.accept(token).is_none() {
-            return;
-        }
-
-        match error {
-            // Not a git repo: clear error in the modal, user re-picks.
-            Some(detail) => picker.error = Some(detail),
-            None => {
-                let machine = picker.machine.clone();
-                let path = picker.path.clone();
-
-                self.picker = None;
-                self.add_workspace(machine, path);
-            }
-        }
+        self.picker = None;
+        self.add_workspace(machine, path);
+        cx.notify();
     }
 
-    /// Opens the folder picker on `machine`. No connection involved: the walk
-    /// is plain host execs (SPEC §Workspace "no daemon or provider
-    /// involvement"), so a machine whose daemon was never bootstrapped starts
-    /// browsing after one SSH round trip instead of a full install.
-    pub(super) fn open_picker(&mut self, machine: String) {
-        self.picker = Some(FolderPicker {
-            machine,
-            path: String::new(),
-            entries: Vec::new(),
-            pending: Pending::default(),
-            error: None,
-        });
-        self.request_home();
+    pub(super) fn open_picker(&mut self, machine: String, cx: &mut Context<Self>) {
+        let (picker, command) = FolderPicker::opening(machine, &self.tokens);
+
+        self.picker = Some(picker);
+        self.send_picker_request(Some(command), cx);
     }
 
     fn close_picker(&mut self, cx: &mut Context<Self>) {
@@ -172,125 +366,38 @@ impl Workbench {
         cx.notify();
     }
 
-    /// The host the open picker browses, or `None` — with the reason in the
-    /// modal — when its machine resolves to none.
-    fn picker_host(&mut self) -> Option<Host> {
-        let machine = self.picker.as_ref()?.machine.clone();
-
-        match self.fleet.host_for(&machine) {
-            Ok(host) => Some(host),
-            // The fleet's own sentence, rendered in the modal rather than the
-            // statusbar — the user is looking at the picker, not at the bar.
-            Err(error) => {
-                if let Some(picker) = &mut self.picker {
-                    picker.error = Some(error.to_string());
-                }
-
-                None
-            }
-        }
-    }
-
-    /// Where to run and how the answer will be correlated, recorded as the one
-    /// request in flight. Every picker request goes through here, so "one at a
-    /// time, matched by its token" holds by construction. `None` when the
-    /// picker's machine resolves to no host — the reason is already in the
-    /// modal.
-    fn picker_asks(&mut self, request: PickerRequest) -> Option<(Host, RequestToken)> {
-        let host = self.picker_host()?;
-        let tokens = self.tokens.clone();
-        let picker = self.picker.as_mut()?;
-
-        picker.error = None;
-
-        Some((host, picker.pending.ask(&tokens, request)))
-    }
-
-    /// The command never reached the worker, so no answer is coming. Without
-    /// this the modal would stay gated on a request that does not exist.
-    fn picker_request_failed(&mut self) {
-        if let Some(picker) = &mut self.picker {
-            picker.pending.cancel();
-        }
-    }
-
-    fn request_home(&mut self) {
-        let Some((host, token)) = self.picker_asks(PickerRequest::Home) else {
-            return;
-        };
-
-        if !self.send_host_command(machines::Command::ResolveHome { host, token }) {
-            self.picker_request_failed();
-        }
-    }
-
-    fn request_listing(&mut self, path: String) {
-        let Some((host, token)) = self.picker_asks(PickerRequest::Listing { path: path.clone() })
-        else {
-            return;
-        };
-        let command = machines::Command::ListDir { host, path, token };
-
-        if !self.send_host_command(command) {
-            self.picker_request_failed();
-        }
-    }
-
+    /// The three ways the modal asks for another listing or a validation; each
+    /// is the picker's decision, sent from here.
     fn picker_open_dir(&mut self, entry_index: usize, cx: &mut Context<Self>) {
-        let Some(picker) = &self.picker else {
-            return;
-        };
+        let tokens = self.tokens.clone();
+        let command = self
+            .picker
+            .as_mut()
+            .and_then(|picker| picker.open_dir(entry_index, &tokens));
 
-        if picker.busy() {
-            return;
-        }
-
-        let Some(entry) = picker.entries.get(entry_index) else {
-            return;
-        };
-        let target_path = join_remote_path(&picker.path, &entry.name);
-
-        self.request_listing(target_path);
-        cx.notify();
+        self.send_picker_request(command, cx);
     }
 
     fn picker_go_up(&mut self, cx: &mut Context<Self>) {
-        let Some(picker) = &self.picker else {
-            return;
-        };
+        let tokens = self.tokens.clone();
+        let command = self
+            .picker
+            .as_mut()
+            .and_then(|picker| picker.go_up(&tokens));
 
-        if picker.busy() {
-            return;
-        }
-
-        let target_path = parent_remote_path(&picker.path);
-
-        self.request_listing(target_path);
-        cx.notify();
+        self.send_picker_request(command, cx);
     }
 
-    /// "Add" — validate the displayed directory; the store write happens on
-    /// `WorkspaceValidated` success.
     fn picker_confirm(&mut self, cx: &mut Context<Self>) {
-        let Some(picker) = &self.picker else {
-            return;
-        };
+        let tokens = self.tokens.clone();
+        let command = self
+            .picker
+            .as_mut()
+            .and_then(|picker| picker.confirm(&tokens));
 
-        if picker.busy() {
-            return;
-        }
-
-        let path = picker.path.clone();
-        let Some((host, token)) = self.picker_asks(PickerRequest::Validation) else {
-            return;
-        };
-
-        if !self.send_host_command(machines::Command::ValidateWorkspace { host, path, token }) {
-            self.picker_request_failed();
-        }
-
-        cx.notify();
+        self.send_picker_request(command, cx);
     }
+
     pub(super) fn render_picker(
         &self,
         picker: &FolderPicker,
@@ -437,6 +544,122 @@ mod tests {
     fn the_root_is_its_own_parent() {
         assert_eq!(parent_remote_path("/"), "/");
         assert_eq!(parent_remote_path("/home"), "/");
+    }
+
+    /// The walk, driven end to end with no `Workbench` and no window — which
+    /// is the point of the split: this file used to be `impl Workbench` and
+    /// none of it could be reached without one.
+    #[test]
+    fn the_walk_goes_home_then_lists_then_validates() {
+        let tokens = RequestTokens::default();
+        let (mut picker, home) = FolderPicker::opening("exe-dev/bloggy".to_string(), &tokens);
+
+        assert!(matches!(home.request, PickerRequest::Home));
+        assert!(picker.busy(), "the modal is gated until $HOME lands");
+        assert_eq!(picker.waiting_note(), Some("finding home directory…"));
+
+        let listing = picker
+            .accept_home(home.token, Ok("/home/exedev".to_string()), &tokens)
+            .expect("home starts the walk");
+
+        assert!(
+            matches!(&listing.request, PickerRequest::Listing { path } if path == "/home/exedev")
+        );
+
+        picker.accept_listing(
+            listing.token,
+            Ok(vec![RemoteDirEntry {
+                name: "repo".to_string(),
+                is_dir: true,
+            }]),
+        );
+
+        assert!(!picker.busy());
+        assert_eq!(picker.path, "/home/exedev");
+
+        let descend = picker.open_dir(0, &tokens).expect("a listed directory");
+
+        assert!(
+            matches!(&descend.request, PickerRequest::Listing { path } if path == "/home/exedev/repo")
+        );
+
+        picker.accept_listing(descend.token, Ok(Vec::new()));
+
+        let validate = picker.confirm(&tokens).expect("a directory to add");
+
+        assert!(
+            matches!(&validate.request, PickerRequest::Validation { path } if path == "/home/exedev/repo")
+        );
+        assert_eq!(
+            picker.accept_validation(validate.token, None),
+            Some((
+                "exe-dev/bloggy".to_string(),
+                "/home/exedev/repo".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_click_while_a_request_is_out_is_ignored() {
+        let tokens = RequestTokens::default();
+        let (mut picker, _home) = FolderPicker::opening("exe-dev/bloggy".to_string(), &tokens);
+
+        assert!(picker.open_dir(0, &tokens).is_none());
+        assert!(picker.go_up(&tokens).is_none());
+        assert!(picker.confirm(&tokens).is_none());
+    }
+
+    /// A failed exec keeps the walk where it was and says why, rather than
+    /// leaving the modal gated on an answer that is not coming.
+    #[test]
+    fn a_failed_listing_keeps_the_previous_directory() {
+        let tokens = RequestTokens::default();
+        let (mut picker, home) = FolderPicker::opening("exe-dev/bloggy".to_string(), &tokens);
+        let listing = picker
+            .accept_home(home.token, Ok("/home/exedev".to_string()), &tokens)
+            .expect("home starts the walk");
+
+        picker.accept_listing(listing.token, Ok(Vec::new()));
+
+        let descend = picker.ask(
+            PickerRequest::Listing {
+                path: "/root".to_string(),
+            },
+            &tokens,
+        );
+
+        picker.accept_listing(descend.token, Err("permission denied".to_string()));
+
+        assert_eq!(picker.path, "/home/exedev");
+        assert_eq!(picker.error.as_deref(), Some("permission denied"));
+        assert!(!picker.busy());
+    }
+
+    #[test]
+    fn a_command_that_never_left_ungates_the_modal() {
+        let tokens = RequestTokens::default();
+        let (mut picker, _home) = FolderPicker::opening("exe-dev/bloggy".to_string(), &tokens);
+
+        picker.request_failed();
+
+        assert!(!picker.busy());
+    }
+
+    #[test]
+    fn a_rejected_workspace_stores_nothing_and_says_why() {
+        let tokens = RequestTokens::default();
+        let (mut picker, home) = FolderPicker::opening("exe-dev/bloggy".to_string(), &tokens);
+        let listing = picker
+            .accept_home(home.token, Ok("/home/exedev".to_string()), &tokens)
+            .expect("home starts the walk");
+
+        picker.accept_listing(listing.token, Ok(Vec::new()));
+
+        let validate = picker.confirm(&tokens).expect("a directory to add");
+        let stored = picker.accept_validation(validate.token, Some("not a git repo".to_string()));
+
+        assert_eq!(stored, None);
+        assert_eq!(picker.error.as_deref(), Some("not a git repo"));
     }
 
     fn idle_picker() -> FolderPicker {

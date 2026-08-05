@@ -201,11 +201,13 @@ impl Workbench {
                 self.last_error = Some(format!("provider {provider}: {detail}"))
             }
             machines::Event::HomeResolved { token, result } => {
-                self.handle_home_resolved(token, result)
+                self.handle_home_resolved(token, result, cx)
             }
-            machines::Event::DirListed { token, result } => self.handle_dir_listed(token, result),
+            machines::Event::DirListed { token, result } => {
+                self.handle_dir_listed(token, result, cx)
+            }
             machines::Event::WorkspaceValidated { token, error } => {
-                self.handle_workspace_validated(token, error)
+                self.handle_workspace_validated(token, error, cx)
             }
         }
 
@@ -821,7 +823,7 @@ impl Workbench {
 
         match candidates.len() {
             0 => self.last_error = Some("no machines available to add a workspace on".to_string()),
-            1 => self.open_picker(candidates[0].key.clone()),
+            1 => self.open_picker(candidates[0].key.clone(), cx),
             _ => self.machine_picker_open = true,
         }
 
@@ -837,7 +839,7 @@ impl Workbench {
         let machine = candidate.key.clone();
 
         self.machine_picker_open = false;
-        self.open_picker(machine);
+        self.open_picker(machine, cx);
         cx.notify();
     }
 
