@@ -95,12 +95,8 @@ impl DaemonReader {
         Ok(Some(serde_json::from_slice(line)?))
     }
 
-    /// The next daemon line as raw bytes, undecoded. For tools that must see
-    /// exactly what the daemon sent — a typed read turns an unrecognised line
-    /// into an error and ends the stream, which is precisely the case a
-    /// protocol debugger needs to observe.
     #[cfg(feature = "raw-protocol")]
-    pub async fn next_raw(&mut self) -> std::io::Result<Option<&[u8]>> {
+    async fn next_raw(&mut self) -> std::io::Result<Option<&[u8]>> {
         read_frame(&mut self.reader, &mut self.line_buffer).await
     }
 }
@@ -116,12 +112,8 @@ impl DaemonWriter {
         self.write_all_flushed(&encode_frame(request)?).await
     }
 
-    /// Send `line` verbatim as one frame, without validating it. Lets a
-    /// protocol tool exercise the daemon's own error paths (a malformed frame
-    /// must produce a parse-error response, and that is untestable through a
-    /// typed send).
     #[cfg(feature = "raw-protocol")]
-    pub async fn send_raw_line(&mut self, line: &[u8]) -> std::io::Result<()> {
+    async fn send_raw_line(&mut self, line: &[u8]) -> std::io::Result<()> {
         let mut frame = line.to_vec();
         frame.push(harvester_proto::LF);
 
@@ -167,6 +159,32 @@ impl DaemonConnection {
                 _forward: forward,
             },
         }
+    }
+}
+
+/// Byte access to a live connection, for `harvester-cli`'s protocol debugger
+/// and nothing else. **Not** a framing bypass: reads still go through
+/// [`read_frame`] and writes still terminate with exactly one `LF`. What these
+/// two skip is *typing* — a line the client cannot parse must be printable
+/// rather than end the stream, and a malformed frame must reach the daemon so
+/// its documented parse-error response can be observed. Neither is expressible
+/// through the typed calls.
+///
+/// A module rather than two more methods on [`DaemonReader`] / [`DaemonWriter`]
+/// because a cargo feature is not a boundary: features unify across a workspace
+/// build, so gating the methods still left them on the production types for the
+/// gpui client to find. Reaching them now means naming this module, which the
+/// shipped client has no reason to do and no way to do by accident.
+#[cfg(feature = "raw-protocol")]
+pub mod raw {
+    use super::{DaemonReader, DaemonWriter};
+
+    pub async fn next_line(reader: &mut DaemonReader) -> std::io::Result<Option<&[u8]>> {
+        reader.next_raw().await
+    }
+
+    pub async fn send_line(writer: &mut DaemonWriter, line: &[u8]) -> std::io::Result<()> {
+        writer.send_raw_line(line).await
     }
 }
 

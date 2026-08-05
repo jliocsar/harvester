@@ -44,6 +44,8 @@ mod workspace;
 
 pub use bootstrap::{bootstrap_and_connect, BootstrapOutcome, Connected};
 pub use client::{DaemonClient, SessionEvent};
+#[cfg(feature = "raw-protocol")]
+pub use connection::raw;
 pub use connection::{DaemonConnection, DaemonReader, DaemonWriter};
 pub use fleet::{
     BridgeEvents, Fleet, FleetError, FleetEvents, MachineCandidate, MachineState, MachinesEvents,

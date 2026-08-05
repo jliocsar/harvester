@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use harvester_client_core::{
-    bootstrap_and_connect, DaemonClient, DaemonConnection, Host, SshTarget,
+    bootstrap_and_connect, raw, DaemonClient, DaemonConnection, Host, SshTarget,
 };
 use harvester_proto::HarvesterCmd;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -105,7 +105,7 @@ async fn raw(connection: DaemonConnection) -> Result<(), Box<dyn std::error::Err
 
     let printer = tokio::spawn(async move {
         loop {
-            match reader.next_raw().await {
+            match raw::next_line(&mut reader).await {
                 Ok(Some(line)) => println!("{}", String::from_utf8_lossy(line)),
                 Ok(None) => break,
                 Err(error) => {
@@ -123,7 +123,7 @@ async fn raw(connection: DaemonConnection) -> Result<(), Box<dyn std::error::Err
             continue;
         }
 
-        writer.send_raw_line(line.as_bytes()).await?;
+        raw::send_line(&mut writer, line.as_bytes()).await?;
     }
 
     drop(writer);
