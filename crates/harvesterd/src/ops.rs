@@ -70,8 +70,10 @@ impl Drop for Attachment {
     }
 }
 
-/// Route one harvester command. `None` means a spawned task owns the response
-/// (slow commands must not head-of-line block the connection loop).
+/// Route one harvester command. `None` means a spawned task owns the response:
+/// the slow commands (pi passthroughs, `list_models`, `list_sessions`) must
+/// never head-of-line block the connection loop, and the envelope `id` — not
+/// arrival order — is what correlates their answers.
 pub fn dispatch(
     daemon: &Daemon,
     id: Option<Value>,
@@ -429,12 +431,10 @@ fn stop(daemon: &Daemon, sid: Sid) -> HarvesterResponse {
 
     // Rung 1: abort any in-flight turn so pi records it cleanly in the session
     // file instead of dying mid-stream. Failure is fine — a dead or deaf pi is
-    // exactly what the rungs below are for. Registering the waiter (and
-    // dropping its receiver) keeps the pump's "no waiter means a task died"
-    // branch honest when pi acknowledges the abort.
+    // exactly what the rungs below are for. Nothing awaits the answer, but
+    // registering the waiter anyway keeps the pump's "no waiter means a task
+    // died" branch honest when pi acknowledges the abort.
     let request_key = daemon.next_passthrough_id();
-    // Nothing awaits this abort's answer; the receiver is dropped immediately
-    // and the pump's "closed receiver" path swallows the reply.
     drop(session.register_response_waiter(request_key.clone()));
     let abort = json!({"id": request_key, "type": "abort"});
 

@@ -93,11 +93,8 @@ fn spawn_writer(
     })
 }
 
-/// Answer from a spawned task instead of from the connection loop. The three
-/// slow commands (pi passthroughs, `list_models`, `list_sessions`) all need
-/// this shape: they must not head-of-line block the loop, and the envelope
-/// `id` — not arrival order — is what correlates the answer. The future yields
-/// the whole `Outgoing` because the answer's *variant* differs per caller
+/// Answer from a spawned task instead of from the connection loop. The future
+/// yields a whole `Outgoing` because the answer's *variant* differs per caller
 /// (`harvester_response` vs `pi_response`).
 pub fn answer_later(
     out_tx: &mpsc::Sender<Outbound>,
@@ -131,9 +128,6 @@ async fn decode_line(line: &[u8], out_tx: &mpsc::Sender<Outbound>) -> Option<Req
     }
 }
 
-/// Route one request. `None` means a spawned task owns the response — slow
-/// commands (pi passthroughs, list_models, list_sessions) must never
-/// head-of-line block this connection's loop.
 fn handle_request(
     daemon: &Daemon,
     request: Request,
