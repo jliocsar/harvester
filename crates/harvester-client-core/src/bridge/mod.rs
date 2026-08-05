@@ -21,6 +21,7 @@ mod attach_window;
 mod dialog;
 mod flows;
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
@@ -117,9 +118,23 @@ pub enum Event {
         detail: String,
     },
     Sessions(Vec<SessionInfo>),
-    /// Attach completed and history was replayed via passthrough
-    /// `get_entries`; `entries` is pi's list, verbatim.
+    /// A session was opened: attach completed and history was replayed via
+    /// passthrough `get_entries`; `entries` is pi's list, verbatim. The
+    /// frontend's cue to *create* the chat for `sid`.
     Attached {
+        sid: String,
+        entries: Vec<Value>,
+    },
+    /// The same `get_entries` snapshot, but as a repair after events were lost
+    /// (a daemon `event_gap`, or our own attach window overflowing) for a
+    /// session the frontend already has a chat for.
+    ///
+    /// Split from `Attached` because the two mean different things to a
+    /// frontend and one of them was wrong: rebuilding the chat entity on a
+    /// repair is what let a late resync clobber the chat on screen. Replace the
+    /// existing chat's entries; if there is no chat for `sid`, ignore it — the
+    /// bridge only ever repairs the session it is attached to.
+    HistoryReplaced {
         sid: String,
         entries: Vec<Value>,
     },
@@ -200,6 +215,9 @@ struct BridgeContext {
     attached: Arc<AsyncMutex<Option<String>>>,
     /// Live events held back while an attach flow is still fetching history.
     attach_buffers: Arc<Mutex<AttachEventBuffers>>,
+    /// Sessions with a repair already in flight, so a burst of gaps costs one
+    /// `get_entries` rather than one per gap.
+    resyncing: Arc<Mutex<HashSet<String>>>,
     /// INTERIM, with `dialog`: the dialog ids this bridge already cancelled.
     answered_dialogs: Arc<AnsweredDialogs>,
 }
@@ -274,6 +292,7 @@ async fn bridge_main(
         events,
         attached: Arc::new(AsyncMutex::new(None)),
         attach_buffers: Arc::new(Mutex::new(AttachEventBuffers::default())),
+        resyncing: Arc::new(Mutex::new(HashSet::new())),
         answered_dialogs: Arc::new(AnsweredDialogs::default()),
     };
 
@@ -312,15 +331,17 @@ fn handle_session_event(context: &BridgeContext, event: SessionEvent) -> bool {
     match event {
         SessionEvent::Pi { sid, event } => handle_live_pi_event(context, sid, event),
         SessionEvent::SessionExit { sid, exit_code } => {
-            context.events.send(Event::SessionExit { sid, exit_code })
+            spawn_flow(flows::forget_attachment(context.clone(), sid.clone()));
+            context.events.send(Event::SessionExit { sid, exit_code });
         }
-        // Recover in the backbone, not the UI: refetch the history we just
-        // lost and republish it as `Attached`, which every frontend already
-        // knows how to render.
+        // Recover in the backbone, not the UI: refetch the history we just lost
+        // and republish it, which every frontend already knows how to render.
         SessionEvent::EventGap { sid, skipped } => {
             eprintln!("bridge: lost {skipped} events for session {sid}; resyncing");
             spawn_flow(flows::resync_flow(context.clone(), sid));
         }
+        // The whole bridge stops here, so there is no attachment left to
+        // forget: this context and its daemon client die with the loop.
         SessionEvent::Disconnected => return false,
     }
 
@@ -412,4 +433,260 @@ fn report_failure(context: &BridgeContext, operation: &str, detail: String) {
     context.events.send(Event::RequestFailed {
         detail: format!("{operation}: {detail}"),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::time::Duration;
+
+    use serde_json::json;
+
+    use crate::connection::{no_forward, DaemonConnection};
+
+    /// How long to wait before concluding the bridge sent nothing. Only ever
+    /// reached by the assertions that *want* silence.
+    const QUIET: Duration = Duration::from_millis(100);
+
+    /// A bridge context wired to a fake daemon over an in-memory duplex pair —
+    /// the whole reason `DaemonConnection` stopped being a `UnixStream`.
+    struct Harness {
+        context: BridgeContext,
+        daemon: DaemonConnection,
+        events: UnboundedReceiver<(String, Event)>,
+    }
+
+    impl Harness {
+        fn new() -> Harness {
+            let (client_side, daemon_side) = tokio::io::duplex(64 * 1024);
+            let (client, _session_events) =
+                DaemonClient::start(DaemonConnection::over(client_side, no_forward()));
+            let (event_sender, events) = unbounded_channel();
+
+            Harness {
+                context: BridgeContext {
+                    client,
+                    events: EventSender {
+                        machine: "vm".to_string(),
+                        sender: event_sender,
+                    },
+                    attached: Arc::new(AsyncMutex::new(None)),
+                    attach_buffers: Arc::new(Mutex::new(AttachEventBuffers::default())),
+                    resyncing: Arc::new(Mutex::new(HashSet::new())),
+                    answered_dialogs: Arc::new(AnsweredDialogs::default()),
+                },
+                daemon: DaemonConnection::over(daemon_side, no_forward()),
+                events,
+            }
+        }
+
+        /// The next request the bridge sent, answered with a bland success so
+        /// the flow that sent it proceeds. Panics if nothing arrives.
+        async fn serve_one(&mut self) -> Value {
+            let request = tokio::time::timeout(QUIET, self.daemon.reader.next_line_for_test())
+                .await
+                .expect("the bridge sent no request");
+            let response = if request["type"] == "pi" {
+                json!({
+                    "id": request["id"],
+                    "type": "pi_response",
+                    "sid": request["sid"],
+                    "response": {"type": "response", "success": true, "data": {"entries": []}},
+                })
+            } else {
+                json!({
+                    "id": request["id"],
+                    "type": "harvester_response",
+                    "response": {"success": true, "data": {}},
+                })
+            };
+
+            self.daemon.writer.send_json_for_test(response).await;
+
+            request
+        }
+
+        /// `create_session` → `attach` → `get_entries`, the whole `Open` chain.
+        async fn serve_open(&mut self) -> Vec<String> {
+            let mut commands = Vec::new();
+
+            for _ in 0..3 {
+                commands.push(command_name(&self.serve_one().await));
+            }
+
+            commands
+        }
+
+        async fn assert_silent(&mut self, why: &str) {
+            let quiet = tokio::time::timeout(QUIET, self.daemon.reader.next_line_for_test()).await;
+
+            assert!(
+                quiet.is_err(),
+                "{why}: got {:?}",
+                quiet.map(|q| q.to_string())
+            );
+        }
+    }
+
+    /// Both envelopes name their command in the same place.
+    fn command_name(request: &Value) -> String {
+        request["cmd"]["type"].as_str().unwrap_or("?").to_string()
+    }
+
+    #[tokio::test]
+    async fn a_session_that_exited_is_not_detached_from_on_the_next_open() {
+        // The bridge used to remember an attachment forever: `attached` was
+        // cleared only by `detach_previous`. So opening a second session after
+        // the first one's pi exited sent a `Detach` for a dead sid, and the
+        // daemon's refusal reached the user as a statusbar error for an action
+        // they never took.
+        let mut harness = Harness::new();
+
+        spawn_flow(flows::open_flow(
+            harness.context.clone(),
+            "01H-first".to_string(),
+            "/work".to_string(),
+        ));
+
+        assert_eq!(
+            harness.serve_open().await,
+            ["create_session", "attach", "get_entries"]
+        );
+
+        handle_session_event(
+            &harness.context,
+            SessionEvent::SessionExit {
+                sid: "01H-first".to_string(),
+                exit_code: Some(0),
+            },
+        );
+
+        spawn_flow(flows::open_flow(
+            harness.context.clone(),
+            "01H-second".to_string(),
+            "/work".to_string(),
+        ));
+
+        assert_eq!(
+            harness.serve_open().await,
+            ["create_session", "attach", "get_entries"],
+            "the exited session must not be detached from"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_still_running_session_is_detached_from_on_the_next_open() {
+        // The other half: forgetting the attachment must be scoped to the
+        // session that actually exited, or one chat pane silently becomes two
+        // live attachments.
+        let mut harness = Harness::new();
+
+        spawn_flow(flows::open_flow(
+            harness.context.clone(),
+            "01H-first".to_string(),
+            "/work".to_string(),
+        ));
+        harness.serve_open().await;
+
+        handle_session_event(
+            &harness.context,
+            SessionEvent::SessionExit {
+                sid: "01H-somebody-else".to_string(),
+                exit_code: Some(0),
+            },
+        );
+
+        spawn_flow(flows::open_flow(
+            harness.context.clone(),
+            "01H-second".to_string(),
+            "/work".to_string(),
+        ));
+
+        assert_eq!(command_name(&harness.serve_one().await), "detach");
+    }
+
+    #[tokio::test]
+    async fn a_gap_for_a_session_nobody_watches_costs_nothing() {
+        // Every `event_gap` used to spawn a full `get_entries`, `attached`
+        // never consulted — so a session the user is not looking at still paid
+        // for a history refetch.
+        let mut harness = Harness::new();
+
+        handle_session_event(
+            &harness.context,
+            SessionEvent::EventGap {
+                sid: "01H-unwatched".to_string(),
+                skipped: 12,
+            },
+        );
+
+        harness
+            .assert_silent("only the attached session is worth repairing")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_burst_of_gaps_costs_one_refetch() {
+        // N gaps used to mean N concurrent refetches of the same history.
+        let mut harness = Harness::new();
+
+        spawn_flow(flows::open_flow(
+            harness.context.clone(),
+            "01H".to_string(),
+            "/work".to_string(),
+        ));
+        harness.serve_open().await;
+
+        for skipped in 1..=5 {
+            handle_session_event(
+                &harness.context,
+                SessionEvent::EventGap {
+                    sid: "01H".to_string(),
+                    skipped,
+                },
+            );
+        }
+
+        assert_eq!(command_name(&harness.serve_one().await), "get_entries");
+        harness
+            .assert_silent("one repair per session at a time")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_repair_is_published_as_its_own_event() {
+        // `Attached` means "create the chat"; a repair means "replace its
+        // entries". A frontend that rebuilt on both clobbered the chat on
+        // screen whenever a resync landed late.
+        let mut harness = Harness::new();
+
+        spawn_flow(flows::open_flow(
+            harness.context.clone(),
+            "01H".to_string(),
+            "/work".to_string(),
+        ));
+        harness.serve_open().await;
+
+        handle_session_event(
+            &harness.context,
+            SessionEvent::EventGap {
+                sid: "01H".to_string(),
+                skipped: 1,
+            },
+        );
+        harness.serve_one().await;
+
+        let mut published = Vec::new();
+
+        while let Ok(Some((_, event))) = tokio::time::timeout(QUIET, harness.events.recv()).await {
+            published.push(match event {
+                Event::Attached { .. } => "attached",
+                Event::HistoryReplaced { .. } => "history_replaced",
+                _ => continue,
+            });
+        }
+
+        assert_eq!(published, ["attached", "history_replaced"]);
+    }
 }

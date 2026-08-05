@@ -289,6 +289,13 @@ impl Workbench {
             BridgeEvent::Attached { sid, entries } => {
                 self.handle_attached(machine, sid, entries, cx)
             }
+            // TODO(gpui wave): a repair must REPLACE the existing chat's
+            // entries, never rebuild the chat entity — rebuilding is what let a
+            // late resync clobber the chat on screen. Routed to `handle_attached`
+            // only to keep today's behaviour unchanged until that lands.
+            BridgeEvent::HistoryReplaced { sid, entries } => {
+                self.handle_attached(machine, sid, entries, cx)
+            }
             BridgeEvent::Pi { sid, event } => self.handle_pi_event(sid, event, cx),
             BridgeEvent::SessionExit { sid, exit_code } => {
                 self.handle_session_exit(sid, exit_code, cx)

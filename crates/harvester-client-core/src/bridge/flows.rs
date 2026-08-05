@@ -9,6 +9,9 @@
 //! [`report_failure`](super::report_failure). None of them return a value —
 //! spawning a flow is fire-and-forget.
 
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
+
 use serde_json::{json, Value};
 
 use harvester_proto::{HarvesterCmd, SessionsData};
@@ -79,26 +82,111 @@ pub(super) async fn open_flow(context: BridgeContext, sid: String, cwd: String) 
     drop(attachment);
 
     // History replay: attach → get_entries → live events (DAEMON.md §attach).
-    replay_history(&context, sid, registration).await;
+    if replay_history(&context, sid.clone(), registration, attached_event).await {
+        spawn_flow(resync_flow(context, sid));
+    }
 }
 
-/// A resync after events were lost: the daemon's `event_gap` and our own
-/// attach-window overflow are the same situation, and `get_entries` is the
-/// same cure. Owns its future for [`spawn_flow`], and registers its own
-/// window — a resync that dropped the events arriving during its own fetch
-/// would reintroduce exactly the hole it exists to close.
+fn attached_event(sid: String, entries: Vec<Value>) -> Event {
+    Event::Attached { sid, entries }
+}
+
+fn history_replaced_event(sid: String, entries: Vec<Value>) -> Event {
+    Event::HistoryReplaced { sid, entries }
+}
+
+/// A repair after events were lost: the daemon's `event_gap` and our own
+/// attach-window overflow are the same situation, and `get_entries` is the same
+/// cure. It registers its own window — a resync that dropped the events
+/// arriving during its own fetch would reintroduce exactly the hole it exists
+/// to close.
+///
+/// Two things it declines to do, both of which it used to: repair a session
+/// nobody is watching (a full `get_entries` for a chat that is not on screen),
+/// and repair the same session twice at once (a burst of gaps meant a burst of
+/// concurrent refetches of one history).
 pub(super) async fn resync_flow(context: BridgeContext, sid: String) {
-    let registration = AttachRegistration::register(&context.attach_buffers, &sid);
+    if context.attached.lock().await.as_deref() != Some(sid.as_str()) {
+        return;
+    }
 
-    replay_history(&context, sid, registration).await;
+    let Some(_in_flight) = ResyncGuard::claim(&context, &sid) else {
+        return;
+    };
+
+    // A loop rather than a respawn: the retry belongs to the claim this flow
+    // already holds. It can in principle overflow again, but that needs a
+    // session outrunning the cap on every attempt — the daemon's ring in front
+    // of us is the narrower bound.
+    loop {
+        let registration = AttachRegistration::register(&context.attach_buffers, &sid);
+
+        if !replay_history(&context, sid.clone(), registration, history_replaced_event).await {
+            return;
+        }
+    }
 }
 
-/// Fetch a session's history and publish it as `Attached` — the one path that
-/// (re)seeds a chat, whether the user just opened the session or the daemon
-/// told us we missed events. pi's session file is the source of truth, so a
-/// refetch is always the correct repair. `registration` holds back the live
-/// events that race this fetch; it is released the moment `Attached` is out.
-async fn replay_history(context: &BridgeContext, sid: String, registration: AttachRegistration) {
+/// One repair per session at a time. RAII for the same reason
+/// [`AttachRegistration`] is: a flow that returned early — or was cancelled —
+/// leaving its sid claimed would block every later repair for the life of the
+/// bridge, which is worse than the duplicate work it prevents.
+struct ResyncGuard {
+    in_flight: Arc<Mutex<HashSet<String>>>,
+    sid: String,
+}
+
+impl ResyncGuard {
+    fn claim(context: &BridgeContext, sid: &str) -> Option<ResyncGuard> {
+        lock_resyncing(&context.resyncing)
+            .insert(sid.to_string())
+            .then(|| ResyncGuard {
+                in_flight: context.resyncing.clone(),
+                sid: sid.to_string(),
+            })
+    }
+}
+
+impl Drop for ResyncGuard {
+    fn drop(&mut self) {
+        lock_resyncing(&self.in_flight).remove(&self.sid);
+    }
+}
+
+/// std::sync — every use is a lock/mutate/unlock with no await inside.
+fn lock_resyncing(sessions: &Mutex<HashSet<String>>) -> std::sync::MutexGuard<'_, HashSet<String>> {
+    sessions.lock().expect("resync mutex")
+}
+
+/// A pi that exited took its attachment with it. Without this the bridge kept
+/// believing it was attached, and the next `Open` sent a `Detach` for a session
+/// whose pi is gone — which fails, and surfaces to the user as a statusbar
+/// error for an action they never took.
+pub(super) async fn forget_attachment(context: BridgeContext, sid: String) {
+    let mut attached = context.attached.lock().await;
+
+    if attached.as_deref() == Some(sid.as_str()) {
+        *attached = None;
+    }
+}
+
+/// Fetch a session's history and publish it — the one path that (re)seeds a
+/// chat, whether the user just opened the session or the daemon told us we
+/// missed events. pi's session file is the source of truth, so a refetch is
+/// always the correct repair. `registration` holds back the live events that
+/// race this fetch; it is released the moment the snapshot is out.
+///
+/// `publish` is what distinguishes the two callers, and the distinction is
+/// load-bearing for the frontend: an open seeds a new chat, a repair replaces
+/// the entries of one already on screen.
+///
+/// Returns `true` when events were lost even so and another repair is owed.
+async fn replay_history(
+    context: &BridgeContext,
+    sid: String,
+    registration: AttachRegistration,
+    publish: fn(String, Vec<Value>) -> Event,
+) -> bool {
     let entries = match pi_flow_result(context, &sid, json!({"type": "get_entries"})).await {
         Ok(data) => data
             .get("entries")
@@ -108,36 +196,37 @@ async fn replay_history(context: &BridgeContext, sid: String, registration: Atta
         Err(detail) => {
             report_failure(context, "get_entries", detail);
 
-            return;
+            return false;
         }
     };
 
-    context.events.send(Event::Attached {
-        sid: sid.clone(),
-        entries,
-    });
-    deliver_buffered_events(context, sid, registration);
+    context.events.send(publish(sid.clone(), entries));
+
+    deliver_buffered_events(context, sid, registration)
 }
 
 /// Release the window the instant the frontend has a chat to put it in. There
-/// is no await between the `Attached` send and this, so no live event can slip
-/// in front of the events it held back.
-fn deliver_buffered_events(context: &BridgeContext, sid: String, registration: AttachRegistration) {
+/// is no await between the snapshot send and this, so no live event can slip in
+/// front of the events it held back. `true` means the window overflowed, so the
+/// snapshot just published is already stale — the daemon's own `event_gap`
+/// vocabulary, reused rather than inventing a second recovery.
+fn deliver_buffered_events(
+    context: &BridgeContext,
+    sid: String,
+    registration: AttachRegistration,
+) -> bool {
     match registration.flush() {
         FlushOutcome::Events(events) => {
             for event in events {
                 handle_pi_event(context, sid.clone(), event);
             }
+
+            false
         }
-        // Reuse the daemon's own vocabulary for this situation rather than
-        // inventing a second recovery: events were lost, so the snapshot we
-        // just published is stale and the cure is another `get_entries`. The
-        // retry can in principle overflow again, but that needs a session
-        // outrunning the cap on every attempt — the ring in front of us is the
-        // narrower bound.
         FlushOutcome::Overflowed => {
             eprintln!("bridge: held-back events overflowed for session {sid}; resyncing");
-            spawn_flow(resync_flow(context.clone(), sid));
+
+            true
         }
     }
 }
@@ -187,12 +276,13 @@ pub(super) async fn start_session_flow(
 
     // Swap the ghost for the live chat right away; the prompt's queued-ack
     // rides its own flow (only rejection is notable).
-    context.events.send(Event::Attached {
-        sid: sid.clone(),
-        entries: Vec::new(),
-    });
-    deliver_buffered_events(&context, sid.clone(), registration);
-    spawn_flow(prompt_flow(context.clone(), sid, first_prompt));
+    context.events.send(attached_event(sid.clone(), Vec::new()));
+
+    if deliver_buffered_events(&context, sid.clone(), registration) {
+        spawn_flow(resync_flow(context.clone(), sid.clone()));
+    }
+
+    spawn_flow(prompt_flow(context, sid, first_prompt));
 }
 
 /// One chat pane means one attachment: leaving the previous session keeps
