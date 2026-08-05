@@ -135,8 +135,17 @@ fn with_checked_sid(
 
 /// Two independent answers, deliberately not one: `version` is envelope
 /// compatibility, `build` identifies this exact running image (docs/DAEMON.md
-/// §ping). The client decides what to do with either; we just report ours.
-fn ping(daemon: &Daemon, _client_version: u32) -> HarvesterResponse {
+/// §ping). Acting on a mismatch is the *client's* call (it is the one that can
+/// re-install), so the daemon only records what it was told and reports ours —
+/// which is what makes a bootstrapped machine's log diagnosable at all.
+fn ping(daemon: &Daemon, client_version: u32) -> HarvesterResponse {
+    if client_version != harvester_proto::PROTOCOL_VERSION {
+        eprintln!(
+            "ping from a client speaking protocol v{client_version}; we speak v{}",
+            harvester_proto::PROTOCOL_VERSION
+        );
+    }
+
     data_response(PingData {
         version: harvester_proto::PROTOCOL_VERSION,
         build: daemon.inner().build_fingerprint.clone(),
@@ -172,12 +181,8 @@ fn spawn_list_sessions(
     let running = daemon.running_sids();
 
     answer_later(out_tx, async move {
-        let scan = tokio::task::spawn_blocking(move || {
-            // Borrowed only for the scan: the owned copy stays on this task.
-            let running_sids = running.iter().map(String::as_str).collect();
-
-            fslist::list_sessions(cwd.as_deref(), &running_sids)
-        });
+        let scan =
+            tokio::task::spawn_blocking(move || fslist::list_sessions(cwd.as_deref(), &running));
         let response = match scan.await {
             Ok(sessions) => data_response(SessionsData { sessions }),
             Err(join_error) => HarvesterResponse::err(format!("list_sessions: {join_error}")),

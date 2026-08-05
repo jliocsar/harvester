@@ -20,26 +20,13 @@ use serde::Serialize;
 /// Hand-rolled rather than a regex crate: three char classes do not earn a
 /// dependency in a binary that ships as a static musl blob.
 fn is_valid_session_id(candidate: &str) -> bool {
-    let mut characters = candidate.chars();
-    let Some(first) = characters.next() else {
-        return false;
-    };
+    let alphanumeric = |character: char| character.is_ascii_alphanumeric();
 
-    if !first.is_ascii_alphanumeric() {
-        return false;
-    }
-
-    let mut last = first;
-
-    for character in characters {
-        if !(character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')) {
-            return false;
-        }
-
-        last = character;
-    }
-
-    last.is_ascii_alphanumeric()
+    candidate.starts_with(alphanumeric)
+        && candidate.ends_with(alphanumeric)
+        && candidate
+            .chars()
+            .all(|character| alphanumeric(character) || matches!(character, '.' | '_' | '-'))
 }
 
 /// A validated session id. The wire representation is the plain string it

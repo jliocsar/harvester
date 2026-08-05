@@ -76,9 +76,10 @@ impl Daemon {
     /// The sids with a live pi child, copied out from under the lock (no guard
     /// may cross the `spawn_blocking` boundary the caller is headed for). A set,
     /// not a list: `list_sessions` asks "is this sid running?" once per session
-    /// file on disk.
-    pub fn running_sids(&self) -> HashSet<String> {
-        self.lock_sessions().keys().map(Sid::to_string).collect()
+    /// file on disk — and `Sid: Borrow<str>` makes that a borrowed lookup, so
+    /// this set is built once and never rebuilt.
+    pub fn running_sids(&self) -> HashSet<Sid> {
+        self.lock_sessions().keys().cloned().collect()
     }
 
     /// Check-and-spawn under one lock — the table is the per-sid single-

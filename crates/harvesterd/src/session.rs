@@ -1,22 +1,24 @@
-//! One pi child per session: spawn, stdin ownership, stdout pump, dialog policy.
+//! One pi child per session: spawn, stdin ownership, stdout pump.
+
+mod dialog;
+mod launch;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::io::Write;
-use std::process::Stdio;
-use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
 
 use harvester_proto::{encode_frame, read_frame};
 use serde::Deserialize;
 use serde_json::value::RawValue;
-use serde_json::{json, Value};
+use serde_json::Value;
 use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::process::{Child, ChildStdin};
+use tokio::sync::{broadcast, mpsc, oneshot, Notify};
 
 use crate::daemon::{Daemon, PASSTHROUGH_ID_PREFIX};
 use crate::sid::Sid;
+
+pub use dialog::cancel as cancel_dialog;
 
 /// Events buffered per session for slow subscribers before they start lagging.
 const SESSION_EVENT_BUFFER: usize = 1024;
@@ -28,16 +30,6 @@ const STDIN_QUEUE_DEPTH: usize = 64;
 
 /// Pump read buffer starting size; grows to the largest pi line seen.
 const PUMP_LINE_BUFFER: usize = 64 * 1024;
-
-const DIALOG_METHODS: [&str; 4] = ["select", "confirm", "input", "editor"];
-
-/// Added to a dialog's own `timeout` before the daemon forgets it. Pi's timer
-/// and ours start at different moments (pi arms its before writing the request;
-/// ours starts when the line is read), so the slack is what keeps the daemon
-/// from forgetting a dialog that pi is still genuinely waiting on — an answer
-/// arriving after eviction would never be forwarded. Generous on purpose: being
-/// late costs nothing (the entry is already dead), being early costs an answer.
-const DIALOG_TIMEOUT_EVICTION_SLACK: Duration = Duration::from_secs(5);
 
 /// Fan-out line from a session to attached connections. Events carry the
 /// complete pre-serialized wire envelope: built once in the pump, shared by
@@ -74,14 +66,13 @@ struct LineProbe<'line> {
     /// and `input` (pi 0.83.0 `modes/rpc/rpc-mode.ts:137,142,147`, typed at
     /// `modes/rpc/rpc-types.ts:239-241,247`). `editor` never carries one
     /// (`rpc-mode.ts:253-269`). Its presence means pi will resolve the dialog
-    /// on its own — see [`spawn_dialog_eviction`].
+    /// on its own — see `dialog::spawn_eviction`.
     #[serde(default)]
     timeout: Option<u64>,
 }
 
 pub struct Session {
     pub sid: Sid,
-    pub pid: Option<u32>,
     /// `{"type":"event","sid":<escaped sid>,"event":` — the constant head of
     /// every event envelope this session emits, built once at spawn so
     /// [`encode_event`] is a byte concatenation instead of a second full JSON
@@ -101,96 +92,15 @@ pub struct Session {
     /// and had to be SIGKILLed).
     stdin_queue: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
     pub output: broadcast::Sender<SessionOutput>,
+    /// Fires the stop ladder's last rung; [`reap_child`] is listening.
+    kill_switch: Notify,
     /// Who is watching and what is waiting on them — one lock, because the
-    /// dialog policy is a decision about both at once.
-    room: Mutex<DialogRoom>,
+    /// dialog policy is a decision about both at once (see `dialog`).
+    room: Mutex<dialog::DialogRoom>,
     /// In-flight passthrough waiters by injected `hv-<n>` id. The pump
     /// resolves them; dropping the map on exit fails every waiter (pi's own
     /// reject-pending-requests-on-exit pattern).
     pending_responses: Mutex<HashMap<String, oneshot::Sender<Value>>>,
-}
-
-/// The empty-room dialog policy's whole state. Counter and pending set live
-/// under one mutex on purpose: "is anybody attached, and if so remember this
-/// dialog" must be one atomic decision. Split across an atomic and a separate
-/// lock (as it once was), a detach landing between the load and the insert
-/// strands the dialog — nobody left to answer it, and nothing left to trigger
-/// the cancel.
-#[derive(Default)]
-struct DialogRoom {
-    /// Number of attached client connections.
-    attached: usize,
-    /// Dialogs awaiting an `extension_ui_response`, by dialog id, each holding
-    /// the pre-serialized wire envelope the pump already built. Keeping the
-    /// envelope (not just the id) is what lets a client attaching *after* the
-    /// dialog arrived still be shown it — otherwise a handoff between clients
-    /// strands pi on a dialog nobody can see. First answer wins; all of them
-    /// are cancelled when the room empties, because pi would otherwise wait
-    /// on an unanswered dialog forever.
-    pending: HashMap<String, Arc<[u8]>>,
-}
-
-/// The state machine itself, deliberately plain and synchronous: the locking
-/// belongs to [`Session`], so the policy can be exercised without a pi child.
-impl DialogRoom {
-    /// Join the room; returns the dialog envelopes already waiting, which the
-    /// caller's forwarder replays so a late attacher sees them too.
-    fn attach(&mut self) -> Vec<Arc<[u8]>> {
-        self.attached += 1;
-
-        self.pending.values().cloned().collect()
-    }
-
-    /// Leave the room. When the last watcher goes, every still-pending dialog
-    /// is returned for cancellation — nothing could answer them anymore, and
-    /// pi would wait forever (docs/DAEMON.md: never leave a dialog unanswered).
-    fn detach(&mut self) -> Vec<String> {
-        self.attached = self.attached.saturating_sub(1);
-
-        if self.attached > 0 {
-            return Vec::new();
-        }
-
-        self.pending
-            .drain()
-            .map(|(dialog_id, _)| dialog_id)
-            .collect()
-    }
-
-    /// Remove-and-return: true means the dialog was still pending and this
-    /// caller's answer is the winning one (first answer wins).
-    fn claim_pending(&mut self, dialog_id: &str) -> bool {
-        self.remove_pending(dialog_id)
-    }
-
-    /// Forget a dialog pi resolved on its own when the `timeout` it published
-    /// fired. Deliberately *not* a cancel: pi has already dropped the entry, so
-    /// an `extension_ui_response` would answer a dialog that no longer exists
-    /// (pi silently discards it — `rpc-mode.ts:768-776`). Returns whether
-    /// anything was still remembered, which is the eviction's only signal.
-    fn evict_timed_out(&mut self, dialog_id: &str) -> bool {
-        self.remove_pending(dialog_id)
-    }
-
-    /// The one removal path, so "answered" and "evicted" cannot drift apart in
-    /// what they do to the room — only in what they mean.
-    fn remove_pending(&mut self, dialog_id: &str) -> bool {
-        self.pending.remove(dialog_id).is_some()
-    }
-
-    /// Remember a dialog (with the envelope to replay on a later attach).
-    /// `false` means the room is empty, so nobody will ever answer it and the
-    /// caller must cancel instead — decided in the same critical section as the
-    /// insert, which is what keeps the two outcomes mutually exclusive.
-    fn remember(&mut self, dialog_id: &str, envelope: Arc<[u8]>) -> bool {
-        if self.attached == 0 {
-            return false;
-        }
-
-        self.pending.insert(dialog_id.to_owned(), envelope);
-
-        true
-    }
 }
 
 pub struct SpawnArgs {
@@ -202,13 +112,11 @@ pub struct SpawnArgs {
 }
 
 impl Session {
-    /// The one launch line (docs/DAEMON.md). Resume-or-create via --session-id.
     /// Callers go through `Daemon::spawn_session`, which owns the pid table.
     pub(crate) fn spawn(args: SpawnArgs, daemon: &Daemon) -> std::io::Result<Arc<Session>> {
-        let mut command = create_pi_command(&args, daemon)?;
+        let mut command = launch::create_pi_command(&args, daemon)?;
         let mut child = command.spawn()?;
 
-        let pid = child.id();
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
         let (output, _) = broadcast::channel(SESSION_EVENT_BUFFER);
@@ -217,16 +125,17 @@ impl Session {
 
         let session = Arc::new(Session {
             sid: args.sid,
-            pid,
             event_prefix,
             stdin_queue: Mutex::new(Some(stdin_sender)),
             output,
-            room: Mutex::new(DialogRoom::default()),
+            kill_switch: Notify::new(),
+            room: Mutex::new(dialog::DialogRoom::default()),
             pending_responses: Mutex::new(HashMap::new()),
         });
+        let reaper = tokio::spawn(reap_child(session.clone(), child));
 
         tokio::spawn(pump_stdin(session.sid.clone(), stdin, stdin_receiver));
-        tokio::spawn(pump_stdout(session.clone(), daemon.clone(), stdout, child));
+        tokio::spawn(pump_stdout(session.clone(), daemon.clone(), stdout, reaper));
 
         Ok(session)
     }
@@ -266,22 +175,10 @@ impl Session {
         drop(self.lock_stdin_queue().take());
     }
 
-    /// Last resort after the stop grace period. Boring on purpose: shelling out
-    /// beats a libc dependency for one syscall.
+    /// Last resort after the stop grace period: SIGKILL, delivered by
+    /// [`reap_child`] — the only owner of the `Child`.
     pub fn kill(&self) {
-        let Some(pid) = self.pid else {
-            return;
-        };
-
-        let status = std::process::Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .status();
-
-        match status {
-            Ok(status) if status.success() => {}
-            Ok(status) => eprintln!("kill -9 {pid} exited with {status}"),
-            Err(error) => eprintln!("kill -9 {pid} failed to run: {error}"),
-        }
+        self.kill_switch.notify_one();
     }
 
     /// Register a waiter for the passthrough response keyed `hv-<n>`. Must be
@@ -292,39 +189,6 @@ impl Session {
         self.lock_pending_responses().insert(request_key, sender);
 
         receiver
-    }
-
-    /// Join the room; returns the dialog envelopes already waiting, which the
-    /// caller's forwarder replays so a late attacher sees them too.
-    pub fn attach(&self) -> Vec<Arc<[u8]>> {
-        self.lock_room().attach()
-    }
-
-    /// Leave the room. When the last watcher goes, every still-pending dialog
-    /// is returned for cancellation — nothing could answer them anymore, and
-    /// pi would wait forever (docs/DAEMON.md: never leave a dialog unanswered).
-    pub fn detach(&self) -> Vec<String> {
-        self.lock_room().detach()
-    }
-
-    /// Remove-and-return: true means the dialog was still pending and this
-    /// caller's answer is the winning one (first answer wins).
-    pub fn claim_pending_dialog(&self, dialog_id: &str) -> bool {
-        self.lock_room().claim_pending(dialog_id)
-    }
-
-    /// Remember a dialog (with the envelope to replay on a later attach).
-    /// `false` means the room is empty, so nobody will ever answer it and the
-    /// caller must cancel instead — checked under the same lock as the insert,
-    /// which is what keeps the two outcomes mutually exclusive.
-    fn remember_dialog(&self, dialog_id: &str, envelope: Arc<[u8]>) -> bool {
-        self.lock_room().remember(dialog_id, envelope)
-    }
-
-    /// Forget a dialog pi already resolved through its own `timeout` — never
-    /// cancel it (see [`DialogRoom::evict_timed_out`]).
-    fn evict_timed_out_dialog(&self, dialog_id: &str) -> bool {
-        self.lock_room().evict_timed_out(dialog_id)
     }
 
     fn resolve_response(&self, request_key: &str, response: Value) {
@@ -346,10 +210,6 @@ impl Session {
 
     fn lock_stdin_queue(&self) -> std::sync::MutexGuard<'_, Option<mpsc::Sender<Vec<u8>>>> {
         self.stdin_queue.lock().expect("stdin_queue mutex")
-    }
-
-    fn lock_room(&self) -> std::sync::MutexGuard<'_, DialogRoom> {
-        self.room.lock().expect("dialog room mutex")
     }
 
     fn lock_pending_responses(
@@ -381,95 +241,30 @@ async fn pump_stdin(sid: Sid, mut stdin: ChildStdin, mut frames: mpsc::Receiver<
     }
 }
 
-/// Answer a dialog with `cancelled: true` — to the extension, identical to a
-/// human pressing Escape. Used at arrival (empty room) and when the room empties.
-pub fn cancel_dialog(session: &Session, dialog_id: &str) {
-    let cancel = json!({"type": "extension_ui_response", "id": dialog_id, "cancelled": true});
-
-    if let Err(error) = session.write_line(&cancel) {
-        eprintln!(
-            "session {}: dialog {dialog_id} auto-cancel write failed: {error}",
-            session.sid
-        );
-    }
-}
-
-/// Open a session's stderr log for the run that is about to start. **Append,
-/// never truncate**: spawn is also resume, so truncating would destroy the
-/// record of why the previous run died — the very thing the user is looking at
-/// when they click resume, and the sole exit-diagnosis channel the contract
-/// gives clients (docs/DAEMON.md §Events). The banner is what makes appended
-/// runs separable in a `tail`.
-fn open_stderr_log(log_dir: &std::path::Path, sid: &Sid) -> std::io::Result<std::fs::File> {
-    let mut log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_dir.join(format!("{sid}.stderr.log")))?;
-    let started_at_unix_seconds = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|since_epoch| since_epoch.as_secs())
-        .unwrap_or_default();
-
-    writeln!(
-        log,
-        "--- harvesterd: spawning pi for {sid} at {started_at_unix_seconds} (unix seconds) ---"
-    )?;
-
-    Ok(log)
-}
-
-/// Build the launch line: env guards, mode flags, optional overrides, stderr log.
-fn create_pi_command(args: &SpawnArgs, daemon: &Daemon) -> std::io::Result<Command> {
-    let log_dir = &daemon.inner().log_dir;
-    let stderr_log = open_stderr_log(log_dir, &args.sid)?;
-
-    let mut cli_args: Vec<&str> = vec![
-        "--mode",
-        "rpc",
-        "--session-id",
-        args.sid.as_str(),
-        "--approve",
-    ];
-
-    if let Some(provider) = &args.provider {
-        cli_args.extend(["--provider", provider]);
+/// The sole owner of the `Child`, so [`Session::kill`] needs no pid and no
+/// `kill(1)`: it waits for the exit and for the kill switch at once, because
+/// the stdout pump is parked on a read that only a dead pi will ever end.
+async fn reap_child(session: Arc<Session>, mut child: Child) -> Option<i32> {
+    tokio::select! {
+        status = child.wait() => return status.ok().and_then(|status| status.code()),
+        _ = session.kill_switch.notified() => {}
     }
 
-    if let Some(model) = &args.model {
-        cli_args.extend(["--model", model]);
-    }
+    let _ = child.start_kill();
 
-    if let Some(name) = &args.name {
-        cli_args.extend(["--name", name]);
-    }
-
-    let mut command = Command::new("pi");
-    command
-        .current_dir(&args.cwd)
-        .env("PI_OFFLINE", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env(
-            "GIT_SSH_COMMAND",
-            "ssh -o BatchMode=yes -o ConnectTimeout=5",
-        )
-        .args(cli_args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::from(stderr_log));
-
-    Ok(command)
+    child.wait().await.ok().and_then(|status| status.code())
 }
 
 /// Read pi stdout lines forever; resolve responses, apply the dialog policy,
-/// forward everything else. Ends by reaping the child, vacating the pid table,
-/// failing in-flight passthroughs, and broadcasting Exit — in that order, so a
-/// client reacting to `session_exit` with an immediate resume never races the
-/// table ("already running" is structurally impossible).
+/// forward everything else. Ends by collecting the exit code, vacating the pid
+/// table, failing in-flight passthroughs, and broadcasting Exit — in that
+/// order, so a client reacting to `session_exit` with an immediate resume never
+/// races the table ("already running" is structurally impossible).
 async fn pump_stdout(
     session: Arc<Session>,
     daemon: Daemon,
     stdout: tokio::process::ChildStdout,
-    mut child: Child,
+    reaper: tokio::task::JoinHandle<Option<i32>>,
 ) {
     let mut reader = BufReader::new(stdout);
     let mut buf: Vec<u8> = Vec::with_capacity(PUMP_LINE_BUFFER);
@@ -491,7 +286,7 @@ async fn pump_stdout(
         route_line(&session, line, probe);
     }
 
-    let exit_code = child.wait().await.ok().and_then(|status| status.code());
+    let exit_code = reaper.await.ok().flatten();
 
     daemon.remove_session_if_same(&session);
     session.fail_pending_responses();
@@ -525,10 +320,6 @@ fn probe_line<'line>(sid: &Sid, line: &'line [u8]) -> Option<LineProbe<'line>> {
     Some(LineProbe::default())
 }
 
-/// Dialog policy (docs/DAEMON.md): a dialog that expects an answer is
-/// remembered and forwarded while anyone is attached (first client answer
-/// wins, and a client attaching later still gets shown it); with an empty room
-/// it is auto-cancelled instead of broadcast into the void.
 fn route_line(session: &Arc<Session>, line: &[u8], probe: LineProbe<'_>) {
     if let Some(request_key) = passthrough_response_key(&probe) {
         // The one arm that needs the whole tree: it hands pi's response object
@@ -546,57 +337,9 @@ fn route_line(session: &Arc<Session>, line: &[u8], probe: LineProbe<'_>) {
 
     let event = encode_event(&session.event_prefix, line);
 
-    if let Some(dialog_id) = dialog_id_awaiting_answer(&probe) {
-        if !session.remember_dialog(dialog_id, event.clone()) {
-            cancel_dialog(session, dialog_id);
-
-            return;
-        }
-
-        // Pi treats `timeout: 0` as no timeout at all (`if (opts?.timeout)` —
-        // rpc-mode.ts:114), so neither do we; an eviction timer pi has no
-        // matching timer for would forget a live dialog.
-        if let Some(timeout_ms) = probe.timeout.filter(|milliseconds| *milliseconds > 0) {
-            spawn_dialog_eviction(session, dialog_id, timeout_ms);
-        }
+    if dialog::accept(session, &probe, &event) {
+        let _ = session.output.send(SessionOutput::Event(event));
     }
-
-    let _ = session.output.send(SessionOutput::Event(event));
-}
-
-/// Forget a `timeout`-carrying dialog once pi has resolved it internally.
-///
-/// Pi resolves such a dialog itself and emits **nothing** on stdout (pi 0.83.0
-/// `modes/rpc/rpc-mode.ts:114-119`: the `setTimeout` callback runs `cleanup()`
-/// and `resolve(defaultValue)`, with no `output(...)`), and afterwards drops any
-/// response for that id silently (`:768-776`). Nothing on the wire announces it,
-/// so a timer is the only way to learn about it. Without one the daemon's entry
-/// is stale for the rest of the process's life: replayed to every later
-/// attacher, unanswerable, and cancelled for nothing at the last detach.
-///
-/// **Weak, never `Arc`**: a dialog may publish a timeout of hours, and the timer
-/// must not keep the `Session` — and with it the broadcast channel every
-/// subscriber holds — alive past the pi process it belongs to.
-fn spawn_dialog_eviction(session: &Arc<Session>, dialog_id: &str, timeout_ms: u64) {
-    let weak_session: Weak<Session> = Arc::downgrade(session);
-    let dialog_id = dialog_id.to_owned();
-    let evict_after =
-        Duration::from_millis(timeout_ms).saturating_add(DIALOG_TIMEOUT_EVICTION_SLACK);
-
-    tokio::spawn(async move {
-        tokio::time::sleep(evict_after).await;
-
-        let Some(session) = weak_session.upgrade() else {
-            return;
-        };
-
-        if session.evict_timed_out_dialog(&dialog_id) {
-            eprintln!(
-                "session {}: dialog {dialog_id} resolved inside pi after {timeout_ms}ms, evicted",
-                session.sid
-            );
-        }
-    });
 }
 
 /// The `hv-<n>` id when the line is a response to an injected passthrough
@@ -637,23 +380,8 @@ fn encode_event(event_prefix: &str, line: &[u8]) -> Arc<[u8]> {
     Arc::from(envelope)
 }
 
-/// The dialog id when this line is an `extension_ui_request` that blocks pi
-/// until it is answered. Fire-and-forget kinds (`notify`, `setStatus`) are
-/// forwarded like any other event, so they are not dialogs for policy purposes.
-fn dialog_id_awaiting_answer<'probe>(probe: &'probe LineProbe<'_>) -> Option<&'probe str> {
-    if probe.kind.as_deref() != Some("extension_ui_request") {
-        return None;
-    }
-
-    if !DIALOG_METHODS.contains(&probe.method.as_deref()?) {
-        return None;
-    }
-
-    probe.id.as_deref()
-}
-
-/// The dialog room in isolation — no pi child, no tokio, no sockets. Every case
-/// here is a clause of the dialog policy in docs/DAEMON.md.
+/// The hand-built envelope against the shared wire enum it must stay
+/// byte-compatible with.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -662,7 +390,6 @@ mod tests {
 
     const FIXTURE_SID: &str = "01JABCDEF0123456789ABCDEFG";
 
-    /// What the envelope must stay byte-compatible with: the shared wire enum.
     fn serde_serialized_event(sid: &str, event: Value) -> Vec<u8> {
         let outgoing = Outgoing::Event {
             sid: sid.to_owned(),
@@ -714,228 +441,5 @@ mod tests {
             serde_serialized_event(awkward_sid, serde_json::json!({"type": "noop"})),
             "the hand-built prefix must escape exactly as serde does",
         );
-    }
-
-    /// Stand-in for the wire envelope the pump would have built; the room only
-    /// ever stores and hands back these bytes, never inspects them.
-    fn envelope(dialog_id: &str) -> Arc<[u8]> {
-        Arc::from(format!(r#"{{"type":"event","id":"{dialog_id}"}}"#).into_bytes())
-    }
-
-    fn sorted(mut dialog_ids: Vec<String>) -> Vec<String> {
-        dialog_ids.sort();
-
-        dialog_ids
-    }
-
-    #[test]
-    fn attach_on_empty_room_replays_nothing() {
-        let mut room = DialogRoom::default();
-
-        assert!(room.attach().is_empty());
-        assert_eq!(room.attached, 1);
-    }
-
-    #[test]
-    fn remember_is_refused_when_the_room_is_empty() {
-        let mut room = DialogRoom::default();
-
-        assert!(!room.remember("d1", envelope("d1")));
-        assert!(room.pending.is_empty());
-    }
-
-    #[test]
-    fn remember_is_accepted_while_a_watcher_is_attached() {
-        let mut room = DialogRoom::default();
-        room.attach();
-
-        assert!(room.remember("d1", envelope("d1")));
-        assert_eq!(room.pending.len(), 1);
-    }
-
-    #[test]
-    fn a_pending_dialog_is_replayed_to_a_later_attacher() {
-        let mut room = DialogRoom::default();
-        room.attach();
-        room.remember("d1", envelope("d1"));
-
-        let replayed = room.attach();
-
-        assert_eq!(replayed, vec![envelope("d1")]);
-    }
-
-    #[test]
-    fn detach_with_another_watcher_left_cancels_nothing() {
-        let mut room = DialogRoom::default();
-        room.attach();
-        room.attach();
-        room.remember("d1", envelope("d1"));
-
-        assert!(room.detach().is_empty());
-        assert_eq!(room.attached, 1);
-        assert_eq!(room.pending.len(), 1);
-    }
-
-    #[test]
-    fn the_last_detach_drains_every_pending_dialog() {
-        let mut room = DialogRoom::default();
-        room.attach();
-        room.attach();
-        room.remember("d1", envelope("d1"));
-        room.remember("d2", envelope("d2"));
-        room.detach();
-
-        let to_cancel = room.detach();
-
-        assert_eq!(sorted(to_cancel), vec!["d1".to_owned(), "d2".to_owned()]);
-        assert_eq!(room.attached, 0);
-        assert!(room.pending.is_empty());
-    }
-
-    #[test]
-    fn claim_pending_lets_only_the_first_answer_win() {
-        let mut room = DialogRoom::default();
-        room.attach();
-        room.remember("d1", envelope("d1"));
-
-        assert!(room.claim_pending("d1"));
-        assert!(!room.claim_pending("d1"));
-    }
-
-    #[test]
-    fn claiming_an_unknown_dialog_is_refused() {
-        let mut room = DialogRoom::default();
-        room.attach();
-
-        assert!(!room.claim_pending("nope"));
-    }
-
-    #[test]
-    fn a_claimed_dialog_is_no_longer_replayed_on_attach() {
-        let mut room = DialogRoom::default();
-        room.attach();
-        room.remember("d1", envelope("d1"));
-        room.claim_pending("d1");
-
-        assert!(room.attach().is_empty());
-    }
-
-    #[test]
-    fn detaching_more_often_than_attaching_saturates_at_zero() {
-        let mut room = DialogRoom::default();
-        room.attach();
-        room.detach();
-
-        assert!(room.detach().is_empty());
-        assert_eq!(room.attached, 0);
-
-        assert!(room.detach().is_empty());
-        assert_eq!(room.attached, 0);
-    }
-
-    #[test]
-    fn evicting_a_timed_out_dialog_removes_it_from_the_room() {
-        let mut room = DialogRoom::default();
-        room.attach();
-        room.remember("d1", envelope("d1"));
-
-        assert!(room.evict_timed_out("d1"));
-        assert!(room.pending.is_empty());
-    }
-
-    #[test]
-    fn an_evicted_dialog_is_never_replayed_to_a_later_attacher() {
-        let mut room = DialogRoom::default();
-        room.attach();
-        room.remember("d1", envelope("d1"));
-        room.evict_timed_out("d1");
-
-        assert!(room.attach().is_empty());
-    }
-
-    #[test]
-    fn an_evicted_dialog_is_not_cancelled_when_the_room_empties() {
-        // The whole point of evicting rather than cancelling: pi already
-        // resolved this dialog, so the cancel would answer a dialog that no
-        // longer exists.
-        let mut room = DialogRoom::default();
-        room.attach();
-        room.remember("timed_out", envelope("timed_out"));
-        room.remember("still_open", envelope("still_open"));
-        room.evict_timed_out("timed_out");
-
-        let to_cancel = room.detach();
-
-        assert_eq!(to_cancel, vec!["still_open".to_owned()]);
-    }
-
-    #[test]
-    fn evicting_an_already_answered_dialog_reports_nothing_to_evict() {
-        // The ordinary race: a client answers just before the timer fires.
-        let mut room = DialogRoom::default();
-        room.attach();
-        room.remember("d1", envelope("d1"));
-
-        assert!(room.claim_pending("d1"));
-        assert!(!room.evict_timed_out("d1"));
-    }
-
-    #[test]
-    fn answering_an_evicted_dialog_is_refused() {
-        let mut room = DialogRoom::default();
-        room.attach();
-        room.remember("d1", envelope("d1"));
-        room.evict_timed_out("d1");
-
-        assert!(!room.claim_pending("d1"));
-    }
-
-    #[test]
-    fn evicting_an_unknown_dialog_is_a_no_op() {
-        let mut room = DialogRoom::default();
-        room.attach();
-
-        assert!(!room.evict_timed_out("nope"));
-    }
-
-    /// The wire field the eviction timer keys on, straight off pi's own
-    /// `extension_ui_request` shape (`rpc-mode.ts:137,142,147`).
-    fn probe(line: &str) -> LineProbe<'_> {
-        serde_json::from_str(line).expect("fixture line must fit the probe")
-    }
-
-    #[test]
-    fn a_dialog_timeout_is_read_off_the_wire() {
-        let parsed = probe(
-            r#"{"type":"extension_ui_request","id":"d1","method":"confirm",
-                "title":"Deploy?","message":"to prod","timeout":30000}"#,
-        );
-
-        assert_eq!(parsed.timeout, Some(30_000));
-        assert_eq!(dialog_id_awaiting_answer(&parsed), Some("d1"));
-    }
-
-    #[test]
-    fn a_dialog_without_a_timeout_probes_as_none() {
-        // `editor` never carries one (rpc-mode.ts:253-269), and neither does a
-        // dialog whose extension passed no `opts.timeout`.
-        let parsed =
-            probe(r#"{"type":"extension_ui_request","id":"d1","method":"editor","title":"t"}"#);
-
-        assert_eq!(parsed.timeout, None);
-    }
-
-    #[test]
-    fn only_the_unanswered_dialog_comes_back_for_cancellation() {
-        let mut room = DialogRoom::default();
-        room.attach();
-        room.remember("answered", envelope("answered"));
-        room.remember("stranded", envelope("stranded"));
-
-        assert!(room.claim_pending("answered"));
-
-        let to_cancel = room.detach();
-
-        assert_eq!(to_cancel, vec!["stranded".to_owned()]);
     }
 }

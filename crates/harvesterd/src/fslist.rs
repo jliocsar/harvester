@@ -12,24 +12,22 @@ use std::time::UNIX_EPOCH;
 use harvester_proto::{SessionInfo, SessionStatus, LF};
 use serde_json::Value;
 
+use crate::paths;
+use crate::sid::Sid;
+
 /// The substring every `session_info` entry must contain. Matched on raw bytes
 /// before anything is UTF-8-validated or parsed — the overwhelming majority of
 /// lines in a conversation log are messages and never match.
 const SESSION_INFO_MARKER: &[u8] = br#""session_info""#;
 
-fn pi_sessions_root() -> std::path::PathBuf {
-    let home = std::env::var("HOME").expect("HOME must be set");
-    std::path::PathBuf::from(home).join(".pi/agent/sessions")
-}
-
 /// Scan all per-cwd dirs (optionally filtered to one cwd). `running` contains
 /// the sids with a live pi child, provided by the caller.
-pub fn list_sessions(cwd_filter: Option<&str>, running: &HashSet<&str>) -> Vec<SessionInfo> {
+pub fn list_sessions(cwd_filter: Option<&str>, running: &HashSet<Sid>) -> Vec<SessionInfo> {
     let mut sessions = Vec::new();
     // Reused across files: line reads allocate once, not per line.
     let mut line_buffer = Vec::new();
 
-    let Ok(dirs) = std::fs::read_dir(pi_sessions_root()) else {
+    let Ok(dirs) = std::fs::read_dir(paths::pi_sessions_root()) else {
         return sessions;
     };
 
@@ -85,7 +83,7 @@ fn read_session_file(
     path: &Path,
     mtime_ms: u64,
     cwd_filter: Option<&str>,
-    running: &HashSet<&str>,
+    running: &HashSet<Sid>,
     line_buffer: &mut Vec<u8>,
 ) -> Option<SessionInfo> {
     let file = std::fs::File::open(path).ok()?;
@@ -219,7 +217,7 @@ mod tests {
         dir: &tempfile::TempDir,
         contents: &[u8],
         cwd_filter: Option<&str>,
-        running: &HashSet<&str>,
+        running: &HashSet<Sid>,
     ) -> Option<SessionInfo> {
         let path = dir.path().join("fixture.jsonl");
         let mut line_buffer = Vec::new();
@@ -239,14 +237,18 @@ mod tests {
         dir: &tempfile::TempDir,
         contents: &str,
         cwd_filter: Option<&str>,
-        running: &HashSet<&str>,
+        running: &HashSet<Sid>,
     ) -> Option<SessionInfo> {
         read_fixture_bytes(dir, contents.as_bytes(), cwd_filter, running)
     }
 
     /// The common case: nothing is running.
-    fn nothing_running() -> HashSet<&'static str> {
+    fn nothing_running() -> HashSet<Sid> {
         HashSet::new()
+    }
+
+    fn sid(raw: &str) -> Sid {
+        Sid::parse(raw).expect("fixture sid must be valid")
     }
 
     fn temp_dir() -> tempfile::TempDir {
@@ -418,7 +420,7 @@ mod tests {
     fn running_sid_reports_running_status() {
         let dir = temp_dir();
         let contents = jsonl(&[session_header(FIXTURE_SID, FIXTURE_CWD)]);
-        let running = HashSet::from([FIXTURE_SID]);
+        let running = HashSet::from([sid(FIXTURE_SID)]);
 
         let info = read_fixture(&dir, &contents, None, &running).expect("valid file must parse");
 
@@ -429,7 +431,7 @@ mod tests {
     fn absent_sid_reports_exited_status() {
         let dir = temp_dir();
         let contents = jsonl(&[session_header(FIXTURE_SID, FIXTURE_CWD)]);
-        let running = HashSet::from(["some-other-sid"]);
+        let running = HashSet::from([sid("some-other-sid")]);
 
         let info = read_fixture(&dir, &contents, None, &running).expect("valid file must parse");
 

@@ -126,7 +126,7 @@ fn forward_dialog_answer(
 ) -> Outgoing {
     let dialog_id = cmd.get("id").and_then(Value::as_str).unwrap_or_default();
 
-    if session.claim_pending_dialog(dialog_id) {
+    if session.remove_pending_dialog(dialog_id) {
         if let Err(error) = session.write_line(cmd) {
             // The winning answer never reached pi — the dialog policy's
             // invariant is at stake, so this must not vanish silently.

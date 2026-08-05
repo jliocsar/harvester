@@ -2,17 +2,17 @@
 //! Contract: docs/DAEMON.md (protocol v1). Stateless by design: pi's session
 //! files are the only source of truth; we hold pids, pipes and subscribers.
 
-mod build_identity;
 mod daemon;
 mod fslist;
 mod ops;
 mod passthrough;
+mod paths;
 mod server;
 mod session;
 mod sid;
 
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use tokio::net::UnixListener;
 
@@ -23,17 +23,22 @@ use tokio::net::UnixListener;
 /// doing exactly the same thing.
 const LOCK_FILE_NAME: &str = "harvesterd.lock";
 
-/// The socket path and its parent directory, both derived from the one shared
-/// constant so the client and the daemon cannot disagree about where to meet.
-fn socket_and_dir() -> (PathBuf, PathBuf) {
-    let home = std::env::var("HOME").expect("HOME must be set");
-    let socket = PathBuf::from(home).join(harvester_proto::DAEMON_SOCKET_PATH);
-    let dir = socket
-        .parent()
-        .expect("socket path has a parent")
-        .to_path_buf();
+/// Read rather than `std::env::current_exe()`'s path so the answer stays right
+/// after an upgrade has replaced the file underneath: this is the image that is
+/// *running*, which is exactly what `ping` claims to report (docs/DAEMON.md
+/// §ping). For `harvesterd build` the process was just launched from the file on
+/// disk, so the same read answers the on-disk question too.
+const RUNNING_EXECUTABLE: &str = "/proc/self/exe";
 
-    (socket, dir)
+/// Reported when the executable cannot be read at all. Never equal to a real
+/// fingerprint, so a client comparing for equality re-installs — the safe
+/// direction: a needless upload beats a machine pinned to a stale daemon.
+const UNAVAILABLE_FINGERPRINT: &str = "unavailable";
+
+/// The hash itself lives in `harvester-proto` because the client must compute
+/// the identical string; which file to read is what is daemon-local.
+fn fingerprint_running_executable() -> std::io::Result<String> {
+    harvester_proto::fingerprint_reader(&mut std::fs::File::open(RUNNING_EXECUTABLE)?)
 }
 
 /// Take the single-instance lock or exit. The handle is deliberately leaked:
@@ -65,9 +70,9 @@ fn acquire_single_instance_lock(dir: &Path, sock_path: &Path) {
     std::mem::forget(lock);
 }
 
-/// Unlink whatever sits at the socket path. Only ever called with the
-/// single-instance lock held, which is what makes it safe: the one process
-/// that could be listening there would have had to take the lock first.
+/// Only ever called with the single-instance lock held, which is what makes it
+/// safe: the one process that could be listening there would have had to take
+/// the lock first.
 fn remove_stale_socket(sock_path: &Path) {
     match std::fs::remove_file(sock_path) {
         Ok(()) => {}
@@ -84,7 +89,7 @@ fn remove_stale_socket(sock_path: &Path) {
 /// degraded sentinel: a client comparing an unreadable answer against a real
 /// fingerprint would reinstall on every single connect, forever.
 fn print_build_fingerprint() {
-    match build_identity::read_running_executable_fingerprint() {
+    match fingerprint_running_executable() {
         Ok(fingerprint) => println!("{fingerprint}"),
         Err(error) => {
             eprintln!("cannot fingerprint this binary: {error}");
@@ -93,13 +98,25 @@ fn print_build_fingerprint() {
     }
 }
 
+/// The identity of the *running image*, taken once at startup so it stays true
+/// after an upgrade replaces the file underneath us — precisely the case the
+/// client needs to detect. Degrades rather than exits: an unreadable
+/// `/proc/self/exe` (an exotic mount namespace) must not stop the daemon from
+/// serving sessions.
+fn startup_build_fingerprint() -> String {
+    fingerprint_running_executable().unwrap_or_else(|error| {
+        eprintln!("cannot fingerprint {RUNNING_EXECUTABLE}: {error}");
+
+        UNAVAILABLE_FINGERPRINT.to_string()
+    })
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    // CLI surface is exactly three forms: `harvesterd` (run),
-    // `harvesterd version` (the protocol handshake the bootstrap probe reads)
-    // and `harvesterd build` (this binary's fingerprint, for install-iff-it-
-    // differs). Still a match on one argument — an arg parser would be a
-    // dependency bought for nothing.
+    // Three CLI forms: `harvesterd` (run), `harvesterd version` (the protocol
+    // handshake the bootstrap probe reads) and `harvesterd build` (this
+    // binary's fingerprint, for install-iff-it-differs). Still a match on one
+    // argument — an arg parser would be a dependency bought for nothing.
     match std::env::args().nth(1) {
         None => {}
         Some(arg) if arg == "version" => {
@@ -118,13 +135,11 @@ async fn main() {
         }
     }
 
-    let (sock_path, dir) = socket_and_dir();
-    let log_dir = dir.join("log");
-    std::fs::create_dir_all(&log_dir).expect("create ~/.harvester/log");
-    // Socket auth *is* these permissions (docs/DAEMON.md §Transport): anyone
-    // who can reach the socket can drive pi sessions. Enforced here, in the
-    // process that owns the socket, so it holds however the daemon was
-    // started and whatever the machine's umask is.
+    let sock_path = paths::socket();
+    let dir = paths::harvester_dir();
+    std::fs::create_dir_all(paths::log_dir()).expect("create ~/.harvester/log");
+    // Enforced here, in the process that owns the socket, so it holds however
+    // the daemon was started and whatever the machine's umask is.
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
         .expect("chmod 700 ~/.harvester");
 
@@ -141,10 +156,7 @@ async fn main() {
         sock_path.display()
     );
 
-    // Once, at startup: this is the identity of the *running image*, so it
-    // stays true after an upgrade replaces the file underneath us — which is
-    // precisely the case the client needs to detect.
-    let daemon = daemon::Daemon::new(log_dir, build_identity::running_executable_fingerprint());
+    let daemon = daemon::Daemon::new(paths::log_dir(), startup_build_fingerprint());
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
@@ -153,5 +165,32 @@ async fn main() {
             }
             Err(error) => eprintln!("accept failed: {error}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The hash's own behaviour is pinned in `harvester-proto`; what is ours to
+    /// prove is that we read the right file and get a real answer — the test
+    /// binary is itself a `/proc/self/exe`.
+    #[test]
+    fn the_running_executable_fingerprints() {
+        let fingerprint = fingerprint_running_executable().expect("the test binary is readable");
+
+        assert!(fingerprint.starts_with("fnv1a64-"), "{fingerprint}");
+        assert_ne!(fingerprint, UNAVAILABLE_FINGERPRINT);
+    }
+
+    /// What makes the sentinel safe: a client comparing it against any
+    /// fingerprint sees a difference and re-installs.
+    #[test]
+    fn the_degraded_answer_is_never_a_real_fingerprint() {
+        assert_ne!(
+            UNAVAILABLE_FINGERPRINT,
+            harvester_proto::fingerprint_bytes(b"")
+        );
+        assert!(!UNAVAILABLE_FINGERPRINT.starts_with("fnv1a64-"));
     }
 }

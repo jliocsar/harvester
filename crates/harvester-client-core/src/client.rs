@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
-use crate::connection::{DaemonConnection, DaemonWriter};
+use crate::connection::{DaemonConnection, DaemonWriter, HANDSHAKE_PING_ID};
 
 /// An unsolicited daemon line: something happened to a session we watch.
 #[derive(Debug)]
@@ -39,13 +39,6 @@ pub enum SessionEvent {
     Disconnected,
 }
 
-/// A response resolved against the wrong envelope would be a daemon bug;
-/// typed so the two request kinds cannot cross.
-enum CorrelatedResponse {
-    Harvester(HarvesterResponse),
-    Pi(Value),
-}
-
 /// Cheap-clone handle: every command flow (spawned task) holds one.
 #[derive(Clone)]
 pub struct DaemonClient {
@@ -56,8 +49,11 @@ struct ClientInner {
     /// Async mutex: the guard is held across the socket write.
     writer: AsyncMutex<DaemonWriter>,
     /// In-flight waiters by request id. std::sync — never held across an await.
-    pending: Mutex<HashMap<u64, oneshot::Sender<CorrelatedResponse>>>,
-    /// 0 was the handshake ping; ids start at 1.
+    /// The whole daemon line is handed over, not a pre-classified payload: the
+    /// router knows only the id, and the requester already knows which envelope
+    /// it sent.
+    pending: Mutex<HashMap<u64, oneshot::Sender<Outgoing>>>,
+    /// Starts at the handshake's id, so the first real request is the one after.
     last_request_id: AtomicU64,
 }
 
@@ -72,7 +68,7 @@ impl DaemonClient {
             inner: Arc::new(ClientInner {
                 writer: AsyncMutex::new(writer),
                 pending: Mutex::new(HashMap::new()),
-                last_request_id: AtomicU64::new(0),
+                last_request_id: AtomicU64::new(HANDSHAKE_PING_ID),
             }),
         };
 
@@ -101,8 +97,8 @@ impl DaemonClient {
     /// One daemon-native command, response at the await point.
     pub async fn harvester(&self, cmd: HarvesterCmd) -> std::io::Result<HarvesterResponse> {
         match self.request(|id| Request::Harvester { id, cmd }).await? {
-            CorrelatedResponse::Harvester(response) => Ok(response),
-            CorrelatedResponse::Pi(_) => Err(envelope_mismatch()),
+            Outgoing::HarvesterResponse { response, .. } => Ok(response),
+            mismatched => Err(envelope_mismatch(&mismatched)),
         }
     }
 
@@ -111,34 +107,28 @@ impl DaemonClient {
         let sid = sid.to_string();
 
         match self.request(|id| Request::Pi { id, sid, cmd }).await? {
-            CorrelatedResponse::Pi(response) => Ok(response),
-            CorrelatedResponse::Harvester(_) => Err(envelope_mismatch()),
+            Outgoing::PiResponse { response, .. } => Ok(response),
+            mismatched => Err(envelope_mismatch(&mismatched)),
         }
     }
 
     async fn request(
         &self,
         build: impl FnOnce(Option<Value>) -> Request,
-    ) -> std::io::Result<CorrelatedResponse> {
+    ) -> std::io::Result<Outgoing> {
         let id = self.inner.last_request_id.fetch_add(1, Ordering::Relaxed) + 1;
         let (sender, receiver) = oneshot::channel();
-        let pending = Pending::register(self, id, sender);
+        let _pending = Pending::register(self, id, sender);
         let request = build(Some(json!(id)));
 
         self.inner.writer.lock().await.send(&request).await?;
 
-        let response = receiver.await.map_err(|_closed| {
+        receiver.await.map_err(|_closed| {
             std::io::Error::new(
                 std::io::ErrorKind::ConnectionAborted,
                 "connection closed before the response",
             )
-        });
-        // The waiter is resolved (or gone) either way; releasing it here is
-        // only tidiness — the guard's Drop covers every path, including the
-        // cancelled-future one that has no code at all.
-        drop(pending);
-
-        response
+        })
     }
 
     fn route_line(
@@ -156,16 +146,17 @@ impl DaemonClient {
             Outgoing::EventGap { sid, skipped } => {
                 let _ = events.send(SessionEvent::EventGap { sid, skipped });
             }
-            Outgoing::HarvesterResponse { id, response } => {
-                self.resolve(id.as_ref(), CorrelatedResponse::Harvester(response));
-            }
-            Outgoing::PiResponse { id, response, .. } => {
-                self.resolve(id.as_ref(), CorrelatedResponse::Pi(response));
+            response @ (Outgoing::HarvesterResponse { .. } | Outgoing::PiResponse { .. }) => {
+                self.resolve(response);
             }
         }
     }
 
-    fn resolve(&self, id: Option<&Value>, response: CorrelatedResponse) {
+    fn resolve(&self, response: Outgoing) {
+        let id = match &response {
+            Outgoing::HarvesterResponse { id, .. } | Outgoing::PiResponse { id, .. } => id.as_ref(),
+            _ => None,
+        };
         let Some(id) = id.and_then(Value::as_u64) else {
             eprintln!("daemon client: response without a usable id");
 
@@ -188,9 +179,7 @@ impl DaemonClient {
         self.lock_pending().clear();
     }
 
-    fn lock_pending(
-        &self,
-    ) -> std::sync::MutexGuard<'_, HashMap<u64, oneshot::Sender<CorrelatedResponse>>> {
+    fn lock_pending(&self) -> std::sync::MutexGuard<'_, HashMap<u64, oneshot::Sender<Outgoing>>> {
         self.inner.pending.lock().expect("pending mutex")
     }
 }
@@ -207,11 +196,7 @@ struct Pending {
 }
 
 impl Pending {
-    fn register(
-        client: &DaemonClient,
-        id: u64,
-        sender: oneshot::Sender<CorrelatedResponse>,
-    ) -> Pending {
+    fn register(client: &DaemonClient, id: u64, sender: oneshot::Sender<Outgoing>) -> Pending {
         client.lock_pending().insert(id, sender);
 
         Pending {
@@ -227,9 +212,11 @@ impl Drop for Pending {
     }
 }
 
-fn envelope_mismatch() -> std::io::Error {
+/// The daemon echoing a request's id on the other envelope is a daemon bug —
+/// impossible by contract, so it is reported rather than handled.
+fn envelope_mismatch(response: &Outgoing) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidData,
-        "response arrived in the wrong envelope",
+        format!("response arrived in the wrong envelope: {response:?}"),
     )
 }
