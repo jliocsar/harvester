@@ -421,17 +421,6 @@ impl Fleet {
         let _ = bridge.commands.send(command);
     }
 
-    /// A clone of one machine's command sender, for a frontend surface that
-    /// owns its own conversation with a bridge (a chat pane) rather than
-    /// sending through [`Fleet::send`] on every keystroke. `None` when no
-    /// bridge was ever started for the machine.
-    pub fn commands_for(&self, machine: &str) -> Option<UnboundedSender<bridge::Command>> {
-        self.machines
-            .get(machine)
-            .and_then(|machine| machine.bridge.as_ref())
-            .map(|bridge| bridge.commands.clone())
-    }
-
     /// Routes a host op (`$HOME`, `ls`, `git rev-parse`) to the machines
     /// worker. These never touch a daemon — docs/SPEC.md §Workspace, "no
     /// daemon or provider involvement" — which is why they do not go through a

@@ -54,10 +54,6 @@ pub use fleet::{
 };
 pub use host::Host;
 pub use machine::{MachineRef, LOCAL_MACHINE};
-pub use provider::{
-    discover_providers, install_bundled_providers, MachineKey, MachineStatus, Provider,
-    ProviderMachine, SshInfo, SUPPORTED_PROVIDER_PROTOCOL,
-};
 pub use ssh::SshTarget;
 pub use token::{Pending, RequestToken, RequestTokens};
 pub use transcript::Transcript;

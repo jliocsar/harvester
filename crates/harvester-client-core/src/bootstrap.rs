@@ -55,9 +55,6 @@ pub struct Connected {
     pub connection: DaemonConnection,
     pub daemon_version: String,
     pub outcome: BootstrapOutcome,
-    /// The machine's `$HOME`, needed for any later plain path work
-    /// (stderr-log tails, workspace browsing).
-    pub remote_home: String,
 }
 
 /// The whole first-connect contract in one call. Also the *every*-connect
@@ -81,7 +78,7 @@ pub async fn bootstrap_and_connect(host: &Host, daemon_binary: &[u8]) -> Result<
     let (connection, ping) = connection::connect_host(host, &probe.home).await?;
 
     if ping.build == shipped_build {
-        return connected_if_protocol_matches(connection, ping, outcome, probe.home);
+        return connected_if_protocol_matches(connection, ping, outcome);
     }
 
     // The file on disk is ours, but the daemon *running* is not it: it was
@@ -108,7 +105,7 @@ pub async fn bootstrap_and_connect(host: &Host, daemon_binary: &[u8]) -> Result<
         );
     }
 
-    connected_if_protocol_matches(connection, ping, BootstrapOutcome::Upgraded, probe.home)
+    connected_if_protocol_matches(connection, ping, BootstrapOutcome::Upgraded)
 }
 
 /// Which install path a probe implies — pure, so the policy that decides
@@ -135,7 +132,6 @@ fn connected_if_protocol_matches(
     connection: DaemonConnection,
     ping: PingData,
     outcome: BootstrapOutcome,
-    remote_home: String,
 ) -> Result<Connected> {
     if ping.version != PROTOCOL_VERSION {
         return Err(Error::VersionMismatch {
@@ -148,7 +144,6 @@ fn connected_if_protocol_matches(
         connection,
         daemon_version: ping.version.to_string(),
         outcome,
-        remote_home,
     })
 }
 

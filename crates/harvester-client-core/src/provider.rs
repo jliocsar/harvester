@@ -71,21 +71,13 @@ impl std::fmt::Display for MachineKey {
     }
 }
 
-/// Provider-reported machine status. Advisory only — the UI dot is driven by
-/// Harvester's own SSH probe, never this field (docs/PROVIDERS.md §list).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MachineStatus {
-    Running,
-    Stopped,
-    Unknown,
-}
-
-/// One machine from a provider's `list`.
+/// One machine from a provider's `list`. No status field: the dot is
+/// Harvester's own SSH probe, never the provider's word (docs/SPEC.md
+/// §Machine), so the reported status is validated and dropped.
 #[derive(Debug, Clone)]
 pub struct ProviderMachine {
     pub id: String,
     pub label: String,
-    pub status: MachineStatus,
     pub ssh: SshInfo,
 }
 
@@ -99,7 +91,11 @@ pub enum SshInfo {
         user: Option<String>,
         port: Option<u16>,
     },
-    Argv(Vec<String>),
+    /// Nothing reads the argv yet, and the variant still has to exist:
+    /// PROVIDERS.md §list makes "such machines still list, with no target"
+    /// normative, and without a variant to decode into they would fail to
+    /// parse and vanish from the sidebar entirely.
+    Argv(#[allow(dead_code)] Vec<String>),
 }
 
 impl SshInfo {
@@ -331,12 +327,15 @@ struct ListResult {
     machines: Vec<Value>,
 }
 
-/// One machine object (docs/PROVIDERS.md §list). `status` is required by
-/// contract; `ssh` is one of two shapes, so it is decoded separately.
+/// One machine object (docs/PROVIDERS.md §list). `ssh` is one of two shapes,
+/// so it is decoded separately.
 #[derive(Deserialize)]
 struct MachineEntry {
     id: String,
     label: String,
+    /// Required by contract, advisory by design: the dot is Harvester's own
+    /// probe, so deserializing it *is* the whole of its use.
+    #[allow(dead_code)]
     status: String,
     ssh: Value,
 }
@@ -403,19 +402,8 @@ fn parse_machine(entry: Value) -> serde_json::Result<ProviderMachine> {
     Ok(ProviderMachine {
         id: entry.id,
         label: entry.label,
-        status: parse_status(&entry.status),
         ssh,
     })
-}
-
-/// Unrecognized status strings degrade to Unknown (forward compat) — the
-/// field is advisory either way.
-fn parse_status(status: &str) -> MachineStatus {
-    match status {
-        "running" => MachineStatus::Running,
-        "stopped" => MachineStatus::Stopped,
-        _ => MachineStatus::Unknown,
-    }
 }
 
 /// The two `ssh` shapes, tried in the contract's precedence order: `argv`
@@ -466,7 +454,6 @@ mod tests {
         assert_eq!(machines.len(), 1);
         assert_eq!(machines[0].id, "bloggy");
         assert_eq!(machines[0].label, "bloggy");
-        assert_eq!(machines[0].status, MachineStatus::Running);
 
         let SshInfo::Host { host, user, port } = &machines[0].ssh else {
             panic!("the host form must decode as SshInfo::Host");
@@ -488,8 +475,6 @@ mod tests {
         let machines =
             parse_machine_list("exe-dev", list_result(json!([entry]))).expect("must parse");
 
-        assert_eq!(machines[0].status, MachineStatus::Stopped);
-
         let SshInfo::Host { user, port, .. } = &machines[0].ssh else {
             panic!("the host form must decode as SshInfo::Host");
         };
@@ -508,27 +493,12 @@ mod tests {
         });
         let machines = parse_machine_list("fly", list_result(json!([entry]))).expect("must parse");
 
-        assert_eq!(machines[0].status, MachineStatus::Unknown);
-
         let SshInfo::Argv(argv) = &machines[0].ssh else {
             panic!("the argv form must decode as SshInfo::Argv");
         };
 
         assert_eq!(argv.len(), 6);
         assert_eq!(argv[0], "fly");
-    }
-
-    /// An unrecognized status is advisory-only, so it degrades rather than
-    /// dropping the machine (docs/PROVIDERS.md §list).
-    #[test]
-    fn unknown_status_string_degrades_to_unknown() {
-        let mut entry = host_machine("bloggy");
-        entry["status"] = json!("provisioning");
-
-        let machines =
-            parse_machine_list("exe-dev", list_result(json!([entry]))).expect("must parse");
-
-        assert_eq!(machines[0].status, MachineStatus::Unknown);
     }
 
     /// The point of per-entry decoding: one bad machine costs one machine.
