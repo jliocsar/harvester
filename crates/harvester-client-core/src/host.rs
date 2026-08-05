@@ -65,6 +65,23 @@ impl Host {
     }
 }
 
+/// Prints the machine's home directory and nothing else. `printf` rather than
+/// `echo`, whose handling of backslashes is shell-dependent.
+pub(crate) const HOME_SCRIPT: &str = r#"printf '%s\n' "$HOME""#;
+
+/// The absolute `$HOME` a [`HOME_SCRIPT`] exec printed on its first line, or
+/// `None` if it printed nothing usable. Trimmed because a `\r` is invisible in
+/// a path and fatal in an `ssh -L` forward spec; rejected unless absolute
+/// because a relative `$HOME` sends the folder picker walking from nowhere and
+/// makes a forward spec meaningless.
+pub(crate) fn parse_home(stdout: &str) -> Option<&str> {
+    stdout
+        .lines()
+        .next()
+        .map(str::trim)
+        .filter(|home| home.starts_with('/'))
+}
+
 /// Single-quotes `value` for the POSIX shell (the `'\''` dance), so arbitrary
 /// characters survive the command-line round trip. Lives next to the exec
 /// boundary because that is what it protects: both the scripts sent through

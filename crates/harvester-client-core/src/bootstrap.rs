@@ -15,7 +15,7 @@ use std::time::Duration;
 use harvester_proto::{fingerprint_bytes, PingData, PROTOCOL_VERSION};
 
 use crate::connection::{self, DaemonConnection};
-use crate::host::Host;
+use crate::host::{parse_home, Host, HOME_SCRIPT};
 use crate::{Error, Result};
 
 /// Ceiling on the probe and start execs (each about one round trip).
@@ -158,8 +158,9 @@ struct Probe {
 /// `~` in `-L`; the local connect joins it the same way), and which build of
 /// harvesterd is on disk, if any.
 async fn probe(host: &Host) -> Result<Probe> {
-    let script = format!(r#"printf '%s\n' "$HOME"; exec ~/{DAEMON_BINARY_PATH} build"#);
-    let output = host.exec(&script, None, BOOTSTRAP_EXEC_TIMEOUT).await?;
+    let output = host
+        .exec(&probe_script(), None, BOOTSTRAP_EXEC_TIMEOUT)
+        .await?;
 
     parse_probe(&output.stdout, output.status.success()).ok_or_else(|| Error::Exec {
         context: "probe home",
@@ -176,18 +177,25 @@ async fn probe(host: &Host) -> Result<Probe> {
 /// `None` means the exec itself failed. The home line prints even when the
 /// binary is missing (the `exec` fails with 126/127 *after* it), so no home line
 /// at all is the only thing that can mean that.
+fn probe_script() -> String {
+    format!("{HOME_SCRIPT}; exec ~/{DAEMON_BINARY_PATH} build")
+}
+
 fn parse_probe(stdout: &str, exec_succeeded: bool) -> Option<Probe> {
-    // Trimmed because a `\r` would be invisible in a path and fatal in a
-    // socket-forward spec.
-    let mut lines = stdout.lines().map(str::trim);
-    let home = lines.next().filter(|home| home.starts_with('/'))?;
+    let home = parse_home(stdout)?;
     // Anything short of a clean answer reads as "nothing usable installed",
     // which reinstalls — the self-healing direction, and a needless upload is
     // the cheap failure. It needs no special case for the daemons that predate
     // `harvesterd build`: they exit non-zero on the unknown argument, which
     // lands here as `None` and retires them.
     let installed_build = exec_succeeded
-        .then(|| lines.next().filter(|build| !build.is_empty()))
+        .then(|| {
+            stdout
+                .lines()
+                .nth(1)
+                .map(str::trim)
+                .filter(|build| !build.is_empty())
+        })
         .flatten();
 
     Some(Probe {
@@ -246,9 +254,10 @@ fn start_script() -> String {
 /// place exactly like a whole one. The swap is atomic against ETXTBSY; it was
 /// never atomic against a short write.
 fn install_script(kill_running_daemon: KillRunningDaemon, binary_len: usize) -> String {
+    // Only the bin dir: the log dir and the 700 both come from the appended
+    // `start_script`, which needs them anyway because `start` runs it alone.
     let replace = format!(
-        "mkdir -p ~/.harvester/bin ~/.harvester/log \
-         && chmod 700 ~/.harvester \
+        "mkdir -p ~/.harvester/bin \
          && cat > ~/{DAEMON_BINARY_PATH}.next.$$ \
          && {{ [ \"$(wc -c < ~/{DAEMON_BINARY_PATH}.next.$$)\" -eq {binary_len} ] \
                || {{ rm -f ~/{DAEMON_BINARY_PATH}.next.$$; \
@@ -474,7 +483,7 @@ mod tests {
     fn the_probe_asks_for_the_build_not_the_version() {
         // The version cannot answer "is this the binary I ship?" — that
         // conflation is the whole of C4.
-        let script = format!(r#"printf '%s\n' "$HOME"; exec ~/{DAEMON_BINARY_PATH} build"#);
+        let script = probe_script();
 
         assert_shell_parses(&script);
         assert!(script.ends_with("build"));
