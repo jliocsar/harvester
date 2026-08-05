@@ -52,8 +52,8 @@ pub use provider::{
     discover_providers, install_bundled_providers, MachineKey, MachineStatus, Provider,
     ProviderMachine, SshInfo, SUPPORTED_PROVIDER_PROTOCOL,
 };
-pub use ssh::{probe_reachable, SshTarget};
-pub use token::{RequestToken, RequestTokens};
+pub use ssh::SshTarget;
+pub use token::{Pending, RequestToken, RequestTokens};
 pub use workspace::{list_directory, resolve_home, validate_git_workspace, RemoteDirEntry};
 
 pub type Result<T> = std::result::Result<T, Error>;

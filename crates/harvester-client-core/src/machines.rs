@@ -21,7 +21,7 @@ use crate::host::Host;
 use crate::provider::{
     discover_providers, install_bundled_providers, MachineKey, Provider, ProviderMachine,
 };
-use crate::ssh::{probe_reachable, SshTarget};
+use crate::ssh::SshTarget;
 use crate::token::RequestToken;
 use crate::workspace::{list_directory, resolve_home, validate_git_workspace, RemoteDirEntry};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -29,6 +29,9 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 /// Probe cadence for the sidebar dots. A warm multiplexed probe is one
 /// network round trip, so this is cheap.
 const PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+/// Ceiling on the liveness probe: ssh's ConnectTimeout=10 bounds only the TCP
+/// connect, so auth and the exec itself need their own stop.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// Provider `list` cadence — machine sets change rarely, and each cycle
 /// costs one control-plane exec per provider (exe-dev: an `ssh exe.dev ls`).
 const LIST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
@@ -168,14 +171,27 @@ async fn worker_main(mut commands: UnboundedReceiver<Command>, events: Unbounded
                     ad_hoc_machines = machines;
                     probe_ad_hoc(&ad_hoc_machines, &events);
                 }
-                Some(Command::ResolveHome { host, token }) => {
-                    spawn_resolve_home(host, token, &events);
-                }
-                Some(Command::ListDir { host, path, token }) => {
-                    spawn_list_dir(host, path, token, &events);
-                }
+                Some(Command::ResolveHome { host, token }) => spawn_host_op(&events, async move {
+                    let result = resolve_home(&host).await.map_err(|error| error.to_string());
+
+                    Event::HomeResolved { token, result }
+                }),
+                Some(Command::ListDir { host, path, token }) => spawn_host_op(&events, async move {
+                    let result = list_directory(&host, &path)
+                        .await
+                        .map_err(|error| error.to_string());
+
+                    Event::DirListed { token, result }
+                }),
                 Some(Command::ValidateWorkspace { host, path, token }) => {
-                    spawn_validate_workspace(host, path, token, &events);
+                    spawn_host_op(&events, async move {
+                        let error = validate_git_workspace(&host, &path)
+                            .await
+                            .err()
+                            .map(|error| error.to_string());
+
+                        Event::WorkspaceValidated { token, error }
+                    })
                 }
             },
             _ = list_tick.tick() => {
@@ -219,40 +235,6 @@ fn spawn_host_op(
     tokio::spawn(async move {
         // A dropped receiver just means the window closed.
         let _ = events.send(op.await);
-    });
-}
-
-fn spawn_resolve_home(host: Host, token: RequestToken, events: &UnboundedSender<Event>) {
-    spawn_host_op(events, async move {
-        let result = resolve_home(&host).await.map_err(|error| error.to_string());
-
-        Event::HomeResolved { token, result }
-    });
-}
-
-fn spawn_list_dir(host: Host, path: String, token: RequestToken, events: &UnboundedSender<Event>) {
-    spawn_host_op(events, async move {
-        let result = list_directory(&host, &path)
-            .await
-            .map_err(|error| error.to_string());
-
-        Event::DirListed { token, result }
-    });
-}
-
-fn spawn_validate_workspace(
-    host: Host,
-    path: String,
-    token: RequestToken,
-    events: &UnboundedSender<Event>,
-) {
-    spawn_host_op(events, async move {
-        let error = validate_git_workspace(&host, &path)
-            .await
-            .err()
-            .map(|error| error.to_string());
-
-        Event::WorkspaceValidated { token, error }
     });
 }
 
@@ -369,9 +351,30 @@ fn probe_machine(key: String, target: SshTarget, events: &UnboundedSender<Event>
     let events = events.clone();
 
     tokio::spawn(async move {
-        let reachable = probe_reachable(&target).await;
-        let _ = events.send(Event::Probed { key, reachable });
+        let _ = events.send(Event::Probed {
+            key,
+            reachable: probe_reachable(&target).await,
+        });
     });
+}
+
+/// Harvester's own machine-liveness probe (docs/SPEC.md §Machine): a plain
+/// `ssh <machine> true`, reachable iff it round-trips with exit 0. Rides the
+/// multiplexed master when one is up, so a warm probe is one round trip.
+/// Errors collapse to unreachable — that is the answer the dot renders.
+///
+/// Here rather than in the transport module because a probe is a *machine*
+/// question answered with an exec: `ssh` owns addressing, `host` owns execs,
+/// and having `ssh` reach back through `host` to `ssh` was a cycle with exactly
+/// one caller, which is this file.
+async fn probe_reachable(target: &SshTarget) -> bool {
+    match Host::Ssh(target.clone())
+        .exec("true", None, PROBE_TIMEOUT)
+        .await
+    {
+        Ok(output) => output.status.success(),
+        Err(_transport_error) => false,
+    }
 }
 
 fn probe_provider_machines(machines: &[MachineRow], events: &UnboundedSender<Event>) {

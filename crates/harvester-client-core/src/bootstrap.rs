@@ -152,6 +152,7 @@ fn connected_if_protocol_matches(
     })
 }
 
+#[derive(Debug, PartialEq, Eq)]
 struct Probe {
     home: String,
     installed_build: Option<String>,
@@ -165,33 +166,38 @@ async fn probe(host: &Host) -> Result<Probe> {
     let script = format!(r#"printf '%s\n' "$HOME"; exec ~/{DAEMON_BINARY_PATH} build"#);
     let output = host.exec(&script, None, BOOTSTRAP_EXEC_TIMEOUT).await?;
 
-    // The home line prints even when the binary is missing (exec fails with
-    // 126/127 after it); no home line at all means the exec itself failed.
-    let mut stdout_lines = output.stdout.lines();
-    let Some(home) = stdout_lines.next().filter(|home| home.starts_with('/')) else {
-        return Err(Error::Exec {
-            context: "probe home",
-            detail: output.describe_failure(),
-        });
-    };
+    parse_probe(&output.stdout, output.status.success()).ok_or_else(|| Error::Exec {
+        context: "probe home",
+        detail: output.describe_failure(),
+    })
+}
 
+/// The probe's answer is **positional** — `$HOME` on line one, the build
+/// fingerprint on line two — so it is pure and tested here rather than read off
+/// an `ExecOutput` inline: one stray line of daemon output shifts the
+/// fingerprint out of place, and a fingerprint that never matches makes every
+/// connect reinstall forever.
+///
+/// `None` means the exec itself failed. The home line prints even when the
+/// binary is missing (the `exec` fails with 126/127 *after* it), so no home line
+/// at all is the only thing that can mean that.
+fn parse_probe(stdout: &str, exec_succeeded: bool) -> Option<Probe> {
+    // Trimmed because a `\r` would be invisible in a path and fatal in a
+    // socket-forward spec.
+    let mut lines = stdout.lines().map(str::trim);
+    let home = lines.next().filter(|home| home.starts_with('/'))?;
     // Anything short of a clean answer reads as "nothing usable installed",
     // which reinstalls — the self-healing direction, and a needless upload is
     // the cheap failure. It needs no special case for the daemons that predate
     // `harvesterd build`: they exit non-zero on the unknown argument, which
     // lands here as `None` and retires them.
-    let installed_build = if output.status.success() {
-        stdout_lines
-            .next()
-            .map(str::to_string)
-            .filter(|build| !build.is_empty())
-    } else {
-        None
-    };
+    let installed_build = exec_succeeded
+        .then(|| lines.next().filter(|build| !build.is_empty()))
+        .flatten();
 
-    Ok(Probe {
+    Some(Probe {
         home: home.to_string(),
-        installed_build,
+        installed_build: installed_build.map(str::to_string),
     })
 }
 
@@ -346,6 +352,76 @@ mod tests {
         assert!(
             assertion < chmod && chmod < swap,
             "a truncated upload must never be made executable or installed:\n{script}"
+        );
+    }
+
+    // --- the probe's positional answer ------------------------------------
+
+    fn probe_of(home: &str, build: Option<&str>) -> Option<Probe> {
+        Some(Probe {
+            home: home.to_string(),
+            installed_build: build.map(str::to_string),
+        })
+    }
+
+    #[test]
+    fn a_clean_probe_yields_the_home_and_the_build() {
+        assert_eq!(
+            parse_probe("/home/exedev\nfnv1a64-852768-1f0c\n", true),
+            probe_of("/home/exedev", Some("fnv1a64-852768-1f0c"))
+        );
+    }
+
+    #[test]
+    fn a_missing_binary_still_yields_the_home() {
+        // `exec` fails *after* the home line printed, with 126/127.
+        assert_eq!(
+            parse_probe("/home/exedev\n", false),
+            probe_of("/home/exedev", None)
+        );
+    }
+
+    #[test]
+    fn a_daemon_too_old_to_know_build_reinstalls() {
+        // It exits non-zero on the unknown argument, and whatever it printed on
+        // line two is not a fingerprint.
+        assert_eq!(
+            parse_probe("/home/exedev\nusage: harvesterd [version]\n", false),
+            probe_of("/home/exedev", None)
+        );
+    }
+
+    #[test]
+    fn an_empty_build_line_reinstalls_rather_than_matching_nothing() {
+        assert_eq!(
+            parse_probe("/home/exedev\n\n", true),
+            probe_of("/home/exedev", None)
+        );
+    }
+
+    #[test]
+    fn a_carriage_return_never_reaches_the_forward_spec() {
+        // It would be invisible in a path and fatal in an `ssh -L` argument.
+        assert_eq!(
+            parse_probe("/home/exedev\r\nfnv1a64-1-0\r\n", true),
+            probe_of("/home/exedev", Some("fnv1a64-1-0"))
+        );
+    }
+
+    #[test]
+    fn no_home_line_is_the_only_thing_that_means_the_exec_failed() {
+        for stdout in ["", "\n", "harvesterd: command not found\n"] {
+            assert_eq!(parse_probe(stdout, false), None, "stdout {stdout:?}");
+        }
+    }
+
+    #[test]
+    fn a_stray_line_ahead_of_the_home_is_an_error_not_a_silent_shift() {
+        // The failure this parse is extracted for: read positionally, one extra
+        // line makes the fingerprint never match and every connect reinstall.
+        assert_eq!(
+            parse_probe("hello from your motd\n/home/exedev\nfnv1a64-1-0\n", true),
+            None
         );
     }
 

@@ -3,13 +3,7 @@
 //! (`connection.rs`).
 
 use std::path::PathBuf;
-use std::time::Duration;
-
-use crate::host;
-
-/// Ceiling on the liveness probe: ConnectTimeout=10 bounds only the TCP
-/// connect, so auth/exec need their own stop.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+use std::sync::OnceLock;
 
 /// How to reach a machine. `dest` is handed to ssh verbatim, so both
 /// `user@host` and ssh-config aliases work.
@@ -77,15 +71,21 @@ const CONTROL_SOCKET_TEMPLATE: &str = "harvester-ssh-%C";
 /// unauthenticated — a fake mux server would MITM every exec. Mirrors the
 /// daemon-side policy (docs/DAEMON.md: socket auth is filesystem permissions).
 /// Degrades to the temp dir (with a loud note) only when `$HOME` is unusable.
-pub(crate) fn client_socket_dir() -> PathBuf {
-    match try_client_socket_dir() {
+///
+/// Resolved once per process: it is on the path of every ssh invocation the
+/// client builds — every probe, every folder-picker click — and it was doing a
+/// `create_dir_all` plus a `set_permissions` on each of them.
+pub(crate) fn client_socket_dir() -> &'static PathBuf {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+
+    DIR.get_or_init(|| match try_client_socket_dir() {
         Ok(dir) => dir,
         Err(error) => {
             eprintln!("~/.harvester/run unavailable ({error}); falling back to the temp dir");
 
             std::env::temp_dir()
         }
-    }
+    })
 }
 
 fn try_client_socket_dir() -> std::io::Result<PathBuf> {
@@ -119,19 +119,5 @@ impl SshTarget {
 
         command.arg(&self.dest);
         command
-    }
-}
-
-/// Harvester's own machine-liveness probe (docs/SPEC.md §Machine): a plain
-/// `ssh <machine> true`, reachable iff it round-trips with exit 0. Rides the
-/// multiplexed master when one is up, so a warm probe is one round trip.
-/// Errors collapse to unreachable — that is the answer the dot renders.
-pub async fn probe_reachable(target: &SshTarget) -> bool {
-    match host::Host::Ssh(target.clone())
-        .exec("true", None, PROBE_TIMEOUT)
-        .await
-    {
-        Ok(output) => output.status.success(),
-        Err(_) => false,
     }
 }

@@ -281,16 +281,9 @@ impl Provider {
             });
         }
 
-        let reported: Option<String> = serde_json::from_str::<Value>(&output.stdout)
-            .ok()
-            .as_ref()
-            .and_then(|value| value.get("error"))
-            .and_then(Value::as_str)
-            .map(str::to_string);
-
-        match reported {
-            Some(message) => Err(self.error(message)),
-            None => Err(self.error(format!(
+        match serde_json::from_str::<ErrorResult>(&output.stdout) {
+            Ok(reported) => Err(self.error(reported.error)),
+            Err(_not_the_contract_shape) => Err(self.error(format!(
                 "`{operation}` failed ({}) — {stderr}",
                 output.status
             ))),
@@ -307,6 +300,12 @@ fn provider_error(provider: &str, detail: String) -> Error {
         provider: provider.to_string(),
         detail,
     }
+}
+
+/// A provider's own failure object (docs/PROVIDERS.md), surfaced verbatim.
+#[derive(Deserialize)]
+struct ErrorResult {
+    error: String,
 }
 
 /// The `info` result (docs/PROVIDERS.md §info). Unknown fields are ignored on

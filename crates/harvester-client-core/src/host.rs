@@ -152,3 +152,105 @@ pub(crate) async fn run(
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
 }
+
+/// `Host::Local` is a real, in-process test double for the exec boundary: the
+/// scripts these tests check are the same strings the SSH arm sends, and the
+/// only difference between the arms is which shell runs them.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const A_MOMENT: Duration = Duration::from_secs(10);
+
+    async fn echo(value: &str) -> String {
+        Host::Local
+            .exec(
+                &format!("printf '%s' {}", shell_quote(value)),
+                None,
+                A_MOMENT,
+            )
+            .await
+            .expect("a local sh -c always runs")
+            .stdout
+    }
+
+    #[tokio::test]
+    async fn a_quoted_value_reaches_the_shell_verbatim() {
+        // Every folder-picker path and every bootstrap script goes through this
+        // `'\''` dance, and it had no test at all.
+        for value in [
+            "plain",
+            "with spaces",
+            "it's",
+            "''",
+            "$HOME",
+            "`id`",
+            "$(id)",
+            "back\\slash",
+            "semi; colon",
+            "pipe | amp & redirect > file",
+            "glob*?[a-z]",
+            "\"double quoted\"",
+            "~/tilde",
+            "üñïçødé",
+        ] {
+            assert_eq!(echo(value).await, value, "value {value:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_quoted_value_cannot_end_its_own_quoting() {
+        // The injection this exists to stop: a lone `'` closing the quote and
+        // whatever follows becoming a command of its own.
+        let attempt = "'; touch /tmp/harvester-shell-quote-escaped; echo '";
+
+        assert_eq!(echo(attempt).await, attempt);
+        assert!(!std::path::Path::new("/tmp/harvester-shell-quote-escaped").exists());
+    }
+
+    #[tokio::test]
+    async fn a_non_zero_exit_carries_the_child_s_own_diagnosis() {
+        let output = Host::Local
+            .exec("echo 'no such thing' >&2; exit 3", None, A_MOMENT)
+            .await
+            .expect("the exec itself succeeds");
+
+        let Err(crate::Error::Exec { context, detail }) = output.require_success("open a widget")
+        else {
+            panic!("exit 3 must not read as success");
+        };
+
+        assert_eq!(context, "open a widget");
+        assert!(detail.contains("no such thing"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn stdin_is_fed_without_deadlocking_on_a_full_output_pipe() {
+        // Writing and draining must overlap: doing them in sequence deadlocks
+        // once the child fills its output pipe before consuming all of stdin,
+        // which is exactly the shape of the multi-megabyte daemon upload.
+        let payload = vec![b'x'; 4 * 1024 * 1024];
+
+        let output = Host::Local
+            .exec("cat", Some(&payload), A_MOMENT)
+            .await
+            .expect("cat runs");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), payload.len());
+    }
+
+    #[tokio::test]
+    async fn a_script_that_never_ends_is_stopped_by_its_deadline() {
+        // Every remote op carries one, because ssh's ConnectTimeout bounds only
+        // the TCP connect.
+        let Err(error) = Host::Local
+            .exec("sleep 30", None, Duration::from_millis(200))
+            .await
+        else {
+            panic!("the deadline must fire");
+        };
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+}

@@ -358,7 +358,7 @@ fn local_socket_path(dest: &str) -> PathBuf {
 pub(crate) async fn sweep_leaked_forward_sockets() {
     let dir = crate::ssh::client_socket_dir();
 
-    let entries = match std::fs::read_dir(&dir) {
+    let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) => {
             eprintln!("harvester: reading {} failed: {error}", dir.display());
