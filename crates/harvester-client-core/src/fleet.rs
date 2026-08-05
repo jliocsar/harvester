@@ -189,16 +189,51 @@ impl std::fmt::Display for FleetError {
 impl std::error::Error for FleetError {}
 
 /// The two event streams a frontend pumps, handed over once at
-/// [`Fleet::start`]. Kept separate from the [`Fleet`] itself because a
-/// frontend owns *how* it pumps them (a gpui task, a tokio task, a thread) —
-/// the fleet only cares that whatever it reads gets fed back in through
-/// [`Fleet::record_bridge_event`] and [`Fleet::record_machines_event`].
+/// [`Fleet::start`]. Separate from the [`Fleet`] itself because a frontend owns
+/// *how* it pumps them (a gpui task, a tokio task, a thread), and separate from
+/// each other so two pumps can own one apiece.
 pub struct FleetEvents {
     /// Every bridge's events, tagged with the machine key.
-    pub bridges: UnboundedReceiver<(String, bridge::Event)>,
+    pub bridges: BridgeEvents,
     /// The machines worker's events; `None` if its thread failed to start (the
     /// machines list then stays empty — the reason is on stderr).
-    pub machines: Option<UnboundedReceiver<machines::Event>>,
+    pub machines: Option<MachinesEvents>,
+}
+
+/// An event straight off a worker, which the fleet has not seen yet.
+///
+/// Opaque on purpose: the only way to reach the value inside is to hand it to
+/// the fleet, which applies it on the way through. The receivers used to be
+/// handed over bare and the fleet was fed by convention — so [`MachineState`]
+/// was correct only while a frontend remembered to call the record method
+/// *before* rendering, and a frontend that forgot got a machine table that
+/// silently stopped tracking reality. This makes that order unrepresentable
+/// instead of merely documented.
+pub struct Unapplied<T>(T);
+
+/// Every bridge's events on one channel. An mpsc receiver is
+/// reactor-independent, so awaiting this from a reactor-free executor is
+/// exactly what the split is designed for (see the module docs).
+pub struct BridgeEvents(UnboundedReceiver<(String, bridge::Event)>);
+
+impl BridgeEvents {
+    /// The next event, `None` once every bridge is gone. Feed it to
+    /// [`Fleet::observe_bridge_event`] — nothing else can open it.
+    pub async fn next(&mut self) -> Option<Unapplied<(String, bridge::Event)>> {
+        self.0.recv().await.map(Unapplied)
+    }
+}
+
+/// The machines worker's events: the provider listing, the probe verdicts, and
+/// the host-op answers that belong to whoever asked.
+pub struct MachinesEvents(UnboundedReceiver<machines::Event>);
+
+impl MachinesEvents {
+    /// The next event, `None` once the worker's thread has ended. Feed it to
+    /// [`Fleet::observe_machines_event`] — nothing else can open it.
+    pub async fn next(&mut self) -> Option<Unapplied<machines::Event>> {
+        self.0.recv().await.map(Unapplied)
+    }
 }
 
 /// Owns the bridge pool, the machine table, the probe verdicts and the
@@ -249,8 +284,8 @@ impl Fleet {
             tracked: Vec::new(),
         };
         let events = FleetEvents {
-            bridges: bridge_receiver,
-            machines: machine_events,
+            bridges: BridgeEvents(bridge_receiver),
+            machines: machine_events.map(MachinesEvents),
         };
 
         (fleet, events)
@@ -415,11 +450,37 @@ impl Fleet {
 
     // --- what the fleet learns from the workers ----------------------------
 
+    /// Applies one bridge event to the machine table and hands it back for the
+    /// frontend to route. Consuming the [`Unapplied`] wrapper is what makes
+    /// this the only way to observe the stream at all: the fleet cannot be
+    /// skipped, so the link state a frontend renders is never older than the
+    /// event that changed it.
+    pub fn observe_bridge_event(
+        &mut self,
+        event: Unapplied<(String, bridge::Event)>,
+    ) -> (String, bridge::Event) {
+        let Unapplied((machine, event)) = event;
+
+        self.record_bridge_event(&machine, &event);
+
+        (machine, event)
+    }
+
+    /// Applies one machines-worker event and hands it back, for the same reason
+    /// and on the same terms as [`Fleet::observe_bridge_event`].
+    pub fn observe_machines_event(&mut self, event: Unapplied<machines::Event>) -> machines::Event {
+        let Unapplied(event) = event;
+
+        self.record_machines_event(&event);
+
+        event
+    }
+
     /// The link half of one bridge's event stream. Everything else in
     /// [`bridge::Event`] is session or request traffic the fleet has no
     /// opinion about, so this takes the event by reference and leaves the
     /// frontend's own routing untouched.
-    pub fn record_bridge_event(&mut self, machine: &str, event: &bridge::Event) {
+    fn record_bridge_event(&mut self, machine: &str, event: &bridge::Event) {
         match event {
             bridge::Event::Connected { daemon_version } => self.set_link_state(
                 machine,
@@ -456,7 +517,7 @@ impl Fleet {
     /// listing and the probe verdicts. The rest — the host-op answers, which
     /// belong to whoever asked, and the provider failure, which is statusbar
     /// material — is the frontend's.
-    pub fn record_machines_event(&mut self, event: &machines::Event) {
+    fn record_machines_event(&mut self, event: &machines::Event) {
         match event {
             machines::Event::Listed(rows) => self.handle_listed(rows),
             machines::Event::Probed { key, reachable } => self.handle_probed(key, *reachable),
@@ -717,6 +778,26 @@ mod tests {
         };
 
         assert_eq!(detail, "daemon connect: handshake timed out");
+    }
+
+    #[test]
+    fn observing_an_event_is_what_applies_it() {
+        // The public path a frontend actually walks: there is no way to take
+        // the event without the table taking it first, which is the point —
+        // the machine table used to be correct only by convention.
+        let mut fleet = fleet();
+
+        with_state(&mut fleet, "vm", MachineState::Connecting);
+
+        let (machine, event) =
+            fleet.observe_bridge_event(Unapplied(("vm".to_string(), bridge::Event::Disconnected)));
+
+        assert_eq!(machine, "vm");
+        assert!(
+            matches!(event, bridge::Event::Disconnected),
+            "the frontend still gets its event"
+        );
+        assert!(matches!(fleet.state("vm"), MachineState::ConnectionLost));
     }
 
     #[test]

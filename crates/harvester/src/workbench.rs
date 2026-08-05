@@ -12,10 +12,11 @@ mod picker;
 use gpui::{
     div, prelude::*, px, rgb, Context, Entity, Focusable, SharedString, Subscription, Window,
 };
-use harvester_client_core::{Fleet, MachineState, RequestToken, RequestTokens, LOCAL_MACHINE};
+use harvester_client_core::{
+    BridgeEvents, Fleet, MachineState, MachinesEvents, RequestToken, RequestTokens, LOCAL_MACHINE,
+};
 use harvester_proto::{SessionInfo, SessionStatus};
 use serde_json::Value;
-use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::chat::{BridgeLink, Chat};
 use crate::input::{PromptSubmitted, TextInput};
@@ -181,14 +182,15 @@ impl Workbench {
     /// Every bridge's events on one machine-tagged channel, pumped by a gpui
     /// task — an mpsc receiver is reactor-independent, so awaiting it from
     /// gpui's executor is exactly what the split is designed for.
-    fn pump_bridge_events(
-        mut events: UnboundedReceiver<(String, BridgeEvent)>,
-        cx: &mut Context<Self>,
-    ) {
+    fn pump_bridge_events(mut events: BridgeEvents, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
-            while let Some((machine, event)) = events.recv().await {
+            while let Some(unapplied) = events.next().await {
                 if this
                     .update(cx, |workbench, cx| {
+                        // The fleet opens the event, taking the link state on
+                        // the way through; what comes back is this window's.
+                        let (machine, event) = workbench.fleet.observe_bridge_event(unapplied);
+
                         workbench.handle_bridge_event(&machine, event, cx)
                     })
                     .is_err()
@@ -201,14 +203,13 @@ impl Workbench {
         .detach();
     }
 
-    fn pump_machines_events(
-        mut events: UnboundedReceiver<machines::Event>,
-        cx: &mut Context<Self>,
-    ) {
+    fn pump_machines_events(mut events: MachinesEvents, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
-            while let Some(event) = events.recv().await {
+            while let Some(unapplied) = events.next().await {
                 if this
                     .update(cx, |workbench, cx| {
+                        let event = workbench.fleet.observe_machines_event(unapplied);
+
                         workbench.handle_machines_event(event, cx)
                     })
                     .is_err()
@@ -220,11 +221,10 @@ impl Workbench {
         .detach();
     }
 
-    /// Pure router for machines-worker events. The fleet takes the machine
-    /// table and the probe verdicts first; what is left is this window's.
+    /// Pure router for machines-worker events; the fleet already took the
+    /// machine table and the probe verdicts off it, so what is left is this
+    /// window's.
     fn handle_machines_event(&mut self, event: machines::Event, cx: &mut Context<Self>) {
-        self.fleet.record_machines_event(&event);
-
         match event {
             // The listing and the probes were the fleet's, and it took them.
             machines::Event::Listed(_) | machines::Event::Probed { .. } => {}
@@ -275,11 +275,9 @@ impl Workbench {
     /// Pure router (house rule: every non-trivial match arm delegates to a
     /// dedicated handler; only one-line assignments stay inline). `machine`
     /// is the bridge the event came from; sid-scoped events route by sid
-    /// alone — sids are uuids, unique across machines. The fleet takes the
-    /// link state off the same event first.
+    /// alone — sids are uuids, unique across machines. The fleet already took
+    /// the link state off the same event.
     fn handle_bridge_event(&mut self, machine: &str, event: BridgeEvent, cx: &mut Context<Self>) {
-        self.fleet.record_bridge_event(machine, &event);
-
         match event {
             // The link state was the fleet's, and it took it; a successful
             // connect asks nothing else of this window.
