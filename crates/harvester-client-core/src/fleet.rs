@@ -22,12 +22,13 @@
 //!
 //! # Probe verdicts and daemon links are one state, not two
 //!
-//! [`MachineState`] is a single value per machine covering both, because they
-//! used to be two maps (`connections` and `probes`) that could disagree, with
-//! a precedence rule written only in the renderer that read them. The rule is
-//! now enforced where the state is written: [`Machine::record_probe`] declines
-//! to overwrite a machine that has a daemon link. A frontend reads one value
-//! and renders it; there is no second field to keep in sync.
+//! They used to be two maps (`connections` and `probes`) that could disagree,
+//! with a precedence rule written only in the renderer that read them. Now one
+//! [`Machine`] row is either probed or linked, the [`BridgeHandle`] lives
+//! inside the linked half, and the precedence rule is enforced where the row is
+//! written ([`Machine::record_probe`]). A frontend reads one [`MachineState`]
+//! and renders it; there is no second field to keep in sync, and no way to
+//! claim a link without holding the bridge that backs it.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -40,8 +41,72 @@ use crate::machine::{MachineRef, LOCAL_MACHINE};
 use crate::machines::{self, MachineRow};
 use crate::ssh::SshTarget;
 
-/// What the client knows about one machine. One value rather than a probe
-/// verdict beside a link state, so the two cannot contradict each other.
+/// One machine's row in the fleet table. A machine has either a bridge or a
+/// probe verdict, never both — the handle lives *inside* the linked half, so
+/// "has a link" and "has somewhere to send" are one fact and cannot drift
+/// apart. Absence from the table is the third case (nothing known at all),
+/// which is why it needs no variant here.
+enum Machine {
+    /// Harvester's own `ssh <machine> true` probe answered, and nothing has
+    /// tried to connect.
+    Probed { reachable: bool },
+    /// A bridge was started (in any outcome). The handle is kept after a
+    /// failure so a command sent to a dying machine still has somewhere to go
+    /// — the send is a no-op once the thread is gone — and so retouching the
+    /// machine can replace it.
+    Linked { bridge: BridgeHandle, link: Link },
+}
+
+/// What a bridge has said about its daemon. Reachable only through
+/// [`Machine::Linked`], so nothing can claim a link without holding one.
+enum Link {
+    /// Up, bootstrapping or handshaking.
+    Connecting,
+    Connected {
+        daemon_version: String,
+    },
+    /// The bridge reported why it could not connect. The detail is the user's
+    /// only diagnosis, so it is carried, not discarded.
+    Failed {
+        detail: String,
+    },
+    /// Connected once, then lost the daemon.
+    Lost,
+}
+
+impl Machine {
+    /// A probe verdict never overwrites a daemon link — an actual connection
+    /// outranks `ssh <machine> true`. The invariant used to live only in the
+    /// renderer that read the two maps this table replaced.
+    fn record_probe(&mut self, reachable: bool) {
+        if let Machine::Probed { .. } = self {
+            *self = Machine::Probed { reachable };
+        }
+    }
+
+    fn state(&self) -> MachineState<'_> {
+        match self {
+            Machine::Probed { reachable: true } => MachineState::Reachable,
+            Machine::Probed { reachable: false } => MachineState::Unreachable,
+            Machine::Linked { link, .. } => link.state(),
+        }
+    }
+}
+
+impl Link {
+    fn state(&self) -> MachineState<'_> {
+        match self {
+            Link::Connecting => MachineState::Connecting,
+            Link::Connected { daemon_version } => MachineState::Connected { daemon_version },
+            Link::Failed { detail } => MachineState::ConnectFailed { detail },
+            Link::Lost => MachineState::ConnectionLost,
+        }
+    }
+}
+
+/// What a frontend renders one machine from: a borrowed view of its row, so
+/// the states only a bridge can be in are exactly the ones the table can only
+/// build while holding that bridge.
 ///
 /// The first three are what a probe can say; the last four are what a bridge
 /// can say. A machine moves up into the bridge half when a bridge is started
@@ -49,96 +114,31 @@ use crate::ssh::SshTarget;
 /// connection, and a machine that failed to connect stays visibly failed until
 /// something retries it.
 #[derive(Debug)]
-pub enum MachineState {
+pub enum MachineState<'a> {
     /// Never probed and never connected. Indistinguishable from "reachable"
     /// without connecting, which is why both render the same.
     Unknown,
-    /// Harvester's own `ssh <machine> true` probe answered.
     Reachable,
     /// The probe failed. Not a veto: connecting is still allowed to try, since
     /// the probe may simply be older than the machine booting.
     Unreachable,
-    /// A bridge is up, bootstrapping or handshaking.
     Connecting,
     Connected {
-        daemon_version: String,
+        daemon_version: &'a str,
     },
-    /// The bridge reported why it could not connect. The detail is the user's
-    /// only diagnosis, so it is carried, not discarded.
     ConnectFailed {
-        detail: String,
+        detail: &'a str,
     },
-    /// The bridge connected and then lost the daemon.
     ConnectionLost,
 }
 
-/// Returned by [`Fleet::state`] for a machine nobody has probed or connected;
-/// a `const` because a borrow of a temporary will not do.
-const UNKNOWN_MACHINE_STATE: MachineState = MachineState::Unknown;
-
-impl MachineState {
-    /// A bridge has been started for this machine (in any outcome). The line
-    /// between "what a probe may say" and "what only a bridge may say".
-    pub fn has_link(&self) -> bool {
-        matches!(
-            self,
-            MachineState::Connecting
-                | MachineState::Connected { .. }
-                | MachineState::ConnectFailed { .. }
-                | MachineState::ConnectionLost
-        )
-    }
-
+impl MachineState<'_> {
     /// The bridge is usable: connected, or on its way and queueing commands.
     pub fn is_live(&self) -> bool {
         matches!(
             self,
             MachineState::Connecting | MachineState::Connected { .. }
         )
-    }
-}
-
-/// One machine's row in the fleet table: what is known about it, and the
-/// bridge that knows it (if one was ever started).
-struct Machine {
-    state: MachineState,
-    /// `None` until a bridge is started. Kept after a failure so a command
-    /// sent to a dying machine still has somewhere to go — the send is a
-    /// no-op once the thread is gone.
-    bridge: Option<BridgeHandle>,
-}
-
-impl Machine {
-    fn probed(reachable: bool) -> Machine {
-        Machine {
-            state: probe_state(reachable),
-            bridge: None,
-        }
-    }
-
-    fn linked(bridge: BridgeHandle) -> Machine {
-        Machine {
-            state: MachineState::Connecting,
-            bridge: Some(bridge),
-        }
-    }
-
-    /// A probe verdict never overwrites a daemon link. This is the invariant
-    /// that used to live only in the renderer that read the two maps.
-    fn record_probe(&mut self, reachable: bool) {
-        if self.state.has_link() {
-            return;
-        }
-
-        self.state = probe_state(reachable);
-    }
-}
-
-fn probe_state(reachable: bool) -> MachineState {
-    if reachable {
-        MachineState::Reachable
-    } else {
-        MachineState::Unreachable
     }
 }
 
@@ -355,7 +355,7 @@ impl Fleet {
     fn connectable_tracked_machines(&self) -> Vec<String> {
         self.tracked
             .iter()
-            .filter(|machine| !self.state(machine).has_link())
+            .filter(|machine| !self.is_linked(machine))
             .filter(|machine| self.host_for(machine).is_ok())
             .cloned()
             .collect()
@@ -401,8 +401,13 @@ impl Fleet {
         // an `Unreachable` dot gives way to `Connecting` rather than vetoing it.
         // Replacing any previous handle is what makes retouching a failed
         // machine the retry.
-        self.machines
-            .insert(machine.to_string(), Machine::linked(handle));
+        self.machines.insert(
+            machine.to_string(),
+            Machine::Linked {
+                bridge: handle,
+                link: Link::Connecting,
+            },
+        );
 
         Ok(())
     }
@@ -410,15 +415,9 @@ impl Fleet {
     /// Routes a command to the machine's bridge. A dead or missing bridge
     /// needs no handling: the link events drive the visible state.
     pub fn send(&self, machine: &str, command: bridge::Command) {
-        let Some(bridge) = self
-            .machines
-            .get(machine)
-            .and_then(|machine| machine.bridge.as_ref())
-        else {
-            return;
-        };
-
-        let _ = bridge.commands.send(command);
+        if let Some(Machine::Linked { bridge, .. }) = self.machines.get(machine) {
+            let _ = bridge.commands.send(command);
+        }
     }
 
     /// Routes a host op (`$HOME`, `ls`, `git rev-parse`) to the machines
@@ -471,35 +470,34 @@ impl Fleet {
     /// frontend's own routing untouched.
     fn record_bridge_event(&mut self, machine: &str, event: &bridge::Event) {
         match event {
-            bridge::Event::Connected { daemon_version } => self.set_link_state(
+            bridge::Event::Connected { daemon_version } => self.set_link(
                 machine,
-                MachineState::Connected {
+                Link::Connected {
                     daemon_version: daemon_version.clone(),
                 },
             ),
-            bridge::Event::ConnectFailed { detail } => self.set_link_state(
+            bridge::Event::ConnectFailed { detail } => self.set_link(
                 machine,
-                MachineState::ConnectFailed {
+                Link::Failed {
                     detail: detail.clone(),
                 },
             ),
-            bridge::Event::Disconnected => {
-                self.set_link_state(machine, MachineState::ConnectionLost)
-            }
+            bridge::Event::Disconnected => self.set_link(machine, Link::Lost),
             _ => {}
         }
     }
 
-    /// Only ever called for a machine whose bridge we started, so the entry
-    /// exists; the `else` is there so a stray event cannot panic a frontend.
-    fn set_link_state(&mut self, machine: &str, state: MachineState) {
-        let Some(entry) = self.machines.get_mut(machine) else {
-            eprintln!("fleet: link event for unknown machine {machine}");
+    /// Only ever called for a machine whose bridge we started, so the row
+    /// exists and is linked; the `else` is there so a stray event cannot panic
+    /// a frontend.
+    fn set_link(&mut self, machine: &str, link: Link) {
+        let Some(Machine::Linked { link: current, .. }) = self.machines.get_mut(machine) else {
+            eprintln!("fleet: link event for {machine}, which has no bridge");
 
             return;
         };
 
-        entry.state = state;
+        *current = link;
     }
 
     /// The fleet's half of the machines worker's event stream: the provider
@@ -534,7 +532,7 @@ impl Fleet {
             Some(machine) => machine.record_probe(reachable),
             None => {
                 self.machines
-                    .insert(key.to_string(), Machine::probed(reachable));
+                    .insert(key.to_string(), Machine::Probed { reachable });
             }
         }
     }
@@ -542,11 +540,16 @@ impl Fleet {
     // --- what the frontend reads ------------------------------------------
 
     /// The one value a frontend renders a machine from.
-    pub fn state(&self, machine: &str) -> &MachineState {
+    pub fn state(&self, machine: &str) -> MachineState<'_> {
         self.machines
             .get(machine)
-            .map(|machine| &machine.state)
-            .unwrap_or(&UNKNOWN_MACHINE_STATE)
+            .map_or(MachineState::Unknown, Machine::state)
+    }
+
+    /// Whether a bridge was ever started for this machine — the question
+    /// `state` deliberately cannot answer on its own any more.
+    fn is_linked(&self, machine: &str) -> bool {
+        matches!(self.machines.get(machine), Some(Machine::Linked { .. }))
     }
 
     /// Machine string → the host its execs run on, through the one place that
@@ -629,14 +632,22 @@ impl Fleet {
     pub fn linked_machine_count(&self) -> usize {
         self.machines
             .values()
-            .filter(|machine| machine.state.has_link())
+            .filter(|machine| matches!(machine, Machine::Linked { .. }))
             .count()
     }
 
     pub fn connected_machine_count(&self) -> usize {
         self.machines
             .values()
-            .filter(|machine| matches!(machine.state, MachineState::Connected { .. }))
+            .filter(|machine| {
+                matches!(
+                    machine,
+                    Machine::Linked {
+                        link: Link::Connected { .. },
+                        ..
+                    }
+                )
+            })
             .count()
     }
 }
@@ -685,12 +696,17 @@ mod tests {
         }
     }
 
-    fn with_state(fleet: &mut Fleet, machine: &str, state: MachineState) {
+    /// A linked row, bridge and all. The handle is a bare sender whose
+    /// receiver is dropped — a bridge whose thread has ended looks exactly
+    /// like this, and the type no longer allows a link without one.
+    fn with_link(fleet: &mut Fleet, machine: &str, link: Link) {
         fleet.machines.insert(
             machine.to_string(),
-            Machine {
-                state,
-                bridge: None,
+            Machine::Linked {
+                bridge: BridgeHandle {
+                    commands: unbounded_channel().0,
+                },
+                link,
             },
         );
     }
@@ -720,21 +736,21 @@ mod tests {
         let mut fleet = fleet();
 
         for linked in [
-            MachineState::Connecting,
-            MachineState::Connected {
+            Link::Connecting,
+            Link::Connected {
                 daemon_version: "0.1.0".to_string(),
             },
-            MachineState::ConnectFailed {
+            Link::Failed {
                 detail: "no route to host".to_string(),
             },
-            MachineState::ConnectionLost,
+            Link::Lost,
         ] {
-            with_state(&mut fleet, "vm", linked);
+            with_link(&mut fleet, "vm", linked);
             fleet.handle_probed("vm", true);
             fleet.handle_probed("vm", false);
 
             assert!(
-                fleet.state("vm").has_link(),
+                fleet.is_linked("vm"),
                 "a probe demoted a machine that has a bridge"
             );
         }
@@ -754,7 +770,7 @@ mod tests {
         // was the trade this type exists to refuse.
         let mut fleet = fleet();
 
-        with_state(&mut fleet, "vm", MachineState::Connecting);
+        with_link(&mut fleet, "vm", Link::Connecting);
         fleet.record_bridge_event(
             "vm",
             &bridge::Event::ConnectFailed {
@@ -776,7 +792,7 @@ mod tests {
         // the machine table used to be correct only by convention.
         let mut fleet = fleet();
 
-        with_state(&mut fleet, "vm", MachineState::Connecting);
+        with_link(&mut fleet, "vm", Link::Connecting);
 
         let (machine, event) =
             fleet.observe_bridge_event(Unapplied(("vm".to_string(), bridge::Event::Disconnected)));
@@ -793,7 +809,7 @@ mod tests {
     fn session_traffic_does_not_touch_the_link() {
         let mut fleet = fleet();
 
-        with_state(&mut fleet, "vm", MachineState::Connecting);
+        with_link(&mut fleet, "vm", Link::Connecting);
         fleet.record_bridge_event(
             "vm",
             &bridge::Event::RequestFailed {
@@ -814,12 +830,12 @@ mod tests {
         let mut fleet = fleet();
 
         for live in [
-            MachineState::Connecting,
-            MachineState::Connected {
+            Link::Connecting,
+            Link::Connected {
                 daemon_version: "0.1.0".to_string(),
             },
         ] {
-            with_state(&mut fleet, "vm", live);
+            with_link(&mut fleet, "vm", live);
 
             assert!(matches!(
                 fleet.connect_decision("vm"),
@@ -835,12 +851,12 @@ mod tests {
         let mut fleet = fleet();
 
         for dead in [
-            MachineState::ConnectFailed {
+            Link::Failed {
                 detail: "boom".to_string(),
             },
-            MachineState::ConnectionLost,
+            Link::Lost,
         ] {
-            with_state(&mut fleet, "vm", dead);
+            with_link(&mut fleet, "vm", dead);
 
             assert!(matches!(
                 fleet.connect_decision("vm"),
@@ -958,10 +974,10 @@ mod tests {
         let mut fleet = fleet();
 
         fleet.tracked = vec![LOCAL_MACHINE.to_string()];
-        with_state(
+        with_link(
             &mut fleet,
             LOCAL_MACHINE,
-            MachineState::ConnectFailed {
+            Link::Failed {
                 detail: "boom".to_string(),
             },
         );
@@ -1008,8 +1024,8 @@ mod tests {
         // bridge thread of a machine deleted upstream.
         let mut fleet = fleet();
 
-        with_state(&mut fleet, "exedev@vm", MachineState::Connecting);
-        with_state(&mut fleet, "exe-dev/bloggy", MachineState::Connecting);
+        with_link(&mut fleet, "exedev@vm", Link::Connecting);
+        with_link(&mut fleet, "exe-dev/bloggy", Link::Connecting);
         fleet.tracked = vec!["exedev@vm".to_string()];
         fleet.provider_rows = vec![provider_row("exe-dev/bloggy", Some("exedev@bloggy"))];
 
@@ -1079,11 +1095,11 @@ mod tests {
         let mut fleet = fleet();
 
         fleet.handle_probed("exedev@probed-only", true);
-        with_state(&mut fleet, "connecting", MachineState::Connecting);
-        with_state(
+        with_link(&mut fleet, "connecting", Link::Connecting);
+        with_link(
             &mut fleet,
             "connected",
-            MachineState::Connected {
+            Link::Connected {
                 daemon_version: "0.1.0".to_string(),
             },
         );

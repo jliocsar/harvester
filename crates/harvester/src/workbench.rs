@@ -1393,7 +1393,7 @@ struct MachineDisplay {
     statusbar_link: Option<String>,
 }
 
-fn present_machine(state: &MachineState, machine: &str) -> MachineDisplay {
+fn present_machine(state: MachineState<'_>, machine: &str) -> MachineDisplay {
     match state {
         MachineState::Connecting => MachineDisplay {
             tone: Tone::Pending,
@@ -1407,7 +1407,7 @@ fn present_machine(state: &MachineState, machine: &str) -> MachineDisplay {
         },
         MachineState::ConnectFailed { detail } => MachineDisplay {
             tone: Tone::Failed,
-            pane_message: Some(detail.clone()),
+            pane_message: Some(detail.to_string()),
             statusbar_link: Some("connect failed".to_string()),
         },
         MachineState::ConnectionLost => MachineDisplay {
