@@ -36,6 +36,14 @@ pub const LF: u8 = b'\n';
 /// Tolerated-and-stripped before `LF`; never emitted.
 pub const CR: u8 = b'\r';
 
+/// Starting size of a reused frame buffer — every read and write side of this
+/// framing: a connection's writer, a session's stdout pump, the throwaway
+/// `list_models` pi. The buffer grows to the largest line it ever sees, so this
+/// only decides how often it has to; 64 KiB clears pi's `message_update`
+/// deltas, which re-send a whole partial message and are the largest routine
+/// line on the wire.
+pub const FRAME_BUFFER_START_BYTES: usize = 64 * 1024;
+
 /// Bytes hashed per read by [`fingerprint_reader`]. A tunable, so it gets a
 /// name; it cannot change the result (see the chunk-independence test).
 const FINGERPRINT_CHUNK_BYTES: usize = 64 * 1024;

@@ -4,7 +4,9 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use harvester_proto::{read_frame, HarvesterResponse, Outgoing, Request, LF};
+use harvester_proto::{
+    read_frame, HarvesterResponse, Outgoing, Request, FRAME_BUFFER_START_BYTES, LF,
+};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
@@ -16,9 +18,6 @@ use crate::passthrough;
 
 /// Outgoing lines queued per connection before backpressure kicks in.
 const OUTGOING_QUEUE_DEPTH: usize = 256;
-
-/// Writer buffer starting size; grows to the largest line seen.
-const OUTGOING_LINE_BUFFER: usize = 64 * 1024;
 
 /// One line bound for a connection. Everything flows through the single
 /// writer task, so responses and events never interleave mid-line — which is
@@ -72,7 +71,7 @@ fn spawn_writer(
     mut out_rx: mpsc::Receiver<Outbound>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut line: Vec<u8> = Vec::with_capacity(OUTGOING_LINE_BUFFER);
+        let mut line: Vec<u8> = Vec::with_capacity(FRAME_BUFFER_START_BYTES);
 
         while let Some(outbound) = out_rx.recv().await {
             line.clear();

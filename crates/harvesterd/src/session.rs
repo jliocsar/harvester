@@ -7,7 +7,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use harvester_proto::{encode_frame, read_frame};
+use harvester_proto::{encode_frame, read_frame, FRAME_BUFFER_START_BYTES};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 use serde_json::Value;
@@ -27,9 +27,6 @@ const SESSION_EVENT_BUFFER: usize = 1024;
 /// that stopped draining its stdin can fill this, and then failing fast beats
 /// queueing without bound — the caller learns immediately instead of parking.
 const STDIN_QUEUE_DEPTH: usize = 64;
-
-/// Pump read buffer starting size; grows to the largest pi line seen.
-const PUMP_LINE_BUFFER: usize = 64 * 1024;
 
 /// Fan-out line from a session to attached connections. Events carry the
 /// complete pre-serialized wire envelope: built once in the pump, shared by
@@ -287,7 +284,7 @@ async fn pump_stdout(
     reaper: tokio::task::JoinHandle<Option<i32>>,
 ) {
     let mut reader = BufReader::new(stdout);
-    let mut buf: Vec<u8> = Vec::with_capacity(PUMP_LINE_BUFFER);
+    let mut buf: Vec<u8> = Vec::with_capacity(FRAME_BUFFER_START_BYTES);
 
     loop {
         let line = match read_frame(&mut reader, &mut buf).await {

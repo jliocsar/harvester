@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use harvester_proto::{
     encode_frame, read_frame, AttachData, CreateSessionData, DetachData, HarvesterCmd,
-    HarvesterResponse, Outgoing, PingData, SessionsData, StopData,
+    HarvesterResponse, Outgoing, PingData, SessionsData, StopData, FRAME_BUFFER_START_BYTES,
 };
 use serde_json::{json, Value};
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -37,9 +37,6 @@ const LIST_MODELS_TIMEOUT: Duration = Duration::from_secs(15);
 /// `hv-` namespace the pump routes on, though this pi has no pump — the reply
 /// filter below matches it directly.
 const MODELS_REQUEST_ID: &str = "hv-models";
-
-/// `list_models` read buffer starting size; grows to the largest pi line seen.
-const MODELS_LINE_BUFFER: usize = 64 * 1024;
 
 /// One live attachment: the forwarder task plus the exact session object whose
 /// `attached` counter it incremented. Holding the `Arc<Session>` (not just the
@@ -271,7 +268,7 @@ async fn query_available_models(cwd: &str) -> Result<Value, String> {
         .map_err(|error| format!("write to pi: {error}"))?;
 
     let mut reader = BufReader::new(stdout);
-    let mut buf: Vec<u8> = Vec::with_capacity(MODELS_LINE_BUFFER);
+    let mut buf: Vec<u8> = Vec::with_capacity(FRAME_BUFFER_START_BYTES);
 
     loop {
         // Skip non-JSON and non-matching lines (pi may emit events before the
