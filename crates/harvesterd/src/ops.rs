@@ -473,8 +473,12 @@ mod tests {
 
     /// The payloads' own wire shapes are pinned in `harvester-proto`; what is
     /// ours is the route they take — `data_response` re-serializes through a
-    /// `serde_json::Map`, so the bytes a client reads carry sorted keys rather
-    /// than the struct's declaration order.
+    /// `serde_json::Map`, which lands the payload under `data` intact.
+    ///
+    /// Compared as values, never as bytes: that `Map` is a sorted `BTreeMap`
+    /// only while `serde_json`'s `preserve_order` is off, and gpui turns it on
+    /// for the whole workspace, so key order here flips with what else is being
+    /// built. Nothing may depend on it — JSON objects are unordered.
     #[test]
     fn a_typed_payload_becomes_the_data_of_a_successful_response() {
         let response = data_response(CreateSessionData {
@@ -483,8 +487,8 @@ mod tests {
         });
 
         assert_eq!(
-            serde_json::to_string(&response).expect("a response serializes"),
-            r#"{"success":true,"data":{"already":true,"sid":"01H"}}"#
+            serde_json::to_value(&response).expect("a response serializes"),
+            serde_json::json!({"success": true, "data": {"sid": "01H", "already": true}})
         );
     }
 }
