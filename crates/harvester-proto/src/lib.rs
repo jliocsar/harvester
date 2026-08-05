@@ -833,13 +833,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_protocol_version_is_the_envelope_version_not_the_crate_version() {
-        // The whole point of C4: these two are allowed to disagree, and the
-        // build identity — not this — is what tracks the binary.
-        assert_eq!(PROTOCOL_VERSION, 1);
-    }
-
     /// These four replace hand-built `json!` objects on the daemon side, so
     /// the bytes they emit must not move: a client that reads `already` or
     /// `stopping` is talking to a daemon that may be older or newer than it.

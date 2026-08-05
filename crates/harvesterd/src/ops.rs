@@ -471,76 +471,24 @@ async fn kill_backstop(daemon: Daemon, session: Arc<Session>) {
     }
 }
 
-/// The four daemon-native payloads are typed now (docs/DAEMON.md §Operations).
-/// A client decodes them, so a field renamed in proto or a lost
-/// `skip_serializing_if` is a wire break no compiler catches — these pin the
-/// JSON each one produces against the `json!` literal it replaced.
-///
-/// Compared as **values, not bytes**: `json!` builds a `serde_json::Map`, which
-/// serializes its keys in sorted order, while a struct serializes them in
-/// declaration order. `create_session` therefore emits `sid` before `already`
-/// where it used to emit `already` first. Same keys, same values, same meaning
-/// to every JSON parser — object key order carries nothing on this wire.
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// What actually crosses the socket: the `data` of a successful response.
-    fn payload(data: impl serde::Serialize) -> Value {
-        serde_json::to_value(data_response(data)).expect("a response serializes")["data"].clone()
-    }
-
+    /// The payloads' own wire shapes are pinned in `harvester-proto`; what is
+    /// ours is the route they take — `data_response` re-serializes through a
+    /// `serde_json::Map`, so the bytes a client reads carry sorted keys rather
+    /// than the struct's declaration order.
     #[test]
-    fn a_spawned_session_reports_its_sid_and_no_already_flag() {
-        let sid = "01JABCDEF0123456789ABCDEFG";
+    fn a_typed_payload_becomes_the_data_of_a_successful_response() {
+        let response = data_response(CreateSessionData {
+            sid: "01H".to_string(),
+            already: true,
+        });
 
         assert_eq!(
-            payload(CreateSessionData {
-                sid: sid.to_owned(),
-                already: false,
-            }),
-            json!({ "sid": sid }),
-        );
-    }
-
-    /// The idempotent arm: `already` is what tells a client no second pi was
-    /// spawned, so it is the one field here that must never quietly vanish.
-    #[test]
-    fn an_already_running_session_reports_the_flag() {
-        let sid = "01JABCDEF0123456789ABCDEFG";
-
-        assert_eq!(
-            payload(CreateSessionData {
-                sid: sid.to_owned(),
-                already: true,
-            }),
-            json!({ "sid": sid, "already": true }),
-        );
-    }
-
-    #[test]
-    fn a_fresh_attach_is_an_empty_object() {
-        assert_eq!(payload(AttachData { already: false }), json!({}));
-    }
-
-    #[test]
-    fn re_attaching_to_the_same_generation_reports_the_flag() {
-        assert_eq!(
-            payload(AttachData { already: true }),
-            json!({"already": true})
-        );
-    }
-
-    #[test]
-    fn detach_is_a_bare_acknowledgement() {
-        assert_eq!(payload(DetachData {}), json!({}));
-    }
-
-    #[test]
-    fn stop_reports_that_shutdown_started() {
-        assert_eq!(
-            payload(StopData { stopping: true }),
-            json!({"stopping": true})
+            serde_json::to_string(&response).expect("a response serializes"),
+            r#"{"success":true,"data":{"already":true,"sid":"01H"}}"#
         );
     }
 }
