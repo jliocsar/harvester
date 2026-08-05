@@ -34,9 +34,6 @@ pub enum SessionEvent {
         sid: String,
         skipped: u64,
     },
-    /// The connection died (EOF or read error); no more lines will arrive
-    /// and every in-flight request has been failed.
-    Disconnected,
 }
 
 /// Cheap-clone handle: every command flow (spawned task) holds one.
@@ -87,8 +84,10 @@ impl DaemonClient {
                 }
             }
 
+            // Dropping the sender closes the event channel: that *is* the
+            // death notice, and the only one — a variant saying the same thing
+            // arrived immediately before it and had to mean exactly it.
             routing_client.fail_all_pending();
-            let _ = event_sender.send(SessionEvent::Disconnected);
         });
 
         (client, event_receiver)

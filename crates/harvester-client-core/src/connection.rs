@@ -250,18 +250,14 @@ async fn bounded_handshake(
     forward: &ForwardHandle,
     deadline: Instant,
 ) -> std::io::Result<(DaemonConnection, PingData)> {
-    let remaining = deadline.duration_since(Instant::now());
-    let stream = tokio::time::timeout(remaining, UnixStream::connect(socket))
+    let stream = tokio::time::timeout_at(deadline, UnixStream::connect(socket))
         .await
         .map_err(|_elapsed| timed_out())??;
     let connection = DaemonConnection::over(stream, forward.clone());
 
-    tokio::time::timeout(
-        deadline.duration_since(Instant::now()),
-        handshake(connection),
-    )
-    .await
-    .map_err(|_elapsed| timed_out())?
+    tokio::time::timeout_at(deadline, handshake(connection))
+        .await
+        .map_err(|_elapsed| timed_out())?
 }
 
 fn timed_out() -> std::io::Error {

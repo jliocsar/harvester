@@ -307,15 +307,12 @@ async fn bridge_main(
                 None => break,
                 Some(command) => dispatch(command, &context),
             },
-            event = session_events.recv() => {
-                // A closed channel is the same news as `Disconnected`: the
-                // client stopped, so this bridge is done.
-                let still_connected = match event {
-                    Some(event) => handle_session_event(&context, event),
-                    None => false,
-                };
-
-                if !still_connected {
+            event = session_events.recv() => match event {
+                Some(event) => handle_session_event(&context, event),
+                // The client stopped, so this bridge is done. There is no
+                // attachment left to forget: this context and its daemon
+                // client die with the loop.
+                None => {
                     context.events.send(Event::Disconnected);
 
                     break;
@@ -325,9 +322,8 @@ async fn bridge_main(
     }
 }
 
-/// One event off the [`DaemonClient`]; `false` when the connection is gone and
-/// the caller should publish `Disconnected` and stop.
-fn handle_session_event(context: &BridgeContext, event: SessionEvent) -> bool {
+/// One event off the [`DaemonClient`].
+fn handle_session_event(context: &BridgeContext, event: SessionEvent) {
     match event {
         SessionEvent::Pi { sid, event } => handle_live_pi_event(context, sid, event),
         SessionEvent::SessionExit { sid, exit_code } => {
@@ -340,12 +336,7 @@ fn handle_session_event(context: &BridgeContext, event: SessionEvent) -> bool {
             eprintln!("bridge: lost {skipped} events for session {sid}; resyncing");
             spawn_flow(flows::resync_flow(context.clone(), sid));
         }
-        // The whole bridge stops here, so there is no attachment left to
-        // forget: this context and its daemon client die with the loop.
-        SessionEvent::Disconnected => return false,
     }
-
-    true
 }
 
 /// Every command is its own spawned straight-line flow; the loop above never
