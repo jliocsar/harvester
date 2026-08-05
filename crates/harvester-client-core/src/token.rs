@@ -62,6 +62,14 @@ impl<T> Pending<T> {
     /// Mints the token for a new request and supersedes any previous one: a
     /// re-ask makes the earlier answer stale by definition, so its context is
     /// dropped here rather than lingering to be applied out of order.
+    ///
+    /// **Records on intent, not on delivery.** The request counts as
+    /// outstanding from here, before the command has reached its worker — so a
+    /// caller whose send can fail must [`cancel`](Self::cancel) on that path,
+    /// or it waits forever for an answer nobody is coming to give. Anything
+    /// gated on [`is_waiting`](Self::is_waiting) then stays gated: the folder
+    /// picker's modal was the first to need it, and it is not the only caller
+    /// with a fallible send.
     pub fn ask(&mut self, tokens: &RequestTokens, context: T) -> RequestToken {
         let token = tokens.mint();
 
