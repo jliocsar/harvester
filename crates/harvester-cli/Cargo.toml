@@ -7,7 +7,7 @@ edition.workspace = true
 # library's dependency tree — the gpui client consumes the library, not this.
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-harvester-client-core = { path = "../harvester-client-core" }
+harvester-client-core = { path = "../harvester-client-core", features = ["raw-protocol"] }
 harvester-proto = { path = "../harvester-proto" }
 serde_json.workspace = true
 # io-std feeds raw mode's stdin JSONL pump.

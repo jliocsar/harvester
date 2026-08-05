@@ -8,3 +8,8 @@ harvester-proto = { path = "../harvester-proto" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+
+[features]
+# The framing bypass `harvester-cli`'s protocol debugger needs. Off for the
+# shipped client, so the production types carry no way around `read_frame`.
+raw-protocol = []
