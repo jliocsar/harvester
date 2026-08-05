@@ -94,6 +94,8 @@ The client obtains the *other* side of the comparison from the binary it is abou
 
 Implemented by readdir over pi's session dirs: header line gives id/cwd/timestamp, the last `session_info` entry gives the display name. `status` is `running` (pid alive in the daemon's table) or `exited`. Optional `cwd` field filters to one workspace.
 
+**Order is normative: newest first by `mtime_ms`** — last *activity*, which is what the file's mtime records. The daemon sorts, so a single-machine client renders the array as it arrives. A client merging several machines' listings into one list necessarily re-sorts and owns whatever order it then picks; it must not assume the daemon's order survives the merge, and it must not assume `sid` order is the same order (uuidv7 sids sort by *creation*, and pi's id charset is wider than uuidv7 — a session file already on disk may carry an id that sorts arbitrarily).
+
 ### `create_session`
 
 ```json
@@ -121,7 +123,11 @@ For the ghost-chat model picker, which needs answers before any session exists. 
 
 ```json
 {"id": 5, "type": "harvester", "cmd": {"type": "attach", "sid": "01H..."}}
+{"id": 5, "type": "harvester_response", "response": {"success": true, "data": {}}}
+{"id": 5, "type": "harvester_response", "response": {"success": true, "data": {"already": true}}}
 ```
+
+`attach` answers `{}`, or `{"already": true}` when this connection is already attached to **this generation** of the session (same live session object, not merely the same sid — a sid that was stopped and resumed is a new generation and attaches normally, replacing the old subscription). `detach` always answers `{}`, including for a sid this connection never attached to: it is a release, not a lookup, and a client tearing down does not need to know which of its attachments survived a session exit. Both `already` fields are omitted when false, so `{}` is the ordinary success payload.
 
 Subscribes this connection to the session's live event stream. A connection may attach to any number of sessions. The daemon guarantee stands as written, but **no client exercises it today**: the gpui client's bridge holds exactly one attachment per machine (one chat pane — `bridge.rs`'s `attached`), detaching from the previous session before attaching to the next. Reconnect/replay is NOT a daemon feature — after attaching, the client sends passthrough `get_entries {since: <last seen entry id>}` to recover history from pi's durable cursor, then renders live events. The verbose delta stream is never replayed.
 
@@ -137,7 +143,9 @@ Non-blocking escalation ladder; responds `{"stopping": true}` immediately:
 
 1. **`abort`** (daemon-injected passthrough) — any in-flight turn is recorded cleanly in the session file instead of dying mid-stream.
 2. **stdin EOF** — pi's shutdown path. Source-verified (rpc-mode.js): EOF triggers immediate shutdown, never waits for a running turn, exits 0.
-3. **SIGKILL after 30s** — pure hang breaker (wedged runtime, stuck extension `session_shutdown` handler); not expected to fire in normal operation.
+3. **SIGKILL, 30s after the `stop` arrives** — pure hang breaker (wedged runtime, stuck extension `session_shutdown` handler); not expected to fire in normal operation.
+
+**Rung 3 is armed first, before rung 1 is even written.** The ladder exists for a pi that has stopped cooperating, so no rung may depend on that pi cooperating — a backstop armed *after* the abort would inherit whatever the abort did. Rungs 1 and 2 only touch the daemon's stdin queue and never the pipe, so neither can block and the 30s is measured from the `stop` request either way; arming first makes that independent of the queue's behaviour rather than a consequence of it. The kill itself is `start_kill` on the child handle from the task that owns it, so it needs no pid and no `kill(1)`.
 
 `session_exit` is the authoritative completion signal — the `stop` response only means "shutdown initiated", and `session_exit` may arrive before or after it. Session file survives; the session shows as `exited` and can be resumed.
 
@@ -151,11 +159,13 @@ Pi commands the client must never send: `new_session`, `switch_session`, `fork`,
 
 ## Events
 
-Every line pi emits on stdout is forwarded verbatim to attached clients, wrapped:
+Every line pi emits on stdout **that parses as JSON** is forwarded verbatim to attached clients, wrapped:
 
 ```json
 {"type": "event", "sid": "01H...", "event": {"type": "agent_settled"}}
 ```
+
+The qualifier is the one exception to "verbatim", and it is structural: the daemon builds this envelope by splicing pi's line in as raw bytes behind a pre-serialized prefix (one JSON scan per line, not two — `message_update` deltas are the hot path), so a line that is not JSON would produce a frame the client cannot parse. Such a line is therefore dropped with a stderr note rather than forwarded. Pi 0.83.0 keeps stdout pure (verified, `HARNESS_RESEARCH.md`), so this is a guard against a future pi or a misbehaving extension, not an observed case. A line that *is* JSON but has an unexpected shape — a non-string `type`/`id`/`method` — is still forwarded: the daemon cannot route it, but dropping it could swallow an `agent_settled` and spin a client's turn forever.
 
 Plus two daemon-originated events:
 
