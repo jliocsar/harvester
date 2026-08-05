@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use harvester_proto::{
-    encode_frame, read_frame, HarvesterCmd, HarvesterResponse, Outgoing, PingData, SessionsData,
+    encode_frame, read_frame, AttachData, CreateSessionData, DetachData, HarvesterCmd,
+    HarvesterResponse, Outgoing, PingData, SessionsData, StopData,
 };
 use serde_json::{json, Value};
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -202,13 +203,16 @@ fn spawn_list_sessions(
 /// spawned: the pid table check inside `spawn_session` is what answers here,
 /// so one pi = one session file still holds.
 fn create_session(daemon: &Daemon, args: SpawnArgs) -> HarvesterResponse {
-    match daemon.spawn_session(args) {
-        Ok(SpawnOutcome::Spawned(session)) => HarvesterResponse::ok(json!({"sid": session.sid})),
-        Ok(SpawnOutcome::AlreadyRunning(session)) => {
-            HarvesterResponse::ok(json!({"sid": session.sid, "already": true}))
-        }
-        Err(error) => HarvesterResponse::err(format!("spawn failed: {error}")),
-    }
+    let (session, already) = match daemon.spawn_session(args) {
+        Ok(SpawnOutcome::Spawned(session)) => (session, false),
+        Ok(SpawnOutcome::AlreadyRunning(session)) => (session, true),
+        Err(error) => return HarvesterResponse::err(format!("spawn failed: {error}")),
+    };
+
+    data_response(CreateSessionData {
+        sid: session.sid.to_string(),
+        already,
+    })
 }
 
 /// The models pi would offer in `cwd`, fetched fresh every call (DAEMON.md:
@@ -328,7 +332,7 @@ fn attach(
         .is_some_and(|existing| Arc::ptr_eq(&existing.session, &session));
 
     if already_attached_to_this_generation {
-        return HarvesterResponse::ok(json!({"already": true}));
+        return data_response(AttachData { already: true });
     }
 
     // Subscribe before joining the room, never the other way round. A dialog
@@ -342,7 +346,7 @@ fn attach(
     let forwarder = spawn_forwarder(events, pending_dialogs, sid.clone(), out_tx.clone());
     attached.insert(sid, Attachment { session, forwarder });
 
-    HarvesterResponse::ok(json!({}))
+    data_response(AttachData { already: false })
 }
 
 /// Stream one session's events/exit to one connection until either side goes
@@ -411,7 +415,7 @@ fn spawn_forwarder(
 fn detach(sid: Sid, attached: &mut AttachedMap) -> HarvesterResponse {
     attached.remove(sid.as_str());
 
-    HarvesterResponse::ok(json!({}))
+    data_response(DetachData {})
 }
 
 /// Non-blocking stop: polite escalation ladder, response returns immediately.
@@ -445,7 +449,7 @@ fn stop(daemon: &Daemon, sid: Sid) -> HarvesterResponse {
     // Rung 2: EOF — pi's shutdown path, after the queued abort drains.
     session.close_stdin();
 
-    HarvesterResponse::ok(json!({"stopping": true}))
+    data_response(StopData { stopping: true })
 }
 
 /// Rung 3: SIGKILL a pi that ignored stdin EOF for `STOP_KILL_BACKSTOP`.
@@ -464,5 +468,79 @@ async fn kill_backstop(daemon: Daemon, session: Arc<Session>) {
             session.sid
         );
         session.kill();
+    }
+}
+
+/// The four daemon-native payloads are typed now (docs/DAEMON.md §Operations).
+/// A client decodes them, so a field renamed in proto or a lost
+/// `skip_serializing_if` is a wire break no compiler catches — these pin the
+/// JSON each one produces against the `json!` literal it replaced.
+///
+/// Compared as **values, not bytes**: `json!` builds a `serde_json::Map`, which
+/// serializes its keys in sorted order, while a struct serializes them in
+/// declaration order. `create_session` therefore emits `sid` before `already`
+/// where it used to emit `already` first. Same keys, same values, same meaning
+/// to every JSON parser — object key order carries nothing on this wire.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What actually crosses the socket: the `data` of a successful response.
+    fn payload(data: impl serde::Serialize) -> Value {
+        serde_json::to_value(data_response(data)).expect("a response serializes")["data"].clone()
+    }
+
+    #[test]
+    fn a_spawned_session_reports_its_sid_and_no_already_flag() {
+        let sid = "01JABCDEF0123456789ABCDEFG";
+
+        assert_eq!(
+            payload(CreateSessionData {
+                sid: sid.to_owned(),
+                already: false,
+            }),
+            json!({ "sid": sid }),
+        );
+    }
+
+    /// The idempotent arm: `already` is what tells a client no second pi was
+    /// spawned, so it is the one field here that must never quietly vanish.
+    #[test]
+    fn an_already_running_session_reports_the_flag() {
+        let sid = "01JABCDEF0123456789ABCDEFG";
+
+        assert_eq!(
+            payload(CreateSessionData {
+                sid: sid.to_owned(),
+                already: true,
+            }),
+            json!({ "sid": sid, "already": true }),
+        );
+    }
+
+    #[test]
+    fn a_fresh_attach_is_an_empty_object() {
+        assert_eq!(payload(AttachData { already: false }), json!({}));
+    }
+
+    #[test]
+    fn re_attaching_to_the_same_generation_reports_the_flag() {
+        assert_eq!(
+            payload(AttachData { already: true }),
+            json!({"already": true})
+        );
+    }
+
+    #[test]
+    fn detach_is_a_bare_acknowledgement() {
+        assert_eq!(payload(DetachData {}), json!({}));
+    }
+
+    #[test]
+    fn stop_reports_that_shutdown_started() {
+        assert_eq!(
+            payload(StopData { stopping: true }),
+            json!({"stopping": true})
+        );
     }
 }
