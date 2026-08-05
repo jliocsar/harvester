@@ -392,7 +392,6 @@ fn spawn_forwarder(
                         break;
                     }
                 }
-                // Exit is terminal: deliver it and end the forwarder.
                 SessionOutput::Exit { exit_code } => {
                     let outgoing = Outgoing::SessionExit {
                         sid: sid.to_string(),

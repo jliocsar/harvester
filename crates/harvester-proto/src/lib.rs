@@ -520,8 +520,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_harvester_matches_the_documented_envelope() {
-        // docs/DAEMON.md §Envelope:
-        // {"id": 1, "type": "harvester", "cmd": {"type": "list_sessions"}}
+        // docs/DAEMON.md §Envelope.
         let request = Request::Harvester {
             id: Some(json!(1)),
             cmd: HarvesterCmd::ListSessions { cwd: None },
@@ -537,8 +536,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_pi_matches_the_documented_envelope() {
-        // docs/DAEMON.md §Envelope:
-        // {"id": 2, "type": "pi", "sid": "01H...", "cmd": {"type": "prompt", ...}}
+        // docs/DAEMON.md §Envelope.
         let request = Request::Pi {
             id: Some(json!(2)),
             sid: "01H".to_string(),
@@ -681,8 +679,7 @@ mod tests {
 
     #[tokio::test]
     async fn outgoing_harvester_response_matches_the_documented_envelope() {
-        // docs/DAEMON.md §Envelope:
-        // {"id": 1, "type": "harvester_response", "response": {"success": true, "data": {...}}}
+        // docs/DAEMON.md §Envelope.
         let outgoing = Outgoing::HarvesterResponse {
             id: Some(json!(1)),
             response: HarvesterResponse::ok(json!({"sessions": []})),
@@ -702,8 +699,7 @@ mod tests {
 
     #[tokio::test]
     async fn outgoing_pi_response_matches_the_documented_envelope() {
-        // docs/DAEMON.md §Envelope:
-        // {"id": 2, "type": "pi_response", "sid": "01H...", "response": {...}}
+        // docs/DAEMON.md §Envelope.
         let outgoing = Outgoing::PiResponse {
             id: Some(json!(2)),
             sid: "01H".to_string(),
@@ -794,9 +790,7 @@ mod tests {
 
     #[tokio::test]
     async fn ping_data_matches_the_documented_response() {
-        // docs/DAEMON.md §ping:
-        // {"id": 1, "type": "harvester_response",
-        //  "response": {"success": true, "data": {"version": 1, "build": "fnv1a64-…"}}}
+        // docs/DAEMON.md §ping.
         let outgoing = Outgoing::HarvesterResponse {
             id: Some(json!(1)),
             response: HarvesterResponse::ok(

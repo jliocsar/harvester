@@ -100,7 +100,6 @@ pub fn pi_passthrough(
     answer_later(out_tx, async move {
         let response = match response_rx.await {
             Ok(response) => response,
-            // Sender dropped: the session exited before answering.
             Err(_closed) => json!({"type": "response", "success": false,
                                    "error": "session exited before responding"}),
         };

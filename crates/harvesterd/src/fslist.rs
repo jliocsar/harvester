@@ -283,7 +283,6 @@ mod tests {
         read_fixture_bytes(dir, contents.as_bytes(), cwd_filter, running)
     }
 
-    /// The common case: nothing is running.
     fn nothing_running() -> HashMap<Sid, RunningSession> {
         HashMap::new()
     }
