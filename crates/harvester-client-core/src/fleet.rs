@@ -116,6 +116,13 @@ impl Machine {
         }
     }
 
+    fn linked(bridge: BridgeHandle) -> Machine {
+        Machine {
+            state: MachineState::Connecting,
+            bridge: Some(bridge),
+        }
+    }
+
     /// A probe verdict never overwrites a daemon link. This is the invariant
     /// that used to live only in the renderer that read the two maps.
     fn record_probe(&mut self, reachable: bool) {
@@ -209,11 +216,10 @@ pub struct Fleet {
     /// The machines worker's command sender; `None` if its thread failed.
     host_commands: Option<UnboundedSender<machines::Command>>,
     /// The machines a frontend told the fleet to care about (see
-    /// [`Fleet::track_machines`]), deduplicated and sorted.
+    /// [`Fleet::track_machines`]), deduplicated and sorted. The ad-hoc subset
+    /// is derived from it on read, never stored: it was a second copy that only
+    /// one site recomputed, so any other way of changing `tracked` desynced it.
     tracked: Vec<String>,
-    /// The [`MachineRef::AdHoc`] subset of `tracked` — the destinations the
-    /// worker probes alongside provider machines, and rows in their own right.
-    ad_hoc: Vec<String>,
 }
 
 impl Fleet {
@@ -241,7 +247,6 @@ impl Fleet {
             provider_rows: Vec::new(),
             host_commands,
             tracked: Vec::new(),
-            ad_hoc: Vec::new(),
         };
         let events = FleetEvents {
             bridges: bridge_receiver,
@@ -267,28 +272,33 @@ impl Fleet {
         tracked.dedup();
 
         self.tracked = tracked;
-        self.ad_hoc = self.ad_hoc_subset();
+        self.forget_unknown_machines();
         self.publish_ad_hoc_machines();
         self.auto_connect_tracked();
-    }
-
-    /// `local` has its own row and no SSH to probe; provider machines are
-    /// probed off the worker's own listing.
-    fn ad_hoc_subset(&self) -> Vec<String> {
-        self.tracked
-            .iter()
-            .filter_map(|machine| match MachineRef::parse(machine) {
-                MachineRef::Local | MachineRef::Provider(_) => None,
-                MachineRef::AdHoc(dest) => Some(dest),
-            })
-            .collect()
     }
 
     fn publish_ad_hoc_machines(&self) {
         if let Some(commands) = &self.host_commands {
             // A dead worker means no probes; the dots stay unknown.
-            let _ = commands.send(machines::Command::SetAdHocMachines(self.ad_hoc.clone()));
+            let _ = commands.send(machines::Command::SetAdHocMachines(self.ad_hoc_machines()));
         }
+    }
+
+    /// Drops every machine the client no longer knows about — untracked and
+    /// unlisted. Without it a machine deleted upstream stayed `Connected`
+    /// forever and kept being counted; dropping the row drops its
+    /// [`BridgeHandle`], which is what actually stops the bridge thread.
+    fn forget_unknown_machines(&mut self) {
+        let Fleet {
+            machines,
+            tracked,
+            provider_rows,
+            ..
+        } = self;
+
+        machines.retain(|key, _| {
+            tracked.contains(key) || provider_rows.iter().any(|row| &row.key == key)
+        });
     }
 
     /// Connects every tracked machine that has no bridge yet and resolves to a
@@ -351,13 +361,13 @@ impl Fleet {
             }
         };
 
-        self.machines.insert(
-            machine.to_string(),
-            Machine {
-                state: MachineState::Connecting,
-                bridge: Some(handle),
-            },
-        );
+        // The mirror of [`Machine::record_probe`], and the half that was
+        // written nowhere: a daemon link always supersedes a probe verdict, so
+        // an `Unreachable` dot gives way to `Connecting` rather than vetoing it.
+        // Replacing any previous handle is what makes retouching a failed
+        // machine the retry.
+        self.machines
+            .insert(machine.to_string(), Machine::linked(handle));
 
         Ok(())
     }
@@ -462,8 +472,10 @@ impl Fleet {
 
         rows.sort_by(|a, b| a.key.cmp(&b.key));
         self.provider_rows = rows;
-        // Provider-key tracked machines become resolvable with the first
-        // listing — connect them so their sessions appear.
+        // A machine that vanished from the listing is gone; a provider-key
+        // tracked machine that just appeared in it becomes resolvable, so
+        // connect it and its sessions show up.
+        self.forget_unknown_machines();
         self.auto_connect_tracked();
     }
 
@@ -530,35 +542,35 @@ impl Fleet {
     }
 
     /// The tracked ad-hoc SSH destinations — their own sidebar rows, since no
-    /// provider lists them.
-    pub fn ad_hoc_machines(&self) -> &[String] {
-        &self.ad_hoc
+    /// provider lists them, and the set the worker probes alongside provider
+    /// machines. `local` has no SSH to probe and provider machines are probed
+    /// off the worker's own listing, so neither belongs here.
+    pub fn ad_hoc_machines(&self) -> Vec<String> {
+        self.tracked
+            .iter()
+            .filter_map(|machine| match MachineRef::parse(machine) {
+                MachineRef::Local | MachineRef::Provider(_) => None,
+                MachineRef::AdHoc(dest) => Some(dest),
+            })
+            .collect()
     }
 
-    /// Machines a workspace can be added on (or a session spawned on): every
-    /// connectable machine — `local`, provider machines with a resolved
-    /// target, and the ad-hoc destinations.
+    /// Machines a workspace can be added on (or a session spawned on).
+    ///
+    /// "Connectable" is [`Fleet::host_for`] and nothing else. It used to be
+    /// spelled twice — once as "resolves to a host" and once as a re-derived
+    /// provider-target filter here — and the two disagreed about ad-hoc
+    /// destinations.
     pub fn machine_candidates(&self) -> Vec<MachineCandidate> {
-        let mut candidates = vec![MachineCandidate {
-            key: LOCAL_MACHINE.to_string(),
-            label: LOCAL_MACHINE.to_string(),
-        }];
-
-        candidates.extend(
-            self.provider_rows
-                .iter()
-                .filter(|row| row.target.is_some())
-                .map(|row| MachineCandidate {
-                    key: row.key.clone(),
-                    label: row.label.clone(),
-                }),
-        );
-        candidates.extend(self.ad_hoc.iter().map(|machine| MachineCandidate {
-            key: machine.clone(),
-            label: machine.clone(),
-        }));
-
-        candidates
+        std::iter::once(LOCAL_MACHINE.to_string())
+            .chain(self.provider_rows.iter().map(|row| row.key.clone()))
+            .chain(self.ad_hoc_machines())
+            .filter(|machine| self.host_for(machine).is_ok())
+            .map(|machine| MachineCandidate {
+                label: self.label(&machine),
+                key: machine,
+            })
+            .collect()
     }
 
     /// How many machines have a bridge at all — the denominator a frontend
@@ -608,7 +620,6 @@ mod tests {
             provider_rows: Vec::new(),
             host_commands: None,
             tracked: Vec::new(),
-            ad_hoc: Vec::new(),
         }
     }
 
@@ -843,7 +854,7 @@ mod tests {
         ];
 
         assert_eq!(
-            fleet.ad_hoc_subset(),
+            fleet.ad_hoc_machines(),
             vec!["exedev@vm.exe.dev".to_string()],
             "`local` has no SSH to probe and provider machines probe off the listing"
         );
@@ -918,6 +929,34 @@ mod tests {
             ["exedev@a".to_string(), "exedev@b".to_string()],
             "one row per machine, stable order — several workspaces may share one"
         );
+    }
+
+    #[test]
+    fn a_machine_nobody_tracks_or_lists_any_more_is_forgotten() {
+        // It used to stay `Connected` forever and keep being counted. The row
+        // owns the bridge handle, so forgetting it is also what stops the
+        // bridge thread of a machine deleted upstream.
+        let mut fleet = fleet();
+
+        with_state(&mut fleet, "exedev@vm", MachineState::Connecting);
+        with_state(&mut fleet, "exe-dev/bloggy", MachineState::Connecting);
+        fleet.tracked = vec!["exedev@vm".to_string()];
+        fleet.provider_rows = vec![provider_row("exe-dev/bloggy", Some("exedev@bloggy"))];
+
+        fleet.forget_unknown_machines();
+
+        assert_eq!(
+            fleet.linked_machine_count(),
+            2,
+            "tracked and listed are both still known"
+        );
+
+        fleet.tracked = Vec::new();
+        fleet.provider_rows = Vec::new();
+        fleet.forget_unknown_machines();
+
+        assert_eq!(fleet.linked_machine_count(), 0);
+        assert!(matches!(fleet.state("exedev@vm"), MachineState::Unknown));
     }
 
     // --- what the frontend reads ------------------------------------------
