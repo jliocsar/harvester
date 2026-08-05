@@ -319,8 +319,14 @@ pub struct SessionInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub cwd: String,
-    pub file: String,
-    /// Milliseconds since epoch of the session file's last modification.
+    /// The session file on the machine, absent while pi has not written one.
+    /// Pi creates it lazily on the first entry, so a session spawned but never
+    /// prompted is genuinely fileless — and a client that fabricates a blank
+    /// path here is claiming a file that does not exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// Milliseconds since epoch of the session file's last modification, or of
+    /// the spawn for a session that has no file yet. Either way: last activity.
     pub mtime_ms: u64,
     pub status: SessionStatus,
 }
@@ -901,7 +907,9 @@ mod tests {
                 sid: "01H".to_string(),
                 name: Some("Refactor auth".to_string()),
                 cwd: "/work/repo".to_string(),
-                file: "/home/u/.pi/agent/sessions/--work-repo--/2026-..._01H....jsonl".to_string(),
+                file: Some(
+                    "/home/u/.pi/agent/sessions/--work-repo--/2026-..._01H....jsonl".to_string(),
+                ),
                 mtime_ms: 1754049600000,
                 status: SessionStatus::Running,
             }],
@@ -928,7 +936,7 @@ mod tests {
             sid: "01H".to_string(),
             name: None,
             cwd: "/work/repo".to_string(),
-            file: "/tmp/s.jsonl".to_string(),
+            file: Some("/tmp/s.jsonl".to_string()),
             mtime_ms: 0,
             status: SessionStatus::Exited,
         };

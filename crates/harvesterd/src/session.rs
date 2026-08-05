@@ -73,6 +73,14 @@ struct LineProbe<'line> {
 
 pub struct Session {
     pub sid: Sid,
+    /// Where pi is running. The pid table is the only record of this until pi
+    /// writes its first entry, so a listing cannot describe a fileless session
+    /// without it.
+    pub cwd: String,
+    /// When this pi was spawned. Stands in for the session file's mtime while
+    /// there is no file — for a session that has done nothing, being spawned
+    /// *is* its last activity.
+    pub spawned_at_ms: u64,
     /// `{"type":"event","sid":<escaped sid>,"event":` — the constant head of
     /// every event envelope this session emits, built once at spawn so
     /// [`encode_event`] is a byte concatenation instead of a second full JSON
@@ -125,6 +133,8 @@ impl Session {
 
         let session = Arc::new(Session {
             sid: args.sid,
+            cwd: args.cwd,
+            spawned_at_ms: unix_millis_now(),
             event_prefix,
             stdin_queue: Mutex::new(Some(stdin_sender)),
             output,
@@ -225,6 +235,16 @@ impl Session {
 /// frame, so every writer's lines stay whole and in arrival order. Ends when
 /// the last sender is gone (`close_stdin`) or the pipe breaks — dropping the
 /// handle on the way out is what delivers EOF.
+/// Wall-clock milliseconds, in the same units as a session file's mtime so the
+/// two are comparable in one listing. A clock before the epoch reads as 0,
+/// which sorts such a session last rather than failing the listing.
+fn unix_millis_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since_epoch| since_epoch.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 async fn pump_stdin(sid: Sid, mut stdin: ChildStdin, mut frames: mpsc::Receiver<Vec<u8>>) {
     while let Some(frame) = frames.recv().await {
         if let Err(error) = stdin.write_all(&frame).await {

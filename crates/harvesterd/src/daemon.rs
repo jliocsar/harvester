@@ -1,7 +1,7 @@
 //! Shared daemon state: the pid table and nothing else (docs/DAEMON.md:
 //! harvesterd is stateless — pi's session files are the only source of truth).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -21,6 +21,13 @@ pub enum SpawnOutcome {
     /// The sid was already in the pid table; no second pi was spawned, which is
     /// what keeps "one pi process = one session file" true.
     AlreadyRunning(Arc<Session>),
+}
+
+/// What the pid table knows about a live session that its file does not.
+/// Enough to list a session pi has not written anything for yet.
+pub struct RunningSession {
+    pub cwd: String,
+    pub spawned_at_ms: u64,
 }
 
 #[derive(Clone)]
@@ -73,13 +80,26 @@ impl Daemon {
         self.lock_sessions().get(sid).cloned()
     }
 
-    /// The sids with a live pi child, copied out from under the lock (no guard
-    /// may cross the `spawn_blocking` boundary the caller is headed for). A set,
-    /// not a list: `list_sessions` asks "is this sid running?" once per session
-    /// file on disk — and `Sid: Borrow<str>` makes that a borrowed lookup, so
-    /// this set is built once and never rebuilt.
-    pub fn running_sids(&self) -> HashSet<Sid> {
-        self.lock_sessions().keys().cloned().collect()
+    /// Every live pi child, copied out from under the lock (no guard may cross
+    /// the `spawn_blocking` boundary the caller is headed for).
+    ///
+    /// Keyed by sid because `list_sessions` asks "is this sid running?" once
+    /// per file on disk, and `Sid: Borrow<str>` makes that a borrowed lookup.
+    /// It carries `cwd` and the spawn time as well as the key, because the pid
+    /// table is the *only* record of a session pi has not written a file for
+    /// yet — a listing built from the filesystem alone cannot see it at all.
+    pub fn running_sessions(&self) -> HashMap<Sid, RunningSession> {
+        self.lock_sessions()
+            .iter()
+            .map(|(sid, session)| {
+                let running = RunningSession {
+                    cwd: session.cwd.clone(),
+                    spawned_at_ms: session.spawned_at_ms,
+                };
+
+                (sid.clone(), running)
+            })
+            .collect()
     }
 
     /// Check-and-spawn under one lock — the table is the per-sid single-

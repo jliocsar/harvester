@@ -4,7 +4,7 @@
 //! Blocking std IO on purpose — the caller runs this on the blocking pool
 //! (`spawn_blocking`); the daemon's single runtime thread never waits on disk.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
@@ -12,6 +12,7 @@ use std::time::UNIX_EPOCH;
 use harvester_proto::{SessionInfo, SessionStatus, LF};
 use serde_json::Value;
 
+use crate::daemon::RunningSession;
 use crate::paths;
 use crate::sid::Sid;
 
@@ -20,9 +21,19 @@ use crate::sid::Sid;
 /// lines in a conversation log are messages and never match.
 const SESSION_INFO_MARKER: &[u8] = br#""session_info""#;
 
-/// Scan all per-cwd dirs (optionally filtered to one cwd). `running` contains
-/// the sids with a live pi child, provided by the caller.
-pub fn list_sessions(cwd_filter: Option<&str>, running: &HashSet<Sid>) -> Vec<SessionInfo> {
+/// Scan all per-cwd dirs (optionally filtered to one cwd). `running` is the
+/// pid table's live sessions, provided by the caller.
+///
+/// The filesystem alone is not the whole answer: pi writes a session file
+/// lazily, on the first entry, so a session spawned but never prompted has a
+/// live pi and nothing on disk. Listing only what the scan found would hide
+/// it — and a client that cannot see a session cannot stop it, so the pi would
+/// outlive every client that could have reaped it. `running` is therefore
+/// unioned in, not merely consulted for status.
+pub fn list_sessions(
+    cwd_filter: Option<&str>,
+    running: &HashMap<Sid, RunningSession>,
+) -> Vec<SessionInfo> {
     let mut sessions = Vec::new();
     // Reused across files: line reads allocate once, not per line.
     let mut line_buffer = Vec::new();
@@ -53,10 +64,40 @@ pub fn list_sessions(cwd_filter: Option<&str>, running: &HashSet<Sid>) -> Vec<Se
         }
     }
 
+    append_fileless_running(&mut sessions, cwd_filter, running);
+
     // Newest first — the sidebar order.
     sessions.sort_by_key(|session| std::cmp::Reverse(session.mtime_ms));
 
     sessions
+}
+
+/// The live sessions the scan could not have found, because pi has not written
+/// their file yet. Their spawn time stands in for an mtime, so they sort by
+/// last activity beside everything else.
+fn append_fileless_running(
+    sessions: &mut Vec<SessionInfo>,
+    cwd_filter: Option<&str>,
+    running: &HashMap<Sid, RunningSession>,
+) {
+    for (sid, session) in running {
+        let on_disk = sessions.iter().any(|found| found.sid == sid.as_str());
+        let wanted = cwd_filter.is_none_or(|cwd| cwd == session.cwd);
+
+        if on_disk || !wanted {
+            continue;
+        }
+
+        sessions.push(SessionInfo {
+            sid: sid.as_str().to_string(),
+            // Pi owns session names and has written nothing to name yet.
+            name: None,
+            cwd: session.cwd.clone(),
+            file: None,
+            mtime_ms: session.spawned_at_ms,
+            status: SessionStatus::Running,
+        });
+    }
 }
 
 /// Milliseconds since epoch from the direntry's own metadata (no extra stat).
@@ -83,7 +124,7 @@ fn read_session_file(
     path: &Path,
     mtime_ms: u64,
     cwd_filter: Option<&str>,
-    running: &HashSet<Sid>,
+    running: &HashMap<Sid, RunningSession>,
     line_buffer: &mut Vec<u8>,
 ) -> Option<SessionInfo> {
     let file = std::fs::File::open(path).ok()?;
@@ -109,7 +150,7 @@ fn read_session_file(
 
     let name = scan_for_last_name(&mut reader, path, line_buffer);
 
-    let status = if running.contains(sid.as_str()) {
+    let status = if running.contains_key(sid.as_str()) {
         SessionStatus::Running
     } else {
         SessionStatus::Exited
@@ -119,7 +160,7 @@ fn read_session_file(
         sid,
         name,
         cwd,
-        file: path.display().to_string(),
+        file: Some(path.display().to_string()),
         mtime_ms,
         status,
     })
@@ -217,7 +258,7 @@ mod tests {
         dir: &tempfile::TempDir,
         contents: &[u8],
         cwd_filter: Option<&str>,
-        running: &HashSet<Sid>,
+        running: &HashMap<Sid, RunningSession>,
     ) -> Option<SessionInfo> {
         let path = dir.path().join("fixture.jsonl");
         let mut line_buffer = Vec::new();
@@ -237,14 +278,25 @@ mod tests {
         dir: &tempfile::TempDir,
         contents: &str,
         cwd_filter: Option<&str>,
-        running: &HashSet<Sid>,
+        running: &HashMap<Sid, RunningSession>,
     ) -> Option<SessionInfo> {
         read_fixture_bytes(dir, contents.as_bytes(), cwd_filter, running)
     }
 
     /// The common case: nothing is running.
-    fn nothing_running() -> HashSet<Sid> {
-        HashSet::new()
+    fn nothing_running() -> HashMap<Sid, RunningSession> {
+        HashMap::new()
+    }
+
+    /// A live session in the pid table, as `Daemon::running_sessions` reports it.
+    fn running(raw: &str, cwd: &str, spawned_at_ms: u64) -> HashMap<Sid, RunningSession> {
+        HashMap::from([(
+            sid(raw),
+            RunningSession {
+                cwd: cwd.to_string(),
+                spawned_at_ms,
+            },
+        )])
     }
 
     fn sid(raw: &str) -> Sid {
@@ -271,8 +323,8 @@ mod tests {
         assert_eq!(info.name.as_deref(), Some("first draft"));
         assert_eq!(info.mtime_ms, FIXTURE_MTIME_MS);
         assert_eq!(
-            info.file,
-            dir.path().join("fixture.jsonl").display().to_string()
+            info.file.as_deref(),
+            Some(dir.path().join("fixture.jsonl").display().to_string()).as_deref()
         );
         assert_eq!(info.status, SessionStatus::Exited);
     }
@@ -420,7 +472,7 @@ mod tests {
     fn running_sid_reports_running_status() {
         let dir = temp_dir();
         let contents = jsonl(&[session_header(FIXTURE_SID, FIXTURE_CWD)]);
-        let running = HashSet::from([sid(FIXTURE_SID)]);
+        let running = running(FIXTURE_SID, FIXTURE_CWD, 1);
 
         let info = read_fixture(&dir, &contents, None, &running).expect("valid file must parse");
 
@@ -431,7 +483,7 @@ mod tests {
     fn absent_sid_reports_exited_status() {
         let dir = temp_dir();
         let contents = jsonl(&[session_header(FIXTURE_SID, FIXTURE_CWD)]);
-        let running = HashSet::from([sid("some-other-sid")]);
+        let running = running("some-other-sid", FIXTURE_CWD, 1);
 
         let info = read_fixture(&dir, &contents, None, &running).expect("valid file must parse");
 
@@ -565,5 +617,68 @@ mod tests {
             read_fixture(&dir, &contents, None, &nothing_running()).expect("valid file must parse");
 
         assert_eq!(info.name.as_deref(), Some("unterminated"));
+    }
+
+    /// Pi writes a session file lazily, on the first entry — so a session that
+    /// was spawned and never prompted has a live pi and nothing on disk. A
+    /// listing built from the filesystem alone cannot see it, and a client that
+    /// cannot see a session cannot stop it: the pi outlives every client that
+    /// could have reaped it. Found on a live VM, not by reading.
+    #[test]
+    fn a_running_session_with_no_file_yet_is_still_listed() {
+        let running = running(FIXTURE_SID, FIXTURE_CWD, 4_242);
+        let mut sessions = Vec::new();
+
+        append_fileless_running(&mut sessions, None, &running);
+
+        let listed = sessions.first().expect("the live pi must be listed");
+
+        assert_eq!(listed.sid, FIXTURE_SID);
+        assert_eq!(listed.cwd, FIXTURE_CWD);
+        assert_eq!(listed.status, SessionStatus::Running);
+        assert_eq!(
+            listed.file, None,
+            "claiming a file pi has not written is worse than admitting there is none"
+        );
+        assert_eq!(
+            listed.mtime_ms, 4_242,
+            "being spawned is the only activity it has had"
+        );
+    }
+
+    /// The scan already reported it, so the pid table must not add a second row
+    /// for the same sid — the union is by sid, not an append.
+    #[test]
+    fn a_running_session_already_found_on_disk_is_not_listed_twice() {
+        let running = running(FIXTURE_SID, FIXTURE_CWD, 4_242);
+        let mut sessions = vec![SessionInfo {
+            sid: FIXTURE_SID.to_string(),
+            name: Some("from disk".to_string()),
+            cwd: FIXTURE_CWD.to_string(),
+            file: Some("/tmp/on-disk.jsonl".to_string()),
+            mtime_ms: 9_000,
+            status: SessionStatus::Running,
+        }];
+
+        append_fileless_running(&mut sessions, None, &running);
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].name.as_deref(), Some("from disk"));
+    }
+
+    /// A fileless session is filtered by the cwd the pid table recorded, since
+    /// there is no header line to read one from.
+    #[test]
+    fn a_fileless_session_honours_the_cwd_filter() {
+        let running = running(FIXTURE_SID, FIXTURE_CWD, 1);
+        let mut sessions = Vec::new();
+
+        append_fileless_running(&mut sessions, Some("/somewhere/else"), &running);
+
+        assert!(sessions.is_empty());
+
+        append_fileless_running(&mut sessions, Some(FIXTURE_CWD), &running);
+
+        assert_eq!(sessions.len(), 1);
     }
 }

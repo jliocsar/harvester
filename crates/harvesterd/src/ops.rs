@@ -181,7 +181,7 @@ fn spawn_list_sessions(
     cwd: Option<String>,
     out_tx: &mpsc::Sender<Outbound>,
 ) {
-    let running = daemon.running_sids();
+    let running = daemon.running_sessions();
 
     answer_later(out_tx, async move {
         let scan =

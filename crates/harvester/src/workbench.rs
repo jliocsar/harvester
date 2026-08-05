@@ -637,8 +637,12 @@ impl Workbench {
         let (workspace, started) = self.ghost.take()?.into_started()?;
 
         // Synthesized sidebar row, newest-first (uuidv7 now is the maximum).
-        // `file`/`mtime_ms` are placeholders: display state only, replaced
-        // by the next real `list_sessions` — disk on the VM stays truth.
+        // Display state only, replaced by the next real `list_sessions` —
+        // disk on the VM stays truth. `file` is absent rather than blank
+        // because pi has not written one yet, and `mtime_ms` is now because
+        // being started is this session's last activity — which is what the
+        // list is ordered by, so the row sorts where the user expects even
+        // before the daemon confirms it.
         self.sessions.insert(
             0,
             MachineSession {
@@ -647,8 +651,8 @@ impl Workbench {
                     sid: started.sid,
                     name: Some(started.name),
                     cwd: workspace.path,
-                    file: String::new(),
-                    mtime_ms: 0,
+                    file: None,
+                    mtime_ms: unix_millis_now(),
                     status: SessionStatus::Running,
                 },
             },
@@ -1347,6 +1351,16 @@ impl Render for Workbench {
                 self.render_model_picker(&models, selected_model, offer_default, cx)
             }))
     }
+}
+
+/// Wall-clock milliseconds, the units `SessionInfo::mtime_ms` is ordered by.
+/// A clock before the epoch reads as 0, which sorts the row last rather than
+/// panicking on a machine with a broken clock.
+fn unix_millis_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since_epoch| since_epoch.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn sid_preview(sid: &str) -> String {

@@ -94,6 +94,8 @@ The client obtains the *other* side of the comparison from the binary it is abou
 
 Implemented by readdir over pi's session dirs: header line gives id/cwd/timestamp, the last `session_info` entry gives the display name. `status` is `running` (pid alive in the daemon's table) or `exited`. Optional `cwd` field filters to one workspace.
 
+**The pid table is unioned in, not merely consulted for `status`.** Pi writes a session file lazily, on its first entry, so a session that was spawned and never prompted has a live pi and nothing on disk. Such a session is listed from the pid table alone: **`file` is absent** (there is none to name — it is `Option`, omitted rather than blank), `name` is absent (pi owns names and has written none), `cwd` is what `create_session` was given, and `mtime_ms` is the spawn time, since being started is the only activity it has had. Without this a client cannot see the session, and a client that cannot see a session cannot `stop` it — the pi would outlive every client that could have reaped it. The window is normally brief, because the create → attach → prompt chain is sent together; it widens whenever the prompt is lost.
+
 **Order is normative: newest first by `mtime_ms`** — last *activity*, which is what the file's mtime records. The daemon sorts, so a single-machine client renders the array as it arrives. A client merging several machines' listings into one list necessarily re-sorts and owns whatever order it then picks; it must not assume the daemon's order survives the merge, and it must not assume `sid` order is the same order (uuidv7 sids sort by *creation*, and pi's id charset is wider than uuidv7 — a session file already on disk may carry an id that sorts arbitrarily).
 
 ### `create_session`
