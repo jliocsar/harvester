@@ -337,7 +337,7 @@ fn route_line(session: &Arc<Session>, line: &[u8], probe: LineProbe<'_>) {
 
     let event = encode_event(&session.event_prefix, line);
 
-    if dialog::accept(session, &probe, &event) {
+    if dialog::apply_policy(session, &probe, &event) {
         let _ = session.output.send(SessionOutput::Event(event));
     }
 }

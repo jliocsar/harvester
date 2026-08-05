@@ -1,7 +1,7 @@
-//! The one pi launch line (docs/DAEMON.md §The pi launch line): CLI flags, env
-//! guards and the stderr log. Pinned to pi 0.83.0 — `--session-id` (resume-or-
-//! create) is source-verified but undocumented, so re-verify this module on
-//! every pi upgrade (CLAUDE.md §Pi version discipline).
+//! The one pi launch line (docs/DAEMON.md §The pi launch line). Pinned to
+//! pi 0.83.0 — `--session-id` (resume-or-create) is source-verified but
+//! undocumented, so re-verify this module on every pi upgrade (CLAUDE.md
+//! §Pi version discipline).
 
 use std::io::Write;
 use std::path::Path;

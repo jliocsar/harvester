@@ -41,17 +41,15 @@ pub struct DialogRoom {
 /// Deliberately plain and synchronous: the locking belongs to [`Session`], so
 /// the policy can be exercised without a pi child.
 impl DialogRoom {
-    /// Join the room; returns the dialog envelopes already waiting, which the
-    /// caller's forwarder replays so a late attacher sees them too.
     fn attach(&mut self) -> Vec<Arc<[u8]>> {
         self.attached += 1;
 
         self.pending.values().cloned().collect()
     }
 
-    /// Leave the room. When the last watcher goes, every still-pending dialog
-    /// is returned for cancellation — nothing could answer them anymore, and
-    /// pi would wait forever (docs/DAEMON.md: never leave a dialog unanswered).
+    /// When the last watcher goes, every still-pending dialog is returned for
+    /// cancellation — nothing could answer them anymore, and pi would wait
+    /// forever (docs/DAEMON.md: never leave a dialog unanswered).
     fn detach(&mut self) -> Vec<String> {
         self.attached = self.attached.saturating_sub(1);
 
@@ -110,11 +108,16 @@ impl Session {
     }
 }
 
-/// Apply the policy to a stdout line that may be a dialog: while anyone is
-/// attached it is remembered and forwarded (first answer wins, and a client
-/// attaching later still gets shown it); with an empty room it is auto-cancelled
-/// instead of broadcast into the void. `false` means "cancelled, do not forward".
-pub(super) fn accept(session: &Arc<Session>, probe: &LineProbe<'_>, event: &Arc<[u8]>) -> bool {
+/// The dialog policy (docs/DAEMON.md §Dialogs), applied to one stdout line.
+/// `false` is the one outcome the caller cannot see for itself: the dialog was
+/// auto-cancelled into an empty room, so the event must *not* also be broadcast
+/// — there is nobody to broadcast it to, and a later attacher would be shown a
+/// dialog that has already been answered.
+pub(super) fn apply_policy(
+    session: &Arc<Session>,
+    probe: &LineProbe<'_>,
+    event: &Arc<[u8]>,
+) -> bool {
     let Some(dialog_id) = id_awaiting_answer(probe) else {
         return true;
     };
@@ -135,8 +138,8 @@ pub(super) fn accept(session: &Arc<Session>, probe: &LineProbe<'_>, event: &Arc<
     true
 }
 
-/// Answer a dialog with `cancelled: true` — to the extension, identical to a
-/// human pressing Escape. Used at arrival (empty room) and when the room empties.
+/// To the extension this is identical to a human pressing Escape. Used at
+/// arrival into an empty room, and when the last watcher leaves.
 pub fn cancel(session: &Session, dialog_id: &str) {
     let cancel = json!({"type": "extension_ui_response", "id": dialog_id, "cancelled": true});
 
@@ -148,9 +151,7 @@ pub fn cancel(session: &Session, dialog_id: &str) {
     }
 }
 
-/// Forget a `timeout`-carrying dialog once pi has resolved it internally.
-///
-/// Pi resolves such a dialog itself and emits **nothing** on stdout (pi 0.83.0
+/// Pi resolves a `timeout`-carrying dialog itself and emits **nothing** on stdout (pi 0.83.0
 /// `modes/rpc/rpc-mode.ts:114-119`: the `setTimeout` callback runs `cleanup()`
 /// and `resolve(defaultValue)`, with no `output(...)`), and afterwards drops any
 /// response for that id silently (`:768-776`). Nothing on the wire announces it,
@@ -183,8 +184,6 @@ fn spawn_eviction(session: &Arc<Session>, dialog_id: &str, timeout_ms: u64) {
     });
 }
 
-/// The dialog id when this line is an `extension_ui_request` that blocks pi
-/// until it is answered.
 fn id_awaiting_answer<'probe>(probe: &'probe LineProbe<'_>) -> Option<&'probe str> {
     if probe.kind.as_deref() != Some("extension_ui_request") {
         return None;
