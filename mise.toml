@@ -1,2 +1,3 @@
 [tools]
+hunkdiff = "latest"
 node = "lts"
