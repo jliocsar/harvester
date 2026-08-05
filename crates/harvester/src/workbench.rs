@@ -288,6 +288,7 @@ impl Workbench {
     /// machine's sessions are unaffected by this one losing its bridge.
     fn abort_machine_flows(&mut self, machine: &str, detail: &str) {
         self.abandon_open_on(machine);
+        self.abandon_ghost_start_on(machine);
 
         if let Some(ghost) = &mut self.ghost {
             if ghost.workspace().machine == machine {
@@ -305,6 +306,19 @@ impl Workbench {
             .is_some_and(|opening| opening.machine == machine)
         {
             self.opening = None;
+        }
+    }
+
+    /// Return a ghost start on `machine` to editable so the user can retry; a
+    /// fresh sid is minted on the next submit. Scoped to the machine that
+    /// failed: a ghost whose own create → attach → prompt chain is still in
+    /// flight elsewhere must keep waiting, or the retry mints a second sid and
+    /// starts a second pi for one prompt.
+    fn abandon_ghost_start_on(&mut self, machine: &str) {
+        if let Some(ghost) = &mut self.ghost {
+            if ghost.workspace().machine == machine {
+                ghost.abandon_start();
+            }
         }
     }
 
@@ -472,12 +486,7 @@ impl Workbench {
 
     fn handle_request_failed(&mut self, machine: &str, detail: String) {
         self.abandon_open_on(machine);
-
-        // A failed ghost start returns the ghost to editable so the user can
-        // retry (a fresh sid is minted on the next submit).
-        if let Some(ghost) = &mut self.ghost {
-            ghost.abandon_start();
-        }
+        self.abandon_ghost_start_on(machine);
 
         self.last_error = Some(format!("{machine}: {detail}"));
     }
