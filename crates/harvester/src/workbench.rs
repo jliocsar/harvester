@@ -82,6 +82,13 @@ struct GhostChat {
     _input_subscription: Subscription,
 }
 
+/// A session opening on a machine: what the sidebar spinner reads, and what a
+/// failure has to match before it may give up on it.
+struct OpeningSession {
+    machine: String,
+    sid: String,
+}
+
 /// What `Attached` needs to finish a ghost start: the sid to match on, the
 /// name for the synthesized sidebar row, the prompt to seed the chat with.
 struct StartedSession {
@@ -109,9 +116,12 @@ pub struct Workbench {
     /// "which machine?" — the folder picker follows the choice.
     machine_picker_open: bool,
     ghost: Option<GhostChat>,
-    /// Sid we asked a bridge to open, until `Attached` promotes it to a
-    /// chat (also the "don't double-open" guard).
-    opening: Option<String>,
+    /// The session we asked a bridge to open, until `Attached` promotes it to
+    /// a chat (also the "don't double-open" guard). Carries the machine as
+    /// well as the sid because it is cleared by *that machine's* failures:
+    /// keyed by sid alone, any other machine losing its bridge cancelled this
+    /// guard, and the next click issued a duplicate `Open`.
+    opening: Option<OpeningSession>,
     /// Collapsed sidebar sections (all expanded at launch).
     machines_collapsed: bool,
     workspaces_collapsed: bool,
@@ -316,12 +326,12 @@ impl Workbench {
         cx.notify();
     }
 
-    /// Commands queued for this machine died with its bridge: return any
-    /// ghost start on it to editable, fail its pending model fetch, and
-    /// clear the opening guard (over-broad for other machines' opens, but
-    /// harmless — a re-click retries).
+    /// Commands queued for this machine died with its bridge: give up on an
+    /// open *on this machine*, return any ghost start on it to editable, and
+    /// fail its pending model fetch. Every clause is machine-scoped — another
+    /// machine's sessions are unaffected by this one losing its bridge.
     fn abort_machine_flows(&mut self, machine: &str, detail: &str) {
-        self.opening = None;
+        self.abandon_open_on(machine);
 
         if let Some(ghost) = &mut self.ghost {
             if ghost.workspace.machine == machine {
@@ -331,6 +341,18 @@ impl Workbench {
                     ghost.models = ModelsState::Failed(detail.to_string());
                 }
             }
+        }
+    }
+
+    /// Stop waiting for an open on `machine`. An open on any other machine is
+    /// still in flight and keeps its guard.
+    fn abandon_open_on(&mut self, machine: &str) {
+        if self
+            .opening
+            .as_ref()
+            .is_some_and(|opening| opening.machine == machine)
+        {
+            self.opening = None;
         }
     }
 
@@ -366,7 +388,7 @@ impl Workbench {
         // The daemon's list may predate a resume we just did; disk on the VM
         // stays authoritative, this is display state only.
         self.set_session_status(&sid, SessionStatus::Running);
-        self.opening = None;
+        self.abandon_open_on(machine);
 
         let first_prompt = self.take_started_ghost(&sid);
         let machine_label: SharedString = self.fleet.label(machine).into();
@@ -490,7 +512,7 @@ impl Workbench {
     }
 
     fn handle_request_failed(&mut self, machine: &str, detail: String) {
-        self.opening = None;
+        self.abandon_open_on(machine);
 
         // A failed ghost start returns the ghost to editable so the user can
         // retry (a fresh sid is minted on the next submit).
@@ -581,8 +603,8 @@ impl Workbench {
         // of which arrive from a daemon that is live but silent — so clicking
         // the same row again is the escape hatch: it clears the guard and
         // reissues Open (create-or-resume + attach is idempotent).
-        if let Some(opening) = self.opening.as_deref() {
-            if opening != sid {
+        if let Some(opening) = &self.opening {
+            if opening.sid != sid {
                 return;
             }
 
@@ -618,7 +640,10 @@ impl Workbench {
             return;
         }
 
-        self.opening = Some(sid.clone());
+        self.opening = Some(OpeningSession {
+            machine: machine.clone(),
+            sid: sid.clone(),
+        });
         self.send_command(&machine, Command::Open { sid, cwd });
         cx.notify();
     }
@@ -801,7 +826,10 @@ impl Workbench {
             name,
             first_prompt: event.0.clone(),
         });
-        self.opening = Some(sid);
+        self.opening = Some(OpeningSession {
+            machine: machine.clone(),
+            sid,
+        });
         self.send_command(&machine, command);
         cx.notify();
     }
@@ -1173,7 +1201,10 @@ impl Workbench {
             .chat
             .as_ref()
             .is_some_and(|chat| chat.read(cx).sid() == session.sid);
-        let opening = self.opening.as_deref() == Some(session.sid.as_str());
+        let opening = self
+            .opening
+            .as_ref()
+            .is_some_and(|opening| opening.sid == session.sid);
         let dot_color = match session.status {
             SessionStatus::Running => theme::STATUS_RUNNING,
             SessionStatus::Exited => theme::TEXT_FAINT,
