@@ -6,7 +6,9 @@
 
 use std::sync::OnceLock;
 
-use gpui::{div, prelude::*, px, rgb, rgba, Div, ElementId, FontWeight, SharedString, Stateful};
+use gpui::{
+    div, prelude::*, px, rgb, rgba, AnyElement, Div, ElementId, FontWeight, SharedString, Stateful,
+};
 
 use crate::theme;
 
@@ -571,9 +573,58 @@ pub fn tool_block_truncation_notice() -> Div {
         .child("… output truncated")
 }
 
-/// Full-window backdrop that centers its child (the modal). Caller chains
-/// `.on_click` for click-outside dismissal; the modal itself must `.occlude()`
-/// so clicks inside it don't reach the scrim's hitbox.
+/// Fixed height for modal scroll lists, so a dialog does not resize with its
+/// contents.
+const MODAL_LIST_HEIGHT: f32 = 280.;
+
+/// How tall a modal's scroll list stands. `Fixed` keeps the dialog the same
+/// size whatever it holds, which is what a list that arrives asynchronously
+/// (models being fetched) or changes wholesale (a directory walk) needs — it
+/// would otherwise resize under the pointer between one click and the next.
+pub enum ModalListHeight {
+    Fixed,
+    FitContent,
+}
+
+/// A dismissible modal list of choices: scrim, dialog frame, scrolling rows.
+/// Four surfaces built this by hand and each carried its own copy of the note
+/// about `.occlude()`; that note now lives once, on [`modal_scrim`].
+///
+/// The caller chains `.on_click` for click-outside dismissal, because dismissal
+/// is the one part that differs — it belongs to whoever owns the modal's state.
+/// A modal with more than a list (the folder picker's context line, error and
+/// buttons) composes [`modal_scrim`], [`modal_frame`] and [`modal_scroll_list`]
+/// itself.
+pub fn modal_list(
+    id: &str,
+    title: impl Into<SharedString>,
+    height: ModalListHeight,
+    rows: Vec<AnyElement>,
+) -> Stateful<Div> {
+    modal_scrim(SharedString::from(format!("{id}-scrim")))
+        .child(modal_frame(title).child(modal_scroll_list(id, height).children(rows)))
+}
+
+/// The scrolling list a modal's choices go in; the caller adds them. Split out
+/// for the one modal that is more than a list — the folder picker, which puts
+/// a context line above it and an error and buttons below.
+pub fn modal_scroll_list(id: &str, height: ModalListHeight) -> Stateful<Div> {
+    let list = div()
+        .id(SharedString::from(format!("{id}-entries")))
+        .overflow_y_scroll()
+        .flex()
+        .flex_col();
+
+    match height {
+        ModalListHeight::Fixed => list.h(px(MODAL_LIST_HEIGHT)),
+        ModalListHeight::FitContent => list.max_h(px(MODAL_LIST_HEIGHT)),
+    }
+}
+
+/// Full-window backdrop that centers its child (the modal). The child is
+/// `.occlude()`d here so clicks inside a dialog never reach the scrim's
+/// dismiss hitbox — every caller used to repeat that. Caller chains
+/// `.on_click` for click-outside dismissal.
 pub fn modal_scrim(id: impl Into<ElementId>) -> Stateful<Div> {
     div()
         .id(id)
@@ -588,8 +639,10 @@ pub fn modal_scrim(id: impl Into<ElementId>) -> Stateful<Div> {
 
 /// A modal dialog panel: title header, then whatever body the caller adds.
 /// Overlay/backdrop wiring belongs to the caller (it owns dismissal).
-pub fn modal_frame(title: impl Into<SharedString>) -> Div {
+pub fn modal_frame(title: impl Into<SharedString>) -> Stateful<Div> {
     div()
+        .id(SharedString::from("modal-frame"))
+        .occlude()
         .w(px(MODAL_WIDTH))
         .bg(rgb(theme::ELEVATED_BG))
         .border_1()

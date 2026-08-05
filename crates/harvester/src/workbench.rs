@@ -13,15 +13,15 @@ use gpui::{
     div, prelude::*, px, rgb, Context, Entity, Focusable, SharedString, Subscription, Window,
 };
 use harvester_client_core::{
-    BridgeEvents, Fleet, MachineState, MachinesEvents, Pending, RequestToken, RequestTokens,
-    LOCAL_MACHINE,
+    BridgeEvents, Fleet, MachineState, MachinesEvents, RequestToken, RequestTokens, LOCAL_MACHINE,
 };
 use harvester_proto::{SessionInfo, SessionStatus};
 use serde_json::Value;
 
 use crate::chat::{Chat, ChatRequest, ChatSession};
 use crate::input::{PromptSubmitted, TextInput};
-use crate::models::{self, ModelChoice, ModelsState};
+use crate::model_control::ModelControl;
+use crate::models::{ModelChoice, ModelsState};
 use crate::theme;
 use crate::ui;
 use crate::workspaces::{self, Workspace};
@@ -32,9 +32,6 @@ use picker::FolderPicker;
 const SIDEBAR_WIDTH: f32 = 240.;
 /// Enough of a uuidv7 to tell sessions apart at a glance.
 const SID_PREVIEW_CHARS: usize = 8;
-/// Fixed height for modal lists (folder picker directories, model picker),
-/// so the dialogs don't resize with their contents.
-const MODAL_LIST_HEIGHT: f32 = 280.;
 /// Cap on the session name derived from the first prompt's first line —
 /// enough to recognize, short enough for pi's session list and the sidebar.
 const SESSION_NAME_MAX_CHARS: usize = 48;
@@ -49,27 +46,17 @@ struct MachineSession {
     info: SessionInfo,
 }
 
-/// Which surface the open model picker belongs to: the ghost chat (choice
-/// rides the launch line) or the live chat (choice becomes a `set_model`).
-#[derive(Clone, Copy)]
-enum ModelPickerTarget {
-    Ghost,
-    Chat,
-}
-
 /// A chat that exists only client-side (SPEC §Flows "Start session (ghost
 /// chat)"): opened from a workspace row, becomes a real session on the first
 /// prompt. Dropped without a trace if navigated away from.
 struct GhostChat {
     /// Where the session will run; the path is the pi cwd.
     workspace: Workspace,
-    models: ModelsState,
-    /// The `ListModels` this ghost is waiting on; an answer to any other
-    /// token was asked for by a ghost (or a machine) it has moved on from.
-    models_request: Pending<()>,
-    /// Index into the `Loaded` list; `None` = let pi pick its default.
+    /// The model list, its request and its modal — the same control the live
+    /// chat has, with a different command behind it (see `model_control`).
+    model: ModelControl,
+    /// Index into the loaded list; `None` = let pi pick its default.
     selected_model: Option<usize>,
-    picker_open: bool,
     /// The prompt box's machine picker is open (only offered while ≥2 stored
     /// workspaces share this path — the control lists those machines).
     machine_picker_open: bool,
@@ -336,10 +323,7 @@ impl Workbench {
         if let Some(ghost) = &mut self.ghost {
             if ghost.workspace.machine == machine {
                 ghost.started = None;
-
-                if matches!(ghost.models, ModelsState::Loading) {
-                    ghost.models = ModelsState::Failed(detail.to_string());
-                }
+                ghost.model.fail(detail.to_string());
             }
         }
     }
@@ -452,10 +436,17 @@ impl Workbench {
         };
 
         if !self.fleet.state(&machine).is_live() {
-            self.last_error = Some(format!(
+            let detail = format!(
                 "{}: not connected — nothing was sent",
                 self.fleet.label(&machine)
-            ));
+            );
+
+            // The refusal has to reach the chat, not just the statusbar: a
+            // model-list request records as outstanding when it is *made*
+            // (`Pending::ask`), so a chat whose request was never sent would
+            // sit on "loading models…" for the life of the pane.
+            chat.update(cx, |chat, cx| chat.fail_model_list(detail.clone(), cx));
+            self.last_error = Some(detail);
             cx.notify();
 
             return;
@@ -713,14 +704,7 @@ impl Workbench {
             return;
         };
 
-        if ghost.models_request.accept(token).is_none() {
-            return;
-        }
-
-        ghost.models = match result {
-            Ok(data) => ModelsState::Loaded(models::extract_model_choices(&data)),
-            Err(detail) => ModelsState::Failed(detail),
-        };
+        ghost.model.accept(token, result);
     }
 
     /// A workspace row was clicked: open a ghost chat there (SPEC §Flows
@@ -755,8 +739,8 @@ impl Workbench {
 
         let input = cx.new(|cx| TextInput::new("Message pi — Enter to send", cx));
         let input_subscription = cx.subscribe(&input, Self::handle_ghost_prompt);
-        let mut models_request = Pending::default();
-        let models_token = models_request.ask(&self.tokens, ());
+        let mut model = ModelControl::default();
+        let models_token = model.fetching(&self.tokens);
 
         self.send_command(
             &workspace.machine,
@@ -767,10 +751,8 @@ impl Workbench {
         );
         self.ghost = Some(GhostChat {
             workspace,
-            models: ModelsState::Loading,
-            models_request,
+            model,
             selected_model: None,
-            picker_open: false,
             machine_picker_open: false,
             started: None,
             focus_input: true,
@@ -803,7 +785,7 @@ impl Workbench {
 
         let sid = uuid::Uuid::now_v7().to_string();
         let name = session_name_from_prompt(&event.0);
-        let (provider, model) = match (&ghost.models, ghost.selected_model) {
+        let (provider, model) = match (ghost.model.state(), ghost.selected_model) {
             (ModelsState::Loaded(models), Some(index)) => match models.get(index) {
                 Some(choice) => (Some(choice.provider.clone()), Some(choice.id.clone())),
                 None => (None, None),
@@ -907,10 +889,9 @@ impl Workbench {
             return;
         };
         let cwd = ghost.workspace.path.clone();
-        let models_token = ghost.models_request.ask(&tokens, ());
+        let models_token = ghost.model.fetching(&tokens);
 
         ghost.workspace.machine = machine.clone();
-        ghost.models = ModelsState::Loading;
         ghost.selected_model = None;
         self.send_command(
             &machine,
@@ -927,15 +908,15 @@ impl Workbench {
             return;
         };
 
-        if matches!(ghost.models, ModelsState::Loaded(_)) && ghost.started.is_none() {
-            ghost.picker_open = true;
+        if ghost.started.is_none() {
+            ghost.model.open();
             cx.notify();
         }
     }
 
     fn ghost_close_model_picker(&mut self, cx: &mut Context<Self>) {
         if let Some(ghost) = &mut self.ghost {
-            ghost.picker_open = false;
+            ghost.model.close();
             cx.notify();
         }
     }
@@ -944,7 +925,7 @@ impl Workbench {
     fn ghost_select_model(&mut self, choice: Option<usize>, cx: &mut Context<Self>) {
         if let Some(ghost) = &mut self.ghost {
             ghost.selected_model = choice;
-            ghost.picker_open = false;
+            ghost.model.close();
             cx.notify();
         }
     }
@@ -1300,7 +1281,7 @@ impl Workbench {
         );
         // The prompt box only renders before the start fires, so `Loaded`
         // alone decides whether the model control is clickable.
-        let (model_label, model_enabled): (SharedString, bool) = match &ghost.models {
+        let (model_label, model_enabled): (SharedString, bool) = match ghost.model.state() {
             ModelsState::Loading => ("loading models…".into(), false),
             ModelsState::Failed(_) => ("default model".into(), false),
             ModelsState::Loaded(models) => (
@@ -1375,7 +1356,7 @@ impl Workbench {
                 div().flex_1().min_h(px(0.)).p_3().children(
                     // Model failure is informational, not blocking: pi still
                     // launches with its default.
-                    match &ghost.models {
+                    match ghost.model.state() {
                         ModelsState::Failed(detail) => Some(
                             div()
                                 .text_xs()
@@ -1389,134 +1370,105 @@ impl Workbench {
             .child(bottom_row)
     }
 
-    /// A picker row was clicked (`None` = the ghost's "default" row): route
-    /// to the surface the picker belongs to.
-    fn model_picked(
-        &mut self,
-        target: ModelPickerTarget,
-        choice: Option<usize>,
-        cx: &mut Context<Self>,
-    ) {
-        match target {
-            ModelPickerTarget::Ghost => self.ghost_select_model(choice, cx),
-            ModelPickerTarget::Chat => {
-                let Some(index) = choice else {
-                    return;
-                };
+    /// A picker row was clicked (`None` = the ghost's "default" row). Which
+    /// surface it belongs to is *derived* from which one has its modal open —
+    /// the ghost first, the same precedence the content pane renders with. A
+    /// stored answer to that question was one more thing that could disagree
+    /// with the state it described.
+    fn model_picked(&mut self, choice: Option<usize>, cx: &mut Context<Self>) {
+        if self.ghost_model_picker_open() {
+            self.ghost_select_model(choice, cx);
 
-                if let Some(chat) = &self.chat {
-                    chat.update(cx, |chat, cx| chat.pick_model(index, cx));
-                }
-            }
+            return;
+        }
+
+        let Some((chat, index)) = self.chat.clone().zip(choice) else {
+            return;
+        };
+
+        chat.update(cx, |chat, cx| chat.pick_model(index, cx));
+    }
+
+    fn model_picker_closed(&mut self, cx: &mut Context<Self>) {
+        if self.ghost_model_picker_open() {
+            self.ghost_close_model_picker(cx);
+
+            return;
+        }
+
+        if let Some(chat) = &self.chat {
+            chat.update(cx, |chat, cx| chat.close_model_picker(cx));
         }
     }
 
-    fn model_picker_closed(&mut self, target: ModelPickerTarget, cx: &mut Context<Self>) {
-        match target {
-            ModelPickerTarget::Ghost => self.ghost_close_model_picker(cx),
-            ModelPickerTarget::Chat => {
-                if let Some(chat) = &self.chat {
-                    chat.update(cx, |chat, cx| chat.close_model_picker(cx));
-                }
-            }
-        }
+    fn ghost_model_picker_open(&self) -> bool {
+        self.ghost
+            .as_ref()
+            .is_some_and(|ghost| ghost.model.is_open())
     }
 
-    /// The model picker modal, painted over everything (same scrim/occlusion
-    /// wiring as the folder picker). One render for both surfaces; only the
-    /// ghost offers the "default (pi chooses)" row — a live session always
-    /// has a concrete model.
+    /// One render for both surfaces. Only the ghost offers the "default (pi
+    /// chooses)" row — a live session always has a concrete model — and that
+    /// difference is the argument, not a stored flag saying whose modal this is.
     fn render_model_picker(
         &self,
-        target: ModelPickerTarget,
         models: &[ModelChoice],
         selected_model: Option<usize>,
+        offer_default: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let model_rows: Vec<_> = models
-            .iter()
-            .enumerate()
-            .map(|(index, choice)| {
+        let default_row = offer_default.then(|| {
+            ui::model_row(
+                "model-default",
+                "default (pi chooses)".into(),
+                selected_model.is_none(),
+            )
+            .on_click(cx.listener(move |workbench, _, _, cx| workbench.model_picked(None, cx)))
+            .into_any_element()
+        });
+        let rows: Vec<_> = default_row
+            .into_iter()
+            .chain(models.iter().enumerate().map(|(index, choice)| {
                 ui::model_row(
                     ("model", index),
                     choice.name.clone(),
                     selected_model == Some(index),
                 )
-                .on_click(cx.listener(move |workbench, _, _, cx| {
-                    workbench.model_picked(target, Some(index), cx)
-                }))
-            })
+                .on_click(
+                    cx.listener(move |workbench, _, _, cx| workbench.model_picked(Some(index), cx)),
+                )
+                .into_any_element()
+            }))
             .collect();
-        let default_row =
-            match target {
-                ModelPickerTarget::Ghost => Some(
-                    ui::model_row(
-                        "model-default",
-                        "default (pi chooses)".into(),
-                        selected_model.is_none(),
-                    )
-                    .on_click(cx.listener(move |workbench, _, _, cx| {
-                        workbench.model_picked(target, None, cx)
-                    })),
-                ),
-                ModelPickerTarget::Chat => None,
-            };
 
-        ui::modal_scrim("model-scrim")
-            .on_click(
-                cx.listener(move |workbench, _, _, cx| workbench.model_picker_closed(target, cx)),
-            )
-            .child(
-                ui::modal_frame("Choose model")
-                    // Keeps clicks inside the dialog from reaching the
-                    // scrim's dismiss handler.
-                    .occlude()
-                    .child(
-                        div()
-                            .id("model-entries")
-                            .h(px(MODAL_LIST_HEIGHT))
-                            .overflow_y_scroll()
-                            .flex()
-                            .flex_col()
-                            .children(default_row)
-                            .children(model_rows),
-                    ),
-            )
+        ui::modal_list("model", "Choose model", ui::ModalListHeight::Fixed, rows)
+            .on_click(cx.listener(move |workbench, _, _, cx| workbench.model_picker_closed(cx)))
     }
 
     /// The add-workspace machine step: same modal-list pattern as the model
     /// picker; picking a machine opens the folder picker there.
     fn render_machine_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let candidate_rows: Vec<_> =
-            self.fleet
-                .machine_candidates()
-                .into_iter()
-                .enumerate()
-                .map(|(index, candidate)| {
-                    ui::model_row(("workspace-machine", index), candidate.label.into(), false)
-                        .on_click(cx.listener(move |workbench, _, _, cx| {
-                            workbench.workspace_machine_picked(index, cx)
-                        }))
-                })
-                .collect();
+        let candidate_rows: Vec<_> = self
+            .fleet
+            .machine_candidates()
+            .into_iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                ui::model_row(("workspace-machine", index), candidate.label.into(), false)
+                    .on_click(cx.listener(move |workbench, _, _, cx| {
+                        workbench.workspace_machine_picked(index, cx)
+                    }))
+                    .into_any_element()
+            })
+            .collect();
 
-        ui::modal_scrim("workspace-machine-scrim")
-            .on_click(cx.listener(|workbench, _, _, cx| workbench.close_machine_picker(cx)))
-            .child(
-                ui::modal_frame("Add workspace — choose machine")
-                    // Keeps clicks inside the dialog from reaching the
-                    // scrim's dismiss handler.
-                    .occlude()
-                    .child(
-                        div()
-                            .id("workspace-machine-entries")
-                            .max_h(px(MODAL_LIST_HEIGHT))
-                            .overflow_y_scroll()
-                            .flex()
-                            .flex_col()
-                            .children(candidate_rows),
-                    ),
-            )
+        ui::modal_list(
+            "workspace-machine",
+            "Add workspace — choose machine",
+            ui::ModalListHeight::FitContent,
+            candidate_rows,
+        )
+        .on_click(cx.listener(|workbench, _, _, cx| workbench.close_machine_picker(cx)))
     }
 
     /// The ghost's prompt-box machine picker: the workspaces sharing its
@@ -1542,26 +1494,17 @@ impl Workbench {
                 .on_click(
                     cx.listener(move |workbench, _, _, cx| workbench.ghost_pick_machine(index, cx)),
                 )
+                .into_any_element()
             })
             .collect();
 
-        ui::modal_scrim("ghost-machine-scrim")
-            .on_click(cx.listener(|workbench, _, _, cx| workbench.ghost_close_machine_picker(cx)))
-            .child(
-                ui::modal_frame("Choose machine")
-                    // Keeps clicks inside the dialog from reaching the
-                    // scrim's dismiss handler.
-                    .occlude()
-                    .child(
-                        div()
-                            .id("ghost-machine-entries")
-                            .max_h(px(MODAL_LIST_HEIGHT))
-                            .overflow_y_scroll()
-                            .flex()
-                            .flex_col()
-                            .children(candidate_rows),
-                    ),
-            )
+        ui::modal_list(
+            "ghost-machine",
+            "Choose machine",
+            ui::ModalListHeight::FitContent,
+            candidate_rows,
+        )
+        .on_click(cx.listener(|workbench, _, _, cx| workbench.ghost_close_machine_picker(cx)))
     }
 
     fn render_statusbar(&self) -> impl IntoElement {
@@ -1631,21 +1574,16 @@ impl Render for Workbench {
 
         // The model picker renders from whichever surface opened it (ghost
         // wins — it also wins the content pane). Data is cloned out here so
-        // the entity borrows don't fight the `&mut cx` the listeners need.
-        let model_picker: Option<(ModelPickerTarget, Vec<ModelChoice>, Option<usize>)> =
-            if let Some(ghost) = self.ghost.as_ref().filter(|ghost| ghost.picker_open) {
-                match &ghost.models {
-                    ModelsState::Loaded(models) => Some((
-                        ModelPickerTarget::Ghost,
-                        models.clone(),
-                        ghost.selected_model,
-                    )),
-                    _ => None,
-                }
+        // the entity borrows don't fight the `&mut cx` the listeners need; the
+        // bool is "offer the default row", which is the only thing the two
+        // surfaces render differently.
+        let model_picker: Option<(Vec<ModelChoice>, Option<usize>, bool)> =
+            if let Some(ghost) = self.ghost.as_ref().filter(|ghost| ghost.model.is_open()) {
+                Some((ghost.model.choices().to_vec(), ghost.selected_model, true))
             } else if let Some(chat) = &self.chat {
                 chat.read(cx)
                     .picker_contents()
-                    .map(|(models, current_index)| (ModelPickerTarget::Chat, models, current_index))
+                    .map(|(models, current_index)| (models, current_index, false))
             } else {
                 None
             };
@@ -1682,8 +1620,8 @@ impl Render for Workbench {
                     .as_ref()
                     .map(|picker| self.render_picker(picker, cx)),
             )
-            .children(model_picker.map(|(target, models, selected_model)| {
-                self.render_model_picker(target, &models, selected_model, cx)
+            .children(model_picker.map(|(models, selected_model, offer_default)| {
+                self.render_model_picker(&models, selected_model, offer_default, cx)
             }))
     }
 }

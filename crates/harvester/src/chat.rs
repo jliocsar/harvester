@@ -12,7 +12,8 @@ use gpui::{
 use serde_json::Value;
 
 use crate::input::{PromptSubmitted, TextInput};
-use crate::models::{self, ModelChoice, ModelsState};
+use crate::model_control::ModelControl;
+use crate::models::{self, ModelChoice};
 use crate::theme;
 use crate::ui;
 use harvester_client_core::transcript::{Item, Message, Role, ToolBlock, ToolStatus, Transcript};
@@ -39,18 +40,15 @@ pub struct Chat {
     /// `create_session` with the same sid).
     exited_notice: Option<String>,
     /// The session's switchable models (passthrough `get_available_models`,
-    /// fetched at open — milliseconds against the running pi).
-    models: ModelsState,
+    /// fetched at open — milliseconds against the running pi) and the modal
+    /// over them.
+    model: ModelControl,
     /// The session's current model (`get_state` at open, replaced by each
     /// successful `set_model`); drives the control's label and check mark.
     current_model: Option<ModelChoice>,
-    /// The model picker modal is open. Rendered by the workbench — the
-    /// scrim has to cover the whole window, not just this pane.
-    picker_open: bool,
     /// The three answers this chat can be waiting on. An answer carrying any
     /// other token belongs to a request already superseded (two `set_model`s
     /// from a fast double-pick are the live case) and is dropped.
-    session_models: Pending<()>,
     session_state: Pending<()>,
     set_model: Pending<()>,
     /// Focus the prompt input on the next frame (set at creation; render has
@@ -136,10 +134,8 @@ impl Chat {
             transcript,
             expanded: HashSet::new(),
             exited_notice: None,
-            models: ModelsState::Loading,
+            model: ModelControl::default(),
             current_model: None,
-            picker_open: false,
-            session_models: Pending::default(),
             session_state: Pending::default(),
             set_model: Pending::default(),
             focus_input: true,
@@ -165,7 +161,7 @@ impl Chat {
     /// this.
     pub fn request_model_controls(&mut self, cx: &mut Context<Self>) {
         cx.emit(ChatRequest::ModelControls {
-            models: self.session_models.ask(&self.tokens, ()),
+            models: self.model.fetching(&self.tokens),
             state: self.session_state.ask(&self.tokens, ()),
         });
     }
@@ -191,19 +187,9 @@ impl Chat {
         result: Result<Value, String>,
         cx: &mut Context<Self>,
     ) {
-        if self.session_models.accept(token).is_none() {
-            return;
+        if self.model.accept(token, result) {
+            cx.notify();
         }
-
-        self.models = match result {
-            Ok(data) => ModelsState::Loaded(models::extract_model_choices(&data)),
-            Err(detail) => {
-                eprintln!("harvester: get_available_models ({}): {detail}", self.sid);
-
-                ModelsState::Failed(detail)
-            }
-        };
-        cx.notify();
     }
 
     /// A `GetSessionState` answered; the current model labels the control.
@@ -241,26 +227,27 @@ impl Chat {
     }
 
     pub fn open_model_picker(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.models, ModelsState::Loaded(_)) {
-            self.picker_open = true;
-            cx.notify();
-        }
+        self.model.open();
+        cx.notify();
     }
 
     pub fn close_model_picker(&mut self, cx: &mut Context<Self>) {
-        self.picker_open = false;
+        self.model.close();
+        cx.notify();
+    }
+
+    /// The fetch this chat asked for will never be answered.
+    pub fn fail_model_list(&mut self, detail: String, cx: &mut Context<Self>) {
+        self.model.fail(detail);
         cx.notify();
     }
 
     /// A picker row was clicked: fire `set_model` on the running session.
     /// No optimism — the label changes when `ModelSet` confirms.
     pub fn pick_model(&mut self, index: usize, cx: &mut Context<Self>) {
-        self.picker_open = false;
+        self.model.close();
 
-        let ModelsState::Loaded(model_choices) = &self.models else {
-            return;
-        };
-        let Some(choice) = model_choices.get(index) else {
+        let Some(choice) = self.model.choices().get(index) else {
             return;
         };
         // A second pick supersedes the first: only the answer to this token
@@ -279,20 +266,18 @@ impl Chat {
     /// What the workbench's shared picker modal renders when this chat's
     /// picker is open: the loaded list and the current model's index.
     pub fn picker_contents(&self) -> Option<(Vec<ModelChoice>, Option<usize>)> {
-        if !self.picker_open {
+        if !self.model.is_open() {
             return None;
         }
 
-        let ModelsState::Loaded(model_choices) = &self.models else {
-            return None;
-        };
+        let model_choices = self.model.choices();
         let current_index = self.current_model.as_ref().and_then(|current| {
             model_choices
                 .iter()
                 .position(|choice| choice.provider == current.provider && choice.id == current.id)
         });
 
-        Some((model_choices.clone(), current_index))
+        Some((model_choices.to_vec(), current_index))
     }
 
     fn handle_prompt_submitted(
@@ -427,7 +412,7 @@ impl Chat {
             Some(choice) => choice.name.clone(),
             None => "model".into(),
         };
-        let model_enabled = matches!(self.models, ModelsState::Loaded(_));
+        let model_enabled = !self.model.choices().is_empty();
 
         row.child(
             ui::prompt_box(input_focused)

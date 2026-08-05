@@ -10,6 +10,7 @@
 mod chat;
 mod input;
 mod kitchen;
+mod model_control;
 mod models;
 mod theme;
 mod ui;

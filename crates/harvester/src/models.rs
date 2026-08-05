@@ -15,7 +15,9 @@ pub struct ModelChoice {
     pub id: String,
 }
 
+#[derive(Default)]
 pub enum ModelsState {
+    #[default]
     Loading,
     Loaded(Vec<ModelChoice>),
     /// The fetch failed; the chat stays usable — pi keeps running on its

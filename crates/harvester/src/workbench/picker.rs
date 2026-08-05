@@ -8,14 +8,13 @@
 //! `git rev-parse`), so browsing a machine costs one round trip and never
 //! waits on a harvesterd bootstrap it would not use.
 
-use gpui::{div, prelude::*, px, rgb, Context};
+use gpui::{div, prelude::*, rgb, Context};
 use harvester_client_core::machines;
 use harvester_client_core::{Host, Pending, RemoteDirEntry, RequestToken};
 
 use super::Workbench;
 use crate::theme;
 use crate::ui;
-use crate::workbench::MODAL_LIST_HEIGHT;
 
 /// The one host op a folder picker has in flight, and what its answer needs in
 /// order to be applied. One at a time: the rows and the Add button ignore
@@ -325,9 +324,6 @@ impl Workbench {
             .on_click(cx.listener(|workbench, _, _, cx| workbench.close_picker(cx)))
             .child(
                 ui::modal_frame("Add workspace")
-                    // Keeps clicks inside the dialog from reaching the
-                    // scrim's dismiss handler.
-                    .occlude()
                     .child(
                         div()
                             .text_xs()
@@ -341,12 +337,7 @@ impl Workbench {
                             )),
                     )
                     .child(
-                        div()
-                            .id("picker-entries")
-                            .h(px(MODAL_LIST_HEIGHT))
-                            .overflow_y_scroll()
-                            .flex()
-                            .flex_col()
+                        ui::modal_scroll_list("picker", ui::ModalListHeight::Fixed)
                             .when(!picker.path.is_empty() && picker.path != "/", |list| {
                                 list.child(ui::picker_dir_row("picker-up", "..".into()).on_click(
                                     cx.listener(|workbench, _, _, cx| workbench.picker_go_up(cx)),
