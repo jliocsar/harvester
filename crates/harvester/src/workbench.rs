@@ -13,12 +13,13 @@ use gpui::{
     div, prelude::*, px, rgb, Context, Entity, Focusable, SharedString, Subscription, Window,
 };
 use harvester_client_core::{
-    BridgeEvents, Fleet, MachineState, MachinesEvents, RequestToken, RequestTokens, LOCAL_MACHINE,
+    BridgeEvents, Fleet, MachineState, MachinesEvents, Pending, RequestToken, RequestTokens,
+    LOCAL_MACHINE,
 };
 use harvester_proto::{SessionInfo, SessionStatus};
 use serde_json::Value;
 
-use crate::chat::{BridgeLink, Chat};
+use crate::chat::{Chat, ChatRequest, ChatSession};
 use crate::input::{PromptSubmitted, TextInput};
 use crate::models::{self, ModelChoice, ModelsState};
 use crate::theme;
@@ -65,7 +66,7 @@ struct GhostChat {
     models: ModelsState,
     /// The `ListModels` this ghost is waiting on; an answer to any other
     /// token was asked for by a ghost (or a machine) it has moved on from.
-    models_request: Option<RequestToken>,
+    models_request: Pending<()>,
     /// Index into the `Loaded` list; `None` = let pi pick its default.
     selected_model: Option<usize>,
     picker_open: bool,
@@ -116,6 +117,9 @@ pub struct Workbench {
     workspaces_collapsed: bool,
     sessions_collapsed: bool,
     chat: Option<Entity<Chat>>,
+    /// Keeps [`Workbench::handle_chat_request`] subscribed for as long as the
+    /// chat it belongs to is the open one; dropped with the next chat's.
+    chat_requests: Option<Subscription>,
     /// Last request failure; sticks in the statusbar until the next one.
     last_error: Option<String>,
 }
@@ -148,6 +152,7 @@ impl Workbench {
             workspaces_collapsed: false,
             sessions_collapsed: false,
             chat: None,
+            chat_requests: None,
             last_error: None,
         };
 
@@ -287,12 +292,8 @@ impl Workbench {
             BridgeEvent::Attached { sid, entries } => {
                 self.handle_attached(machine, sid, entries, cx)
             }
-            // TODO(gpui wave): a repair must REPLACE the existing chat's
-            // entries, never rebuild the chat entity — rebuilding is what let a
-            // late resync clobber the chat on screen. Routed to `handle_attached`
-            // only to keep today's behaviour unchanged until that lands.
             BridgeEvent::HistoryReplaced { sid, entries } => {
-                self.handle_attached(machine, sid, entries, cx)
+                self.handle_history_replaced(sid, entries, cx)
             }
             BridgeEvent::Pi { sid, event } => self.handle_pi_event(sid, event, cx),
             BridgeEvent::SessionExit { sid, exit_code } => {
@@ -340,9 +341,19 @@ impl Workbench {
                 machine: machine.to_string(),
                 info,
             }));
-        // Newest first across machines; uuidv7 sids sort chronologically, so
-        // the sid itself is the created-at key.
-        self.sessions.sort_by(|a, b| b.info.sid.cmp(&a.info.sid));
+        // Newest first by last *activity*, which is the daemon's own order
+        // (docs/DAEMON.md §list_sessions) and the only one that survives
+        // merging machines. Not by sid: a uuidv7 sorts by creation, so a
+        // session prompted five minutes ago sank below one created after it
+        // and untouched since — and pi's id charset is wider than uuidv7, so a
+        // sid already on disk may not sort chronologically at all. The sid
+        // breaks ties only to keep the order stable between listings.
+        self.sessions.sort_by(|a, b| {
+            b.info
+                .mtime_ms
+                .cmp(&a.info.mtime_ms)
+                .then_with(|| b.info.sid.cmp(&a.info.sid))
+        });
     }
 
     fn handle_attached(
@@ -358,13 +369,6 @@ impl Workbench {
         self.opening = None;
 
         let first_prompt = self.take_started_ghost(&sid);
-        let Some(commands) = self.fleet.commands_for(machine) else {
-            return;
-        };
-        let bridge = BridgeLink {
-            commands,
-            tokens: self.tokens.clone(),
-        };
         let machine_label: SharedString = self.fleet.label(machine).into();
         // The session is in the list by now (a ghost start just inserted its
         // row above); its cwd names the repository in the prompt box.
@@ -376,17 +380,99 @@ impl Workbench {
             .unwrap_or_default()
             .into();
 
-        self.chat = Some(cx.new(|cx| {
-            Chat::new(
-                sid,
-                workspace_label,
-                machine_label,
-                &entries,
-                first_prompt,
-                bridge,
-                cx,
-            )
-        }));
+        let session = ChatSession {
+            sid,
+            machine: machine.to_string(),
+            workspace_label,
+            machine_label,
+        };
+        let chat = cx.new(|cx| Chat::new(session, &entries, first_prompt, self.tokens.clone(), cx));
+
+        // Subscribe before the chat asks for anything: an entity cannot emit
+        // to a subscriber that does not exist yet.
+        self.chat_requests = Some(cx.subscribe(&chat, Self::handle_chat_request));
+        chat.update(cx, |chat, cx| chat.request_model_controls(cx));
+        self.chat = Some(chat);
+    }
+
+    /// A resync answered (docs/DAEMON.md §Events, `event_gap`): the entries
+    /// replace what the open chat renders. Never a new chat entity — that is
+    /// what let a late resync clobber the chat on screen, taking the user's
+    /// half-typed prompt and its focus with it.
+    fn handle_history_replaced(
+        &mut self,
+        sid: String,
+        entries: Vec<Value>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(chat) = self.chat_for(&sid, cx) else {
+            return;
+        };
+
+        chat.update(cx, |chat, cx| chat.replace_history(&entries, cx));
+    }
+
+    /// The chat holds no command sender (see [`Chat::machine`]), so every
+    /// request it makes is routed here against the bridge that is live *now*.
+    /// A machine with no usable bridge is the case that used to vanish: the
+    /// prompt was rendered, the turn went busy, and the send failed into
+    /// stderr. It says so in the statusbar instead.
+    fn handle_chat_request(
+        &mut self,
+        chat: Entity<Chat>,
+        request: &ChatRequest,
+        cx: &mut Context<Self>,
+    ) {
+        let (machine, sid) = {
+            let chat = chat.read(cx);
+
+            (chat.machine().to_string(), chat.sid().to_string())
+        };
+
+        if !self.fleet.state(&machine).is_live() {
+            self.last_error = Some(format!(
+                "{}: not connected — nothing was sent",
+                self.fleet.label(&machine)
+            ));
+            cx.notify();
+
+            return;
+        }
+
+        match request {
+            ChatRequest::Prompt(text) => self.send_command(
+                &machine,
+                Command::Prompt {
+                    sid,
+                    text: text.clone(),
+                },
+            ),
+            ChatRequest::SetModel {
+                provider,
+                model_id,
+                token,
+            } => self.send_command(
+                &machine,
+                Command::SetModel {
+                    sid,
+                    provider: provider.clone(),
+                    model_id: model_id.clone(),
+                    token: *token,
+                },
+            ),
+            ChatRequest::ModelControls { models, state } => {
+                self.send_command(
+                    &machine,
+                    Command::ListSessionModels {
+                        sid: sid.clone(),
+                        token: *models,
+                    },
+                );
+                self.send_command(&machine, Command::GetSessionState { sid, token: *state });
+            }
+        }
+
+        cx.notify();
     }
 
     fn handle_pi_event(&mut self, sid: String, event: Value, cx: &mut Context<Self>) {
@@ -602,11 +688,10 @@ impl Workbench {
             return;
         };
 
-        if ghost.models_request != Some(token) {
+        if ghost.models_request.accept(token).is_none() {
             return;
         }
 
-        ghost.models_request = None;
         ghost.models = match result {
             Ok(data) => ModelsState::Loaded(models::extract_model_choices(&data)),
             Err(detail) => ModelsState::Failed(detail),
@@ -645,7 +730,8 @@ impl Workbench {
 
         let input = cx.new(|cx| TextInput::new("Message pi — Enter to send", cx));
         let input_subscription = cx.subscribe(&input, Self::handle_ghost_prompt);
-        let models_token = self.tokens.mint();
+        let mut models_request = Pending::default();
+        let models_token = models_request.ask(&self.tokens, ());
 
         self.send_command(
             &workspace.machine,
@@ -657,7 +743,7 @@ impl Workbench {
         self.ghost = Some(GhostChat {
             workspace,
             models: ModelsState::Loading,
-            models_request: Some(models_token),
+            models_request,
             selected_model: None,
             picker_open: false,
             machine_picker_open: false,
@@ -788,15 +874,15 @@ impl Workbench {
             return;
         }
 
-        let models_token = self.tokens.mint();
+        let tokens = self.tokens.clone();
         let Some(ghost) = &mut self.ghost else {
             return;
         };
         let cwd = ghost.workspace.path.clone();
+        let models_token = ghost.models_request.ask(&tokens, ());
 
         ghost.workspace.machine = machine.clone();
         ghost.models = ModelsState::Loading;
-        ghost.models_request = Some(models_token);
         ghost.selected_model = None;
         self.send_command(
             &machine,

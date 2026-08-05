@@ -6,18 +6,16 @@
 use std::collections::HashMap;
 
 use gpui::{
-    div, prelude::*, px, rgb, AnyElement, Context, Div, Entity, Focusable, ScrollHandle,
-    SharedString, Subscription, Window,
+    div, prelude::*, px, rgb, AnyElement, Context, Div, Entity, EventEmitter, Focusable,
+    ScrollHandle, SharedString, Subscription, Window,
 };
 use serde_json::Value;
-use tokio::sync::mpsc::UnboundedSender;
 
 use crate::input::{PromptSubmitted, TextInput};
 use crate::models::{self, ModelChoice, ModelsState};
 use crate::theme;
 use crate::ui;
-use harvester_client_core::bridge::Command;
-use harvester_client_core::{RequestToken, RequestTokens};
+use harvester_client_core::{Pending, RequestToken, RequestTokens};
 
 /// Who said a rendered message. Tool results render as `ToolBlock`s, not
 /// messages; system entries are skipped.
@@ -98,68 +96,78 @@ pub struct Chat {
     /// The model picker modal is open. Rendered by the workbench — the
     /// scrim has to cover the whole window, not just this pane.
     picker_open: bool,
-    /// The request each of this chat's three answers is expected from; an
-    /// answer carrying any other token belongs to a request this chat has
-    /// already superseded (two `set_model`s from a fast double-pick are the
-    /// live case) and is dropped.
-    outstanding: OutstandingRequests,
+    /// The three answers this chat can be waiting on. An answer carrying any
+    /// other token belongs to a request already superseded (two `set_model`s
+    /// from a fast double-pick are the live case) and is dropped.
+    session_models: Pending<()>,
+    session_state: Pending<()>,
+    set_model: Pending<()>,
     /// Focus the prompt input on the next frame (set at creation; render has
     /// the `Window` that focusing needs).
     focus_input: bool,
     input: Entity<TextInput>,
     scroll: ScrollHandle,
-    commands: UnboundedSender<Command>,
+    /// Which machine's bridge serves this session — the workbench routes by
+    /// it. Deliberately the key and not a command sender: `Fleet` replaces a
+    /// machine's bridge wholesale on reconnect, so a sender cloned at attach
+    /// time is dead the moment the machine comes back, and every prompt sent
+    /// through it was swallowed with one line on stderr (found in review). A
+    /// key cannot go stale.
+    machine: String,
     tokens: RequestTokens,
     _input_subscription: Subscription,
 }
 
-/// How a chat reaches its machine's bridge: the command channel plus the
-/// token source that labels the requests it sends. They always travel
-/// together — a command minted from any other source could not be matched to
-/// its answer.
-#[derive(Clone)]
-pub struct BridgeLink {
-    pub commands: UnboundedSender<Command>,
-    pub tokens: RequestTokens,
+/// Which session a chat renders, as opposed to what it renders: identity plus
+/// the two labels the prompt box shows read-only. Grouped because they are
+/// looked up together at attach time and never change afterwards — a running
+/// session does not move machines or repositories.
+pub struct ChatSession {
+    pub sid: String,
+    pub machine: String,
+    pub workspace_label: SharedString,
+    pub machine_label: SharedString,
 }
 
-/// One slot per answer this chat can be waiting on (docs/SPEC.md §Decisions,
-/// C2). `None` = nothing outstanding, so any answer of that kind is stale.
-#[derive(Default)]
-struct OutstandingRequests {
-    session_models: Option<RequestToken>,
-    session_state: Option<RequestToken>,
-    set_model: Option<RequestToken>,
+/// What a chat asks of its machine's bridge. The chat emits; the workbench
+/// looks up the live bridge and sends — see [`Chat::machine`] for why the chat
+/// may not hold the sender itself. Intents rather than `bridge::Command`s
+/// because the workbench is the layer that knows a request's routing (and
+/// because a `Command` is not `Clone`, so an event cannot carry one).
+pub enum ChatRequest {
+    Prompt(String),
+    SetModel {
+        provider: String,
+        model_id: String,
+        token: RequestToken,
+    },
+    /// The prompt box's model control, filled at open: the session's model
+    /// list and its current model. Both queue on pi's in-order stdin.
+    ModelControls {
+        models: RequestToken,
+        state: RequestToken,
+    },
 }
 
-impl OutstandingRequests {
-    /// Consumes the slot: an answer settles the request it answers, so a
-    /// duplicate of it is stale too.
-    fn settles(slot: &mut Option<RequestToken>, token: RequestToken) -> bool {
-        if *slot != Some(token) {
-            return false;
-        }
-
-        *slot = None;
-
-        true
-    }
-}
+impl EventEmitter<ChatRequest> for Chat {}
 
 impl Chat {
     /// `first_prompt` seeds a ghost-chat start: the bridge already sent that
     /// prompt as part of the create → attach chain, so the conversation opens
     /// with it rendered and the turn marked busy.
     pub fn new(
-        sid: String,
-        workspace_label: SharedString,
-        machine_label: SharedString,
+        session: ChatSession,
         entries: &[Value],
         first_prompt: Option<String>,
-        bridge: BridgeLink,
+        tokens: RequestTokens,
         cx: &mut Context<Self>,
     ) -> Self {
-        let BridgeLink { commands, tokens } = bridge;
+        let ChatSession {
+            sid,
+            machine,
+            workspace_label,
+            machine_label,
+        } = session;
         let input = cx.new(|cx| TextInput::new("Message pi — Enter to send", cx));
         let input_subscription = cx.subscribe(&input, Self::handle_prompt_submitted);
         let mut items = items_from_entries(entries);
@@ -172,25 +180,6 @@ impl Chat {
             }));
         }
 
-        // The model control needs the list and the current model; both queue
-        // on pi's in-order stdin. A dead bridge is handled by `Disconnected`.
-        let session_models = tokens.mint();
-        let session_state = tokens.mint();
-        let outstanding = OutstandingRequests {
-            session_models: Some(session_models),
-            session_state: Some(session_state),
-            set_model: None,
-        };
-
-        let _ = commands.send(Command::ListSessionModels {
-            sid: sid.clone(),
-            token: session_models,
-        });
-        let _ = commands.send(Command::GetSessionState {
-            sid: sid.clone(),
-            token: session_state,
-        });
-
         Self {
             sid,
             workspace_label,
@@ -202,11 +191,13 @@ impl Chat {
             models: ModelsState::Loading,
             current_model: None,
             picker_open: false,
-            outstanding,
+            session_models: Pending::default(),
+            session_state: Pending::default(),
+            set_model: Pending::default(),
             focus_input: true,
             input,
             scroll: ScrollHandle::new(),
-            commands,
+            machine,
             tokens,
             _input_subscription: input_subscription,
         }
@@ -214,6 +205,35 @@ impl Chat {
 
     pub fn sid(&self) -> &str {
         &self.sid
+    }
+
+    pub fn machine(&self) -> &str {
+        &self.machine
+    }
+
+    /// Ask for what the prompt box's model control needs. Separate from
+    /// `new` because an entity cannot emit to a subscriber that does not exist
+    /// yet: the workbench subscribes to the chat it just created, then calls
+    /// this.
+    pub fn request_model_controls(&mut self, cx: &mut Context<Self>) {
+        cx.emit(ChatRequest::ModelControls {
+            models: self.session_models.ask(&self.tokens, ()),
+            state: self.session_state.ask(&self.tokens, ()),
+        });
+    }
+
+    /// A resync (`event_gap`, or a reconnect's refetch) answered: the entries
+    /// are authoritative, so they replace what is rendered. Deliberately not a
+    /// new chat entity — rebuilding is what let a late resync clobber the chat
+    /// on screen, discarding the input's contents and its focus with it. The
+    /// in-flight partial message goes because the snapshot supersedes it; the
+    /// next `message_update` carries the whole partial again.
+    pub fn replace_history(&mut self, entries: &[Value], cx: &mut Context<Self>) {
+        self.items = items_from_entries(entries);
+        self.streaming = None;
+
+        self.scroll.scroll_to_bottom();
+        cx.notify();
     }
 
     /// A `ListSessionModels` answered. On failure the control just stays
@@ -224,7 +244,7 @@ impl Chat {
         result: Result<Value, String>,
         cx: &mut Context<Self>,
     ) {
-        if !OutstandingRequests::settles(&mut self.outstanding.session_models, token) {
+        if self.session_models.accept(token).is_none() {
             return;
         }
 
@@ -247,7 +267,7 @@ impl Chat {
         result: Result<Value, String>,
         cx: &mut Context<Self>,
     ) {
-        if !OutstandingRequests::settles(&mut self.outstanding.session_state, token) {
+        if self.session_state.accept(token).is_none() {
             return;
         }
 
@@ -263,7 +283,7 @@ impl Chat {
     /// A `set_model` succeeded; pi's `data` is the full Model object now in
     /// effect (failures surface in the statusbar, workbench-side).
     pub fn handle_model_set(&mut self, token: RequestToken, data: &Value, cx: &mut Context<Self>) {
-        if !OutstandingRequests::settles(&mut self.outstanding.set_model, token) {
+        if self.set_model.accept(token).is_none() {
             return;
         }
 
@@ -299,24 +319,13 @@ impl Chat {
         // A second pick supersedes the first: only the answer to this token
         // may move the label, so a slow reply for the abandoned model cannot
         // land on top of a newer one.
-        let token = self.tokens.mint();
+        let request = ChatRequest::SetModel {
+            provider: choice.provider.clone(),
+            model_id: choice.id.clone(),
+            token: self.set_model.ask(&self.tokens, ()),
+        };
 
-        self.outstanding.set_model = Some(token);
-
-        if self
-            .commands
-            .send(Command::SetModel {
-                sid: self.sid.clone(),
-                provider: choice.provider.clone(),
-                model_id: choice.id.clone(),
-                token,
-            })
-            .is_err()
-        {
-            // Bridge gone; the Disconnected event drives the visible state.
-            eprintln!("harvester: bridge gone; set_model not sent");
-        }
-
+        cx.emit(request);
         cx.notify();
     }
 
@@ -355,18 +364,7 @@ impl Chat {
         }));
         self.busy = true;
 
-        if self
-            .commands
-            .send(Command::Prompt {
-                sid: self.sid.clone(),
-                text: event.0.clone(),
-            })
-            .is_err()
-        {
-            // Bridge gone; the Disconnected event drives the visible state.
-            eprintln!("harvester: bridge gone; prompt not sent");
-        }
-
+        cx.emit(ChatRequest::Prompt(event.0.clone()));
         self.scroll.scroll_to_bottom();
         cx.notify();
     }
