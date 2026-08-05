@@ -8,6 +8,8 @@ A **provider** is a user-supplied executable that answers one question for Harve
 
 Providers are **control plane only**. Session traffic (harvesterd, pi, file pickers, git checks) always flows over plain SSH using the connection info the provider returns. A provider never proxies session data.
 
+A provider also *makes its own connections*: it is a separate program, so Harvester's client-side SSH multiplexing and keepalive policy do not extend to it, and none of it is contract. A provider that talks to a control plane on every `list` pays its own handshake each time (the bundled `exe-dev` does) — acceptable at `list` cadence, and the provider's own call if it wants otherwise.
+
 ## Discovery
 
 ```
@@ -16,7 +18,8 @@ Providers are **control plane only**. Session traffic (harvesterd, pi, file pick
 
 - Executable bit set → registered, `<name>` is the provider id shown in the UI.
 - Non-executable files and dotfiles are ignored.
-- Harvester ships one default provider, `exe-dev`, dropped into this directory on first run — **implemented in the same format as user providers.** There are no privileged code paths.
+- Harvester ships one default provider, `exe-dev`, written into this directory whenever it is **absent** — on first run, and on any later run where it is missing. Implemented in the same format as user providers; there are no privileged code paths.
+  - The consequence, since absence is the only trigger: **deleting the bundled provider does not disable it** — the next launch writes it back. **Clear the executable bit to disable any provider** (non-executable files are ignored by discovery). This applies to the bundled one only; a user provider is never written or modified by Harvester.
 
 ## Transport: one-shot invocations
 
@@ -30,7 +33,7 @@ No resident process, no framing, no handshake. Each operation is one exec:
 
 - **Exit 0** = success, stdout must parse as the operation's result object.
 - **Exit non-zero** = failure; stdout *may* contain `{"error": "human-readable message"}` which is surfaced verbatim in the UI. If stdout is unparseable, Harvester shows a generic failure + captured stderr.
-- **Timeout**: Harvester kills any invocation after **30s** (`create`: **120s**). A timeout is a failure. Implementers must not depend on longer runtimes.
+- **Timeout**: Harvester kills any invocation after **30s** (`create`: **120s**, contract only — see `create`). A timeout is a failure. Implementers must not depend on longer runtimes.
 - stdin is closed after the args object is written. Providers must not prompt or wait for further input.
 - Unknown operations must exit non-zero (Harvester uses this for forward compat).
 
@@ -59,7 +62,7 @@ No stdin args.
 }
 ```
 
-- `protocol` (required): contract version this binary speaks. Harvester rejects providers with a version it doesn't support.
+- `protocol` (required): contract version this binary speaks. **Harvester requires exact equality** with the one version it speaks (`1` today) and refuses everything else, older included — there is no compatibility window, and none is implied by the number being an integer. Forward compatibility is the job of `capabilities`, which is why additive commands never move this field.
 - `capabilities` (required): **the list of optional operations this executable implements, by command name.** This is the composition mechanism of the protocol: every part of the API beyond the mandatory core (`info`, `list`) is an independent capability that a provider opts into, and future protocol additions (e.g. a hypothetical `resize`, `logs`, `stop`) arrive as new capability strings — no version bump needed for additive commands. v1 defines `create` and `delete`. Rules:
   - Mandatory operations (`info`, `list`) are never declared.
   - Declaring a capability promises the command exists and speaks its documented schema.
@@ -101,7 +104,11 @@ No stdin args.
 
   `argv` is a command producing a bidirectional byte stream to the machine's shell (ProxyCommand-style). This is what makes arbitrary platforms wireable without Harvester knowing about them.
 
+  **[NOT IMPLEMENTED]** — the client refuses to derive a target from `{argv}` today. Such machines still *list* (they appear in the sidebar, sourced and labelled) but carry no connection target: they never probe, never bootstrap a daemon, and their dot stays gray. Nothing warns the machine's author, so **a provider returning only `{argv}` machines ships a fleet that cannot connect**; return `{host, user, port}` for anything that must work now. Tracked as deferred in `SPEC.md` §Deferred.
+
 ### `create` — provision a machine
+
+**[NOT IMPLEMENTED]** — deferred with the machine-CRUD slice (the `create_fields` modal and the "+" affordance are the same slice). Harvester never invokes it today, and the 120s timeout below is contract, not code: the only timeout that exists is the 30s general one. The bundled `exe-dev` implements `create` regardless, so the contract below is live-tested by running it in a terminal — it just has no caller inside Harvester yet.
 
 stdin: the values collected from `create_fields`, e.g. `{"name": "vps-work", "cpu": 4}`.
 
@@ -112,6 +119,8 @@ stdin: the values collected from `create_fields`, e.g. `{"name": "vps-work", "cp
 Same machine object shape as `list`. Timeout 120s.
 
 ### `delete` — destroy a machine
+
+**[NOT IMPLEMENTED]** — same slice, same status as `create`.
 
 stdin: `{"id": "vps-work"}` → `{}` on success.
 
@@ -133,7 +142,9 @@ The default provider is approximately a field-renaming wrapper over exe.dev's SS
 - `delete` → `ssh exe.dev rm <id>`
 - Auth rides the user's existing exe.dev SSH key; the provider stores nothing.
 
-It doubles as the contract's living documentation: small enough to read in one sitting, and proof that a shell script is a valid provider. Implemented at `providers/exe-dev` (POSIX sh + `jq`); verified live against exe.dev — full create/list/delete cycle, error paths, and unsafe-name rejection (machine ids travel into a remote command line, so anything outside `[A-Za-z0-9-]` is refused rather than quoted).
+It doubles as the contract's living documentation: small enough to read in one sitting, and proof that a shell script is a valid provider. Implemented at `providers/exe-dev` (POSIX sh + `jq`); verified live against exe.dev — full create/list/delete cycle, error paths, and unsafe-value rejection.
+
+That last one is the rule worth copying into any provider that shells out: **every value that reaches the remote command line is gated on `[A-Za-z0-9-]` and refused rather than quoted** — machine ids, but equally `--cpu` and `--memory`, which travel exactly as far. Refusing is the point: a quoting scheme is a thing to get subtly wrong once, whereas a rejected value is a visible error with an exit code. The gate is `require_safe_value` in the script.
 
 ## Local machine
 
