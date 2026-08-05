@@ -1,6 +1,8 @@
 # Harvester Provider Contract (protocol v1)
 
 > Status: agreed 2026-08-01. Open decisions listed at the bottom; everything else is normative.
+>
+> **Implementation status (2026-08-04).** Normative ≠ built. Harvester implements the mandatory core — discovery, `info` (with the protocol gate), `list`, the 30s timeout — and nothing else. Sections marked **[NOT IMPLEMENTED]** are contract a provider may satisfy today but Harvester will not exercise: `create`, `delete`, and the `{argv}` form of `ssh`. A provider that only implements `info` + `list` returning `{host, user, port}` is fully usable right now; one that relies on a deferred section is not, and the marker is there so that is knowable without reading the client.
 
 A **provider** is a user-supplied executable that answers one question for Harvester: *what machines exist and how do I SSH into them?* — plus machine CRUD.
 
