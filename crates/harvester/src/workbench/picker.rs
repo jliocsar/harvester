@@ -10,35 +10,26 @@
 
 use gpui::{div, prelude::*, px, rgb, Context};
 use harvester_client_core::machines;
-use harvester_client_core::{Host, RemoteDirEntry, RequestToken};
+use harvester_client_core::{Host, Pending, RemoteDirEntry, RequestToken};
 
 use super::Workbench;
 use crate::theme;
 use crate::ui;
 use crate::workbench::MODAL_LIST_HEIGHT;
 
-/// The one host op a folder picker has in flight. One at a time: the rows and
-/// the Add button ignore clicks while a request is out, so the modal never
-/// has two answers to reconcile.
+/// The one host op a folder picker has in flight, and what its answer needs in
+/// order to be applied. One at a time: the rows and the Add button ignore
+/// clicks while a request is out, so the modal never has two answers to
+/// reconcile. The correlating token is [`Pending`]'s, not this enum's.
 enum PickerRequest {
     /// The machine's `$HOME`, which starts the walk — one exec, no daemon.
-    Home(RequestToken),
-    /// A listing, plus the directory it would move the picker to.
+    Home,
+    /// The directory the answer would move the picker to. The request's, never
+    /// the answer's: nothing is echoed back over the wire for it to trust.
     Listing {
-        token: RequestToken,
         path: String,
     },
-    Validation(RequestToken),
-}
-
-impl PickerRequest {
-    fn token(&self) -> RequestToken {
-        match self {
-            PickerRequest::Home(token) => *token,
-            PickerRequest::Listing { token, .. } => *token,
-            PickerRequest::Validation(token) => *token,
-        }
-    }
+    Validation,
 }
 
 /// The add-workspace modal's state (SPEC §Flows "Add workspace"). Its execs
@@ -51,24 +42,31 @@ pub(super) struct FolderPicker {
     /// until `$HOME` answers.
     path: String,
     entries: Vec<RemoteDirEntry>,
-    pending: Option<PickerRequest>,
+    pending: Pending<PickerRequest>,
     /// Listing or validation failure, rendered inside the modal.
     error: Option<String>,
 }
 
 impl FolderPicker {
     fn busy(&self) -> bool {
-        self.pending.is_some()
+        self.pending.is_waiting()
     }
 
-    /// The answer with this token, if it is the one still outstanding —
-    /// consuming the slot, so a duplicate cannot be applied twice.
-    fn take_pending(&mut self, token: RequestToken) -> Option<PickerRequest> {
-        if self.pending.as_ref()?.token() != token {
+    /// The modal's progress note, or `None` when nothing is in flight. Which
+    /// note is a question about the walk, not about the request: an empty path
+    /// means `$HOME` has not landed yet, and that is the only state the user
+    /// needs named. Everything else — a listing, and now the `git rev-parse`
+    /// behind "Add", which used to show nothing at all — is "loading…".
+    fn waiting_note(&self) -> Option<&'static str> {
+        if !self.busy() {
             return None;
         }
 
-        self.pending.take()
+        if self.path.is_empty() {
+            return Some("finding home directory…");
+        }
+
+        Some("loading…")
     }
 }
 
@@ -85,7 +83,7 @@ impl Workbench {
             return;
         };
 
-        if picker.take_pending(token).is_none() {
+        if picker.pending.accept(token).is_none() {
             return;
         }
 
@@ -113,7 +111,7 @@ impl Workbench {
         let Some(picker) = &mut self.picker else {
             return;
         };
-        let Some(PickerRequest::Listing { path, .. }) = picker.take_pending(token) else {
+        let Some(PickerRequest::Listing { path }) = picker.pending.accept(token) else {
             return;
         };
 
@@ -138,7 +136,7 @@ impl Workbench {
             return;
         };
 
-        if picker.take_pending(token).is_none() {
+        if picker.pending.accept(token).is_none() {
             return;
         }
 
@@ -164,7 +162,7 @@ impl Workbench {
             machine,
             path: String::new(),
             entries: Vec::new(),
-            pending: None,
+            pending: Pending::default(),
             error: None,
         });
         self.request_home();
@@ -194,40 +192,48 @@ impl Workbench {
         }
     }
 
-    /// Records what the picker is waiting on. Every picker request goes
-    /// through here, so "one request in flight, matched by its token" holds
-    /// by construction.
-    fn set_picker_pending(&mut self, request: PickerRequest) {
+    /// Where to run and how the answer will be correlated, recorded as the one
+    /// request in flight. Every picker request goes through here, so "one at a
+    /// time, matched by its token" holds by construction. `None` when the
+    /// picker's machine resolves to no host — the reason is already in the
+    /// modal.
+    fn picker_asks(&mut self, request: PickerRequest) -> Option<(Host, RequestToken)> {
+        let host = self.picker_host()?;
+        let tokens = self.tokens.clone();
+        let picker = self.picker.as_mut()?;
+
+        picker.error = None;
+
+        Some((host, picker.pending.ask(&tokens, request)))
+    }
+
+    /// The command never reached the worker, so no answer is coming. Without
+    /// this the modal would stay gated on a request that does not exist.
+    fn picker_request_failed(&mut self) {
         if let Some(picker) = &mut self.picker {
-            picker.error = None;
-            picker.pending = Some(request);
+            picker.pending.cancel();
         }
     }
 
     fn request_home(&mut self) {
-        let Some(host) = self.picker_host() else {
+        let Some((host, token)) = self.picker_asks(PickerRequest::Home) else {
             return;
         };
-        let token = self.tokens.mint();
 
-        if self.send_host_command(machines::Command::ResolveHome { host, token }) {
-            self.set_picker_pending(PickerRequest::Home(token));
+        if !self.send_host_command(machines::Command::ResolveHome { host, token }) {
+            self.picker_request_failed();
         }
     }
 
     fn request_listing(&mut self, path: String) {
-        let Some(host) = self.picker_host() else {
+        let Some((host, token)) = self.picker_asks(PickerRequest::Listing { path: path.clone() })
+        else {
             return;
         };
-        let token = self.tokens.mint();
-        let command = machines::Command::ListDir {
-            host,
-            path: path.clone(),
-            token,
-        };
+        let command = machines::Command::ListDir { host, path, token };
 
-        if self.send_host_command(command) {
-            self.set_picker_pending(PickerRequest::Listing { token, path });
+        if !self.send_host_command(command) {
+            self.picker_request_failed();
         }
     }
 
@@ -276,13 +282,12 @@ impl Workbench {
         }
 
         let path = picker.path.clone();
-        let Some(host) = self.picker_host() else {
+        let Some((host, token)) = self.picker_asks(PickerRequest::Validation) else {
             return;
         };
-        let token = self.tokens.mint();
 
-        if self.send_host_command(machines::Command::ValidateWorkspace { host, path, token }) {
-            self.set_picker_pending(PickerRequest::Validation(token));
+        if !self.send_host_command(machines::Command::ValidateWorkspace { host, path, token }) {
+            self.picker_request_failed();
         }
 
         cx.notify();
@@ -315,7 +320,6 @@ impl Workbench {
         // Nothing to add before `$HOME` lands (or after it failed): the
         // displayed directory is what "Add" would store.
         let can_submit = !picker.busy() && !picker.path.is_empty();
-        let resolving_home = matches!(picker.pending, Some(PickerRequest::Home(_)));
 
         ui::modal_scrim("picker-scrim")
             .on_click(cx.listener(|workbench, _, _, cx| workbench.close_picker(cx)))
@@ -350,29 +354,14 @@ impl Workbench {
                             })
                             .children(directory_rows)
                             .children(file_rows)
-                            .when(resolving_home, |list| {
-                                list.child(
-                                    div()
-                                        .px_2()
-                                        .py_1()
-                                        .text_xs()
-                                        .text_color(rgb(theme::TEXT_FAINT))
-                                        .child("finding home directory…"),
-                                )
-                            })
-                            .when(
-                                matches!(picker.pending, Some(PickerRequest::Listing { .. })),
-                                |list| {
-                                    list.child(
-                                        div()
-                                            .px_2()
-                                            .py_1()
-                                            .text_xs()
-                                            .text_color(rgb(theme::TEXT_FAINT))
-                                            .child("loading…"),
-                                    )
-                                },
-                            ),
+                            .children(picker.waiting_note().map(|note| {
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .text_xs()
+                                    .text_color(rgb(theme::TEXT_FAINT))
+                                    .child(note)
+                            })),
                     )
                     .children(picker.error.clone().map(|error| {
                         div()
@@ -430,9 +419,9 @@ fn parent_remote_path(path: &str) -> String {
     }
 }
 
-/// The picker's two testable halves: the path walk, and the token guard that
-/// decides which answer the modal is allowed to apply. Everything else needs
-/// a gpui context and a machine.
+/// The picker's two testable halves: the path walk, and the context an answer
+/// is applied with. The token guard itself is [`Pending`]'s, and tested there.
+/// Everything else needs a gpui context and a machine.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,58 +448,50 @@ mod tests {
         assert_eq!(parent_remote_path("/home"), "/");
     }
 
-    fn picker_pending(request: PickerRequest) -> FolderPicker {
+    fn idle_picker() -> FolderPicker {
         FolderPicker {
             machine: "exe-dev/bloggy".to_string(),
             path: "/home/exedev".to_string(),
             entries: Vec::new(),
-            pending: Some(request),
+            pending: Pending::default(),
             error: None,
         }
-    }
-
-    #[test]
-    fn only_the_outstanding_request_is_applied() {
-        // The failure this replaces: a picker closed and reopened, or a
-        // second listing of the same path, whose first answer would
-        // otherwise land on the new walk.
-        let tokens = RequestTokens::default();
-        let outstanding = tokens.mint();
-        let superseded = tokens.mint();
-        let mut picker = picker_pending(PickerRequest::Home(outstanding));
-
-        assert!(picker.take_pending(superseded).is_none());
-        assert!(picker.busy(), "a stale answer must not clear the slot");
-        assert!(picker.take_pending(outstanding).is_some());
-        assert!(!picker.busy());
-    }
-
-    #[test]
-    fn an_answer_is_applied_at_most_once() {
-        let token = RequestTokens::default().mint();
-        let mut picker = picker_pending(PickerRequest::Validation(token));
-
-        assert!(picker.take_pending(token).is_some());
-        assert!(
-            picker.take_pending(token).is_none(),
-            "the slot is consumed, so a duplicate answers nothing"
-        );
     }
 
     #[test]
     fn a_listing_carries_the_directory_it_would_move_to() {
         // The path is the request's, not the answer's — nothing is echoed
         // back over the wire for the picker to trust.
-        let token = RequestTokens::default().mint();
-        let mut picker = picker_pending(PickerRequest::Listing {
-            token,
-            path: "/home/exedev/src".to_string(),
-        });
+        let tokens = RequestTokens::default();
+        let mut picker = idle_picker();
+        let token = picker.pending.ask(
+            &tokens,
+            PickerRequest::Listing {
+                path: "/home/exedev/src".to_string(),
+            },
+        );
 
-        let Some(PickerRequest::Listing { path, .. }) = picker.take_pending(token) else {
+        assert!(picker.busy(), "the modal is gated while the answer is out");
+        assert_eq!(picker.waiting_note(), Some("loading…"));
+
+        let Some(PickerRequest::Listing { path }) = picker.pending.accept(token) else {
             panic!("the outstanding request is a listing");
         };
 
         assert_eq!(path, "/home/exedev/src");
+        assert!(!picker.busy());
+    }
+
+    /// The modal must not stay gated on a request that never left: a host
+    /// command the worker refused has no answer coming.
+    #[test]
+    fn a_request_that_never_left_stops_gating_the_modal() {
+        let tokens = RequestTokens::default();
+        let mut picker = idle_picker();
+
+        picker.pending.ask(&tokens, PickerRequest::Home);
+        picker.pending.cancel();
+
+        assert!(!picker.busy());
     }
 }
