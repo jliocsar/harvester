@@ -2,7 +2,6 @@
 //! harvesterd is stateless — pi's session files are the only source of truth).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::session::{Session, SpawnArgs};
@@ -35,12 +34,11 @@ pub struct Daemon {
     inner: Arc<DaemonInner>,
 }
 
-pub struct DaemonInner {
-    pub log_dir: PathBuf,
+struct DaemonInner {
     /// This process's own build fingerprint, computed once at startup and
     /// reported in `ping` (docs/DAEMON.md §ping). Not persisted state — it is
     /// the identity of the running image, and it dies with the process.
-    pub build_fingerprint: String,
+    build_fingerprint: String,
     /// The pid table. std::sync on purpose: no guard is ever held across an
     /// await, and lookups happen on every passthrough.
     sessions: Mutex<HashMap<Sid, Arc<Session>>>,
@@ -50,10 +48,9 @@ pub struct DaemonInner {
 }
 
 impl Daemon {
-    pub fn new(log_dir: PathBuf, build_fingerprint: String) -> Self {
+    pub fn new(build_fingerprint: String) -> Self {
         Daemon {
             inner: Arc::new(DaemonInner {
-                log_dir,
                 build_fingerprint,
                 sessions: Mutex::new(HashMap::new()),
                 request_counter: std::sync::atomic::AtomicU64::new(0),
@@ -61,8 +58,8 @@ impl Daemon {
         }
     }
 
-    pub fn inner(&self) -> &DaemonInner {
-        &self.inner
+    pub fn build_fingerprint(&self) -> &str {
+        &self.inner.build_fingerprint
     }
 
     /// The next `hv-<n>` id for a command the daemon injects into pi. Paired

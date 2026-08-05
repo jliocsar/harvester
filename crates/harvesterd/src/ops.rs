@@ -151,7 +151,7 @@ fn ping(daemon: &Daemon, client_version: u32) -> HarvesterResponse {
 
     data_response(PingData {
         version: harvester_proto::PROTOCOL_VERSION,
-        build: daemon.inner().build_fingerprint.clone(),
+        build: daemon.build_fingerprint().to_string(),
     })
 }
 

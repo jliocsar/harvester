@@ -4,17 +4,20 @@
 //! §Pi version discipline).
 
 use std::io::Write;
-use std::path::Path;
 use std::process::Stdio;
 
 use tokio::process::Command;
 
-use super::SpawnArgs;
-use crate::daemon::Daemon;
+use super::{unix_millis_now, SpawnArgs};
+use crate::paths;
 use crate::sid::Sid;
 
-pub(super) fn create_pi_command(args: &SpawnArgs, daemon: &Daemon) -> std::io::Result<Command> {
-    let stderr_log = open_stderr_log(&daemon.inner().log_dir, &args.sid)?;
+/// A spawn banner is stamped in whole seconds — the unit a `tail` of the log is
+/// read in, and the one the contract names (docs/DAEMON.md §The pi launch line).
+const MILLIS_PER_SECOND: u64 = 1_000;
+
+pub(super) fn create_pi_command(args: &SpawnArgs) -> std::io::Result<Command> {
+    let stderr_log = open_stderr_log(&args.sid)?;
     let mut cli_args: Vec<&str> = vec![
         "--mode",
         "rpc",
@@ -60,15 +63,12 @@ pub(super) fn create_pi_command(args: &SpawnArgs, daemon: &Daemon) -> std::io::R
 /// at when they click resume, and the sole exit-diagnosis channel the contract
 /// gives clients (docs/DAEMON.md §Events). The banner is what makes appended
 /// runs separable in a `tail`.
-fn open_stderr_log(log_dir: &Path, sid: &Sid) -> std::io::Result<std::fs::File> {
+fn open_stderr_log(sid: &Sid) -> std::io::Result<std::fs::File> {
     let mut log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(log_dir.join(format!("{sid}.stderr.log")))?;
-    let started_at_unix_seconds = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|since_epoch| since_epoch.as_secs())
-        .unwrap_or_default();
+        .open(paths::log_dir().join(format!("{sid}.stderr.log")))?;
+    let started_at_unix_seconds = unix_millis_now() / MILLIS_PER_SECOND;
 
     writeln!(
         log,

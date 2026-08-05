@@ -156,7 +156,7 @@ async fn main() {
         sock_path.display()
     );
 
-    let daemon = daemon::Daemon::new(paths::log_dir(), startup_build_fingerprint());
+    let daemon = daemon::Daemon::new(startup_build_fingerprint());
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {

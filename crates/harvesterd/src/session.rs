@@ -122,7 +122,7 @@ pub struct SpawnArgs {
 impl Session {
     /// Callers go through `Daemon::spawn_session`, which owns the pid table.
     pub(crate) fn spawn(args: SpawnArgs, daemon: &Daemon) -> std::io::Result<Arc<Session>> {
-        let mut command = launch::create_pi_command(&args, daemon)?;
+        let mut command = launch::create_pi_command(&args)?;
         let mut child = command.spawn()?;
 
         let stdin = child.stdin.take().expect("piped stdin");
@@ -231,10 +231,6 @@ impl Session {
     }
 }
 
-/// The only holder of pi's stdin: drains queued frames in order, one flush per
-/// frame, so every writer's lines stay whole and in arrival order. Ends when
-/// the last sender is gone (`close_stdin`) or the pipe breaks — dropping the
-/// handle on the way out is what delivers EOF.
 /// Wall-clock milliseconds, in the same units as a session file's mtime so the
 /// two are comparable in one listing. A clock before the epoch reads as 0,
 /// which sorts such a session last rather than failing the listing.
@@ -245,6 +241,10 @@ fn unix_millis_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// The only holder of pi's stdin: drains queued frames in order, one flush per
+/// frame, so every writer's lines stay whole and in arrival order. Ends when
+/// the last sender is gone (`close_stdin`) or the pipe breaks — dropping the
+/// handle on the way out is what delivers EOF.
 async fn pump_stdin(sid: Sid, mut stdin: ChildStdin, mut frames: mpsc::Receiver<Vec<u8>>) {
     while let Some(frame) = frames.recv().await {
         if let Err(error) = stdin.write_all(&frame).await {
