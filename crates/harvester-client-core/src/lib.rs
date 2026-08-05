@@ -40,6 +40,7 @@ pub mod machines;
 mod provider;
 mod ssh;
 mod token;
+pub mod transcript;
 mod workspace;
 
 pub use bootstrap::{bootstrap_and_connect, BootstrapOutcome, Connected};
@@ -59,6 +60,7 @@ pub use provider::{
 };
 pub use ssh::SshTarget;
 pub use token::{Pending, RequestToken, RequestTokens};
+pub use transcript::Transcript;
 pub use workspace::{list_directory, resolve_home, validate_git_workspace, RemoteDirEntry};
 
 pub type Result<T> = std::result::Result<T, Error>;
