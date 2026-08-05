@@ -22,7 +22,7 @@ use serde_json::Value;
 use crate::chat::{Chat, ChatRequest, ChatSession};
 use crate::input::{PromptSubmitted, TextInput};
 use crate::models::ModelChoice;
-use crate::theme;
+use crate::theme::{self, Tone};
 use crate::ui;
 use crate::workspaces::{self, Workspace};
 use ghost::{GhostChat, GhostRequest, MachineCandidate};
@@ -1039,15 +1039,8 @@ impl Workbench {
     /// One `match` over one value: the precedence between a probe verdict and
     /// a daemon link used to live here, in a renderer, reading two maps. It
     /// is the fleet's invariant now.
-    fn machine_dot(&self, key: &str) -> u32 {
-        match self.fleet.state(key) {
-            MachineState::Connected { .. } => theme::STATUS_RUNNING,
-            MachineState::Connecting => theme::STATUS_PENDING,
-            MachineState::ConnectFailed { .. }
-            | MachineState::ConnectionLost
-            | MachineState::Unreachable => theme::STATUS_ERROR,
-            MachineState::Unknown | MachineState::Reachable => theme::TEXT_FAINT,
-        }
+    fn machine_dot(&self, key: &str) -> Tone {
+        present_machine(self.fleet.state(key), key).tone
     }
 
     fn render_session_row(
@@ -1066,9 +1059,9 @@ impl Workbench {
             .opening
             .as_ref()
             .is_some_and(|opening| opening.sid == session.sid);
-        let dot_color = match session.status {
-            SessionStatus::Running => theme::STATUS_RUNNING,
-            SessionStatus::Exited => theme::TEXT_FAINT,
+        let tone = match session.status {
+            SessionStatus::Running => Tone::Live,
+            SessionStatus::Exited => Tone::Idle,
         };
         let title: SharedString = match &session.name {
             Some(name) => name.clone().into(),
@@ -1082,7 +1075,7 @@ impl Workbench {
             ("session", index),
             title,
             workspace_name,
-            dot_color,
+            tone,
             selected,
             opening,
         )
@@ -1108,7 +1101,7 @@ impl Workbench {
         let (hint, color) = match &self.argv_machine {
             Some(machine) => self.argv_machine_hint(machine),
             // No argv machine: the workspace rows are the way in.
-            None => (NO_ARGV_MACHINE_HINT.to_string(), theme::TEXT_FAINT),
+            None => (NO_ARGV_MACHINE_HINT.to_string(), Tone::Idle),
         };
 
         content.child(
@@ -1118,7 +1111,7 @@ impl Workbench {
                 .items_center()
                 .justify_center()
                 .p_4()
-                .text_color(rgb(color))
+                .text_color(rgb(color.color()))
                 .child(hint),
         )
     }
@@ -1126,15 +1119,12 @@ impl Workbench {
     /// The empty content pane when the argv machine has a bridge; a machine
     /// that only ever got probed falls back to the workspace-rows hint,
     /// because there is nothing about its daemon to report yet.
-    fn argv_machine_hint(&self, machine: &str) -> (String, u32) {
-        match self.fleet.state(machine) {
-            MachineState::Connecting => (format!("connecting to {machine}…"), theme::TEXT_FAINT),
-            MachineState::Connected { .. } => ("select a session".to_string(), theme::TEXT_FAINT),
-            MachineState::ConnectFailed { detail } => (detail.clone(), theme::STATUS_ERROR),
-            MachineState::ConnectionLost => ("connection lost".to_string(), theme::STATUS_ERROR),
-            MachineState::Unknown | MachineState::Reachable | MachineState::Unreachable => {
-                (NO_ARGV_MACHINE_HINT.to_string(), theme::TEXT_FAINT)
-            }
+    fn argv_machine_hint(&self, machine: &str) -> (String, Tone) {
+        let display = present_machine(self.fleet.state(machine), machine);
+
+        match display.pane_message {
+            Some(message) => (message, display.tone),
+            None => (NO_ARGV_MACHINE_HINT.to_string(), Tone::Idle),
         }
     }
 
@@ -1240,10 +1230,10 @@ impl Workbench {
     }
 
     fn render_statusbar(&self) -> impl IntoElement {
-        let (link_text, link_color) = self.statusbar_link();
+        let (link_text, link_tone) = self.statusbar_link();
 
         ui::statusbar_frame()
-            .child(div().text_color(rgb(link_color)).child(link_text))
+            .child(div().text_color(rgb(link_tone.color())).child(link_text))
             .child(div().flex_1())
             .children(self.last_error.clone().map(|error| {
                 div()
@@ -1256,7 +1246,7 @@ impl Workbench {
 
     /// Transitional until the machines list (next stage): the argv machine's
     /// link when it has one, else a connected-machine count.
-    fn statusbar_link(&self) -> (String, u32) {
+    fn statusbar_link(&self) -> (String, Tone) {
         if let Some(link) = self.argv_statusbar_link() {
             return link;
         }
@@ -1267,7 +1257,7 @@ impl Workbench {
                 self.fleet.connected_machine_count(),
                 self.fleet.linked_machine_count()
             ),
-            theme::TEXT_FAINT,
+            Tone::Idle,
         )
     }
 
@@ -1275,23 +1265,11 @@ impl Workbench {
     /// the statusbar then shows the fleet-wide count instead. Returning the
     /// absence rather than inventing a string for the probe-only states is
     /// what keeps this a total match over [`MachineState`].
-    fn argv_statusbar_link(&self) -> Option<(String, u32)> {
+    fn argv_statusbar_link(&self) -> Option<(String, Tone)> {
         let machine = self.argv_machine.as_ref()?;
+        let display = present_machine(self.fleet.state(machine), machine);
 
-        match self.fleet.state(machine) {
-            MachineState::Connecting => Some(("connecting…".to_string(), theme::TEXT_FAINT)),
-            MachineState::Connected { daemon_version } => Some((
-                format!("{machine} · harvesterd {daemon_version}"),
-                theme::TEXT_FAINT,
-            )),
-            MachineState::ConnectFailed { .. } => {
-                Some(("connect failed".to_string(), theme::STATUS_ERROR))
-            }
-            MachineState::ConnectionLost => {
-                Some(("connection lost".to_string(), theme::STATUS_ERROR))
-            }
-            MachineState::Unknown | MachineState::Reachable | MachineState::Unreachable => None,
-        }
+        Some((display.statusbar_link?, display.tone))
     }
 }
 
@@ -1371,6 +1349,60 @@ impl Render for Workbench {
 
 fn sid_preview(sid: &str) -> String {
     sid.chars().take(SID_PREVIEW_CHARS).collect()
+}
+
+/// Everything the UI says about one machine's link, decided in one place.
+///
+/// There used to be three matches over [`MachineState`] in this file — the
+/// dot, the empty pane's sentence, the statusbar link — and a fourth would
+/// have been free to disagree with them. A state that means "failed" cannot
+/// now be red in one and gray in another, because the tone is chosen once.
+/// The strings differ per surface because they are different sentences, not
+/// because the state means different things.
+struct MachineDisplay {
+    tone: Tone,
+    /// The content pane's sentence when this machine is the one on screen.
+    /// `None` for the probe-only states: nothing about a daemon to report.
+    pane_message: Option<String>,
+    /// The statusbar's link text, same rule.
+    statusbar_link: Option<String>,
+}
+
+fn present_machine(state: &MachineState, machine: &str) -> MachineDisplay {
+    match state {
+        MachineState::Connecting => MachineDisplay {
+            tone: Tone::Pending,
+            pane_message: Some(format!("connecting to {machine}…")),
+            statusbar_link: Some("connecting…".to_string()),
+        },
+        MachineState::Connected { daemon_version } => MachineDisplay {
+            tone: Tone::Live,
+            pane_message: Some("select a session".to_string()),
+            statusbar_link: Some(format!("{machine} · harvesterd {daemon_version}")),
+        },
+        MachineState::ConnectFailed { detail } => MachineDisplay {
+            tone: Tone::Failed,
+            pane_message: Some(detail.clone()),
+            statusbar_link: Some("connect failed".to_string()),
+        },
+        MachineState::ConnectionLost => MachineDisplay {
+            tone: Tone::Failed,
+            pane_message: Some("connection lost".to_string()),
+            statusbar_link: Some("connection lost".to_string()),
+        },
+        // A probe verdict is not a link: unreachable still reads as failed,
+        // but there is nothing to say about a daemon nobody has reached for.
+        MachineState::Unreachable => MachineDisplay {
+            tone: Tone::Failed,
+            pane_message: None,
+            statusbar_link: None,
+        },
+        MachineState::Unknown | MachineState::Reachable => MachineDisplay {
+            tone: Tone::Idle,
+            pane_message: None,
+            statusbar_link: None,
+        },
+    }
 }
 
 /// Last path component; whole path if there is no separator.

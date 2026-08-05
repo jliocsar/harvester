@@ -18,8 +18,8 @@ mod workbench;
 mod workspaces;
 
 use gpui::{
-    actions, px, size, App, AppContext, Application, Bounds, KeyBinding, TitlebarOptions,
-    WindowBounds, WindowOptions,
+    actions, px, size, App, AppContext, Application, Bounds, KeyBinding, SharedString,
+    TitlebarOptions, WindowBounds, WindowOptions,
 };
 
 use crate::kitchen::Kitchen;
@@ -33,8 +33,35 @@ const EMBEDDED_DAEMON: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/harvest
 /// Dev fallback, relative to the repo-root cwd of `cargo run -p harvester`.
 const DEV_DAEMON_PATH: &str = "target/x86_64-unknown-linux-musl/release/harvesterd";
 
+/// Ask fontconfig for the system monospace family, once, before anything
+/// renders. Here rather than in `ui` because it spawns a subprocess, and a
+/// rendering module that shells out cannot be lifted into a component library
+/// — nor run anywhere a subprocess is unwelcome. `None` leaves `ui` on its own
+/// fallback.
+fn resolve_mono_font_family() -> Option<SharedString> {
+    let fontconfig_match = std::process::Command::new("fc-match")
+        .args(["--format", "%{family}", "monospace"])
+        .output()
+        .ok()?;
+
+    if !fontconfig_match.status.success() || fontconfig_match.stdout.is_empty() {
+        return None;
+    }
+
+    Some(
+        String::from_utf8_lossy(&fontconfig_match.stdout)
+            .trim()
+            .to_string()
+            .into(),
+    )
+}
+
 fn main() {
     let argv_machine = std::env::args().nth(1);
+
+    if let Some(family) = resolve_mono_font_family() {
+        ui::use_mono_font_family(family);
+    }
 
     // The design-system catalog: pure rendering, no bridge, no daemon.
     if argv_machine.as_deref() == Some("kitchen") {

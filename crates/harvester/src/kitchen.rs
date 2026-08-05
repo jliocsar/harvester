@@ -6,7 +6,7 @@
 use gpui::{div, prelude::*, px, rgb, rgba, Context, Entity, Focusable, Window};
 
 use crate::input::TextInput;
-use crate::theme;
+use crate::theme::{self, Tone};
 use crate::ui;
 
 /// Palette swatches, in theme.rs order. `SELECTION_RGBA` is rendered
@@ -302,7 +302,7 @@ fn render_status_dots() -> impl IntoElement {
                 .flex()
                 .items_center()
                 .gap_2()
-                .child(ui::status_dot(theme::STATUS_RUNNING))
+                .child(ui::status_dot(Tone::Live))
                 .child(div().text_xs().child("running")),
         )
         .child(
@@ -310,7 +310,7 @@ fn render_status_dots() -> impl IntoElement {
                 .flex()
                 .items_center()
                 .gap_2()
-                .child(ui::status_dot(theme::TEXT_FAINT))
+                .child(ui::status_dot(Tone::Idle))
                 .child(div().text_xs().child("exited")),
         )
 }
@@ -360,26 +360,26 @@ fn render_machine_rows() -> impl IntoElement {
         .py_1()
         .flex()
         .flex_col()
-        .child(ui::machine_row("local".into(), None, theme::TEXT_FAINT))
+        .child(ui::machine_row("local".into(), None, Tone::Idle))
         .child(ui::machine_row(
             "bloggy".into(),
             Some("exe-dev".into()),
-            theme::STATUS_RUNNING,
+            Tone::Live,
         ))
         .child(ui::machine_row(
             "vps-work".into(),
             Some("exe-dev".into()),
-            theme::STATUS_PENDING,
+            Tone::Pending,
         ))
         .child(ui::machine_row(
             "unreachable".into(),
             Some("fly.io".into()),
-            theme::STATUS_ERROR,
+            Tone::Failed,
         ))
         .child(ui::machine_row(
             "a-machine-with-a-very-long-label.exe.xyz".into(),
             Some("a-provider-with-a-long-name".into()),
-            theme::TEXT_FAINT,
+            Tone::Idle,
         ))
 }
 
@@ -398,7 +398,7 @@ fn render_session_rows() -> impl IntoElement {
             "kitchen-row-selected",
             "Refactor auth".into(),
             "bloggy · egg-by-penguin".into(),
-            theme::STATUS_RUNNING,
+            Tone::Live,
             true,
             false,
         ))
@@ -406,7 +406,7 @@ fn render_session_rows() -> impl IntoElement {
             "kitchen-row-opening",
             "019fc40d".into(),
             "harvester · local".into(),
-            theme::STATUS_RUNNING,
+            Tone::Live,
             false,
             true,
         ))
@@ -414,7 +414,7 @@ fn render_session_rows() -> impl IntoElement {
             "kitchen-row-exited",
             "A very long session title that should ellipsize".into(),
             "some-deeply-nested-workspace-name".into(),
-            theme::TEXT_FAINT,
+            Tone::Idle,
             false,
             false,
         ))
@@ -567,19 +567,19 @@ fn render_chat_messages() -> impl IntoElement {
         .gap_3()
         .child(ui::chat_message(
             "you",
-            theme::ACCENT,
+            Tone::Active,
             "Deploy the fix to staging and run the smoke tests.",
             true,
         ))
         .child(ui::chat_message(
             "pi",
-            theme::TEXT_DIM,
+            Tone::Muted,
             "Running the deploy now.",
             false,
         ))
         .child(ui::chat_message(
             "pi",
-            theme::TEXT_DIM,
+            Tone::Muted,
             "Streaming a partial answer▍",
             false,
         ))
@@ -599,7 +599,7 @@ fn render_tool_blocks() -> impl IntoElement {
             "read, done, collapsed",
             ui::tool_block().child(ui::tool_block_header(
                 "kitchen-tool-read",
-                theme::TEXT_FAINT,
+                Tone::Idle,
                 ui::tool_block_label()
                     .child(ui::tool_block_verb("Read"))
                     .child(ui::tool_block_subject("main.rs".into(), false)),
@@ -611,7 +611,7 @@ fn render_tool_blocks() -> impl IntoElement {
             ui::tool_block()
                 .child(ui::tool_block_header(
                     "kitchen-tool-bash-running",
-                    theme::ACCENT,
+                    Tone::Active,
                     ui::tool_block_label()
                         .child(ui::tool_block_verb("$"))
                         .child(ui::tool_block_subject(
@@ -636,7 +636,7 @@ fn render_tool_blocks() -> impl IntoElement {
             ui::tool_block()
                 .child(ui::tool_block_header(
                     "kitchen-tool-edit",
-                    theme::TEXT_FAINT,
+                    Tone::Idle,
                     ui::tool_block_label()
                         .child(ui::tool_block_verb("Edit"))
                         .child(ui::tool_block_subject("demo.txt".into(), false))
@@ -669,7 +669,7 @@ fn render_tool_blocks() -> impl IntoElement {
             ui::tool_block()
                 .child(ui::tool_block_header(
                     "kitchen-tool-write",
-                    theme::TEXT_FAINT,
+                    Tone::Idle,
                     ui::tool_block_label()
                         .child(ui::tool_block_verb("Write"))
                         .child(ui::tool_block_subject("fresh.txt".into(), false))
@@ -698,7 +698,7 @@ fn render_tool_blocks() -> impl IntoElement {
             ui::tool_block()
                 .child(ui::tool_block_header(
                     "kitchen-tool-bash-error",
-                    theme::STATUS_ERROR,
+                    Tone::Failed,
                     ui::tool_block_label()
                         .child(ui::tool_block_verb("$"))
                         .child(ui::tool_block_subject("grep beta fresh.txt".into(), true)),
@@ -718,7 +718,7 @@ fn render_tool_blocks() -> impl IntoElement {
             ui::tool_block()
                 .child(ui::tool_block_header(
                     "kitchen-tool-truncated",
-                    theme::TEXT_FAINT,
+                    Tone::Idle,
                     ui::tool_block_label().child(ui::tool_block_verb("$")).child(
                         ui::tool_block_subject(
                             "cat a-file-with-an-unreasonably-long-name-that-should-ellipsize-cleanly-in-the-header.log"
@@ -744,7 +744,7 @@ fn render_tool_blocks() -> impl IntoElement {
             "unknown tool: name + compact args",
             ui::tool_block().child(ui::tool_block_header(
                 "kitchen-tool-unknown",
-                theme::TEXT_FAINT,
+                Tone::Idle,
                 ui::tool_block_label()
                     .child(ui::tool_block_verb("browser_navigate"))
                     .child(ui::tool_block_subject(

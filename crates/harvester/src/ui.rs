@@ -10,12 +10,12 @@ use gpui::{
     div, prelude::*, px, rgb, rgba, AnyElement, Div, ElementId, FontWeight, SharedString, Stateful,
 };
 
-use crate::theme;
+use crate::theme::{self, Tone};
 
 /// Statusbar height; the workbench and the kitchen sample must agree.
-pub const STATUSBAR_HEIGHT: f32 = 26.;
+const STATUSBAR_HEIGHT: f32 = 26.;
 /// Modal panel width — wide enough for a path, narrow enough to stay a dialog.
-pub const MODAL_WIDTH: f32 = 420.;
+const MODAL_WIDTH: f32 = 420.;
 
 /// Sidebar section label ("MACHINES", "SESSIONS", …) — Apple-sidebar style:
 /// small, semibold, faint. Collapsible: the whole row is the toggle (caller
@@ -44,9 +44,13 @@ pub fn section_chevron(expanded: bool) -> Div {
     div().flex_none().child(if expanded { "▾" } else { "▸" })
 }
 
-/// Session liveness indicator (`STATUS_RUNNING` green / `TEXT_FAINT` exited).
-pub fn status_dot(color: u32) -> Div {
-    div().flex_none().size(px(6.)).rounded_full().bg(rgb(color))
+/// The one dot: a machine's link, a session's liveness, a tool call's status.
+pub fn status_dot(tone: Tone) -> Div {
+    div()
+        .flex_none()
+        .size(px(6.))
+        .rounded_full()
+        .bg(rgb(tone.color()))
 }
 
 pub enum ButtonKind {
@@ -101,7 +105,7 @@ pub fn session_row(
     id: impl Into<ElementId>,
     title: SharedString,
     workspace_name: SharedString,
-    dot_color: u32,
+    dot: Tone,
     selected: bool,
     opening: bool,
 ) -> Stateful<Div> {
@@ -122,7 +126,7 @@ pub fn session_row(
                 .flex()
                 .items_center()
                 .gap_2()
-                .child(status_dot(dot_color))
+                .child(status_dot(dot))
                 .child(div().overflow_hidden().text_ellipsis().child(title))
                 .when(opening, |row| {
                     row.child(
@@ -149,7 +153,7 @@ pub fn session_row(
 /// the local row — it comes from nowhere). Dot semantics live with the
 /// caller (SPEC §UI machine dots); the probe is Harvester's own SSH check,
 /// never provider-reported status (SPEC §Machine).
-pub fn machine_row(label: SharedString, detail: Option<SharedString>, dot_color: u32) -> Div {
+pub fn machine_row(label: SharedString, detail: Option<SharedString>, dot: Tone) -> Div {
     div()
         // Same 6+6 inset as session_row, aligning with section_header text.
         .mx(px(6.))
@@ -162,7 +166,7 @@ pub fn machine_row(label: SharedString, detail: Option<SharedString>, dot_color:
                 .flex()
                 .items_center()
                 .gap_2()
-                .child(status_dot(dot_color))
+                .child(status_dot(dot))
                 .child(div().overflow_hidden().text_ellipsis().child(label)),
         )
         .children(detail.map(|detail| {
@@ -179,7 +183,7 @@ pub fn machine_row(label: SharedString, detail: Option<SharedString>, dot_color:
 /// One chat message: author label over the text; user messages get a bubble.
 pub fn chat_message(
     author: &'static str,
-    author_color: u32,
+    author_tone: Tone,
     text: impl Into<SharedString>,
     bubble: bool,
 ) -> Div {
@@ -187,7 +191,12 @@ pub fn chat_message(
         .flex()
         .flex_col()
         .gap_1()
-        .child(div().text_xs().text_color(rgb(author_color)).child(author))
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(author_tone.color()))
+                .child(author),
+        )
         .child(
             div()
                 .when(bubble, |style| {
@@ -405,32 +414,24 @@ pub fn picker_file_row(name: SharedString) -> Div {
         .child(name)
 }
 
-/// The system monospace family for tool-block bodies. gpui matches font
-/// families by exact name — there is no generic "monospace" resolution — so
-/// ask fontconfig once and cache the answer for the process's lifetime.
-pub fn mono_font_family() -> SharedString {
-    static FAMILY: OnceLock<SharedString> = OnceLock::new();
-
-    FAMILY
-        .get_or_init(|| {
-            let fontconfig_match = std::process::Command::new("fc-match")
-                .args(["--format", "%{family}", "monospace"])
-                .output();
-
-            match fontconfig_match {
-                Ok(output) if output.status.success() && !output.stdout.is_empty() => {
-                    String::from_utf8_lossy(&output.stdout)
-                        .trim()
-                        .to_string()
-                        .into()
-                }
-                // No fontconfig (macOS) or it failed: a family every macOS
-                // ships; on Linux a miss falls back to gpui's default font.
-                _ => "Menlo".into(),
-            }
-        })
-        .clone()
+/// The monospace family tool-block bodies render in. gpui matches families by
+/// exact name — there is no generic "monospace" resolution — so someone has to
+/// resolve one; that someone is the **application**, at startup
+/// ([`main::resolve_mono_font_family`]), because asking the system means
+/// spawning a subprocess and a rendering module must not do that.
+///
+/// Unset, it answers `Menlo`: a family every macOS ships, and on Linux a miss
+/// falls back to gpui's own default — so the components stay usable (the
+/// kitchen catalog, a test) without an application around them.
+pub fn use_mono_font_family(family: SharedString) {
+    let _ = MONO_FONT_FAMILY.set(family);
 }
+
+pub fn mono_font_family() -> SharedString {
+    MONO_FONT_FAMILY.get().cloned().unwrap_or("Menlo".into())
+}
+
+static MONO_FONT_FAMILY: OnceLock<SharedString> = OnceLock::new();
 
 /// A tool-call block (SPEC §Rendering pi): rounded bordered card holding a
 /// `tool_block_header` and, when expanded, a `tool_block_body`. Sits on the
@@ -451,7 +452,7 @@ pub fn tool_block() -> Div {
 /// toggle expansion. Dot color: accent = running, faint = done, red = error.
 pub fn tool_block_header(
     id: impl Into<ElementId>,
-    dot_color: u32,
+    dot: Tone,
     label: Div,
     expanded: bool,
 ) -> Stateful<Div> {
@@ -464,7 +465,7 @@ pub fn tool_block_header(
         .gap_2()
         .cursor_pointer()
         .hover(|style| style.bg(rgb(theme::ROW_HOVER)))
-        .child(status_dot(dot_color))
+        .child(status_dot(dot))
         .child(label.flex_1().min_w(px(0.)))
         .child(
             div()

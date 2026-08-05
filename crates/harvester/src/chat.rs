@@ -14,7 +14,7 @@ use serde_json::Value;
 use crate::input::{PromptSubmitted, TextInput};
 use crate::model_control::ModelControl;
 use crate::models::{self, ModelChoice};
-use crate::theme;
+use crate::theme::{self, Tone};
 use crate::ui;
 use harvester_client_core::transcript::{Item, Message, Role, ToolBlock, ToolStatus, Transcript};
 use harvester_client_core::{Pending, RequestToken, RequestTokens};
@@ -350,16 +350,18 @@ impl Chat {
         block: &ToolBlock,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let dot_color = match block.status {
-            ToolStatus::Running => theme::ACCENT,
-            ToolStatus::Ok => theme::TEXT_FAINT,
-            ToolStatus::Error => theme::STATUS_ERROR,
+        let tone = match block.status {
+            // Running is the accent, not "pending": a tool the user is
+            // watching run is the live thing on screen.
+            ToolStatus::Running => Tone::Active,
+            ToolStatus::Ok => Tone::Idle,
+            ToolStatus::Error => Tone::Failed,
         };
         let expanded = self.expanded.contains(&block.tool_call_id);
         let tool_call_id = block.tool_call_id.clone();
         let header = ui::tool_block_header(
             ("tool-block", index),
-            dot_color,
+            tone,
             tool_block_label(block),
             expanded,
         )
@@ -380,7 +382,7 @@ impl Chat {
             (None, false) => return None,
         };
 
-        Some(ui::chat_message("pi", theme::TEXT_DIM, text, false))
+        Some(ui::chat_message("pi", Tone::Muted, text, false))
     }
 
     /// The send button's path; Enter inside the input reaches the same
@@ -491,14 +493,14 @@ impl Render for Chat {
 }
 
 fn render_message(message: &Message) -> impl IntoElement {
-    let (label, label_color) = match message.role {
-        Role::User => ("you", theme::ACCENT),
-        Role::Assistant => ("pi", theme::TEXT_DIM),
+    let (label, tone) = match message.role {
+        Role::User => ("you", Tone::Active),
+        Role::Assistant => ("pi", Tone::Muted),
     };
 
     ui::chat_message(
         label,
-        label_color,
+        tone,
         message.text.clone(),
         message.role == Role::User,
     )

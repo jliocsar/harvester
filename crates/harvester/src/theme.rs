@@ -52,3 +52,41 @@ pub const SCRIM_RGBA: u32 = 0x00000080;
 pub const ROW_HOVER: u32 = 0x232325;
 /// Sidebar selection pill (Apple uses a gray pill; accent stays for text).
 pub const ROW_SELECTED: u32 = 0x3a3a3c;
+
+/// What a component is being told about its subject — the vocabulary that
+/// crosses the seam into `ui`, in place of the pixels it used to carry. A
+/// component handed `0x30d158` has had a theme decision made for it by its
+/// caller and can never be re-themed; one handed [`Tone::Live`] has not.
+///
+/// Deliberately small, and named for meaning rather than for colour: `Live`
+/// rather than `Green`, because the day a theme paints "live" differently is
+/// the day the name has to survive it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    /// Present, but not what the user is looking for: secondary labels.
+    Muted,
+    /// Backgrounded: an unprobed machine, a tool that has finished.
+    Idle,
+    /// What the user is doing right now.
+    Active,
+    /// Working; the outcome is not known yet.
+    Pending,
+    /// Confirmed good — a connected daemon, a running session.
+    Live,
+    /// Failed, and the user needs to see that it did.
+    Failed,
+}
+
+impl Tone {
+    /// The one place a meaning becomes a colour.
+    pub fn color(self) -> u32 {
+        match self {
+            Tone::Muted => TEXT_DIM,
+            Tone::Idle => TEXT_FAINT,
+            Tone::Active => ACCENT,
+            Tone::Pending => STATUS_PENDING,
+            Tone::Live => STATUS_RUNNING,
+            Tone::Failed => STATUS_ERROR,
+        }
+    }
+}
