@@ -120,7 +120,6 @@ impl SshInfo {
     }
 }
 
-/// `~/.harvester/providers`.
 fn providers_dir() -> Result<PathBuf> {
     match std::env::var_os("HOME") {
         Some(home) => Ok(PathBuf::from(home).join(".harvester/providers")),
@@ -432,7 +431,6 @@ mod tests {
 
     use serde_json::json;
 
-    /// A `list` result carrying `entries` verbatim.
     fn list_result(entries: Value) -> Value {
         json!({ "machines": entries })
     }

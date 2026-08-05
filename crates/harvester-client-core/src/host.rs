@@ -112,7 +112,6 @@ impl ExecOutput {
         })
     }
 
-    /// One-line failure description for error messages.
     pub(crate) fn describe_failure(&self) -> String {
         format!("{} — {}", self.status, self.stderr.trim())
     }
@@ -153,7 +152,6 @@ pub(crate) async fn run(
             if let Err(error) = stdin.write_all(&data).await {
                 eprintln!("exec: writing stdin failed: {error}");
             }
-            // Dropping the handle is what delivers EOF.
         })
     });
 

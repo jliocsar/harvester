@@ -322,7 +322,6 @@ async fn bridge_main(
     }
 }
 
-/// One event off the [`DaemonClient`].
 fn handle_session_event(context: &BridgeContext, event: SessionEvent) {
     match event {
         SessionEvent::Pi { sid, event } => handle_live_pi_event(context, sid, event),

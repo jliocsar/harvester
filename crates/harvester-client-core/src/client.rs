@@ -85,8 +85,7 @@ impl DaemonClient {
             }
 
             // Dropping the sender closes the event channel: that *is* the
-            // death notice, and the only one — a variant saying the same thing
-            // arrived immediately before it and had to mean exactly it.
+            // death notice, and the only one.
             routing_client.fail_all_pending();
         });
 
