@@ -5,27 +5,22 @@
 //! [`Fleet`], which owns the bridge pool, the machine table, the probe
 //! verdicts and the connect policy. What is left here reads a machine's one
 //! [`MachineState`] and renders it, routes commands by machine key, and keeps
-//! the surfaces (ghost chat, chat, pickers) the user actually touches.
+//! the surfaces (the chat, the pickers) the user actually touches.
 
-mod ghost;
 mod picker;
 
-use gpui::{
-    div, prelude::*, px, rgb, Context, Entity, Focusable, SharedString, Subscription, Window,
-};
+use gpui::{div, prelude::*, px, rgb, Context, Entity, SharedString, Subscription, Window};
 use harvester_client_core::{
     BridgeEvents, Fleet, MachineState, MachinesEvents, RequestToken, RequestTokens, LOCAL_MACHINE,
 };
 use harvester_proto::{SessionInfo, SessionStatus};
 use serde_json::Value;
 
-use crate::chat::{Chat, ChatRequest, ChatSession};
-use crate::input::{PromptSubmitted, TextInput};
+use crate::chat::{Chat, ChatRequest, ChatTarget, MachineCandidate};
 use crate::models::ModelChoice;
 use crate::theme::{self, Tone};
 use crate::ui;
-use crate::workspaces::{self, Workspace};
-use ghost::{GhostChat, GhostRequest, MachineCandidate};
+use crate::workspaces::{self, folder_name, Workspace};
 use harvester_client_core::bridge::{Command, Event as BridgeEvent};
 use harvester_client_core::machines;
 use picker::FolderPicker;
@@ -69,7 +64,6 @@ pub struct Workbench {
     /// The add-workspace flow's first step when several machines qualify:
     /// "which machine?" — the folder picker follows the choice.
     machine_picker_open: bool,
-    ghost: Option<GhostChat>,
     /// The session we asked a bridge to open, until `Attached` promotes it to
     /// a chat (also the "don't double-open" guard). Carries the machine as
     /// well as the sid because it is cleared by *that machine's* failures:
@@ -80,6 +74,9 @@ pub struct Workbench {
     machines_collapsed: bool,
     workspaces_collapsed: bool,
     sessions_collapsed: bool,
+    /// The one open conversation, whether or not a session exists behind it
+    /// yet — an unstarted chat is the same entity in an earlier state (see
+    /// [`Chat`]), so there is nothing else here for it to be.
     chat: Option<Entity<Chat>>,
     /// Keeps [`Workbench::handle_chat_request`] subscribed for as long as the
     /// chat it belongs to is the open one; dropped with the next chat's.
@@ -110,7 +107,6 @@ impl Workbench {
             workspaces: workspaces::load(),
             picker: None,
             machine_picker_open: false,
-            ghost: None,
             opening: None,
             machines_collapsed: false,
             workspaces_collapsed: false,
@@ -253,48 +249,60 @@ impl Workbench {
             // The link state was the fleet's, and it took it; a successful
             // connect asks nothing else of this window.
             BridgeEvent::Connected { .. } => {}
-            BridgeEvent::ConnectFailed { detail } => self.abort_machine_flows(machine, &detail),
+            BridgeEvent::ConnectFailed { detail } => self.abort_machine_flows(machine, &detail, cx),
             BridgeEvent::Sessions(sessions) => self.handle_sessions_listed(machine, sessions),
             BridgeEvent::Attached { sid, entries } => {
                 self.handle_attached(machine, sid, entries, cx)
             }
             BridgeEvent::HistoryReplaced { sid, entries } => {
-                self.handle_history_replaced(sid, entries, cx)
+                self.with_chat(&sid, cx, |chat, cx| chat.replace_history(&entries, cx))
+            }
+            BridgeEvent::HistoryExtended { sid, entries } => {
+                self.with_chat(&sid, cx, |chat, cx| chat.extend_history(&entries, cx))
             }
             BridgeEvent::Pi { sid, event } => self.handle_pi_event(sid, event, cx),
             BridgeEvent::SessionExit { sid, exit_code } => {
                 self.handle_session_exit(sid, exit_code, cx)
             }
-            BridgeEvent::RequestFailed { detail } => self.handle_request_failed(machine, detail),
-            BridgeEvent::ModelsListed { token, result } => self.handle_models_listed(token, result),
+            BridgeEvent::RequestFailed { detail } => {
+                self.handle_request_failed(machine, detail, cx)
+            }
+            BridgeEvent::ModelsListed { token, result } => {
+                self.handle_models_listed(machine, token, result, cx)
+            }
             BridgeEvent::SessionModelsListed { sid, token, result } => {
-                self.handle_session_models_listed(sid, token, result, cx)
+                self.with_chat(&sid, cx, |chat, cx| {
+                    chat.handle_models_listed(token, result, cx)
+                })
             }
             BridgeEvent::SessionState { sid, token, result } => {
-                self.handle_session_state(sid, token, result, cx)
+                self.with_chat(&sid, cx, |chat, cx| {
+                    chat.handle_session_state(token, result, cx)
+                })
             }
             BridgeEvent::ModelSet { sid, token, result } => {
                 self.handle_model_set(sid, token, result, cx)
             }
-            BridgeEvent::Disconnected => self.abort_machine_flows(machine, "connection lost"),
+            BridgeEvent::Disconnected => self.abort_machine_flows(machine, "connection lost", cx),
         }
 
         cx.notify();
     }
 
     /// Commands queued for this machine died with its bridge: give up on an
-    /// open *on this machine*, return any ghost start on it to editable, and
-    /// fail its pending model fetch. Every clause is machine-scoped — another
+    /// open *on this machine* and tell a chat targeting it that nothing it
+    /// asked for will arrive. Every clause is machine-scoped — another
     /// machine's sessions are unaffected by this one losing its bridge.
-    fn abort_machine_flows(&mut self, machine: &str, detail: &str) {
+    fn abort_machine_flows(&mut self, machine: &str, detail: &str, cx: &mut Context<Self>) {
         self.abandon_open_on(machine);
-        self.abandon_ghost_start_on(machine);
 
-        if let Some(ghost) = &mut self.ghost {
-            if ghost.workspace().machine == machine {
-                ghost.fail_models(detail.to_string());
-            }
-        }
+        let Some(chat) = self.chat_on(machine, cx) else {
+            return;
+        };
+
+        chat.update(cx, |chat, cx| {
+            chat.fail_pending_requests(detail.to_string(), cx)
+        });
     }
 
     /// Stop waiting for an open on `machine`. An open on any other machine is
@@ -309,17 +317,15 @@ impl Workbench {
         }
     }
 
-    /// Return a ghost start on `machine` to editable so the user can retry; a
-    /// fresh sid is minted on the next submit. Scoped to the machine that
-    /// failed: a ghost whose own create → attach → prompt chain is still in
-    /// flight elsewhere must keep waiting, or the retry mints a second sid and
-    /// starts a second pi for one prompt.
-    fn abandon_ghost_start_on(&mut self, machine: &str) {
-        if let Some(ghost) = &mut self.ghost {
-            if ghost.workspace().machine == machine {
-                ghost.abandon_start();
-            }
-        }
+    /// The open chat, if it targets `machine`. Scoping by machine is what
+    /// keeps one machine's failure from cancelling a start still in flight on
+    /// another — without it a retry mints a second sid and starts a second pi
+    /// for one prompt.
+    fn chat_on(&self, machine: &str, cx: &Context<Self>) -> Option<Entity<Chat>> {
+        self.chat
+            .as_ref()
+            .filter(|chat| chat.read(cx).machine() == machine)
+            .cloned()
     }
 
     fn handle_sessions_listed(&mut self, machine: &str, sessions: Vec<SessionInfo>) {
@@ -356,25 +362,21 @@ impl Workbench {
         self.set_session_status(&sid, SessionStatus::Running);
         self.abandon_open_on(machine);
 
-        let first_prompt = self.take_started_ghost(&sid);
-        let machine_label: SharedString = self.fleet.label(machine).into();
-        // The session is in the list by now (a ghost start just inserted its
-        // row above); its cwd names the repository in the prompt box.
-        let workspace_label: SharedString = self
-            .sessions
-            .iter()
-            .find(|session| session.info.sid == sid)
-            .map(|session| folder_name(&session.info.cwd).to_string())
-            .unwrap_or_default()
-            .into();
+        // The chat that minted this sid is already on screen with the user's
+        // first prompt rendered in it, so it is promoted in place. Building a
+        // fresh entity here would throw away the pane they are already
+        // watching — the same mistake C7 fixed for resyncs.
+        if let Some(chat) = self.take_starting_chat(&sid, cx) {
+            chat.update(cx, |chat, cx| {
+                chat.promote_to_live(sid, &entries, cx);
+                chat.request_model_controls(cx);
+            });
 
-        let session = ChatSession {
-            sid,
-            machine: machine.to_string(),
-            workspace_label,
-            machine_label,
-        };
-        let chat = cx.new(|cx| Chat::new(session, &entries, first_prompt, self.tokens.clone(), cx));
+            return;
+        }
+
+        let target = self.chat_target(machine, &sid);
+        let chat = cx.new(|cx| Chat::live(sid, target, &entries, self.tokens.clone(), cx));
 
         // Subscribe before the chat asks for anything: an entity cannot emit
         // to a subscriber that does not exist yet.
@@ -383,24 +385,25 @@ impl Workbench {
         self.chat = Some(chat);
     }
 
-    /// A resync answered (docs/DAEMON.md §Events, `event_gap`): the entries
-    /// replace what the open chat renders. Never a new chat entity — that is
-    /// what let a late resync clobber the chat on screen, taking the user's
-    /// half-typed prompt and its focus with it.
-    fn handle_history_replaced(
-        &mut self,
-        sid: String,
-        entries: Vec<Value>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(chat) = self.chat_for(&sid, cx) else {
-            return;
-        };
+    /// Where a chat for `sid` runs, as the sidebar knows it. The session is in
+    /// the list by now — a start inserts its row before `Attached` lands, and
+    /// an open can only have come from a row that was already there.
+    fn chat_target(&self, machine: &str, sid: &str) -> ChatTarget {
+        let workspace_path = self
+            .sessions
+            .iter()
+            .find(|session| session.info.sid == sid)
+            .map(|session| session.info.cwd.clone())
+            .unwrap_or_default();
 
-        chat.update(cx, |chat, cx| chat.replace_history(&entries, cx));
+        ChatTarget {
+            machine: machine.to_string(),
+            machine_label: self.fleet.label(machine).into(),
+            workspace_path,
+        }
     }
 
-    /// The chat holds no command sender (see [`Chat::machine`]), so every
+    /// The chat holds no command sender (see [`ChatTarget::machine`]), so every
     /// request it makes is routed here against the bridge that is live *now*.
     /// A machine with no usable bridge is the case that used to vanish: the
     /// prompt was rendered, the turn went busy, and the send failed into
@@ -411,13 +414,9 @@ impl Workbench {
         request: &ChatRequest,
         cx: &mut Context<Self>,
     ) {
-        let (machine, sid) = {
-            let chat = chat.read(cx);
+        let machine = chat.read(cx).machine().to_string();
 
-            (chat.machine().to_string(), chat.sid().to_string())
-        };
-
-        if !self.fleet.state(&machine).is_live() {
+        if !self.machine_ready_for(request, &machine) {
             let detail = format!(
                 "{}: not connected — nothing was sent",
                 self.fleet.label(&machine)
@@ -427,7 +426,9 @@ impl Workbench {
             // model-list request records as outstanding when it is *made*
             // (`Pending::ask`), so a chat whose request was never sent would
             // sit on "loading models…" for the life of the pane.
-            chat.update(cx, |chat, cx| chat.fail_model_list(detail.clone(), cx));
+            chat.update(cx, |chat, cx| {
+                chat.fail_pending_requests(detail.clone(), cx)
+            });
             self.last_error = Some(detail);
             cx.notify();
 
@@ -435,27 +436,62 @@ impl Workbench {
         }
 
         match request {
-            ChatRequest::Prompt(text) => self.send_command(
+            ChatRequest::ListModels { cwd, token } => self.send_command(
+                &machine,
+                Command::ListModels {
+                    cwd: cwd.clone(),
+                    token: *token,
+                },
+            ),
+            ChatRequest::Start {
+                sid,
+                cwd,
+                provider,
+                model,
+                name,
+                first_prompt,
+            } => {
+                // The open guard goes up against the session the chat just
+                // minted: the sidebar spinner reads it, and only a failure
+                // naming this machine may clear it.
+                self.opening = Some(OpeningSession {
+                    machine: machine.clone(),
+                    sid: sid.clone(),
+                });
+                self.send_command(
+                    &machine,
+                    Command::StartSession {
+                        sid: sid.clone(),
+                        cwd: cwd.clone(),
+                        provider: provider.clone(),
+                        model: model.clone(),
+                        name: name.clone(),
+                        first_prompt: first_prompt.clone(),
+                    },
+                );
+            }
+            ChatRequest::Prompt { sid, text } => self.send_command(
                 &machine,
                 Command::Prompt {
-                    sid,
+                    sid: sid.clone(),
                     text: text.clone(),
                 },
             ),
             ChatRequest::SetModel {
+                sid,
                 provider,
                 model_id,
                 token,
             } => self.send_command(
                 &machine,
                 Command::SetModel {
-                    sid,
+                    sid: sid.clone(),
                     provider: provider.clone(),
                     model_id: model_id.clone(),
                     token: *token,
                 },
             ),
-            ChatRequest::ModelControls { models, state } => {
+            ChatRequest::ModelControls { sid, models, state } => {
                 self.send_command(
                     &machine,
                     Command::ListSessionModels {
@@ -463,56 +499,68 @@ impl Workbench {
                         token: *models,
                     },
                 );
-                self.send_command(&machine, Command::GetSessionState { sid, token: *state });
+                self.send_command(
+                    &machine,
+                    Command::GetSessionState {
+                        sid: sid.clone(),
+                        token: *state,
+                    },
+                );
             }
         }
 
         cx.notify();
     }
 
-    fn handle_pi_event(&mut self, sid: String, event: Value, cx: &mut Context<Self>) {
-        if let Some(chat) = self.chat_for(&sid, cx) {
-            chat.update(cx, |chat, cx| chat.handle_pi_event(&event, cx));
+    /// Whether `machine` can carry this request now. The two halves of a chat
+    /// want different answers: a chat with no session yet connects lazily and
+    /// lets its commands queue in the bridge channel behind the bootstrap
+    /// (SPEC §Flows "Start session" — no readiness gate), while a live one
+    /// refuses to send into a bridge that is not up, because a prompt that
+    /// fails into stderr looks to the user exactly like one pi ignored.
+    fn machine_ready_for(&mut self, request: &ChatRequest, machine: &str) -> bool {
+        if request.is_pre_session() {
+            return self.ensure_connection(machine);
         }
+
+        self.fleet.state(machine).is_live()
+    }
+
+    fn handle_pi_event(&mut self, sid: String, event: Value, cx: &mut Context<Self>) {
+        self.with_chat(&sid, cx, |chat, cx| chat.handle_pi_event(&event, cx));
     }
 
     fn handle_session_exit(&mut self, sid: String, exit_code: Option<i32>, cx: &mut Context<Self>) {
         self.set_session_status(&sid, SessionStatus::Exited);
-
-        if let Some(chat) = self.chat_for(&sid, cx) {
-            chat.update(cx, |chat, cx| chat.handle_session_exit(exit_code, cx));
-        }
+        self.with_chat(&sid, cx, |chat, cx| chat.handle_session_exit(exit_code, cx));
     }
 
-    fn handle_request_failed(&mut self, machine: &str, detail: String) {
+    fn handle_request_failed(&mut self, machine: &str, detail: String, cx: &mut Context<Self>) {
         self.abandon_open_on(machine);
-        self.abandon_ghost_start_on(machine);
+
+        if let Some(chat) = self.chat_on(machine, cx) {
+            chat.update(cx, Chat::abandon_start);
+        }
 
         self.last_error = Some(format!("{machine}: {detail}"));
     }
 
-    fn handle_session_models_listed(
+    /// A `list_models` answered (the unstarted chat's throwaway pi). Routed by
+    /// machine, not sid, because the chat that asked has no session yet; a
+    /// chat that has since been retargeted is waiting on a different token, so
+    /// the abandoned request's answer is dropped by the control itself.
+    fn handle_models_listed(
         &mut self,
-        sid: String,
+        machine: &str,
         token: RequestToken,
         result: Result<Value, String>,
         cx: &mut Context<Self>,
     ) {
-        if let Some(chat) = self.chat_for(&sid, cx) {
-            chat.update(cx, |chat, cx| chat.handle_session_models(token, result, cx));
-        }
-    }
+        let Some(chat) = self.chat_on(machine, cx) else {
+            return;
+        };
 
-    fn handle_session_state(
-        &mut self,
-        sid: String,
-        token: RequestToken,
-        result: Result<Value, String>,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(chat) = self.chat_for(&sid, cx) {
-            chat.update(cx, |chat, cx| chat.handle_session_state(token, result, cx));
-        }
+        chat.update(cx, |chat, cx| chat.handle_models_listed(token, result, cx));
     }
 
     fn handle_model_set(
@@ -524,9 +572,7 @@ impl Workbench {
     ) {
         match result {
             Ok(data) => {
-                if let Some(chat) = self.chat_for(&sid, cx) {
-                    chat.update(cx, |chat, cx| chat.handle_model_set(token, &data, cx));
-                }
+                self.with_chat(&sid, cx, |chat, cx| chat.handle_model_set(token, &data, cx))
             }
             // The session keeps its previous model; statusbar material.
             Err(detail) => self.last_error = Some(format!("set_model: {detail}")),
@@ -536,8 +582,23 @@ impl Workbench {
     fn chat_for(&self, sid: &str, cx: &Context<Self>) -> Option<Entity<Chat>> {
         self.chat
             .as_ref()
-            .filter(|chat| chat.read(cx).sid() == sid)
+            .filter(|chat| chat.read(cx).sid() == Some(sid))
             .cloned()
+    }
+
+    /// Act on the open chat if it is the one rendering `sid` — the shape every
+    /// sid-scoped bridge event shares.
+    fn with_chat(
+        &mut self,
+        sid: &str,
+        cx: &mut Context<Self>,
+        act: impl FnOnce(&mut Chat, &mut Context<Chat>),
+    ) {
+        let Some(chat) = self.chat_for(sid, cx) else {
+            return;
+        };
+
+        chat.update(cx, act);
     }
 
     /// Remote machines list everything — their disk is the only source of
@@ -586,9 +647,10 @@ impl Workbench {
         let sid = session.info.sid.clone();
         let cwd = session.info.cwd.clone();
 
-        // Navigating to a session abandons any ghost chat — deliberate move
-        // away from something that never existed daemon-side.
-        self.ghost = None;
+        // Navigating to a session abandons a chat that never became one —
+        // deliberate move away from something that exists nowhere but here.
+        // A chat mid-start keeps its place: its pi is on the way.
+        self.discard_unstarted_chat(cx);
 
         // Only an open chat we have not seen exit can be re-shown as-is;
         // anything else goes through Open, which resumes if needed.
@@ -616,7 +678,21 @@ impl Workbench {
         cx.notify();
     }
 
-    fn add_workspace(&mut self, machine: String, path: String) {
+    /// A chat with no session behind it exists only here, so navigating away
+    /// from it is the whole of discarding it.
+    fn discard_unstarted_chat(&mut self, cx: &Context<Self>) {
+        let unstarted = self
+            .chat
+            .as_ref()
+            .is_some_and(|chat| chat.read(cx).sid().is_none());
+
+        if unstarted {
+            self.chat = None;
+            self.chat_requests = None;
+        }
+    }
+
+    fn add_workspace(&mut self, machine: String, path: String, cx: &mut Context<Self>) {
         let workspace = Workspace { machine, path };
 
         if self.workspaces.contains(&workspace) {
@@ -624,6 +700,7 @@ impl Workbench {
         }
 
         self.workspaces.push(workspace);
+        self.refresh_chat_machine_candidates(cx);
         // A new ad-hoc machine may have entered the probe set, and the picker
         // no longer connects the machine it browses (its execs need no
         // daemon) — so this is where a machine that just earned a workspace
@@ -635,15 +712,37 @@ impl Workbench {
         }
     }
 
-    /// If this `Attached` completes a ghost start: drop the ghost, add the
-    /// new session to the sidebar, hand back the first prompt for seeding
-    /// the chat. `None` for plain opens/resumes.
-    fn take_started_ghost(&mut self, sid: &str) -> Option<String> {
-        if self.ghost.as_ref().and_then(GhostChat::started_sid) != Some(sid) {
-            return None;
-        }
+    /// The workspace list changed, so which machines an unstarted chat could
+    /// run on changed with it. The chat holds the answer rather than deriving
+    /// it (see [`Chat::set_machine_candidates`]), so it has to be told.
+    fn refresh_chat_machine_candidates(&mut self, cx: &mut Context<Self>) {
+        let Some(chat) = self.chat.clone() else {
+            return;
+        };
+        let candidates = self.machine_candidates_for(chat.read(cx).workspace_path());
 
-        let (workspace, started) = self.ghost.take()?.into_started()?;
+        chat.update(cx, |chat, _cx| chat.set_machine_candidates(candidates));
+    }
+
+    /// If this `Attached` completes a start the open chat made: add its
+    /// session to the sidebar and hand the chat back to be promoted in place.
+    /// `None` for plain opens and resumes, which build their own chat.
+    fn take_starting_chat(&mut self, sid: &str, cx: &Context<Self>) -> Option<Entity<Chat>> {
+        let chat = self.chat.clone()?;
+        let (machine, cwd, name) = {
+            let chat = chat.read(cx);
+            let (starting_sid, name) = chat.starting_session()?;
+
+            if starting_sid != sid {
+                return None;
+            }
+
+            (
+                chat.machine().to_string(),
+                chat.workspace_path().to_string(),
+                name.to_string(),
+            )
+        };
 
         // Synthesized sidebar row, newest-first (uuidv7 now is the maximum).
         // Display state only, replaced by the next real `list_sessions` —
@@ -655,11 +754,11 @@ impl Workbench {
         self.sessions.insert(
             0,
             MachineSession {
-                machine: workspace.machine,
+                machine,
                 info: SessionInfo {
-                    sid: started.sid,
-                    name: Some(started.name),
-                    cwd: workspace.path,
+                    sid: sid.to_string(),
+                    name: Some(name),
+                    cwd,
                     file: None,
                     mtime_ms: unix_millis_now(),
                     status: SessionStatus::Running,
@@ -667,127 +766,54 @@ impl Workbench {
             },
         );
 
-        Some(started.first_prompt)
+        Some(chat)
     }
 
-    /// A `list_models` answered. A ghost that has since been retargeted (or
-    /// closed and reopened) is waiting on a different token, so the answer to
-    /// the abandoned request is dropped.
-    fn handle_models_listed(&mut self, token: RequestToken, result: Result<Value, String>) {
-        if let Some(ghost) = &mut self.ghost {
-            ghost.accept_models(token, result);
-        }
-    }
-
-    /// Act on the open ghost and redraw. The one door the ghost's own
-    /// listeners come back through: the state is the workbench's, every
-    /// decision about it is the ghost's (see `ghost`).
-    pub(in crate::workbench) fn with_ghost(
-        &mut self,
-        cx: &mut Context<Self>,
-        act: impl FnOnce(&mut GhostChat),
-    ) {
-        if let Some(ghost) = &mut self.ghost {
-            act(ghost);
-            cx.notify();
-        }
-    }
-
-    /// Carry out what the ghost cannot: reach a machine's bridge, and register
-    /// the open guard against the session it just minted.
-    fn send_ghost_request(&mut self, request: GhostRequest, cx: &mut Context<Self>) {
-        match request {
-            GhostRequest::ListModels {
-                machine,
-                cwd,
-                token,
-            } => self.send_command(&machine, Command::ListModels { cwd, token }),
-            GhostRequest::Start {
-                machine,
-                sid,
-                command,
-            } => {
-                self.opening = Some(OpeningSession {
-                    machine: machine.clone(),
-                    sid,
-                });
-                self.send_command(&machine, command);
-            }
-        }
-
-        cx.notify();
-    }
-
-    /// A workspace row was clicked: open a ghost chat there (SPEC §Flows
-    /// "Start session"). The workspace's machine connects lazily here;
-    /// commands queue in the bridge channel while the bootstrap runs, so no
-    /// readiness gate.
-    fn open_ghost(&mut self, workspace_index: usize, cx: &mut Context<Self>) {
+    /// A workspace row's "+" was clicked: open a chat there with no session
+    /// behind it yet (SPEC §Flows "Start session"). The workspace's machine
+    /// connects lazily when the chat's first request routes through
+    /// [`Workbench::machine_ready_for`].
+    fn open_new_session_chat(&mut self, workspace_index: usize, cx: &mut Context<Self>) {
         let Some(workspace) = self.workspaces.get(workspace_index).cloned() else {
             return;
         };
 
-        // Re-clicking the current ghost's row keeps it (and any typed text).
-        let same_ghost = self
-            .ghost
-            .as_ref()
-            .is_some_and(|ghost| ghost.workspace() == &workspace);
+        // Re-clicking the row of the chat already on screen keeps it, and the
+        // text typed into it.
+        let same_workspace = self.chat.as_ref().is_some_and(|chat| {
+            let chat = chat.read(cx);
 
-        if self.opening.is_some() || same_ghost {
+            chat.starting_session().is_none()
+                && chat.sid().is_none()
+                && chat.machine() == workspace.machine
+                && chat.workspace_path() == workspace.path
+        });
+
+        if self.opening.is_some() || same_workspace {
             return;
         }
 
-        if !self.ensure_connection(&workspace.machine) {
-            cx.notify();
+        let target = ChatTarget {
+            machine_label: self.fleet.label(&workspace.machine).into(),
+            machine: workspace.machine,
+            workspace_path: workspace.path,
+        };
+        let candidates = self.machine_candidates_for(&target.workspace_path);
+        let chat = cx.new(|cx| Chat::unstarted(target, candidates, self.tokens.clone(), cx));
 
-            return;
-        }
-
-        let input = cx.new(|cx| TextInput::new("Message pi — Enter to send", cx));
-        let input_subscription = cx.subscribe(&input, Self::handle_ghost_prompt);
-        let (ghost, request) = GhostChat::new(workspace, input, input_subscription, &self.tokens);
-
-        self.ghost = Some(ghost);
-        self.send_ghost_request(request, cx);
+        // Subscribed before anything can be emitted — including the model
+        // fetch the constructor itself starts.
+        self.chat_requests = Some(cx.subscribe(&chat, Self::handle_chat_request));
+        self.chat = Some(chat);
+        cx.notify();
     }
 
-    fn handle_ghost_prompt(
-        &mut self,
-        _input: Entity<TextInput>,
-        event: &PromptSubmitted,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(request) = self
-            .ghost
-            .as_mut()
-            .and_then(|ghost| ghost.start(event.0.clone()))
-        else {
-            return;
-        };
-
-        self.send_ghost_request(request, cx);
-    }
-
-    /// The send button's path; Enter inside the input reaches the same
-    /// `PromptSubmitted` through the `Submit` action.
-    pub(super) fn submit_ghost_prompt(&mut self, cx: &mut Context<Self>) {
-        let Some(input) = self.ghost.as_ref().map(GhostChat::input) else {
-            return;
-        };
-
-        input.update(cx, |input, cx| input.submit_prompt(cx));
-    }
-
-    /// Machines the ghost could spawn on: the stored workspaces sharing its
-    /// path, as (machine key, display label) pairs.
-    pub(super) fn ghost_machine_candidates(&self) -> Vec<MachineCandidate> {
-        let Some(ghost) = &self.ghost else {
-            return Vec::new();
-        };
-
+    /// Machines an unstarted chat on `path` could be retargeted to: the stored
+    /// workspaces sharing that path, as (machine key, display label) pairs.
+    fn machine_candidates_for(&self, path: &str) -> Vec<MachineCandidate> {
         self.workspaces
             .iter()
-            .filter(|workspace| workspace.path == ghost.workspace().path)
+            .filter(|workspace| workspace.path == path)
             .map(|workspace| {
                 (
                     workspace.machine.clone(),
@@ -795,34 +821,6 @@ impl Workbench {
                 )
             })
             .collect()
-    }
-
-    /// A machine was picked for the ghost: retarget it, connect the new
-    /// machine lazily, and refetch its model list.
-    pub(super) fn ghost_pick_machine(&mut self, candidate_index: usize, cx: &mut Context<Self>) {
-        let candidates = self.ghost_machine_candidates();
-        let tokens = self.tokens.clone();
-        let Some(request) = self
-            .ghost
-            .as_mut()
-            .and_then(|ghost| ghost.pick_machine(candidate_index, &candidates, &tokens))
-        else {
-            cx.notify();
-
-            return;
-        };
-        let GhostRequest::ListModels { machine, .. } = &request else {
-            return;
-        };
-        let machine = machine.clone();
-
-        if !self.ensure_connection(&machine) {
-            cx.notify();
-
-            return;
-        }
-
-        self.send_ghost_request(request, cx);
     }
 
     /// The workspaces-header "+": one qualifying machine goes straight to
@@ -969,7 +967,8 @@ impl Workbench {
             }))
     }
 
-    /// Read-only rows; the per-row "+" is the one click target (ghost chat).
+    /// Read-only rows; the per-row "+" is the one click target (opens an
+    /// unstarted chat in that workspace).
     fn render_workspace_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex()
@@ -985,7 +984,9 @@ impl Workbench {
                         )
                         .child(
                             ui::workspace_row_add(("workspace-add", index)).on_click(cx.listener(
-                                move |workbench, _, _, cx| workbench.open_ghost(index, cx),
+                                move |workbench, _, _, cx| {
+                                    workbench.open_new_session_chat(index, cx)
+                                },
                             )),
                         )
                     }),
@@ -1069,7 +1070,7 @@ impl Workbench {
         let selected = self
             .chat
             .as_ref()
-            .is_some_and(|chat| chat.read(cx).sid() == session.sid);
+            .is_some_and(|chat| chat.read(cx).sid() == Some(session.sid.as_str()));
         let opening = self
             .opening
             .as_ref()
@@ -1097,17 +1098,8 @@ impl Workbench {
         .on_click(cx.listener(move |workbench, _, _, cx| workbench.open_session(&sid, cx)))
     }
 
-    fn render_content(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_content(&self) -> impl IntoElement {
         let content = div().flex_1().min_w(px(0.)).h_full();
-
-        // The ghost wins over an open chat: the user just asked for a new
-        // session; the chat comes back when they navigate to it.
-        if let Some(ghost) = &self.ghost {
-            let machine_label: SharedString = self.fleet.label(&ghost.workspace().machine).into();
-            let candidates = self.ghost_machine_candidates();
-
-            return content.child(ghost.render(machine_label, &candidates, window, cx));
-        }
 
         if let Some(chat) = &self.chat {
             return content.child(chat.clone());
@@ -1143,46 +1135,28 @@ impl Workbench {
         }
     }
 
-    /// A picker row was clicked (`None` = the ghost's "default" row). Which
-    /// surface it belongs to is *derived* from which one has its modal open —
-    /// the ghost first, the same precedence the content pane renders with. A
-    /// stored answer to that question was one more thing that could disagree
-    /// with the state it described.
+    /// A picker row was clicked (`None` = the "default (pi chooses)" row).
+    /// There is one chat and it owns its own picker, so there is no longer a
+    /// question of whose modal this is.
     fn model_picked(&mut self, choice: Option<usize>, cx: &mut Context<Self>) {
-        if self.ghost_model_picker_open() {
-            self.with_ghost(cx, |ghost| ghost.select_model(choice));
-
-            return;
-        }
-
-        let Some((chat, index)) = self.chat.clone().zip(choice) else {
+        let Some(chat) = self.chat.clone() else {
             return;
         };
 
-        chat.update(cx, |chat, cx| chat.pick_model(index, cx));
+        chat.update(cx, |chat, cx| chat.pick_model(choice, cx));
     }
 
     fn model_picker_closed(&mut self, cx: &mut Context<Self>) {
-        if self.ghost_model_picker_open() {
-            self.with_ghost(cx, GhostChat::close_model_picker);
-
+        let Some(chat) = self.chat.clone() else {
             return;
-        }
+        };
 
-        if let Some(chat) = &self.chat {
-            chat.update(cx, |chat, cx| chat.close_model_picker(cx));
-        }
+        chat.update(cx, |chat, cx| chat.close_model_picker(cx));
     }
 
-    fn ghost_model_picker_open(&self) -> bool {
-        self.ghost
-            .as_ref()
-            .is_some_and(GhostChat::model_picker_open)
-    }
-
-    /// One render for both surfaces. Only the ghost offers the "default (pi
-    /// chooses)" row — a live session always has a concrete model — and that
-    /// difference is the argument, not a stored flag saying whose modal this is.
+    /// Only a chat with no session yet offers the "default (pi chooses)" row —
+    /// a running session always has a concrete model — and that difference is
+    /// an argument, not a stored flag saying which state this modal is for.
     fn render_model_picker(
         &self,
         models: &[ModelChoice],
@@ -1289,33 +1263,18 @@ impl Workbench {
 }
 
 impl Render for Workbench {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if let Some(ghost) = &mut self.ghost {
-            if ghost.take_focus_request() {
-                window.focus(&ghost.input().read(cx).focus_handle(cx));
-            }
-        }
-
-        // The model picker renders from whichever surface opened it (ghost
-        // wins — it also wins the content pane). Data is cloned out here so
-        // the entity borrows don't fight the `&mut cx` the listeners need; the
-        // bool is "offer the default row", which is the only thing the two
-        // surfaces render differently.
-        let model_picker: Option<(Vec<ModelChoice>, Option<usize>, bool)> = if let Some(ghost) =
-            self.ghost
-                .as_ref()
-                .filter(|ghost| ghost.model_picker_open())
-        {
-            let (models, selected) = ghost.picker_contents();
-
-            Some((models, selected, true))
-        } else if let Some(chat) = &self.chat {
-            chat.read(cx)
-                .picker_contents()
-                .map(|(models, current_index)| (models, current_index, false))
-        } else {
-            None
-        };
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Cloned out of the chat here so the entity borrow doesn't fight the
+        // `&mut cx` the modal's listeners need.
+        let model_picker: Option<(Vec<ModelChoice>, Option<usize>, bool)> = self
+            .chat
+            .as_ref()
+            .and_then(|chat| chat.read(cx).picker_contents());
+        let machine_picker = self
+            .chat
+            .as_ref()
+            .filter(|chat| chat.read(cx).machine_picker_open())
+            .cloned();
 
         div()
             .size_full()
@@ -1330,7 +1289,7 @@ impl Render for Workbench {
                     .min_h(px(0.))
                     .flex()
                     .child(self.render_sidebar(cx))
-                    .child(self.render_content(window, cx)),
+                    .child(self.render_content()),
             )
             .child(self.render_statusbar())
             // Painted last so the scrims cover everything above.
@@ -1338,19 +1297,12 @@ impl Render for Workbench {
                 self.machine_picker_open
                     .then(|| self.render_machine_picker(cx)),
             )
-            .children(
-                self.ghost
-                    .as_ref()
-                    .is_some_and(GhostChat::machine_picker_open)
-                    .then(|| {
-                        let candidates = self.ghost_machine_candidates();
-
-                        self.ghost
-                            .as_ref()
-                            .map(|ghost| ghost.render_machine_picker(&candidates, cx))
-                    })
-                    .flatten(),
-            )
+            .children(machine_picker.map(|chat| {
+                // The chat owns this modal's rows and clicks; the workbench
+                // only decides where in the stack it is painted.
+                chat.update(cx, |chat, cx| chat.render_machine_picker(cx))
+                    .into_any_element()
+            }))
             .children(
                 self.picker
                     .as_ref()
@@ -1428,9 +1380,4 @@ fn present_machine(state: MachineState<'_>, machine: &str) -> MachineDisplay {
             statusbar_link: None,
         },
     }
-}
-
-/// Last path component; whole path if there is no separator.
-fn folder_name(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
 }

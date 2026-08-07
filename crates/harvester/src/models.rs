@@ -1,7 +1,7 @@
-//! Model-domain types shared by the ghost chat (pre-session picker) and the
-//! live chat (mid-session `set_model`): only what the UI renders and what a
-//! launch line or `set_model` call needs, extracted from pi's verbatim Model
-//! objects — the payloads themselves are never normalized.
+//! Model-domain types shared by the unstarted chat's picker (pre-session)
+//! and the live chat's (mid-session `set_model`): only what the UI renders
+//! and what a launch line or `set_model` call needs, extracted from pi's
+//! verbatim Model objects — the payloads themselves are never normalized.
 
 use gpui::SharedString;
 use serde_json::Value;

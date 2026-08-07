@@ -98,9 +98,22 @@ pub enum Item {
 }
 
 /// One session's conversation. Built from history, advanced by live events.
+///
+/// This is the **repairable replica** of docs/SPEC.md §Design invariants: the
+/// session file on the machine stays the only authority, and any doubt is
+/// resolved by refetching rather than by reconciling. What makes a cheap
+/// refetch possible is [`Transcript::history_len`] — knowing which items came
+/// from pi and which this client guessed from live events.
 #[derive(Debug, Default)]
 pub struct Transcript {
     items: Vec<Item>,
+    /// How many leading items came from a `get_entries` snapshot. Everything
+    /// past it was built from live events, which carry no entry ids (pi 0.83.0
+    /// — verified) and so cannot be matched against fetched entries one by
+    /// one. That is exactly why the boundary is worth recording: a delta is
+    /// the authoritative account of the span the live tail was guessing at, so
+    /// the tail is replaced by it rather than appended to.
+    history_len: usize,
     streaming: Option<String>,
     busy: bool,
 }
@@ -111,8 +124,11 @@ impl Transcript {
     /// — the same data the live events carry (verified against pi 0.83.0
     /// session captures).
     pub fn new(entries: &[Value]) -> Self {
+        let items = items_from_entries(entries);
+
         Transcript {
-            items: items_from_entries(entries),
+            history_len: items.len(),
+            items,
             streaming: None,
             busy: false,
         }
@@ -141,7 +157,27 @@ impl Transcript {
     /// and a snapshot fetched mid-turn does not end it.
     pub fn replace_history(&mut self, entries: &[Value]) {
         self.items = items_from_entries(entries);
+        self.history_len = self.items.len();
         self.streaming = None;
+    }
+
+    /// A delta from `get_entries {since}` (docs/SPEC.md C6) folded onto what is
+    /// already held: the cheap repair, where [`Transcript::replace_history`] is
+    /// the expensive one.
+    ///
+    /// The live tail goes first — see [`Transcript::history_len`] for why it
+    /// cannot be reconciled entry by entry. What survives the truncation is the
+    /// prefix pi already confirmed, which is the point: a session with a
+    /// thousand entries repairs by fetching the handful it missed.
+    ///
+    /// `busy` survives, exactly as in a full replace: the turn's state is the
+    /// event stream's to say, and a snapshot fetched mid-turn does not end it.
+    pub fn extend_history(&mut self, entries: &[Value]) {
+        self.items.truncate(self.history_len);
+        self.streaming = None;
+
+        extend_items(&mut self.items, entries);
+        self.history_len = self.items.len();
     }
 
     /// The user's prompt, shown before pi echoes anything back, which also
@@ -280,19 +316,26 @@ impl Transcript {
         }
     }
 
-    /// The block a tool event belongs to, by `toolCallId` — searched from the
-    /// back, since live events concern recent blocks.
+    /// The block a live tool event belongs to, by `toolCallId`.
     fn tool_block_for(&mut self, event: &Value) -> Option<&mut ToolBlock> {
         let tool_call_id = event.get("toolCallId").and_then(Value::as_str)?;
 
-        self.items.iter_mut().rev().find_map(|item| match item {
-            Item::Tool(block) if block.tool_call_id == tool_call_id => Some(block),
-            _ => None,
-        })
+        find_tool_block(&mut self.items, tool_call_id)
     }
 }
 
 fn items_from_entries(entries: &[Value]) -> Vec<Item> {
+    let mut items = Vec::new();
+
+    extend_items(&mut items, entries);
+
+    items
+}
+
+/// Fold `entries` onto `items`, which may already hold earlier ones. Splitting
+/// this out of [`items_from_entries`] is what lets a `get_entries {since}`
+/// delta be applied without refetching the history in front of it.
+fn extend_items(items: &mut Vec<Item>, entries: &[Value]) {
     // toolCallId → toolResult message, collected ahead of the walk (results
     // land in later entries than their calls).
     let mut tool_results: HashMap<&str, &Value> = HashMap::new();
@@ -309,7 +352,15 @@ fn items_from_entries(entries: &[Value]) -> Vec<Item> {
         }
     }
 
-    let mut items = Vec::new();
+    // A result whose call is already held finishes that block where it stands.
+    // Across a delta boundary the call sits in the prefix and its result in the
+    // delta, and pushing a new block for it would render the same call twice —
+    // once finished, once running forever.
+    for (tool_call_id, result) in &tool_results {
+        if let Some(block) = find_tool_block(items, tool_call_id) {
+            fill_tool_block_from_result(block, result);
+        }
+    }
 
     for entry in entries {
         let Some(message) = entry.get("message") else {
@@ -344,8 +395,15 @@ fn items_from_entries(entries: &[Value]) -> Vec<Item> {
             }
         }
     }
+}
 
-    items
+/// A held block by `toolCallId` — searched from the back, since a delta's
+/// results belong to the most recent calls.
+fn find_tool_block<'a>(items: &'a mut [Item], tool_call_id: &str) -> Option<&'a mut ToolBlock> {
+    items.iter_mut().rev().find_map(|item| match item {
+        Item::Tool(block) if block.tool_call_id == tool_call_id => Some(block),
+        _ => None,
+    })
 }
 
 /// One history `toolCall {id, name, arguments}` → a block, filled from its
@@ -371,9 +429,16 @@ fn tool_block_from_history(
         status: ToolStatus::Running,
     };
 
-    let Some(result) = tool_results.get(tool_call_id) else {
-        return Some(tool_block);
-    };
+    if let Some(result) = tool_results.get(tool_call_id) {
+        fill_tool_block_from_result(&mut tool_block, result);
+    }
+
+    Some(tool_block)
+}
+
+/// Finish a block from its history `toolResult`: status, output and the
+/// pre-rendered diff pi ships for edits.
+fn fill_tool_block_from_result(tool_block: &mut ToolBlock, result: &Value) {
     let is_error = result
         .get("isError")
         .and_then(Value::as_bool)
@@ -386,8 +451,6 @@ fn tool_block_from_history(
     };
     (tool_block.output, tool_block.output_truncated) = capped_content_text(result);
     tool_block.diff = extract_diff(result);
-
-    Some(tool_block)
 }
 
 /// The joined text of a result-like object's `content` blocks (live results and
@@ -792,5 +855,110 @@ mod tests {
         }));
 
         assert_eq!(tool_blocks(&transcript)[0].line_stats(), Some((2, 1)));
+    }
+
+    fn user_entry(text: &str) -> Value {
+        json!({"message": {"role": "user", "content": text}})
+    }
+
+    fn assistant_entry(text: &str) -> Value {
+        json!({"message": {"role": "assistant", "content": text_content(text)}})
+    }
+
+    fn message_texts(transcript: &Transcript) -> Vec<&str> {
+        transcript
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                Item::Message(message) => Some(message.text.as_str()),
+                Item::Tool(_) => None,
+            })
+            .collect()
+    }
+
+    /// The reason the cursor is worth having: a repair fetches only what came
+    /// after it, and what was already confirmed stays put.
+    #[test]
+    fn a_delta_extends_the_confirmed_history() {
+        let mut transcript = Transcript::new(&[user_entry("first"), assistant_entry("answer")]);
+
+        transcript.extend_history(&[user_entry("second")]);
+
+        assert_eq!(message_texts(&transcript), ["first", "answer", "second"]);
+    }
+
+    /// Live events carry no entry ids, so what they built cannot be reconciled
+    /// against a delta entry by entry. The delta is the authoritative account
+    /// of that same span — appending to the guess would render the turn twice.
+    #[test]
+    fn a_delta_replaces_what_live_events_had_guessed() {
+        let mut transcript = Transcript::new(&[user_entry("first")]);
+
+        transcript.apply(&json!({
+            "type": "message_end",
+            "message": { "role": "assistant", "content": text_content("streamed answer") },
+        }));
+
+        assert_eq!(message_texts(&transcript), ["first", "streamed answer"]);
+
+        transcript.extend_history(&[assistant_entry("streamed answer")]);
+
+        assert_eq!(
+            message_texts(&transcript),
+            ["first", "streamed answer"],
+            "the fetched entry stands in for the streamed one, not beside it"
+        );
+    }
+
+    /// The boundary case that makes the fold incremental rather than a fresh
+    /// build: a tool call confirmed before the cursor, its result arriving
+    /// after it. A delta that pushed a second block would leave the same call
+    /// on screen twice — once finished, once running forever.
+    #[test]
+    fn a_delta_finishes_a_tool_call_left_running_before_the_cursor() {
+        let mut transcript = Transcript::new(&[
+            json!({"message": {"role": "assistant", "content": [
+                {"type": "toolCall", "id": "call-a", "name": "bash", "arguments": {"command": "ls"}},
+            ]}}),
+        ]);
+
+        assert_eq!(tool_blocks(&transcript).len(), 1);
+        assert!(matches!(
+            tool_blocks(&transcript)[0].status,
+            ToolStatus::Running
+        ));
+
+        transcript.extend_history(&[json!({"message": {
+            "role": "toolResult", "toolCallId": "call-a", "content": text_content("a\nb"),
+        }})]);
+
+        let blocks = tool_blocks(&transcript);
+
+        assert_eq!(blocks.len(), 1, "the call is one block, not two");
+        assert!(matches!(blocks[0].status, ToolStatus::Ok));
+        assert_eq!(blocks[0].output, "a\nb");
+    }
+
+    /// A repair mid-turn does not end it: whether a turn is running is the
+    /// event stream's to say, and `agent_settled` has not arrived.
+    #[test]
+    fn a_delta_leaves_the_turn_running() {
+        let mut transcript = Transcript::new(&[user_entry("first")]);
+
+        transcript.apply(&json!({"type": "agent_start"}));
+        transcript.extend_history(&[assistant_entry("partial work")]);
+
+        assert!(transcript.is_busy());
+    }
+
+    /// An empty delta is the common case — the gap was in events the entries
+    /// had already recorded — and it must not disturb what is on screen.
+    #[test]
+    fn an_empty_delta_keeps_the_confirmed_history() {
+        let mut transcript = Transcript::new(&[user_entry("first"), assistant_entry("answer")]);
+
+        transcript.extend_history(&[]);
+
+        assert_eq!(message_texts(&transcript), ["first", "answer"]);
     }
 }

@@ -48,7 +48,9 @@ pub(super) struct FolderPicker {
 
 /// What the picker needs run on its machine. The picker decides *what* to ask
 /// for and correlates the answer; the workbench resolves the [`Host`] and owns
-/// the machines worker, so it does the asking (mirrors `ghost`'s split).
+/// the machines worker, so it does the asking — the same decide/ask split
+/// every workbench-owned surface uses, since only the workbench holds the
+/// machines worker.
 pub(super) struct PickerCommand {
     request: PickerRequest,
     token: RequestToken,
@@ -255,8 +257,8 @@ impl FolderPicker {
 }
 
 impl Workbench {
-    /// Act on the open picker and redraw — the ghost's `with_ghost` door, for
-    /// the picker's own state.
+    /// Act on the open picker and redraw — `with_chat`'s shape, for the
+    /// picker's own state instead of a sid-scoped one.
     pub(in crate::workbench) fn with_picker(
         &mut self,
         cx: &mut Context<Self>,
@@ -350,7 +352,7 @@ impl Workbench {
         };
 
         self.picker = None;
-        self.add_workspace(machine, path);
+        self.add_workspace(machine, path, cx);
         cx.notify();
     }
 

@@ -34,6 +34,7 @@ use crate::bootstrap::bootstrap_and_connect;
 use crate::client::{DaemonClient, SessionEvent};
 use crate::host::Host;
 use crate::token::RequestToken;
+use crate::tokio_thread::run_on_tokio_thread;
 use attach_window::{
     lock_attach_buffers, AttachEventBuffers, PushOutcome, ATTACH_EVENT_BUFFER_CAP,
 };
@@ -61,7 +62,7 @@ pub enum Command {
         sid: String,
         text: String,
     },
-    /// Turn a ghost chat into a real session (SPEC §Flows "Start session"):
+    /// Turn an unstarted chat into a real session (SPEC §Flows "Start session"):
     /// `create_session` → `attach` → first prompt, all riding pi's in-order
     /// stdin queue — no readiness probe. Ends in `Event::Attached` (with
     /// empty entries — the session is brand new) or a failure event.
@@ -138,6 +139,19 @@ pub enum Event {
         sid: String,
         entries: Vec<Value>,
     },
+    /// The same repair, done cheaply: `entries` are only those *after* the
+    /// cursor the last fetch left (docs/SPEC.md C6), so they extend the
+    /// frontend's replica instead of replacing it. Same rule as
+    /// `HistoryReplaced` otherwise — ignore it when there is no chat for `sid`.
+    ///
+    /// The frontend must drop whatever it built from live events before
+    /// applying these: live events carry no entry ids, so the delta is the
+    /// authoritative account of the very span they were guessing at.
+    /// `Transcript::extend_history` is that rule, written once.
+    HistoryExtended {
+        sid: String,
+        entries: Vec<Value>,
+    },
     /// One live pi event for an attached session, verbatim.
     Pi {
         sid: String,
@@ -154,7 +168,7 @@ pub enum Event {
     },
     /// A `ListModels` answered; pi's `data` verbatim (the client speaks Pi —
     /// the workbench extracts what its picker renders). Errors render inside
-    /// the ghost chat, not the statusbar.
+    /// the unstarted chat, not the statusbar.
     ModelsListed {
         token: RequestToken,
         result: Result<Value, String>,
@@ -218,8 +232,20 @@ struct BridgeContext {
     /// Sessions with a repair already in flight, so a burst of gaps costs one
     /// `get_entries` rather than one per gap.
     resyncing: Arc<Mutex<HashSet<String>>>,
+    /// The attached session's replay cursor, from the last `get_entries`
+    /// (docs/SPEC.md C6). One slot, because one bridge holds one attachment.
+    cursor: Arc<Mutex<Option<SessionCursor>>>,
     /// INTERIM, with `dialog`: the dialog ids this bridge already cancelled.
     answered_dialogs: Arc<AnsweredDialogs>,
+}
+
+/// Pi's `leafId` from a `get_entries`, tagged with the session it describes.
+/// The sid is half the value: a cursor is only ever valid for the session it
+/// was fetched for, and pairing them makes spending it on another impossible
+/// rather than merely unlikely.
+struct SessionCursor {
+    sid: String,
+    leaf_id: String,
 }
 
 pub fn start(
@@ -249,21 +275,12 @@ fn run_bridge_thread(
     commands: UnboundedReceiver<Command>,
     events: EventSender,
 ) {
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            events.send(Event::ConnectFailed {
-                detail: format!("tokio runtime: {error}"),
-            });
+    let report_events = events.clone();
 
-            return;
-        }
-    };
-
-    runtime.block_on(bridge_main(host, daemon_binary, commands, events));
+    run_on_tokio_thread(
+        bridge_main(host, daemon_binary, commands, events),
+        |detail| report_events.send(Event::ConnectFailed { detail }),
+    );
 }
 
 async fn bridge_main(
@@ -293,6 +310,7 @@ async fn bridge_main(
         attached: Arc::new(AsyncMutex::new(None)),
         attach_buffers: Arc::new(Mutex::new(AttachEventBuffers::default())),
         resyncing: Arc::new(Mutex::new(HashSet::new())),
+        cursor: Arc::new(Mutex::new(None)),
         answered_dialogs: Arc::new(AnsweredDialogs::default()),
     };
 
@@ -464,6 +482,7 @@ mod tests {
                     attached: Arc::new(AsyncMutex::new(None)),
                     attach_buffers: Arc::new(Mutex::new(AttachEventBuffers::default())),
                     resyncing: Arc::new(Mutex::new(HashSet::new())),
+                    cursor: Arc::new(Mutex::new(None)),
                     answered_dialogs: Arc::new(AnsweredDialogs::default()),
                 },
                 daemon: DaemonConnection::over(daemon_side, no_forward()),

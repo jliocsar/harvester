@@ -14,6 +14,13 @@ pub struct Workspace {
     pub path: String,
 }
 
+/// The name a workspace goes by on screen: its path's last component (the
+/// whole path when there is no separator). Lives here because a workspace path
+/// is this module's domain, and both the sidebar and the chat need to say it.
+pub fn folder_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
 /// `~/.harvester/workspaces.json`; `None` when `$HOME` is unset.
 fn store_path() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME")

@@ -288,7 +288,7 @@ pub fn prompt_box_send(id: impl Into<ElementId>) -> Stateful<Div> {
 
 /// One sidebar workspace row: `folder_name in machine_label` — read-only by
 /// design (workspaces are listed, not clicked). Compose with
-/// `workspace_row_add` for the trailing "+" that starts a ghost chat there.
+/// `workspace_row_add` for the trailing "+" that opens an unstarted chat there.
 pub fn workspace_row(name: SharedString, machine: SharedString) -> Div {
     div()
         // Same 6+6 inset as session_row, aligning with section_header text.
@@ -320,8 +320,8 @@ pub fn workspace_row(name: SharedString, machine: SharedString) -> Div {
 }
 
 /// The workspace row's "+" — the one click target on the row (SPEC §Flows
-/// "Start session"): starts a ghost chat in that workspace. Caller chains
-/// `.on_click`.
+/// "Start session"): opens an unstarted chat in that workspace. Caller
+/// chains `.on_click`.
 pub fn workspace_row_add(id: impl Into<ElementId>) -> Stateful<Div> {
     div()
         .id(id)
@@ -334,7 +334,7 @@ pub fn workspace_row_add(id: impl Into<ElementId>) -> Stateful<Div> {
         .child("+")
 }
 
-/// One model in the ghost chat's picker; the selected one carries a leading
+/// One model in the unstarted chat's picker; the selected one carries a leading
 /// check, the others an equally wide blank so names align. Caller chains
 /// `.on_click` (select-and-close — no confirm step).
 pub fn model_row(id: impl Into<ElementId>, name: SharedString, selected: bool) -> Stateful<Div> {
@@ -359,8 +359,8 @@ pub fn model_row(id: impl Into<ElementId>, name: SharedString, selected: bool) -
         .child(div().overflow_hidden().text_ellipsis().child(name))
 }
 
-/// Chat pane header: title + faint subtitle (the ghost chat's "New session"
-/// line — the model control lives in the prompt box, not here).
+/// Chat pane header: title + faint subtitle (the unstarted chat's "New
+/// session" line — the model control lives in the prompt box, not here).
 pub fn chat_header(title: SharedString, subtitle: SharedString) -> Div {
     div()
         .flex_none()

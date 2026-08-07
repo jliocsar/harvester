@@ -1,8 +1,8 @@
 //! The prompt box's model control, owned once and used twice.
 //!
-//! The ghost chat and the live chat both load a model list, open a modal over
-//! it, and take a pick — and they differ in exactly two places: the command
-//! that loads the list (`list_models` against a throwaway pi, versus
+//! The unstarted chat and the live chat both load a model list, open a modal
+//! over it, and take a pick — and they differ in exactly two places: the
+//! command that loads the list (`list_models` against a throwaway pi, versus
 //! `get_available_models` against the running one) and what a pick means (a
 //! launch-line argument, versus a `set_model` the session must confirm). Those
 //! two stay with their surfaces. Everything below was written twice.
@@ -15,9 +15,9 @@ use crate::models::{self, ModelChoice, ModelsState};
 #[derive(Default)]
 pub struct ModelControl {
     state: ModelsState,
-    /// The list request in flight. A retargeted ghost (or a reopened chat) is
-    /// waiting on a different token, so the abandoned request's answer is
-    /// dropped rather than filling the new surface's list.
+    /// The list request in flight. A machine-switched unstarted chat (or a
+    /// reopened chat) is waiting on a different token, so the abandoned
+    /// request's answer is dropped rather than filling the new surface's list.
     request: Pending<()>,
     open: bool,
 }

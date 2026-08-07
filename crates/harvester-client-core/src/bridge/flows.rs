@@ -10,14 +10,17 @@
 //! spawning a flow is fire-and-forget.
 
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde_json::{json, Value};
 
 use harvester_proto::{HarvesterCmd, SessionsData};
 
 use super::attach_window::{AttachRegistration, FlushOutcome};
-use super::{flatten_harvester, handle_pi_event, report_failure, spawn_flow, BridgeContext, Event};
+use super::{
+    flatten_harvester, handle_pi_event, report_failure, spawn_flow, BridgeContext, Event,
+    SessionCursor,
+};
 use crate::token::RequestToken;
 
 pub(super) async fn sessions_flow(context: BridgeContext) {
@@ -82,17 +85,9 @@ pub(super) async fn open_flow(context: BridgeContext, sid: String, cwd: String) 
     drop(attachment);
 
     // History replay: attach → get_entries → live events (DAEMON.md §attach).
-    if replay_history(&context, sid.clone(), registration, attached_event).await {
+    if replay_history(&context, sid.clone(), registration).await {
         spawn_flow(resync_flow(context, sid));
     }
-}
-
-fn attached_event(sid: String, entries: Vec<Value>) -> Event {
-    Event::Attached { sid, entries }
-}
-
-fn history_replaced_event(sid: String, entries: Vec<Value>) -> Event {
-    Event::HistoryReplaced { sid, entries }
 }
 
 /// A repair after events were lost: the daemon's `event_gap` and our own
@@ -121,10 +116,106 @@ pub(super) async fn resync_flow(context: BridgeContext, sid: String) {
     loop {
         let registration = AttachRegistration::register(&context.attach_buffers, &sid);
 
-        if !replay_history(&context, sid.clone(), registration, history_replaced_event).await {
+        if !repair_history(&context, &sid).await {
+            return;
+        }
+
+        if !deliver_buffered_events(&context, sid.clone(), registration) {
             return;
         }
     }
+}
+
+/// The repair itself (docs/SPEC.md C6): a **delta** when this session left a
+/// cursor, a full refetch otherwise. A long session then repairs by fetching
+/// the handful of entries it missed rather than its whole history.
+///
+/// A failed delta falls back to a full refetch rather than being reported. The
+/// cursor has one failure of its own — pi answering `Entry not found: <since>`
+/// for an id compaction retired — and starting over is the documented cure for
+/// it. Testing for that by matching pi's error text would be the narrower
+/// check; refetching is less code and the same answer, because a fetch that
+/// failed for any other reason fails again below and reports there.
+async fn repair_history(context: &BridgeContext, sid: &str) -> bool {
+    if let Some(leaf_id) = cursor_for(context, sid) {
+        if let Ok((entries, next_leaf_id)) = fetch_entries(context, sid, Some(&leaf_id)).await {
+            record_cursor(context, sid, next_leaf_id);
+            context.events.send(Event::HistoryExtended {
+                sid: sid.to_string(),
+                entries,
+            });
+
+            return true;
+        }
+    }
+
+    let (entries, leaf_id) = match fetch_entries(context, sid, None).await {
+        Ok(fetched) => fetched,
+        Err(detail) => {
+            report_failure(context, "get_entries", detail);
+
+            return false;
+        }
+    };
+
+    record_cursor(context, sid, leaf_id);
+    context.events.send(Event::HistoryReplaced {
+        sid: sid.to_string(),
+        entries,
+    });
+
+    true
+}
+
+/// One `get_entries`, with or without a cursor: pi's entries plus the `leafId`
+/// that becomes the next cursor (HARNESS_RESEARCH.md — "an entry id works as a
+/// durable cursor … even across client restarts").
+async fn fetch_entries(
+    context: &BridgeContext,
+    sid: &str,
+    since: Option<&str>,
+) -> Result<(Vec<Value>, Option<String>), String> {
+    let command = match since {
+        Some(leaf_id) => json!({"type": "get_entries", "since": leaf_id}),
+        None => json!({"type": "get_entries"}),
+    };
+    let data = pi_flow_result(context, sid, command).await?;
+    let entries = data
+        .get("entries")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let leaf_id = data
+        .get("leafId")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    Ok((entries, leaf_id))
+}
+
+/// This session's replay cursor, if its last fetch left one. Filtered by sid
+/// rather than cleared on attach: a cursor that names the session it came from
+/// cannot be spent on the session that replaced it, whatever order the
+/// attach and the fetch landed in.
+fn cursor_for(context: &BridgeContext, sid: &str) -> Option<String> {
+    lock_cursor(&context.cursor)
+        .as_ref()
+        .filter(|cursor| cursor.sid == sid)
+        .map(|cursor| cursor.leaf_id.clone())
+}
+
+/// A fetch with no `leafId` leaves no cursor: the next repair refetches whole,
+/// which is always correct and never worse than guessing.
+fn record_cursor(context: &BridgeContext, sid: &str, leaf_id: Option<String>) {
+    *lock_cursor(&context.cursor) = leaf_id.map(|leaf_id| SessionCursor {
+        sid: sid.to_string(),
+        leaf_id,
+    });
+}
+
+/// std::sync — every use is a lock/mutate/unlock with no await inside.
+fn lock_cursor(cursor: &Mutex<Option<SessionCursor>>) -> MutexGuard<'_, Option<SessionCursor>> {
+    cursor.lock().expect("cursor mutex")
 }
 
 /// One repair per session at a time. RAII for the same reason
@@ -170,29 +261,19 @@ pub(super) async fn forget_attachment(context: BridgeContext, sid: String) {
     }
 }
 
-/// Fetch a session's history and publish it — the one path that (re)seeds a
-/// chat, whether the user just opened the session or the daemon told us we
-/// missed events. pi's session file is the source of truth, so a refetch is
-/// always the correct repair. `registration` holds back the live events that
-/// race this fetch; it is released the moment the snapshot is out.
+/// Seed a chat with a session's whole history: the opening fetch, which has no
+/// cursor to work from because nothing has been fetched for this session yet.
+/// The repair path is [`repair_history`]. `registration` holds back the live
+/// events that race this fetch; it is released the moment the snapshot is out.
 ///
-/// `publish` is what distinguishes the two callers, and the distinction is
-/// load-bearing for the frontend: an open seeds a new chat, a repair replaces
-/// the entries of one already on screen.
-///
-/// Returns `true` when events were lost even so and another repair is owed.
+/// Returns `true` when events were lost even so and a repair is owed.
 async fn replay_history(
     context: &BridgeContext,
     sid: String,
     registration: AttachRegistration,
-    publish: fn(String, Vec<Value>) -> Event,
 ) -> bool {
-    let entries = match pi_flow_result(context, &sid, json!({"type": "get_entries"})).await {
-        Ok(data) => data
-            .get("entries")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default(),
+    let (entries, leaf_id) = match fetch_entries(context, &sid, None).await {
+        Ok(fetched) => fetched,
         Err(detail) => {
             report_failure(context, "get_entries", detail);
 
@@ -200,7 +281,11 @@ async fn replay_history(
         }
     };
 
-    context.events.send(publish(sid.clone(), entries));
+    record_cursor(context, &sid, leaf_id);
+    context.events.send(Event::Attached {
+        sid: sid.clone(),
+        entries,
+    });
 
     deliver_buffered_events(context, sid, registration)
 }
@@ -231,9 +316,9 @@ fn deliver_buffered_events(
     }
 }
 
-/// `StartSession`: the ghost chat's create → attach → first-prompt chain as
-/// one straight line. `Attached` publishes with empty entries — the session
-/// file is brand new, there is no history to fetch.
+/// `StartSession`: an unstarted chat's create → attach → first-prompt chain
+/// as one straight line. `Attached` publishes with empty entries — the
+/// session file is brand new, there is no history to fetch.
 pub(super) async fn start_session_flow(
     context: BridgeContext,
     sid: String,
@@ -274,9 +359,14 @@ pub(super) async fn start_session_flow(
         return;
     }
 
-    // Swap the ghost for the live chat right away; the prompt's queued-ack
+    // Move the chat into its live state right away; the prompt's queued-ack
     // rides its own flow (only rejection is notable).
-    context.events.send(attached_event(sid.clone(), Vec::new()));
+    // No history to fetch and so no cursor to record: the session file is
+    // brand new, and the first repair will fetch it whole.
+    context.events.send(Event::Attached {
+        sid: sid.clone(),
+        entries: Vec::new(),
+    });
 
     if deliver_buffered_events(&context, sid.clone(), registration) {
         spawn_flow(resync_flow(context.clone(), sid.clone()));

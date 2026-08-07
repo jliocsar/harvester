@@ -90,8 +90,8 @@ impl Render for Kitchen {
     }
 }
 
-/// The prompt box as it composes in production (ghost and live chat share
-/// the shape: model control + send), plus the static loading/ellipsis
+/// The prompt box as it composes in production (unstarted and live chat
+/// share the shape: model control + send), plus the static loading/ellipsis
 /// states. The first sample carries a real `TextInput` so focus and typing
 /// are tastable.
 fn render_prompt_box_samples(
@@ -422,7 +422,8 @@ fn render_session_rows() -> impl IntoElement {
 
 fn render_workspace_rows() -> impl IntoElement {
     // Sidebar-width container, like the session-row samples. Rows are
-    // read-only; the trailing "+" is the one click target (ghost chat).
+    // read-only; the trailing "+" is the one click target (opens an
+    // unstarted chat).
     div()
         .w(px(240.))
         .bg(rgb(theme::PANEL_BG))
@@ -445,8 +446,9 @@ fn render_workspace_rows() -> impl IntoElement {
         )
 }
 
-/// The ghost chat's model picker as it composes in production: modal frame,
-/// fixed-height scrollable list (50 models on exe.dev), one selected row.
+/// The unstarted chat's model picker as it composes in production: modal
+/// frame, fixed-height scrollable list (50 models on exe.dev), one selected
+/// row.
 fn render_model_picker_sample() -> impl IntoElement {
     ui::modal_frame("Choose model")
         .child(
@@ -494,8 +496,8 @@ fn render_model_picker_sample() -> impl IntoElement {
         ))
 }
 
-/// The ghost chat's header: title + faint folder subtitle (the model control
-/// lives in the prompt box).
+/// The unstarted chat's header: title + faint folder subtitle (the model
+/// control lives in the prompt box).
 fn render_chat_header_sample() -> impl IntoElement {
     div()
         .bg(rgb(theme::WINDOW_BG))
