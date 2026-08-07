@@ -23,6 +23,7 @@ use crate::provider::{
 };
 use crate::ssh::SshTarget;
 use crate::token::RequestToken;
+use crate::tokio_thread::run_on_tokio_thread;
 use crate::workspace::{list_directory, resolve_home, validate_git_workspace, RemoteDirEntry};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
@@ -124,19 +125,9 @@ pub fn start() -> std::io::Result<MachinesWorker> {
 }
 
 fn run_worker_thread(commands: UnboundedReceiver<Command>, events: UnboundedSender<Event>) {
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            eprintln!("harvester: machines worker tokio runtime: {error}");
-
-            return;
-        }
-    };
-
-    runtime.block_on(worker_main(commands, events));
+    run_on_tokio_thread(worker_main(commands, events), |detail| {
+        eprintln!("harvester: machines worker: {detail}");
+    });
 }
 
 async fn worker_main(mut commands: UnboundedReceiver<Command>, events: UnboundedSender<Event>) {

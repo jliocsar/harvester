@@ -21,8 +21,8 @@
 //! What it does *not* get, and would still write itself: the workspace store
 //! (`~/.harvester/workspaces.json` lives in the gpui crate), the merged
 //! newest-first session list across machines, and every rendering decision —
-//! which colour a [`MachineState`] is, what a session row says, how the ghost
-//! chat behaves.
+//! which colour a [`MachineState`] is, what a session row says, how a chat
+//! with no session behind it yet behaves.
 //!
 //! Three entry points matter: [`Fleet::start`] (the whole client backbone),
 //! [`bridge::start`] (one machine's worker, if a frontend wants only that)
@@ -40,6 +40,7 @@ pub mod machines;
 mod provider;
 mod ssh;
 mod token;
+mod tokio_thread;
 pub mod transcript;
 mod workspace;
 
