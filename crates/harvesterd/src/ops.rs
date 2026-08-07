@@ -319,6 +319,11 @@ fn attach(
         return no_such_session(&sid);
     };
 
+    // The same generation rule as [`Daemon::is_current_generation`] — a
+    // session's identity is its `Arc` pointer, because resume spawns a new
+    // generation under the same sid — but asked of the *attached* map, not the
+    // pid table, so it cannot share that implementation.
+    //
     // Attaching twice to the same session object is a no-op; an entry for an
     // *older* generation of this sid (stopped and resumed since) is not, and
     // needs no handling of its own — the `insert` below overwrites it, and the
@@ -449,14 +454,13 @@ fn stop(daemon: &Daemon, sid: Sid) -> HarvesterResponse {
 }
 
 /// Rung 3: SIGKILL a pi that ignored stdin EOF for `STOP_KILL_BACKSTOP`.
-/// "Still in the pid table" is the liveness test — the pump vacates the entry
-/// before broadcasting Exit, and `ptr_eq` ignores a resumed successor.
+/// "Still the pid table's current generation" is the liveness test — the pump
+/// vacates the entry before broadcasting Exit, and the generation rule keeps
+/// this backstop from killing a pi that was resumed during the wait.
 async fn kill_backstop(daemon: Daemon, session: Arc<Session>) {
     tokio::time::sleep(STOP_KILL_BACKSTOP).await;
 
-    let still_running = daemon
-        .session(session.sid.as_str())
-        .is_some_and(|stored| Arc::ptr_eq(&stored, &session));
+    let still_running = daemon.is_current_generation(&session);
 
     if still_running {
         eprintln!(

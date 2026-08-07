@@ -117,16 +117,34 @@ impl Daemon {
         Ok(SpawnOutcome::Spawned(session))
     }
 
-    /// Vacate `session`'s table entry — only if it is still the stored
-    /// generation (`Arc::ptr_eq`); a resumed successor is never evicted.
-    /// Called by the stdout pump *before* it broadcasts Exit.
+    /// True while `session` *is* the pid table's entry for its own sid.
+    ///
+    /// A session's identity is its `Arc` pointer, not its sid: stopping and
+    /// resuming a sid spawns a **new generation** — a different pi child, a
+    /// different `Arc<Session>` — under the same key. So a sid match alone
+    /// says "some pi for this sid is alive", which is the wrong question for
+    /// anyone holding an older handle. `Arc::ptr_eq` asks the right one, and
+    /// every "is my session still the live one?" test goes through here so the
+    /// generation rule is stated once.
+    ///
+    /// Takes the sid from the session on purpose — a caller-supplied sid could
+    /// disagree with the handle, and that pairing is exactly the invariant.
+    pub fn is_current_generation(&self, session: &Arc<Session>) -> bool {
+        is_current_generation_in(&self.lock_sessions(), session)
+    }
+
+    /// Vacate `session`'s table entry — only if it is still the current
+    /// generation; a resumed successor is never evicted. Called by the stdout
+    /// pump *before* it broadcasts Exit.
+    ///
+    /// Tests and removes under *one* lock rather than calling
+    /// [`Daemon::is_current_generation`] and re-locking: a resume landing
+    /// between the two would make this evict the successor it just checked
+    /// was different.
     pub fn remove_session_if_same(&self, session: &Arc<Session>) {
         let mut sessions = self.lock_sessions();
 
-        if sessions
-            .get(session.sid.as_str())
-            .is_some_and(|stored| Arc::ptr_eq(stored, session))
-        {
+        if is_current_generation_in(&sessions, session) {
             sessions.remove(&session.sid);
         }
     }
@@ -134,4 +152,12 @@ impl Daemon {
     fn lock_sessions(&self) -> MutexGuard<'_, HashMap<Sid, Arc<Session>>> {
         self.inner.sessions.lock().expect("sessions mutex")
     }
+}
+
+/// The generation rule itself, spelled once, against an already-locked table
+/// so a caller that needs check-and-act can hold the lock across both.
+fn is_current_generation_in(sessions: &HashMap<Sid, Arc<Session>>, session: &Arc<Session>) -> bool {
+    sessions
+        .get(session.sid.as_str())
+        .is_some_and(|stored| Arc::ptr_eq(stored, session))
 }
