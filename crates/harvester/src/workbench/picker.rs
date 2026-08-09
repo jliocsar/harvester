@@ -17,13 +17,13 @@ use gpui::{
     div, prelude::*, px, App, Context, Entity, EventEmitter, IntoElement, Render, SharedString,
     Task, Window,
 };
+use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
-use gpui_component::{ActiveTheme as _, IndexPath, WindowExt as _};
+use gpui_component::{ActiveTheme as _, Disableable as _, IndexPath, WindowExt as _};
 use harvester_client_core::machines;
 use harvester_client_core::{Host, Pending, RemoteDirEntry, RequestToken, RequestTokens};
 
 use super::Workbench;
-use crate::ui;
 
 /// Fixed height for the entries list, so the dialog does not resize under the
 /// pointer when a listing arrives or a filter narrows it.
@@ -525,24 +525,21 @@ impl FolderPicker {
             .flex()
             .justify_end()
             .gap_2()
+            .child(Button::new("picker-cancel").label("Cancel").on_click(
+                // The dialog is the picker's own; closing it is not news
+                // for the workbench.
+                cx.listener(|_, _, window, cx| window.close_dialog(cx)),
+            ))
             .child(
-                ui::button("picker-cancel", "Cancel", ui::ButtonKind::Neutral, true).on_click(
-                    // The dialog is the picker's own; closing it is not news
-                    // for the workbench.
-                    cx.listener(|_, _, window, cx| window.close_dialog(cx)),
-                ),
-            )
-            .child(
-                ui::button("picker-add", "Add", ui::ButtonKind::Primary, can_submit).when(
-                    can_submit,
-                    |button| {
-                        button.on_click(cx.listener(|picker, _, _, cx| {
-                            let command = picker.walk.confirm();
+                Button::new("picker-add")
+                    .label("Add")
+                    .primary()
+                    .disabled(!can_submit)
+                    .on_click(cx.listener(|picker, _, _, cx| {
+                        let command = picker.walk.confirm();
 
-                            picker.dispatch(command, cx);
-                        }))
-                    },
-                ),
+                        picker.dispatch(command, cx);
+                    })),
             )
     }
 }

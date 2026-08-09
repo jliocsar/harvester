@@ -1,23 +1,87 @@
-//! The design system: every reusable visual primitive lives here, and every
-//! primitive has a section in the kitchen (`harvester kitchen`) showing its
-//! variants. Components return `Div`/`Stateful<Div>` so callers can keep
-//! chaining (`.on_click`, extra children); behavior stays with the caller,
-//! looks stay here.
+//! What is left of the hand-rolled design system: the prompt box, the tool
+//! block, and the frame around a chat message. Rows, dialogs, lists, the text
+//! input and a message's own markdown are `gpui-component`'s (SPEC C11).
+//!
+//! Every helper takes `&App` and reads `cx.theme()`. Nothing here holds a
+//! colour of its own — that is the whole point of the palette being gone.
+//! Components return `Div`/`Stateful<Div>` so callers can keep chaining
+//! (`.on_click`, extra children); behavior stays with the caller, looks stay
+//! here.
 
 use std::sync::OnceLock;
 
-use gpui::{div, prelude::*, px, rgb, Div, ElementId, FontWeight, SharedString, Stateful};
+use gpui::{div, prelude::*, px, rems, App, Div, ElementId, FontWeight, SharedString, Stateful};
+use gpui_component::highlighter::HighlightTheme;
+use gpui_component::text::{TextView, TextViewStyle};
+use gpui_component::ActiveTheme as _;
 
-use crate::theme::{self, Tone};
-
-/// Statusbar height; the workbench and the kitchen sample must agree.
+/// Statusbar height; the workbench and the statusbar frame must agree.
 const STATUSBAR_HEIGHT: f32 = 26.;
+
+/// What a component is being told about its subject — the vocabulary that
+/// crosses the seam into `ui`, in place of the pixels it used to carry. A
+/// component handed a colour has had a theme decision made for it by its
+/// caller and can never be re-themed; one handed [`Tone::Live`] has not.
+///
+/// Deliberately small, and named for meaning rather than for colour: `Live`
+/// rather than `Green`, because the day a theme paints "live" differently is
+/// the day the name has to survive it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    /// Present, but not what the user is looking for: secondary labels.
+    Muted,
+    /// Backgrounded: an unprobed machine, a tool that has finished.
+    Idle,
+    /// What the user is doing right now.
+    Active,
+    /// Working; the outcome is not known yet.
+    Pending,
+    /// Confirmed good — a connected daemon, a running session.
+    Live,
+    /// Failed, and the user needs to see that it did.
+    Failed,
+}
+
+impl Tone {
+    /// The one place a meaning becomes a colour.
+    ///
+    /// `Active` is `blue` rather than `primary`: in the library's dark theme
+    /// `primary` is near-white, which is right for a filled button and wrong
+    /// for the word "you". `Idle` is `Muted` faded, the one distinction the
+    /// library has no token for.
+    pub fn color(self, cx: &App) -> gpui::Hsla {
+        let theme = cx.theme();
+
+        match self {
+            Tone::Muted => theme.muted_foreground,
+            Tone::Idle => theme.muted_foreground.opacity(IDLE_OPACITY),
+            Tone::Active => theme.blue,
+            Tone::Pending => theme.warning,
+            Tone::Live => theme.success,
+            Tone::Failed => theme.danger,
+        }
+    }
+}
+
+/// How far `Tone::Idle` sits behind `Tone::Muted`, and what the faint text
+/// throughout this module is faded by.
+const IDLE_OPACITY: f32 = 0.6;
+
+/// Secondary text: labels, subtitles, the dim half of a two-tone line.
+fn dim(cx: &App) -> gpui::Hsla {
+    cx.theme().muted_foreground
+}
+
+/// Tertiary text: context lines, disabled controls, disclosure chevrons.
+fn faint(cx: &App) -> gpui::Hsla {
+    cx.theme().muted_foreground.opacity(IDLE_OPACITY)
+}
 
 /// Sidebar section label ("MACHINES", "SESSIONS", …) — Apple-sidebar style:
 /// small, semibold, faint. Collapsible: the whole row is the toggle (caller
 /// chains `.on_click`); the caller adds optional extras (the workspaces "+")
 /// and then `section_chevron` so the disclosure sits rightmost.
-pub fn section_header(id: impl Into<ElementId>, title: &'static str) -> Stateful<Div> {
+pub fn section_header(id: impl Into<ElementId>, title: &'static str, cx: &App) -> Stateful<Div> {
     div()
         .id(id)
         .px_3()
@@ -28,9 +92,9 @@ pub fn section_header(id: impl Into<ElementId>, title: &'static str) -> Stateful
         .gap_2()
         .text_xs()
         .font_weight(FontWeight::SEMIBOLD)
-        .text_color(rgb(theme::TEXT_FAINT))
+        .text_color(faint(cx))
         .cursor_pointer()
-        .hover(|style| style.text_color(rgb(theme::TEXT_DIM)))
+        .hover(|style| style.text_color(dim(cx)))
         .child(title.to_uppercase())
         .child(div().flex_1())
 }
@@ -41,65 +105,51 @@ pub fn section_chevron(expanded: bool) -> Div {
 }
 
 /// The one dot: a machine's link, a session's liveness, a tool call's status.
-pub fn status_dot(tone: Tone) -> Div {
+pub fn status_dot(tone: Tone, cx: &App) -> Div {
     div()
         .flex_none()
         .size(px(6.))
         .rounded_full()
-        .bg(rgb(tone.color()))
+        .bg(tone.color(cx))
 }
 
-pub enum ButtonKind {
-    Neutral,
-    Primary,
+/// Assistant prose, rendered as markdown.
+///
+/// The state behind this lives in the window, keyed by `id`, and
+/// `TextViewState::set_text` returns early when the text is unchanged — so a
+/// settled message parses once and costs nothing on later frames, while the
+/// streaming partial reparses per chunk. That reparse is bounded by one
+/// message, and it is synchronous, which is what keeps the laid-out height
+/// correct on the first frame (SPEC C11).
+pub fn markdown(id: impl Into<ElementId>, text: impl Into<SharedString>) -> TextView {
+    TextView::markdown(id, text)
+        .selectable(true)
+        .style(markdown_style())
 }
 
-/// A clickable button; caller chains `.on_click`. Disabled buttons keep their
-/// footprint but drop the pointer affordances — the caller must also skip the
-/// click handler. No animation: buttons are high-frequency chrome.
-pub fn button(
-    id: impl Into<ElementId>,
-    label: impl Into<SharedString>,
-    kind: ButtonKind,
-    enabled: bool,
-) -> Stateful<Div> {
-    // Apple dark-mode push buttons: borderless fills, a whisper of shadow on
-    // the enabled ones, flat when disabled.
-    let base = div()
-        .id(id)
-        .px_3()
-        .py_1()
-        .rounded_md()
-        .text_sm()
-        .child(label.into());
+/// The one markdown style, built once: the library's default is the light
+/// highlight theme, and the app is pinned dark.
+fn markdown_style() -> TextViewStyle {
+    static STYLE: OnceLock<TextViewStyle> = OnceLock::new();
 
-    match (kind, enabled) {
-        (ButtonKind::Neutral, true) => base
-            .bg(rgb(theme::BUTTON_BG))
-            .text_color(rgb(theme::TEXT))
-            .shadow_sm()
-            .cursor_pointer()
-            .hover(|style| style.bg(rgb(theme::BUTTON_HOVER)))
-            .active(|style| style.bg(rgb(theme::BUTTON_ACTIVE))),
-        (ButtonKind::Primary, true) => base
-            .bg(rgb(theme::ACCENT))
-            .text_color(rgb(theme::TEXT_ON_ACCENT))
-            .shadow_sm()
-            .cursor_pointer()
-            .hover(|style| style.bg(rgb(theme::ACCENT_HOVER)))
-            .active(|style| style.bg(rgb(theme::ACCENT_ACTIVE))),
-        (_, false) => base
-            .bg(rgb(theme::BUTTON_BG))
-            .text_color(rgb(theme::TEXT_FAINT)),
-    }
+    STYLE
+        .get_or_init(|| TextViewStyle {
+            highlight_theme: HighlightTheme::default_dark(),
+            is_dark: true,
+            // The library's 1rem is book spacing; a chat turn is denser.
+            paragraph_gap: rems(0.5),
+            ..TextViewStyle::default()
+        })
+        .clone()
 }
 
-/// One chat message: author label over the text; user messages get a bubble.
+/// One chat message: author label over the body; user messages get a bubble.
 pub fn chat_message(
     author: &'static str,
     author_tone: Tone,
-    text: impl Into<SharedString>,
+    body: impl IntoElement,
     bubble: bool,
+    cx: &App,
 ) -> Div {
     div()
         .flex()
@@ -108,37 +158,37 @@ pub fn chat_message(
         .child(
             div()
                 .text_xs()
-                .text_color(rgb(author_tone.color()))
+                .text_color(author_tone.color(cx))
                 .child(author),
         )
         .child(
             div()
                 .when(bubble, |style| {
-                    style.bg(rgb(theme::INPUT_BG)).rounded_md().px_3().py_2()
+                    style.bg(cx.theme().muted).rounded_md().px_3().py_2()
                 })
-                .child(text.into()),
+                .child(body),
         )
 }
 
 /// The agent prompt box (SPEC §Flows "Start session", chat input): one
 /// rounded card holding the text input on top and a controls row at the
-/// bottom of the same frame; accent border while the input is focused.
+/// bottom of the same frame; the focus ring while the input is focused.
 /// Compose with `prompt_box_input` and `prompt_box_controls`.
-pub fn prompt_box(focused: bool) -> Div {
+pub fn prompt_box(focused: bool, cx: &App) -> Div {
     div()
         .rounded_xl()
-        .bg(rgb(theme::INPUT_BG))
+        .bg(cx.theme().input)
         .border_1()
         .border_color(if focused {
-            rgb(theme::ACCENT)
+            cx.theme().ring
         } else {
-            rgb(theme::BORDER)
+            cx.theme().border
         })
         .flex()
         .flex_col()
 }
 
-/// The prompt box's input slot: padding around the caller's `TextInput`.
+/// The prompt box's input slot: padding around the caller's `Input`.
 pub fn prompt_box_input(input: impl IntoElement) -> Div {
     div().px_3().pt_3().pb_2().child(input)
 }
@@ -157,6 +207,7 @@ pub fn prompt_box_control(
     id: impl Into<ElementId>,
     label: SharedString,
     enabled: bool,
+    cx: &App,
 ) -> Stateful<Div> {
     let base = div()
         .id(id)
@@ -168,47 +219,47 @@ pub fn prompt_box_control(
         .text_ellipsis();
 
     if enabled {
-        base.text_color(rgb(theme::TEXT_DIM))
+        base.text_color(dim(cx))
             .cursor_pointer()
-            .hover(|style| style.text_color(rgb(theme::TEXT)))
+            .hover(|style| style.text_color(cx.theme().foreground))
             .child(format!("{label} ▾"))
     } else {
-        base.text_color(rgb(theme::TEXT_FAINT)).child(label)
+        base.text_color(faint(cx)).child(label)
     }
 }
 
 /// Diameter of the prompt box's round send button.
 const SEND_BUTTON_SIZE: f32 = 22.;
 
-/// The prompt box's round accent send button ("↑"). Caller chains
-/// `.on_click`; Enter in the input is the other path to the same submit.
-pub fn prompt_box_send(id: impl Into<ElementId>) -> Stateful<Div> {
+/// The prompt box's round send button ("↑"). Caller chains `.on_click`; Enter
+/// in the input is the other path to the same submit.
+pub fn prompt_box_send(id: impl Into<ElementId>, cx: &App) -> Stateful<Div> {
     div()
         .id(id)
         .size(px(SEND_BUTTON_SIZE))
         .flex_none()
         .rounded_full()
-        .bg(rgb(theme::ACCENT))
-        .text_color(rgb(theme::TEXT_ON_ACCENT))
+        .bg(cx.theme().primary)
+        .text_color(cx.theme().primary_foreground)
         .flex()
         .items_center()
         .justify_center()
         .text_xs()
         .cursor_pointer()
-        .hover(|style| style.bg(rgb(theme::ACCENT_HOVER)))
-        .active(|style| style.bg(rgb(theme::ACCENT_ACTIVE)))
+        .hover(|style| style.bg(cx.theme().primary_hover))
+        .active(|style| style.bg(cx.theme().primary_active))
         .child("↑")
 }
 
 /// Chat pane header: title + faint subtitle (the unstarted chat's "New
 /// session" line — the model control lives in the prompt box, not here).
-pub fn chat_header(title: SharedString, subtitle: SharedString) -> Div {
+pub fn chat_header(title: SharedString, subtitle: SharedString, cx: &App) -> Div {
     div()
         .flex_none()
         .px_3()
         .py_2()
         .border_b_1()
-        .border_color(rgb(theme::BORDER))
+        .border_color(cx.theme().border)
         .flex()
         .items_center()
         .gap_2()
@@ -221,7 +272,7 @@ pub fn chat_header(title: SharedString, subtitle: SharedString) -> Div {
         .child(
             div()
                 .text_xs()
-                .text_color(rgb(theme::TEXT_FAINT))
+                .text_color(faint(cx))
                 .overflow_hidden()
                 .text_ellipsis()
                 .child(subtitle),
@@ -235,8 +286,8 @@ pub fn chat_header(title: SharedString, subtitle: SharedString) -> Div {
 /// spawning a subprocess and a rendering module must not do that.
 ///
 /// Unset, it answers `Menlo`: a family every macOS ships, and on Linux a miss
-/// falls back to gpui's own default — so the components stay usable (the
-/// kitchen catalog, a test) without an application around them.
+/// falls back to gpui's own default — so the components stay usable without an
+/// application around them.
 pub fn use_mono_font_family(family: SharedString) {
     let _ = MONO_FONT_FAMILY.set(family);
 }
@@ -249,13 +300,13 @@ static MONO_FONT_FAMILY: OnceLock<SharedString> = OnceLock::new();
 
 /// A tool-call block (SPEC §Rendering pi): rounded bordered card holding a
 /// `tool_block_header` and, when expanded, a `tool_block_body`. Sits on the
-/// chat background; the panel fill sets it apart from message bubbles.
-pub fn tool_block() -> Div {
+/// chat background; the sidebar fill sets it apart from message bubbles.
+pub fn tool_block(cx: &App) -> Div {
     div()
         .rounded_lg()
-        .bg(rgb(theme::PANEL_BG))
+        .bg(cx.theme().sidebar)
         .border_1()
-        .border_color(rgb(theme::BORDER))
+        .border_color(cx.theme().border)
         .flex()
         .flex_col()
         .overflow_hidden()
@@ -269,6 +320,7 @@ pub fn tool_block_header(
     dot: Tone,
     label: Div,
     expanded: bool,
+    cx: &App,
 ) -> Stateful<Div> {
     div()
         .id(id)
@@ -278,14 +330,14 @@ pub fn tool_block_header(
         .items_center()
         .gap_2()
         .cursor_pointer()
-        .hover(|style| style.bg(rgb(theme::ROW_HOVER)))
-        .child(status_dot(dot))
+        .hover(|style| style.bg(cx.theme().list_hover))
+        .child(status_dot(dot, cx))
         .child(label.flex_1().min_w(px(0.)))
         .child(
             div()
                 .flex_none()
                 .text_xs()
-                .text_color(rgb(theme::TEXT_FAINT))
+                .text_color(faint(cx))
                 .child(if expanded { "▾" } else { "▸" }),
         )
 }
@@ -302,11 +354,8 @@ pub fn tool_block_label() -> Div {
 }
 
 /// The label's dim leading verb ("Read", "Edit", "$").
-pub fn tool_block_verb(text: impl Into<SharedString>) -> Div {
-    div()
-        .flex_none()
-        .text_color(rgb(theme::TEXT_DIM))
-        .child(text.into())
+pub fn tool_block_verb(text: impl Into<SharedString>, cx: &App) -> Div {
+    div().flex_none().text_color(dim(cx)).child(text.into())
 }
 
 /// The label's subject: file basename, pattern, or the bash command line
@@ -320,7 +369,7 @@ pub fn tool_block_subject(text: SharedString, mono: bool) -> Div {
 }
 
 /// "+N −N" line stats for edit/write labels.
-pub fn tool_block_stats(added: usize, removed: usize) -> Div {
+pub fn tool_block_stats(added: usize, removed: usize, cx: &App) -> Div {
     div()
         .flex_none()
         .flex()
@@ -328,12 +377,12 @@ pub fn tool_block_stats(added: usize, removed: usize) -> Div {
         .text_xs()
         .child(
             div()
-                .text_color(rgb(theme::DIFF_ADDED))
+                .text_color(cx.theme().success)
                 .child(format!("+{added}")),
         )
         .child(
             div()
-                .text_color(rgb(theme::DIFF_REMOVED))
+                .text_color(cx.theme().danger)
                 .child(format!("−{removed}")),
         )
 }
@@ -341,10 +390,10 @@ pub fn tool_block_stats(added: usize, removed: usize) -> Div {
 /// The expanded body under the header: monospace, small, separated by a
 /// hairline. Compose with `tool_block_context`, `tool_block_output`,
 /// `tool_block_diff_line` and `tool_block_truncation_notice`.
-pub fn tool_block_body() -> Div {
+pub fn tool_block_body(cx: &App) -> Div {
     div()
         .border_t_1()
-        .border_color(rgb(theme::BORDER))
+        .border_color(cx.theme().border)
         .px_3()
         .py_2()
         .flex()
@@ -355,13 +404,13 @@ pub fn tool_block_body() -> Div {
 }
 
 /// The body's faint context line (full path, full command, raw args).
-pub fn tool_block_context(text: SharedString) -> Div {
-    div().text_color(rgb(theme::TEXT_FAINT)).child(text)
+pub fn tool_block_context(text: SharedString, cx: &App) -> Div {
+    div().text_color(faint(cx)).child(text)
 }
 
 /// The body's output text (tool result or live partial snapshot).
-pub fn tool_block_output(text: SharedString) -> Div {
-    div().text_color(rgb(theme::TEXT_DIM)).child(text)
+pub fn tool_block_output(text: SharedString, cx: &App) -> Div {
+    div().text_color(dim(cx)).child(text)
 }
 
 /// One line of an edit/write diff body.
@@ -371,25 +420,23 @@ pub enum DiffLineKind {
     Removed,
 }
 
-pub fn tool_block_diff_line(kind: DiffLineKind, text: SharedString) -> Div {
+pub fn tool_block_diff_line(kind: DiffLineKind, text: SharedString, cx: &App) -> Div {
     let color = match kind {
-        DiffLineKind::Context => theme::TEXT_DIM,
-        DiffLineKind::Added => theme::DIFF_ADDED,
-        DiffLineKind::Removed => theme::DIFF_REMOVED,
+        DiffLineKind::Context => dim(cx),
+        DiffLineKind::Added => cx.theme().success,
+        DiffLineKind::Removed => cx.theme().danger,
     };
 
-    div().text_color(rgb(color)).child(text)
+    div().text_color(color).child(text)
 }
 
 /// Shown above capped output — the head was dropped, the tail is live.
-pub fn tool_block_truncation_notice() -> Div {
-    div()
-        .text_color(rgb(theme::TEXT_FAINT))
-        .child("… output truncated")
+pub fn tool_block_truncation_notice(cx: &App) -> Div {
+    div().text_color(faint(cx)).child("… output truncated")
 }
 
 /// The bottom statusbar container; caller adds its content children.
-pub fn statusbar_frame() -> Div {
+pub fn statusbar_frame(cx: &App) -> Div {
     div()
         .h(px(STATUSBAR_HEIGHT))
         .flex_none()
@@ -398,7 +445,7 @@ pub fn statusbar_frame() -> Div {
         .gap_3()
         .px_3()
         .border_t_1()
-        .border_color(rgb(theme::BORDER))
-        .bg(rgb(theme::PANEL_BG))
+        .border_color(cx.theme().status_bar_border)
+        .bg(cx.theme().status_bar)
         .text_xs()
 }

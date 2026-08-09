@@ -17,7 +17,7 @@
 use std::collections::HashSet;
 
 use gpui::{
-    div, prelude::*, px, rgb, AnyElement, Context, Div, Entity, EventEmitter, Focusable,
+    div, prelude::*, px, AnyElement, App, Context, Div, Entity, EventEmitter, Focusable,
     ScrollHandle, SharedString, Subscription, Window,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -27,8 +27,7 @@ use crate::choices;
 use crate::model_control::ModelControl;
 use crate::models::{self, ModelChoice, ModelsState};
 use crate::store::{FleetStore, StoreEvent};
-use crate::theme::{self, Tone};
-use crate::ui;
+use crate::ui::{self, Tone};
 use crate::workspaces::folder_name;
 use harvester_client_core::bridge::Event as BridgeEvent;
 use harvester_client_core::transcript::{Item, Message, Role, ToolBlock, ToolStatus, Transcript};
@@ -831,7 +830,7 @@ impl Chat {
                             .enumerate()
                             .map(|(index, item)| self.render_item(index, item, cx)),
                     )
-                    .children(self.render_streaming()),
+                    .children(self.render_streaming(cx)),
             )
     }
 
@@ -839,7 +838,7 @@ impl Chat {
     /// toggles is the block's `toolCallId`, which survives a resync.
     fn render_item(&self, index: usize, item: &Item, cx: &mut Context<Self>) -> AnyElement {
         match item {
-            Item::Message(message) => render_message(message).into_any_element(),
+            Item::Message(message) => render_message(index, message, cx).into_any_element(),
             Item::Tool(block) => self.render_tool_block(index, block, cx).into_any_element(),
         }
     }
@@ -862,27 +861,40 @@ impl Chat {
         let header = ui::tool_block_header(
             ("tool-block", index),
             tone,
-            tool_block_label(block),
+            tool_block_label(block, cx),
             expanded,
+            cx,
         )
         .on_click(
             cx.listener(move |chat, _, _, cx| chat.toggle_tool_block(tool_call_id.clone(), cx)),
         );
 
-        ui::tool_block().child(header).when(expanded, |container| {
-            container.child(render_tool_body(block))
-        })
+        ui::tool_block(cx)
+            .child(header)
+            .when(expanded, |container| {
+                container.child(render_tool_body(block, cx))
+            })
     }
 
-    fn render_streaming(&self) -> Option<impl IntoElement> {
-        let text = match (self.transcript.streaming(), self.transcript.is_busy()) {
-            (Some(text), _) => format!("{text}▍"),
+    /// The turn in flight: the partial message, or that pi is thinking.
+    ///
+    /// The partial is markdown like any other pi message, so a fence that has
+    /// opened but not closed formats as it arrives rather than snapping into
+    /// shape when the turn settles. It parses on every chunk — bounded by the
+    /// one message, and only while a turn is live.
+    fn render_streaming(&self, cx: &App) -> Option<Div> {
+        match (self.transcript.streaming(), self.transcript.is_busy()) {
+            (Some(text), _) => Some(ui::chat_message(
+                "pi",
+                Tone::Muted,
+                ui::markdown("streaming-message", format!("{text}▍")),
+                false,
+                cx,
+            )),
             // Prompt accepted, no partial yet: show that pi is working.
-            (None, true) => "…".to_string(),
-            (None, false) => return None,
-        };
-
-        Some(ui::chat_message("pi", Tone::Muted, text, false))
+            (None, true) => Some(ui::chat_message("pi", Tone::Muted, "…", false, cx)),
+            (None, false) => None,
+        }
     }
 
     /// The pane's bottom row: the prompt box, or the one sentence that
@@ -901,7 +913,7 @@ impl Chat {
             return row.child(
                 div()
                     .text_xs()
-                    .text_color(rgb(theme::TEXT_FAINT))
+                    .text_color(Tone::Idle.color(cx))
                     .child(notice),
             );
         }
@@ -921,12 +933,12 @@ impl Chat {
             matches!(self.state, ChatState::Unstarted) && self.can_switch_machine(cx);
         let machine_label = self.machine_label(cx);
 
-        ui::prompt_box(input_focused)
+        ui::prompt_box(input_focused, cx)
             .child(ui::prompt_box_input(Input::new(&self.input)))
             .child(
                 ui::prompt_box_controls()
                     .child(
-                        ui::prompt_box_control("chat-model", model_label, model_enabled).when(
+                        ui::prompt_box_control("chat-model", model_label, model_enabled, cx).when(
                             model_enabled,
                             |control| {
                                 control.on_click(cx.listener(|chat, _, window, cx| {
@@ -939,9 +951,10 @@ impl Chat {
                         "chat-repo",
                         folder_name(&self.target.workspace_path).to_string().into(),
                         false,
+                        cx,
                     ))
                     .child(
-                        ui::prompt_box_control("chat-machine", machine_label, machine_enabled)
+                        ui::prompt_box_control("chat-machine", machine_label, machine_enabled, cx)
                             .when(machine_enabled, |control| {
                                 control.on_click(cx.listener(|chat, _, window, cx| {
                                     chat.open_machine_picker(window, cx)
@@ -949,7 +962,7 @@ impl Chat {
                             }),
                     )
                     .child(div().flex_1())
-                    .child(ui::prompt_box_send("chat-send").on_click(
+                    .child(ui::prompt_box_send("chat-send", cx).on_click(
                         cx.listener(|chat, _, window, cx| chat.submit_prompt(window, cx)),
                     )),
             )
@@ -975,7 +988,7 @@ impl Chat {
 
     /// The unstarted body: empty, except when the model fetch failed — which
     /// is informational, not blocking, since pi still launches with a default.
-    fn render_unstarted_body(&self) -> impl IntoElement {
+    fn render_unstarted_body(&self, cx: &App) -> impl IntoElement {
         div()
             .flex_1()
             .min_h(px(0.))
@@ -984,7 +997,7 @@ impl Chat {
                 ModelsState::Failed(detail) => Some(
                     div()
                         .text_xs()
-                        .text_color(rgb(theme::STATUS_ERROR))
+                        .text_color(Tone::Failed.color(cx))
                         .child(format!("{detail} — pi will use its default model")),
                 ),
                 _ => None,
@@ -1009,8 +1022,9 @@ impl Render for Chat {
                 .child(ui::chat_header(
                     "New session".into(),
                     self.unstarted_subtitle(cx),
+                    cx,
                 ))
-                .child(self.render_unstarted_body()),
+                .child(self.render_unstarted_body(cx)),
             ChatState::Live { .. } => pane.child(self.render_messages(cx)),
         };
 
@@ -1031,18 +1045,20 @@ fn session_name_from_prompt(prompt: &str) -> String {
         .collect()
 }
 
-fn render_message(message: &Message) -> impl IntoElement {
-    let (label, tone) = match message.role {
-        Role::User => ("you", Tone::Active),
-        Role::Assistant => ("pi", Tone::Muted),
-    };
-
-    ui::chat_message(
-        label,
-        tone,
-        message.text.clone(),
-        message.role == Role::User,
-    )
+/// One settled message. The user's own text renders verbatim — it is what they
+/// typed, and a `#` or a `*` in it is a character, not a heading or emphasis.
+/// Pi's is markdown, which is what pi writes.
+fn render_message(index: usize, message: &Message, cx: &App) -> Div {
+    match message.role {
+        Role::User => ui::chat_message("you", Tone::Active, message.text.clone(), true, cx),
+        Role::Assistant => ui::chat_message(
+            "pi",
+            Tone::Muted,
+            ui::markdown(("message", index), message.text.clone()),
+            false,
+            cx,
+        ),
+    }
 }
 
 /// Cap on the compact-args summary in unknown-tool labels; the full args
@@ -1052,7 +1068,7 @@ const ARGS_SUMMARY_MAX_CHARS: usize = 80;
 /// The header one-liner per tool (built-ins verified against pi 0.83.0:
 /// read/bash/edit/write/grep/find/ls). Bash gets a `$ command` form — pi has
 /// no human titles for calls, the command itself is the best label.
-fn tool_block_label(block: &ToolBlock) -> Div {
+fn tool_block_label(block: &ToolBlock, cx: &App) -> Div {
     let label = ui::tool_block_label();
 
     match block.tool_name.as_str() {
@@ -1061,7 +1077,7 @@ fn tool_block_label(block: &ToolBlock) -> Div {
             let first_line = command.lines().next().unwrap_or_default().to_string();
 
             label
-                .child(ui::tool_block_verb("$"))
+                .child(ui::tool_block_verb("$", cx))
                 .child(ui::tool_block_subject(first_line.into(), true))
         }
         "read" | "write" | "edit" => {
@@ -1072,14 +1088,14 @@ fn tool_block_label(block: &ToolBlock) -> Div {
             };
             let path = block.arg("path").unwrap_or_default();
             let label = label
-                .child(ui::tool_block_verb(verb))
+                .child(ui::tool_block_verb(verb, cx))
                 .child(ui::tool_block_subject(
                     basename(path).to_string().into(),
                     false,
                 ));
 
             match block.line_stats() {
-                Some((added, removed)) => label.child(ui::tool_block_stats(added, removed)),
+                Some((added, removed)) => label.child(ui::tool_block_stats(added, removed, cx)),
                 None => label,
             }
         }
@@ -1092,18 +1108,18 @@ fn tool_block_label(block: &ToolBlock) -> Div {
             let pattern = block.arg("pattern").unwrap_or_default();
 
             label
-                .child(ui::tool_block_verb(verb))
+                .child(ui::tool_block_verb(verb, cx))
                 .child(ui::tool_block_subject(pattern.to_string().into(), true))
         }
         "ls" => {
             let path = block.arg("path").unwrap_or(".");
 
             label
-                .child(ui::tool_block_verb("List"))
+                .child(ui::tool_block_verb("List", cx))
                 .child(ui::tool_block_subject(path.to_string().into(), false))
         }
         _ => label
-            .child(ui::tool_block_verb(block.tool_name.clone()))
+            .child(ui::tool_block_verb(block.tool_name.clone(), cx))
             .child(ui::tool_block_subject(
                 compact_args(&block.args).into(),
                 true,
@@ -1113,13 +1129,14 @@ fn tool_block_label(block: &ToolBlock) -> Div {
 
 /// The expanded body: context line, then a diff (edit/write) or the output
 /// snapshot. Errors always show the output — that is where the message is.
-fn render_tool_body(block: &ToolBlock) -> Div {
-    let mut body = ui::tool_block_body().child(ui::tool_block_context(context_line(block).into()));
+fn render_tool_body(block: &ToolBlock, cx: &App) -> Div {
+    let mut body =
+        ui::tool_block_body(cx).child(ui::tool_block_context(context_line(block).into(), cx));
 
     if !matches!(block.status, ToolStatus::Error) {
         // Edit: pi's pre-rendered numbered diff (`details.diff`).
         if let Some(diff) = &block.diff {
-            return body.children(diff.lines().map(diff_line));
+            return body.children(diff.lines().map(|line| diff_line(line, cx)));
         }
 
         // Write: synthesize the all-added diff from the content argument.
@@ -1129,6 +1146,7 @@ fn render_tool_body(block: &ToolBlock) -> Div {
                     ui::tool_block_diff_line(
                         ui::DiffLineKind::Added,
                         format!("+{} {line}", line_index + 1).into(),
+                        cx,
                     )
                 }));
             }
@@ -1136,7 +1154,7 @@ fn render_tool_body(block: &ToolBlock) -> Div {
     }
 
     if block.output_truncated {
-        body = body.child(ui::tool_block_truncation_notice());
+        body = body.child(ui::tool_block_truncation_notice(cx));
     }
 
     if block.output.is_empty() {
@@ -1145,10 +1163,10 @@ fn render_tool_body(block: &ToolBlock) -> Div {
             _ => "(no output)",
         };
 
-        return body.child(ui::tool_block_output(placeholder.into()));
+        return body.child(ui::tool_block_output(placeholder.into(), cx));
     }
 
-    body.child(ui::tool_block_output(block.output.clone().into()))
+    body.child(ui::tool_block_output(block.output.clone().into(), cx))
 }
 
 /// The body's faint first line: enough to identify the call in full.
@@ -1161,14 +1179,14 @@ fn context_line(block: &ToolBlock) -> String {
 }
 
 /// One line of pi's numbered diff format (" 1 ctx" / "-2 old" / "+2 new").
-fn diff_line(line: &str) -> Div {
+fn diff_line(line: &str, cx: &App) -> Div {
     let kind = match line.as_bytes().first() {
         Some(b'+') => ui::DiffLineKind::Added,
         Some(b'-') => ui::DiffLineKind::Removed,
         _ => ui::DiffLineKind::Context,
     };
 
-    ui::tool_block_diff_line(kind, line.to_string().into())
+    ui::tool_block_diff_line(kind, line.to_string().into(), cx)
 }
 
 fn basename(path: &str) -> &str {

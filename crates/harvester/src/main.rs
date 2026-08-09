@@ -2,18 +2,15 @@
 //!
 //! `harvester` is the normal launch (machines come from providers and the
 //! workspace list); `harvester <ssh-destination>` adds that destination as an
-//! ad-hoc machine (the dev workflow); `harvester kitchen` opens the
-//! design-system catalog. Argument parsing stays manual — clap lives in
-//! harvester-cli only, and one positional argument does not earn it here
-//! either.
+//! ad-hoc machine (the dev workflow). Argument parsing stays manual — clap
+//! lives in harvester-cli only, and one positional argument does not earn it
+//! here either.
 
 mod chat;
 mod choices;
-mod kitchen;
 mod model_control;
 mod models;
 mod store;
-mod theme;
 mod ui;
 mod workbench;
 mod workspaces;
@@ -24,7 +21,6 @@ use gpui::{
 };
 use gpui_component::{Root, Theme, ThemeMode};
 
-use crate::kitchen::Kitchen;
 use crate::workbench::Workbench;
 
 actions!(harvester, [Quit]);
@@ -63,12 +59,6 @@ fn main() {
 
     if let Some(family) = resolve_mono_font_family() {
         ui::use_mono_font_family(family);
-    }
-
-    // The design-system catalog: pure rendering, no bridge, no daemon.
-    if argv_machine.as_deref() == Some("kitchen") {
-        run_kitchen();
-        return;
     }
 
     let daemon_binary = match daemon_binary() {
@@ -118,7 +108,7 @@ fn main() {
         });
 }
 
-/// gpui-component's one-time setup, shared by both windows. `init` must precede
+/// gpui-component's one-time setup. `init` must precede
 /// every other call into the library; it also hardcodes light mode, so dark is
 /// chosen explicitly right after. `Theme::sync_system_appearance` is
 /// deliberately never called — nothing else observes the desktop's appearance,
@@ -126,41 +116,6 @@ fn main() {
 fn install_widget_layer(cx: &mut App) {
     gpui_component::init(cx);
     Theme::change(ThemeMode::Dark, None, cx);
-}
-
-fn run_kitchen() {
-    gpui_platform::application()
-        .with_assets(gpui_component_assets::Assets)
-        .run(|cx: &mut App| {
-            install_widget_layer(cx);
-            bind_keys(cx);
-            cx.on_action(|_: &Quit, cx| cx.quit());
-
-            let bounds = Bounds::centered(None, size(px(820.), px(720.)), cx);
-            let open_result = cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    titlebar: Some(TitlebarOptions {
-                        title: Some("Harvester — kitchen".into()),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                },
-                |window, cx| {
-                    let kitchen = cx.new(|cx| Kitchen::new(window, cx));
-
-                    cx.new(|cx| Root::new(kitchen, window, cx))
-                },
-            );
-
-            match open_result {
-                Ok(_) => cx.activate(true),
-                Err(error) => {
-                    eprintln!("harvester: open kitchen window: {error}");
-                    cx.quit();
-                }
-            }
-        });
 }
 
 fn daemon_binary() -> Result<Vec<u8>, String> {

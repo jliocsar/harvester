@@ -24,6 +24,12 @@ gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "
     "tree-sitter-typescript",
     "tree-sitter-tsx",
     "tree-sitter-bash",
+    "tree-sitter-rust",
+    "tree-sitter-python",
+    "tree-sitter-go",
+    "tree-sitter-diff",
+    "tree-sitter-toml",
+    "tree-sitter-yaml",
 ] }
 # Lucide SVGs behind `IconName`. Without an AssetSource every icon renders blank.
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "f96f1576" }

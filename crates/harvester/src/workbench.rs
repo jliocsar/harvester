@@ -10,9 +10,7 @@
 
 mod picker;
 
-use gpui::{
-    div, prelude::*, px, rgb, App, Context, Div, Entity, SharedString, Subscription, Window,
-};
+use gpui::{div, prelude::*, px, App, Context, Div, Entity, SharedString, Subscription, Window};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::list::ListItem;
 use gpui_component::notification::NotificationType;
@@ -27,8 +25,7 @@ use serde_json::Value;
 use crate::chat::{Chat, ChatRequest, ChatTarget};
 use crate::choices;
 use crate::store::{FleetStore, MachineSession, StoreEvent};
-use crate::theme::{self, Tone};
-use crate::ui;
+use crate::ui::{self, Tone};
 use crate::workspaces::folder_name;
 use harvester_client_core::bridge::{Command, Event as BridgeEvent};
 use harvester_client_core::machines;
@@ -505,11 +502,11 @@ impl Workbench {
             .flex_none()
             .flex()
             .flex_col()
-            .bg(rgb(theme::PANEL_BG))
+            .bg(cx.theme().sidebar)
             .border_r_1()
-            .border_color(rgb(theme::BORDER))
+            .border_color(cx.theme().sidebar_border)
             .child(
-                ui::section_header("machines-header", "machines")
+                ui::section_header("machines-header", "machines", cx)
                     .child(ui::section_chevron(!self.machines_collapsed))
                     .on_click(cx.listener(|workbench, _, _, cx| {
                         workbench.machines_collapsed = !workbench.machines_collapsed;
@@ -524,7 +521,7 @@ impl Workbench {
                 sidebar.child(self.render_workspace_list(cx))
             })
             .child(
-                ui::section_header("sessions-header", "sessions")
+                ui::section_header("sessions-header", "sessions", cx)
                     .child(ui::section_chevron(!self.sessions_collapsed))
                     .on_click(cx.listener(|workbench, _, _, cx| {
                         workbench.sessions_collapsed = !workbench.sessions_collapsed;
@@ -573,7 +570,7 @@ impl Workbench {
     fn render_workspaces_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let can_add = !self.store.read(cx).machine_candidates().is_empty();
 
-        ui::section_header("workspaces-header", "workspaces")
+        ui::section_header("workspaces-header", "workspaces", cx)
             .child(
                 Button::new("add-workspace")
                     .icon(IconName::Plus)
@@ -832,7 +829,7 @@ impl Workbench {
                 .items_center()
                 .justify_center()
                 .p_4()
-                .text_color(rgb(color.color()))
+                .text_color(color.color(cx))
                 .child(hint),
         )
     }
@@ -854,7 +851,7 @@ impl Workbench {
     fn render_statusbar(&self, cx: &Context<Self>) -> impl IntoElement {
         let (link_text, link_tone) = self.statusbar_link(cx);
 
-        ui::statusbar_frame().child(div().text_color(rgb(link_tone.color())).child(link_text))
+        ui::statusbar_frame(cx).child(div().text_color(link_tone.color(cx)).child(link_text))
     }
 
     fn statusbar_link(&self, cx: &Context<Self>) -> (String, Tone) {
@@ -905,8 +902,8 @@ impl Render for Workbench {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(theme::WINDOW_BG))
-            .text_color(rgb(theme::TEXT))
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
             .text_size(px(13.))
             .child(
                 div()
@@ -957,7 +954,7 @@ fn stacked_row(
         .child(
             h_flex()
                 .gap_2()
-                .child(ui::status_dot(dot))
+                .child(ui::status_dot(dot, cx))
                 .child(div().overflow_hidden().text_ellipsis().child(title))
                 .children(note.map(|note| {
                     div()
