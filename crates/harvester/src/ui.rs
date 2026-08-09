@@ -6,16 +6,12 @@
 
 use std::sync::OnceLock;
 
-use gpui::{
-    div, prelude::*, px, rgb, rgba, AnyElement, Div, ElementId, FontWeight, SharedString, Stateful,
-};
+use gpui::{div, prelude::*, px, rgb, Div, ElementId, FontWeight, SharedString, Stateful};
 
 use crate::theme::{self, Tone};
 
 /// Statusbar height; the workbench and the kitchen sample must agree.
 const STATUSBAR_HEIGHT: f32 = 26.;
-/// Modal panel width — wide enough for a path, narrow enough to stay a dialog.
-const MODAL_WIDTH: f32 = 420.;
 
 /// Sidebar section label ("MACHINES", "SESSIONS", …) — Apple-sidebar style:
 /// small, semibold, faint. Collapsible: the whole row is the toggle (caller
@@ -96,88 +92,6 @@ pub fn button(
             .bg(rgb(theme::BUTTON_BG))
             .text_color(rgb(theme::TEXT_FAINT)),
     }
-}
-
-/// One sidebar session row: status dot + title line, workspace line under it,
-/// hover/selection as an Apple-sidebar rounded pill (inset from the edges).
-/// Caller chains `.on_click`.
-pub fn session_row(
-    id: impl Into<ElementId>,
-    title: SharedString,
-    workspace_name: SharedString,
-    dot: Tone,
-    selected: bool,
-    opening: bool,
-) -> Stateful<Div> {
-    div()
-        .id(id)
-        // 6px margin + 6px padding = the 12px text inset section_header uses.
-        .mx(px(6.))
-        .px(px(6.))
-        .py_1()
-        .rounded_md()
-        .flex()
-        .flex_col()
-        .cursor_pointer()
-        .hover(|style| style.bg(rgb(theme::ROW_HOVER)))
-        .when(selected, |style| style.bg(rgb(theme::ROW_SELECTED)))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(status_dot(dot))
-                .child(div().overflow_hidden().text_ellipsis().child(title))
-                .when(opening, |row| {
-                    row.child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(theme::TEXT_FAINT))
-                            .child("opening…"),
-                    )
-                }),
-        )
-        .child(
-            div()
-                .pl(px(14.))
-                .text_xs()
-                .text_color(rgb(theme::TEXT_FAINT))
-                .overflow_hidden()
-                .text_ellipsis()
-                .child(workspace_name),
-        )
-}
-
-/// One sidebar machine row — read-only by design (machines are listed, not
-/// clicked): status dot + label, the machine's source under it (`None` for
-/// the local row — it comes from nowhere). Dot semantics live with the
-/// caller (SPEC §UI machine dots); the probe is Harvester's own SSH check,
-/// never provider-reported status (SPEC §Machine).
-pub fn machine_row(label: SharedString, detail: Option<SharedString>, dot: Tone) -> Div {
-    div()
-        // Same 6+6 inset as session_row, aligning with section_header text.
-        .mx(px(6.))
-        .px(px(6.))
-        .py_1()
-        .flex()
-        .flex_col()
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(status_dot(dot))
-                .child(div().overflow_hidden().text_ellipsis().child(label)),
-        )
-        .children(detail.map(|detail| {
-            div()
-                .pl(px(14.))
-                .text_xs()
-                .text_color(rgb(theme::TEXT_FAINT))
-                .overflow_hidden()
-                .text_ellipsis()
-                .child(detail)
-        }))
 }
 
 /// One chat message: author label over the text; user messages get a bubble.
@@ -286,79 +200,6 @@ pub fn prompt_box_send(id: impl Into<ElementId>) -> Stateful<Div> {
         .child("↑")
 }
 
-/// One sidebar workspace row: `folder_name in machine_label` — read-only by
-/// design (workspaces are listed, not clicked). Compose with
-/// `workspace_row_add` for the trailing "+" that opens an unstarted chat there.
-pub fn workspace_row(name: SharedString, machine: SharedString) -> Div {
-    div()
-        // Same 6+6 inset as session_row, aligning with section_header text.
-        .mx(px(6.))
-        .px(px(6.))
-        .py_1()
-        .flex()
-        .items_baseline()
-        .gap_1()
-        .child(
-            div()
-                .flex_none()
-                // Cap the folder name so a long one still leaves the machine
-                // label readable inside the 240px sidebar.
-                .max_w(px(140.))
-                .overflow_hidden()
-                .text_ellipsis()
-                .child(name),
-        )
-        .child(
-            div()
-                .text_xs()
-                .text_color(rgb(theme::TEXT_FAINT))
-                .overflow_hidden()
-                .text_ellipsis()
-                .child(format!("in {machine}")),
-        )
-        .child(div().flex_1())
-}
-
-/// The workspace row's "+" — the one click target on the row (SPEC §Flows
-/// "Start session"): opens an unstarted chat in that workspace. Caller
-/// chains `.on_click`.
-pub fn workspace_row_add(id: impl Into<ElementId>) -> Stateful<Div> {
-    div()
-        .id(id)
-        .flex_none()
-        .px_1()
-        .rounded_md()
-        .text_color(rgb(theme::TEXT_FAINT))
-        .cursor_pointer()
-        .hover(|style| style.text_color(rgb(theme::TEXT)).bg(rgb(theme::ROW_HOVER)))
-        .child("+")
-}
-
-/// One model in the unstarted chat's picker; the selected one carries a leading
-/// check, the others an equally wide blank so names align. Caller chains
-/// `.on_click` (select-and-close — no confirm step).
-pub fn model_row(id: impl Into<ElementId>, name: SharedString, selected: bool) -> Stateful<Div> {
-    div()
-        .id(id)
-        .px_2()
-        .py_1()
-        .rounded_md()
-        .cursor_pointer()
-        .hover(|style| style.bg(rgb(theme::ROW_HOVER)))
-        .when(selected, |style| style.bg(rgb(theme::ROW_SELECTED)))
-        .flex()
-        .items_center()
-        .gap_2()
-        .child(
-            div()
-                .flex_none()
-                .w(px(14.))
-                .text_color(rgb(theme::ACCENT))
-                .when(selected, |check| check.child("✓")),
-        )
-        .child(div().overflow_hidden().text_ellipsis().child(name))
-}
-
 /// Chat pane header: title + faint subtitle (the unstarted chat's "New
 /// session" line — the model control lives in the prompt box, not here).
 pub fn chat_header(title: SharedString, subtitle: SharedString) -> Div {
@@ -385,33 +226,6 @@ pub fn chat_header(title: SharedString, subtitle: SharedString) -> Div {
                 .text_ellipsis()
                 .child(subtitle),
         )
-}
-
-/// A clickable directory row in the folder picker (trailing `/` marks it as
-/// enterable). Caller chains `.on_click` to navigate into it.
-pub fn picker_dir_row(id: impl Into<ElementId>, name: SharedString) -> Stateful<Div> {
-    div()
-        .id(id)
-        .px_2()
-        .py_1()
-        .rounded_md()
-        .cursor_pointer()
-        .hover(|style| style.bg(rgb(theme::ROW_HOVER)))
-        .overflow_hidden()
-        .text_ellipsis()
-        .child(format!("{name}/"))
-}
-
-/// A non-directory entry in the folder picker: shown faint for orientation,
-/// not clickable.
-pub fn picker_file_row(name: SharedString) -> Div {
-    div()
-        .px_2()
-        .py_1()
-        .text_color(rgb(theme::TEXT_FAINT))
-        .overflow_hidden()
-        .text_ellipsis()
-        .child(name)
 }
 
 /// The monospace family tool-block bodies render in. gpui matches families by
@@ -572,94 +386,6 @@ pub fn tool_block_truncation_notice() -> Div {
     div()
         .text_color(rgb(theme::TEXT_FAINT))
         .child("… output truncated")
-}
-
-/// Fixed height for modal scroll lists, so a dialog does not resize with its
-/// contents.
-const MODAL_LIST_HEIGHT: f32 = 280.;
-
-/// How tall a modal's scroll list stands. `Fixed` keeps the dialog the same
-/// size whatever it holds, which is what a list that arrives asynchronously
-/// (models being fetched) or changes wholesale (a directory walk) needs — it
-/// would otherwise resize under the pointer between one click and the next.
-pub enum ModalListHeight {
-    Fixed,
-    FitContent,
-}
-
-/// A dismissible modal list of choices: scrim, dialog frame, scrolling rows.
-/// Four surfaces built this by hand and each carried its own copy of the note
-/// about `.occlude()`; that note now lives once, on [`modal_scrim`].
-///
-/// The caller chains `.on_click` for click-outside dismissal, because dismissal
-/// is the one part that differs — it belongs to whoever owns the modal's state.
-/// A modal with more than a list (the folder picker's context line, error and
-/// buttons) composes [`modal_scrim`], [`modal_frame`] and [`modal_scroll_list`]
-/// itself.
-pub fn modal_list(
-    id: &str,
-    title: impl Into<SharedString>,
-    height: ModalListHeight,
-    rows: Vec<AnyElement>,
-) -> Stateful<Div> {
-    modal_scrim(SharedString::from(format!("{id}-scrim")))
-        .child(modal_frame(title).child(modal_scroll_list(id, height).children(rows)))
-}
-
-/// The scrolling list a modal's choices go in; the caller adds them. Split out
-/// for the one modal that is more than a list — the folder picker, which puts
-/// a context line above it and an error and buttons below.
-pub fn modal_scroll_list(id: &str, height: ModalListHeight) -> Stateful<Div> {
-    let list = div()
-        .id(SharedString::from(format!("{id}-entries")))
-        .overflow_y_scroll()
-        .flex()
-        .flex_col();
-
-    match height {
-        ModalListHeight::Fixed => list.h(px(MODAL_LIST_HEIGHT)),
-        ModalListHeight::FitContent => list.max_h(px(MODAL_LIST_HEIGHT)),
-    }
-}
-
-/// Full-window backdrop that centers its child (the modal). The child is
-/// `.occlude()`d here so clicks inside a dialog never reach the scrim's
-/// dismiss hitbox — every caller used to repeat that. Caller chains
-/// `.on_click` for click-outside dismissal.
-pub fn modal_scrim(id: impl Into<ElementId>) -> Stateful<Div> {
-    div()
-        .id(id)
-        .absolute()
-        .inset_0()
-        .bg(rgba(theme::SCRIM_RGBA))
-        .flex()
-        .items_center()
-        .justify_center()
-        .occlude()
-}
-
-/// A modal dialog panel: title header, then whatever body the caller adds.
-/// Overlay/backdrop wiring belongs to the caller (it owns dismissal).
-pub fn modal_frame(title: impl Into<SharedString>) -> Stateful<Div> {
-    div()
-        .id(SharedString::from("modal-frame"))
-        .occlude()
-        .w(px(MODAL_WIDTH))
-        .bg(rgb(theme::ELEVATED_BG))
-        .border_1()
-        .border_color(rgb(theme::BORDER))
-        .rounded_xl()
-        .shadow_lg()
-        .p_4()
-        .flex()
-        .flex_col()
-        .gap_3()
-        .child(
-            div()
-                .text_color(rgb(theme::TEXT))
-                .font_weight(FontWeight::MEDIUM)
-                .child(title.into()),
-        )
 }
 
 /// The bottom statusbar container; caller adds its content children.

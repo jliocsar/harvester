@@ -79,19 +79,13 @@ impl Render for Kitchen {
                     .child(section("buttons", render_buttons()))
                     .child(section("status dots", render_status_dots()))
                     .child(section("section headers", render_section_headers()))
-                    .child(section("machine rows", render_machine_rows()))
-                    .child(section("session rows", render_session_rows()))
-                    .child(section("workspace rows", render_workspace_rows()))
                     .child(section("chat header", render_chat_header_sample()))
                     .child(section(
                         "prompt box",
                         render_prompt_box_samples(self.prompt_input.clone(), prompt_focused),
                     ))
-                    .child(section("model picker", render_model_picker_sample()))
-                    .child(section("folder picker", render_folder_picker_sample()))
                     .child(section("chat messages", render_chat_messages()))
                     .child(section("tool blocks", render_tool_blocks()))
-                    .child(section("modal", render_modal_sample()))
                     .child(section("statusbar", render_statusbar_sample())),
             )
             // The catalog previews components, so it needs the same overlay
@@ -359,155 +353,6 @@ fn render_section_headers() -> impl IntoElement {
         )
 }
 
-fn render_machine_rows() -> impl IntoElement {
-    // Sidebar-width container so ellipsis behavior shows realistically.
-    // Machine rows are read-only: no hover, no click target. One row per dot
-    // state (SPEC §UI machine dots); `local` has no subtitle.
-    div()
-        .w(px(240.))
-        .bg(rgb(theme::PANEL_BG))
-        .border_1()
-        .border_color(rgb(theme::BORDER))
-        .rounded_md()
-        .py_1()
-        .flex()
-        .flex_col()
-        .child(ui::machine_row("local".into(), None, Tone::Idle))
-        .child(ui::machine_row(
-            "bloggy".into(),
-            Some("exe-dev".into()),
-            Tone::Live,
-        ))
-        .child(ui::machine_row(
-            "vps-work".into(),
-            Some("exe-dev".into()),
-            Tone::Pending,
-        ))
-        .child(ui::machine_row(
-            "unreachable".into(),
-            Some("fly.io".into()),
-            Tone::Failed,
-        ))
-        .child(ui::machine_row(
-            "a-machine-with-a-very-long-label.exe.xyz".into(),
-            Some("a-provider-with-a-long-name".into()),
-            Tone::Idle,
-        ))
-}
-
-fn render_session_rows() -> impl IntoElement {
-    // Sidebar-width container so ellipsis behavior shows realistically.
-    div()
-        .w(px(240.))
-        .bg(rgb(theme::PANEL_BG))
-        .border_1()
-        .border_color(rgb(theme::BORDER))
-        .rounded_md()
-        .py_1()
-        .flex()
-        .flex_col()
-        .child(ui::session_row(
-            "kitchen-row-selected",
-            "Refactor auth".into(),
-            "bloggy · egg-by-penguin".into(),
-            Tone::Live,
-            true,
-            false,
-        ))
-        .child(ui::session_row(
-            "kitchen-row-opening",
-            "019fc40d".into(),
-            "harvester · local".into(),
-            Tone::Live,
-            false,
-            true,
-        ))
-        .child(ui::session_row(
-            "kitchen-row-exited",
-            "A very long session title that should ellipsize".into(),
-            "some-deeply-nested-workspace-name".into(),
-            Tone::Idle,
-            false,
-            false,
-        ))
-}
-
-fn render_workspace_rows() -> impl IntoElement {
-    // Sidebar-width container, like the session-row samples. Rows are
-    // read-only; the trailing "+" is the one click target (opens an
-    // unstarted chat).
-    div()
-        .w(px(240.))
-        .bg(rgb(theme::PANEL_BG))
-        .border_1()
-        .border_color(rgb(theme::BORDER))
-        .rounded_md()
-        .py_1()
-        .flex()
-        .flex_col()
-        .child(
-            ui::workspace_row("bloggy".into(), "egg-by-penguin".into())
-                .child(ui::workspace_row_add("kitchen-workspace-add-1")),
-        )
-        .child(
-            ui::workspace_row(
-                "a-very-long-workspace-folder-name".into(),
-                "some-machine-with-a-long-label.exe.xyz".into(),
-            )
-            .child(ui::workspace_row_add("kitchen-workspace-add-2")),
-        )
-}
-
-/// The unstarted chat's model picker as it composes in production: modal
-/// frame, fixed-height scrollable list (50 models on exe.dev), one selected
-/// row.
-fn render_model_picker_sample() -> impl IntoElement {
-    ui::modal_frame("Choose model")
-        .child(
-            div()
-                .id("kitchen-model-list")
-                .h(px(160.))
-                .overflow_y_scroll()
-                .flex()
-                .flex_col()
-                .child(ui::model_row(
-                    "kitchen-model-1",
-                    "openai/gpt-5.6-sol (llm)".into(),
-                    false,
-                ))
-                .child(ui::model_row(
-                    "kitchen-model-2",
-                    "anthropic/claude-sonnet-4.7 (llm)".into(),
-                    true,
-                ))
-                .child(ui::model_row(
-                    "kitchen-model-3",
-                    "a-provider/a-model-with-an-unreasonably-long-name-that-ellipsizes (llm)"
-                        .into(),
-                    false,
-                ))
-                .child(ui::model_row(
-                    "kitchen-model-4",
-                    "google/gemini-3.2-pro (llm)".into(),
-                    false,
-                )),
-        )
-        .child(labeled(
-            "loading state",
-            div()
-                .text_xs()
-                .text_color(rgb(theme::TEXT_FAINT))
-                .child("loading models…"),
-        ))
-        .child(labeled(
-            "error state",
-            div()
-                .text_xs()
-                .text_color(rgb(theme::STATUS_ERROR))
-                .child("list_models: pi gave no answer within 15s"),
-        ))
-}
-
 /// The unstarted chat's header: title + faint folder subtitle (the model
 /// control lives in the prompt box).
 fn render_chat_header_sample() -> impl IntoElement {
@@ -520,58 +365,6 @@ fn render_chat_header_sample() -> impl IntoElement {
             "New session".into(),
             "bloggy on egg-by-penguin".into(),
         ))
-}
-
-/// The add-workspace picker as it composes in production: modal frame, path
-/// line, `../` + dir/file rows, a validation error, the button row.
-fn render_folder_picker_sample() -> impl IntoElement {
-    ui::modal_frame("Add workspace")
-        .child(
-            div()
-                .text_xs()
-                .text_color(rgb(theme::TEXT_DIM))
-                .overflow_hidden()
-                .text_ellipsis()
-                .child("/home/exedev/projects"),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .child(ui::picker_dir_row("kitchen-picker-up", "..".into()))
-                .child(ui::picker_dir_row("kitchen-picker-dir-1", "bloggy".into()))
-                .child(ui::picker_dir_row("kitchen-picker-dir-2", ".config".into()))
-                .child(ui::picker_dir_row(
-                    "kitchen-picker-dir-3",
-                    "a-very-long-directory-name-that-should-ellipsize-cleanly".into(),
-                ))
-                .child(ui::picker_file_row("README.md".into()))
-                .child(ui::picker_file_row("notes.txt".into())),
-        )
-        .child(
-            div()
-                .text_xs()
-                .text_color(rgb(theme::STATUS_ERROR))
-                .child("validate workspace: fatal: not a git repository"),
-        )
-        .child(
-            div()
-                .flex()
-                .justify_end()
-                .gap_2()
-                .child(ui::button(
-                    "kitchen-picker-cancel",
-                    "Cancel",
-                    ui::ButtonKind::Neutral,
-                    true,
-                ))
-                .child(ui::button(
-                    "kitchen-picker-add",
-                    "Add",
-                    ui::ButtonKind::Primary,
-                    true,
-                )),
-        )
 }
 
 fn render_chat_messages() -> impl IntoElement {
@@ -768,34 +561,6 @@ fn render_tool_blocks() -> impl IntoElement {
                 false,
             )),
         ))
-}
-
-fn render_modal_sample() -> impl IntoElement {
-    ui::modal_frame("Add workspace")
-        .child(
-            div()
-                .text_sm()
-                .text_color(rgb(theme::TEXT_DIM))
-                .child("Path to a git repository on the machine."),
-        )
-        .child(
-            div()
-                .flex()
-                .justify_end()
-                .gap_2()
-                .child(ui::button(
-                    "kitchen-modal-cancel",
-                    "Cancel",
-                    ui::ButtonKind::Neutral,
-                    true,
-                ))
-                .child(ui::button(
-                    "kitchen-modal-add",
-                    "Add",
-                    ui::ButtonKind::Primary,
-                    true,
-                )),
-        )
 }
 
 fn render_statusbar_sample() -> impl IntoElement {

@@ -8,9 +8,11 @@
 //! either.
 
 mod chat;
+mod choices;
 mod kitchen;
 mod model_control;
 mod models;
+mod store;
 mod theme;
 mod ui;
 mod workbench;

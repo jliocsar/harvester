@@ -19,16 +19,15 @@ pub struct ModelControl {
     /// reopened chat) is waiting on a different token, so the abandoned
     /// request's answer is dropped rather than filling the new surface's list.
     request: Pending<()>,
-    open: bool,
 }
 
 impl ModelControl {
-    /// Start a fetch, superseding any earlier one. The modal closes: what it
-    /// was showing is about to be replaced, and a pick landing in the gap
-    /// would apply to a list nobody can see anymore.
+    /// Start a fetch, superseding any earlier one. A modal already open over
+    /// the old list stays open and stays pickable: its rows are a snapshot, so
+    /// a pick landing in the gap applies the model the user actually read
+    /// rather than whatever took that row's index.
     pub fn fetching(&mut self, tokens: &RequestTokens) -> RequestToken {
         self.state = ModelsState::Loading;
-        self.open = false;
 
         self.request.ask(tokens, ())
     }
@@ -74,19 +73,5 @@ impl ModelControl {
 
     pub fn is_loading(&self) -> bool {
         matches!(self.state, ModelsState::Loading)
-    }
-
-    pub fn is_open(&self) -> bool {
-        self.open
-    }
-
-    /// Only a loaded list can be picked from; a click while it is still
-    /// loading is a click on nothing rather than an empty modal.
-    pub fn open(&mut self) {
-        self.open = matches!(self.state, ModelsState::Loaded(_));
-    }
-
-    pub fn close(&mut self) {
-        self.open = false;
     }
 }

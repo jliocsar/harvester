@@ -23,11 +23,14 @@ use gpui::{
 use gpui_component::input::{Input, InputEvent, InputState};
 use serde_json::Value;
 
+use crate::choices;
 use crate::model_control::ModelControl;
 use crate::models::{self, ModelChoice, ModelsState};
+use crate::store::{FleetStore, StoreEvent};
 use crate::theme::{self, Tone};
 use crate::ui;
 use crate::workspaces::folder_name;
+use harvester_client_core::bridge::Event as BridgeEvent;
 use harvester_client_core::transcript::{Item, Message, Role, ToolBlock, ToolStatus, Transcript};
 use harvester_client_core::{Pending, RequestToken, RequestTokens};
 
@@ -72,6 +75,11 @@ impl ChatState {
 
 /// Where a chat runs. The machine is switchable only while unstarted — a
 /// running session never moves — so this is near-immutable by construction.
+///
+/// Two fields, both keys: how the machine is *named* is the store's answer,
+/// read whenever this chat renders. It used to be a third field here, taken
+/// once at open, and a label a provider resolved later never reached the pane
+/// (SPEC C12).
 pub struct ChatTarget {
     /// Machine key; the workbench routes every request by it. Deliberately the
     /// key and not a command sender: `Fleet` replaces a machine's bridge
@@ -80,7 +88,6 @@ pub struct ChatTarget {
     /// swallowed with one line on stderr (found in review). A key cannot go
     /// stale.
     pub machine: String,
-    pub machine_label: SharedString,
     /// The session's cwd — pi's working directory, and the repository the
     /// prompt box names.
     pub workspace_path: String,
@@ -149,13 +156,11 @@ impl EventEmitter<ChatRequest> for Chat {}
 pub struct Chat {
     state: ChatState,
     target: ChatTarget,
-    /// The machines this chat could still be retargeted to, as the workbench
-    /// resolved them: the stored workspaces sharing this cwd. Pushed in rather
-    /// than derived because the workspace list and the machine labels are both
-    /// the workbench's; refreshed whenever that list changes. Only ever read
-    /// while unstarted.
-    machine_candidates: Vec<MachineCandidate>,
-    machine_picker_open: bool,
+    /// Where this chat's machine label and its retargeting candidates come
+    /// from, read on every render. Observed, so a provider listing that
+    /// renames a machine or a workspace the user just added reaches this pane
+    /// without anyone remembering to push it (SPEC C12).
+    store: Entity<FleetStore>,
     /// What is rendered, and the pi vocabulary behind it — client-core's, so
     /// the wire shapes are testable without a window.
     transcript: Transcript,
@@ -187,7 +192,9 @@ pub struct Chat {
     input: Entity<InputState>,
     scroll: ScrollHandle,
     tokens: RequestTokens,
-    _input_subscription: Subscription,
+    /// The input's Enter, the store's repaints, and the store's events. Held
+    /// rather than detached so all three die with this pane.
+    _subscriptions: [Subscription; 3],
 }
 
 impl Chat {
@@ -196,14 +203,12 @@ impl Chat {
     /// hide behind the user typing.
     pub fn unstarted(
         target: ChatTarget,
-        machine_candidates: Vec<MachineCandidate>,
-        tokens: RequestTokens,
+        store: Entity<FleetStore>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut chat = Self::new(ChatState::Unstarted, target, tokens, window, cx);
+        let mut chat = Self::new(ChatState::Unstarted, target, store, window, cx);
 
-        chat.machine_candidates = machine_candidates;
         chat.request_model_list(cx);
 
         chat
@@ -215,11 +220,11 @@ impl Chat {
         sid: String,
         target: ChatTarget,
         entries: &[Value],
-        tokens: RequestTokens,
+        store: Entity<FleetStore>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut chat = Self::new(ChatState::Live { sid }, target, tokens, window, cx);
+        let mut chat = Self::new(ChatState::Live { sid }, target, store, window, cx);
 
         chat.transcript.replace_history(entries);
 
@@ -229,7 +234,7 @@ impl Chat {
     fn new(
         state: ChatState,
         target: ChatTarget,
-        tokens: RequestTokens,
+        store: Entity<FleetStore>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -243,13 +248,17 @@ impl Chat {
                 .auto_grow(1, 8)
                 .submit_on_enter(true)
         });
-        let input_subscription = cx.subscribe_in(&input, window, Self::handle_prompt_submitted);
+        let subscriptions = [
+            cx.subscribe_in(&input, window, Self::handle_prompt_submitted),
+            cx.observe(&store, |_, _, cx| cx.notify()),
+            cx.subscribe(&store, Self::handle_store_event),
+        ];
+        let tokens = store.read(cx).tokens();
 
         Self {
             state,
             target,
-            machine_candidates: Vec::new(),
-            machine_picker_open: false,
+            store,
             transcript: Transcript::new(&[]),
             expanded: HashSet::new(),
             exited_notice: None,
@@ -261,8 +270,99 @@ impl Chat {
             input,
             scroll: ScrollHandle::new(),
             tokens,
-            _input_subscription: input_subscription,
+            _subscriptions: subscriptions,
         }
+    }
+
+    /// The store's events, filtered to this chat's own.
+    ///
+    /// Every answer pi produces for this pane arrives here rather than being
+    /// routed in from above: a chat knows which sid it renders and which
+    /// machine it runs on, and that is the whole of the routing rule (SPEC
+    /// C12). Guards rather than a total match because *whose* an event is,
+    /// is the question — the fall-through is another chat's, another
+    /// machine's, or `Attached`, which builds chats and so is the workbench's.
+    fn handle_store_event(
+        &mut self,
+        _store: Entity<FleetStore>,
+        event: &StoreEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let StoreEvent::Bridge { machine, event } = event else {
+            return;
+        };
+
+        match event {
+            // Machine-scoped: the bridge this chat runs on died, or answered
+            // the throwaway `list_models` an unstarted chat asked it for —
+            // that one has no sid to be found by.
+            BridgeEvent::ConnectFailed { detail } if self.runs_on(machine) => {
+                self.fail_pending_requests(detail.clone(), cx)
+            }
+            BridgeEvent::Disconnected if self.runs_on(machine) => {
+                self.fail_pending_requests("connection lost".to_string(), cx)
+            }
+            BridgeEvent::RequestFailed { .. } if self.runs_on(machine) => self.abandon_start(cx),
+            BridgeEvent::ModelsListed { token, result } if self.runs_on(machine) => {
+                self.handle_models_listed(*token, result.clone(), cx)
+            }
+            // Sid-scoped: sids are uuids, unique across machines, so these
+            // need no machine to be routed by.
+            BridgeEvent::HistoryReplaced { sid, entries } if self.renders(sid) => {
+                self.replace_history(entries, cx)
+            }
+            BridgeEvent::HistoryExtended { sid, entries } if self.renders(sid) => {
+                self.extend_history(entries, cx)
+            }
+            BridgeEvent::Pi { sid, event } if self.renders(sid) => self.handle_pi_event(event, cx),
+            BridgeEvent::SessionExit { sid, exit_code } if self.renders(sid) => {
+                self.handle_session_exit(*exit_code, cx)
+            }
+            BridgeEvent::SessionModelsListed { sid, token, result } if self.renders(sid) => {
+                self.handle_models_listed(*token, result.clone(), cx)
+            }
+            BridgeEvent::SessionState { sid, token, result } if self.renders(sid) => {
+                self.handle_session_state(*token, result.clone(), cx)
+            }
+            // A failed `set_model` is the store's to report; this pane only
+            // moves its label when pi confirms one.
+            BridgeEvent::ModelSet {
+                sid,
+                token,
+                result: Ok(data),
+            } if self.renders(sid) => self.handle_model_set(*token, data, cx),
+            _ => {}
+        }
+    }
+
+    /// Whether this chat runs on `machine`.
+    ///
+    /// Scoping by machine is what keeps one machine's failure from cancelling
+    /// a start still in flight on another — without it a retry mints a second
+    /// sid and starts a second pi for one prompt.
+    fn runs_on(&self, machine: &str) -> bool {
+        self.target.machine == machine
+    }
+
+    /// Whether this chat is the one rendering `sid`.
+    fn renders(&self, sid: &str) -> bool {
+        self.state.sid() == Some(sid)
+    }
+
+    /// How this chat's machine is named on screen — the store's answer, never
+    /// a copy of it.
+    fn machine_label(&self, cx: &Context<Self>) -> SharedString {
+        self.store.read(cx).label(&self.target.machine).into()
+    }
+
+    /// The machines this chat could still be retargeted to: the stored
+    /// workspaces sharing its cwd. Derived on every read, so adding a
+    /// workspace enables the control without anyone saying so. Only ever
+    /// consulted while unstarted — a running session never moves.
+    fn machine_candidates(&self, cx: &Context<Self>) -> Vec<MachineCandidate> {
+        self.store
+            .read(cx)
+            .machine_candidates_for(&self.target.workspace_path)
     }
 
     /// `None` for an unstarted chat — it names no session (see [`ChatState`]).
@@ -285,13 +385,6 @@ impl Chat {
 
     pub fn workspace_path(&self) -> &str {
         &self.target.workspace_path
-    }
-
-    /// Machines the user may retarget an unstarted chat to. Refreshed by the
-    /// workbench whenever the workspace list changes; ignored once started,
-    /// because a running session never moves.
-    pub fn set_machine_candidates(&mut self, candidates: Vec<MachineCandidate>) {
-        self.machine_candidates = candidates;
     }
 
     /// Ask for what a live chat's prompt box needs. Separate from the
@@ -338,7 +431,7 @@ impl Chat {
     /// on screen, discarding the input's contents and its focus with it. The
     /// in-flight partial message goes because the snapshot supersedes it; the
     /// next `message_update` carries the whole partial again.
-    pub fn replace_history(&mut self, entries: &[Value], cx: &mut Context<Self>) {
+    fn replace_history(&mut self, entries: &[Value], cx: &mut Context<Self>) {
         self.transcript.replace_history(entries);
 
         self.scroll.scroll_to_bottom();
@@ -348,7 +441,7 @@ impl Chat {
     /// The same repair, cheap: only the entries after the last fetch's cursor
     /// (docs/SPEC.md C6). The transcript owns what that means for the items it
     /// built from live events in the meantime.
-    pub fn extend_history(&mut self, entries: &[Value], cx: &mut Context<Self>) {
+    fn extend_history(&mut self, entries: &[Value], cx: &mut Context<Self>) {
         self.transcript.extend_history(entries);
 
         self.scroll.scroll_to_bottom();
@@ -356,7 +449,7 @@ impl Chat {
     }
 
     /// The start failed. Back to editable — a retry mints a fresh sid.
-    pub fn abandon_start(&mut self, cx: &mut Context<Self>) {
+    fn abandon_start(&mut self, cx: &mut Context<Self>) {
         if matches!(self.state, ChatState::Starting { .. }) {
             self.state = ChatState::Unstarted;
             cx.notify();
@@ -373,7 +466,7 @@ impl Chat {
     /// A model list answered, from either source. A chat that has since been
     /// retargeted is waiting on a different token, so the abandoned request's
     /// answer is dropped.
-    pub fn handle_models_listed(
+    fn handle_models_listed(
         &mut self,
         token: RequestToken,
         result: Result<Value, String>,
@@ -386,7 +479,7 @@ impl Chat {
 
     /// A `GetSessionState` answered; the current model labels the control.
     /// Failure is cosmetic (generic label), so it is only logged.
-    pub fn handle_session_state(
+    fn handle_session_state(
         &mut self,
         token: RequestToken,
         result: Result<Value, String>,
@@ -410,7 +503,7 @@ impl Chat {
 
     /// A `set_model` succeeded; pi's `data` is the full Model object now in
     /// effect (failures surface in the statusbar, workbench-side).
-    pub fn handle_model_set(&mut self, token: RequestToken, data: &Value, cx: &mut Context<Self>) {
+    fn handle_model_set(&mut self, token: RequestToken, data: &Value, cx: &mut Context<Self>) {
         if self.set_model.accept(token).is_none() {
             return;
         }
@@ -421,51 +514,74 @@ impl Chat {
         }
     }
 
-    /// A started chat's model is already on its launch line or in its pi;
-    /// only an unstarted one is still choosing.
-    pub fn open_model_picker(&mut self, cx: &mut Context<Self>) {
-        if !matches!(self.state, ChatState::Starting { .. }) {
-            self.model.open();
-            cx.notify();
-        }
-    }
-
-    pub fn close_model_picker(&mut self, cx: &mut Context<Self>) {
-        self.model.close();
-        cx.notify();
-    }
-
-    /// What the workbench's shared model modal renders for this chat: the
-    /// loaded list, the current model's index, and whether to offer the
-    /// "default (pi chooses)" row — which only an unstarted chat may, since a
-    /// running session always has a concrete model (SPEC §Flows "Switch
-    /// model"). The flag is derived from the state, not stored: a stored
+    /// A started chat's model is already on its launch line or in its pi; only
+    /// an unstarted one is still choosing. A list that has not loaded opens
+    /// nothing: a click while it is still fetching is a click on nothing rather
+    /// than an empty modal.
+    ///
+    /// Only a chat with no session yet offers the "default (pi chooses)" row —
+    /// a running session always has a concrete model (SPEC §Flows "Switch
+    /// model") — and that is derived from the state, not stored: a stored
     /// answer would be one more thing that could disagree with it.
-    pub fn picker_contents(&self) -> Option<(Vec<ModelChoice>, Option<usize>, bool)> {
-        if !self.model.is_open() {
-            return None;
+    pub fn open_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.state, ChatState::Starting { .. }) {
+            return;
         }
 
-        let choices = self.model.choices();
-        let current_index = self.current_model.as_ref().and_then(|current| {
-            choices
-                .iter()
-                .position(|choice| choice.provider == current.provider && choice.id == current.id)
-        });
-        let offer_default = matches!(self.state, ChatState::Unstarted);
+        let choices = self.model.choices().to_vec();
 
-        Some((choices.to_vec(), current_index, offer_default))
+        if choices.is_empty() {
+            return;
+        }
+
+        let offer_default = matches!(self.state, ChatState::Unstarted);
+        let current = self.current_model.clone();
+        // The picked model travels with the row rather than as an index into a
+        // list that may be refetched behind the modal — the pick then always
+        // applies to the model the user actually read.
+        let picks: Vec<Option<ModelChoice>> = offer_default
+            .then_some(None)
+            .into_iter()
+            .chain(choices.iter().cloned().map(Some))
+            .collect();
+        let rows = picks
+            .iter()
+            .map(|pick| choices::ChoiceRow {
+                label: match pick {
+                    Some(choice) => choice.name.clone(),
+                    None => "default (pi chooses)".into(),
+                },
+                selected: match (pick, &current) {
+                    (Some(choice), Some(current)) => {
+                        choice.provider == current.provider && choice.id == current.id
+                    }
+                    (None, None) => true,
+                    _ => false,
+                },
+            })
+            .collect();
+
+        choices::open(
+            "Choose model",
+            choices::ChoiceList::Searchable,
+            rows,
+            move |chat, index, _, cx| {
+                let Some(pick) = picks.get(index).cloned() else {
+                    return;
+                };
+
+                chat.pick_model(pick, cx);
+            },
+            window,
+            cx,
+        );
     }
 
     /// A picker row was clicked; `None` is the "default (pi chooses)" row.
     /// Unstarted the pick is local (it becomes a launch-line argument); live it
     /// costs a `set_model` the session must confirm, so the label does not move
     /// until [`Chat::handle_model_set`] says pi agreed.
-    pub fn pick_model(&mut self, choice: Option<usize>, cx: &mut Context<Self>) {
-        self.model.close();
-
-        let picked = choice.and_then(|index| self.model.choices().get(index).cloned());
-
+    fn pick_model(&mut self, picked: Option<ModelChoice>, cx: &mut Context<Self>) {
         match &self.state {
             ChatState::Unstarted => self.current_model = picked,
             ChatState::Live { sid } => {
@@ -490,41 +606,54 @@ impl Chat {
         cx.notify();
     }
 
-    pub fn machine_picker_open(&self) -> bool {
-        self.machine_picker_open
-    }
-
-    /// Offered only while unstarted and at least two stored workspaces share
-    /// this path — below that the control reads as the fixed destination.
-    pub fn open_machine_picker(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.state, ChatState::Unstarted) && self.can_switch_machine() {
-            self.machine_picker_open = true;
-            cx.notify();
+    /// The workspaces sharing this chat's path, the current destination
+    /// checked. Offered only while unstarted and at least two of them exist —
+    /// below that the control reads as the fixed destination.
+    pub fn open_machine_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.state, ChatState::Unstarted) || !self.can_switch_machine(cx) {
+            return;
         }
+
+        let candidates = self.machine_candidates(cx);
+        let rows = candidates
+            .iter()
+            .map(|(machine, label)| choices::ChoiceRow {
+                label: label.clone().into(),
+                selected: machine == &self.target.machine,
+            })
+            .collect();
+        // The keys travel with the pick, so a listing landing behind the modal
+        // cannot move a row out from under the click.
+        let keys: Vec<String> = candidates
+            .into_iter()
+            .map(|(machine, _label)| machine)
+            .collect();
+
+        choices::open(
+            "Choose machine",
+            choices::ChoiceList::Short,
+            rows,
+            move |chat, index, _, cx| {
+                let Some(machine) = keys.get(index).cloned() else {
+                    return;
+                };
+
+                chat.pick_machine(machine, cx);
+            },
+            window,
+            cx,
+        );
     }
 
-    pub fn close_machine_picker(&mut self, cx: &mut Context<Self>) {
-        self.machine_picker_open = false;
-        cx.notify();
-    }
-
-    fn can_switch_machine(&self) -> bool {
-        self.machine_candidates.len() >= 2
+    fn can_switch_machine(&self, cx: &Context<Self>) -> bool {
+        self.machine_candidates(cx).len() >= 2
     }
 
     /// Retarget to another machine: the typed prompt survives, only the
     /// destination changes. A pick of the current machine changes nothing, so
     /// nothing is refetched. The stale answer from the old machine is dropped
     /// by the model control's own token.
-    pub fn pick_machine(&mut self, candidate_index: usize, cx: &mut Context<Self>) {
-        self.machine_picker_open = false;
-
-        let Some((machine, label)) = self.machine_candidates.get(candidate_index).cloned() else {
-            cx.notify();
-
-            return;
-        };
-
+    fn pick_machine(&mut self, machine: String, cx: &mut Context<Self>) {
         if self.target.machine == machine {
             cx.notify();
 
@@ -532,7 +661,6 @@ impl Chat {
         }
 
         self.target.machine = machine;
-        self.target.machine_label = label.into();
         self.current_model = None;
         self.request_model_list(cx);
         cx.notify();
@@ -545,7 +673,7 @@ impl Chat {
         self.exited_notice.is_none()
     }
 
-    pub fn handle_session_exit(&mut self, exit_code: Option<i32>, cx: &mut Context<Self>) {
+    fn handle_session_exit(&mut self, exit_code: Option<i32>, cx: &mut Context<Self>) {
         let code_text = exit_code
             .map(|code| format!(" (exit code {code})"))
             .unwrap_or_default();
@@ -557,7 +685,7 @@ impl Chat {
         cx.notify();
     }
 
-    pub fn handle_pi_event(&mut self, event: &Value, cx: &mut Context<Self>) {
+    fn handle_pi_event(&mut self, event: &Value, cx: &mut Context<Self>) {
         // `false` is an event this model does not cover (retries, compaction,
         // queue): nothing moved, so nothing is redrawn.
         if !self.transcript.apply(event) {
@@ -674,11 +802,11 @@ impl Chat {
     /// The unstarted chat's header line: which repository, on which machine.
     /// A live chat has no header — its prompt box already names both, and the
     /// conversation identifies it better than any title could.
-    fn unstarted_subtitle(&self) -> SharedString {
+    fn unstarted_subtitle(&self, cx: &Context<Self>) -> SharedString {
         format!(
             "{} on {}",
             folder_name(&self.target.workspace_path),
-            self.target.machine_label
+            self.machine_label(cx)
         )
         .into()
     }
@@ -790,7 +918,8 @@ impl Chat {
     fn render_prompt_box(&self, input_focused: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let (model_label, model_enabled) = self.model_control_state();
         let machine_enabled =
-            matches!(self.state, ChatState::Unstarted) && self.can_switch_machine();
+            matches!(self.state, ChatState::Unstarted) && self.can_switch_machine(cx);
+        let machine_label = self.machine_label(cx);
 
         ui::prompt_box(input_focused)
             .child(ui::prompt_box_input(Input::new(&self.input)))
@@ -800,9 +929,9 @@ impl Chat {
                         ui::prompt_box_control("chat-model", model_label, model_enabled).when(
                             model_enabled,
                             |control| {
-                                control.on_click(
-                                    cx.listener(|chat, _, _, cx| chat.open_model_picker(cx)),
-                                )
+                                control.on_click(cx.listener(|chat, _, window, cx| {
+                                    chat.open_model_picker(window, cx)
+                                }))
                             },
                         ),
                     )
@@ -812,16 +941,12 @@ impl Chat {
                         false,
                     ))
                     .child(
-                        ui::prompt_box_control(
-                            "chat-machine",
-                            self.target.machine_label.clone(),
-                            machine_enabled,
-                        )
-                        .when(machine_enabled, |control| {
-                            control.on_click(
-                                cx.listener(|chat, _, _, cx| chat.open_machine_picker(cx)),
-                            )
-                        }),
+                        ui::prompt_box_control("chat-machine", machine_label, machine_enabled)
+                            .when(machine_enabled, |control| {
+                                control.on_click(cx.listener(|chat, _, window, cx| {
+                                    chat.open_machine_picker(window, cx)
+                                }))
+                            }),
                     )
                     .child(div().flex_1())
                     .child(ui::prompt_box_send("chat-send").on_click(
@@ -865,33 +990,6 @@ impl Chat {
                 _ => None,
             })
     }
-
-    /// The machine modal: the workspaces sharing this chat's path, the current
-    /// destination checked.
-    pub fn render_machine_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let rows: Vec<_> = self
-            .machine_candidates
-            .iter()
-            .enumerate()
-            .map(|(index, (machine, label))| {
-                ui::model_row(
-                    ("chat-machine-choice", index),
-                    label.clone().into(),
-                    machine == &self.target.machine,
-                )
-                .on_click(cx.listener(move |chat, _, _, cx| chat.pick_machine(index, cx)))
-                .into_any_element()
-            })
-            .collect();
-
-        ui::modal_list(
-            "chat-machine-picker",
-            "Choose machine",
-            ui::ModalListHeight::FitContent,
-            rows,
-        )
-        .on_click(cx.listener(|chat, _, _, cx| chat.close_machine_picker(cx)))
-    }
 }
 
 impl Render for Chat {
@@ -910,7 +1008,7 @@ impl Render for Chat {
             ChatState::Unstarted | ChatState::Starting { .. } => pane
                 .child(ui::chat_header(
                     "New session".into(),
-                    self.unstarted_subtitle(),
+                    self.unstarted_subtitle(cx),
                 ))
                 .child(self.render_unstarted_body()),
             ChatState::Live { .. } => pane.child(self.render_messages(cx)),
