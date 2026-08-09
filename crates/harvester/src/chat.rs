@@ -869,7 +869,7 @@ impl Render for Chat {
             self.exited_notice.is_none() && !matches!(self.state, ChatState::Starting { .. });
 
         if self.focus_input && accepts_input {
-            window.focus(&self.input.read(cx).focus_handle(cx));
+            window.focus(&self.input.read(cx).focus_handle(cx), cx);
             self.focus_input = false;
         }
 

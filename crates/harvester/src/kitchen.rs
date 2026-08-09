@@ -4,6 +4,7 @@
 //! before production use. No bridge, no daemon: pure rendering.
 
 use gpui::{div, prelude::*, px, rgb, rgba, Context, Entity, Focusable, Window};
+use gpui_component::Root;
 
 use crate::input::TextInput;
 use crate::theme::{self, Tone};
@@ -87,6 +88,11 @@ impl Render for Kitchen {
                     .child(section("modal", render_modal_sample()))
                     .child(section("statusbar", render_statusbar_sample())),
             )
+            // The catalog previews components, so it needs the same overlay
+            // layers the workbench has or a sample dialog would open into
+            // nothing.
+            .children(Root::render_dialog_layer(window, cx))
+            .children(Root::render_notification_layer(window, cx))
     }
 }
 

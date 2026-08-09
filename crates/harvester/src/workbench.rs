@@ -10,6 +10,7 @@
 mod picker;
 
 use gpui::{div, prelude::*, px, rgb, Context, Entity, SharedString, Subscription, Window};
+use gpui_component::Root;
 use harvester_client_core::{
     BridgeEvents, Fleet, MachineState, MachinesEvents, RequestToken, RequestTokens, LOCAL_MACHINE,
 };
@@ -1263,7 +1264,7 @@ impl Workbench {
 }
 
 impl Render for Workbench {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Cloned out of the chat here so the entity borrow doesn't fight the
         // `&mut cx` the modal's listeners need.
         let model_picker: Option<(Vec<ModelChoice>, Option<usize>, bool)> = self
@@ -1311,6 +1312,12 @@ impl Render for Workbench {
             .children(model_picker.map(|(models, selected_model, offer_default)| {
                 self.render_model_picker(&models, selected_model, offer_default, cx)
             }))
+            // `Root` holds the dialogs and notifications but renders neither;
+            // placing their layers is the root view's job, and omitting them
+            // makes `open_dialog` a silent no-op. Above the hand-rolled scrims
+            // above, which they replace over the course of the migration.
+            .children(Root::render_dialog_layer(window, cx))
+            .children(Root::render_notification_layer(window, cx))
     }
 }
 

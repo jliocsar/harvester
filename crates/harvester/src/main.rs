@@ -18,9 +18,10 @@ mod workbench;
 mod workspaces;
 
 use gpui::{
-    actions, px, size, App, AppContext, Application, Bounds, KeyBinding, SharedString,
-    TitlebarOptions, WindowBounds, WindowOptions,
+    actions, px, size, App, AppContext, Bounds, KeyBinding, SharedString, TitlebarOptions,
+    WindowBounds, WindowOptions,
 };
+use gpui_component::{Root, Theme, ThemeMode};
 
 use crate::kitchen::Kitchen;
 use crate::workbench::Workbench;
@@ -77,63 +78,87 @@ fn main() {
         }
     };
 
-    Application::new().run(move |cx: &mut App| {
-        bind_keys(cx);
-        cx.on_action(|_: &Quit, cx| cx.quit());
+    gpui_platform::application()
+        .with_assets(gpui_component_assets::Assets)
+        .run(move |cx: &mut App| {
+            install_widget_layer(cx);
+            bind_keys(cx);
+            cx.on_action(|_: &Quit, cx| cx.quit());
 
-        let title = match &argv_machine {
-            Some(machine) => format!("Harvester — {machine}"),
-            None => "Harvester".to_string(),
-        };
-        let bounds = Bounds::centered(None, size(px(1100.), px(720.)), cx);
-        let open_result = cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions {
-                    title: Some(title.into()),
+            let title = match &argv_machine {
+                Some(machine) => format!("Harvester — {machine}"),
+                None => "Harvester".to_string(),
+            };
+            let bounds = Bounds::centered(None, size(px(1100.), px(720.)), cx);
+            let open_result = cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some(title.into()),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            },
-            |_, cx| cx.new(|cx| Workbench::new(argv_machine, daemon_binary, cx)),
-        );
+                },
+                |window, cx| {
+                    let workbench = cx.new(|cx| Workbench::new(argv_machine, daemon_binary, cx));
 
-        match open_result {
-            Ok(_) => cx.activate(true),
-            Err(error) => {
-                eprintln!("harvester: open window: {error}");
-                cx.quit();
+                    cx.new(|cx| Root::new(workbench, window, cx))
+                },
+            );
+
+            match open_result {
+                Ok(_) => cx.activate(true),
+                Err(error) => {
+                    eprintln!("harvester: open window: {error}");
+                    cx.quit();
+                }
             }
-        }
-    });
+        });
+}
+
+/// gpui-component's one-time setup, shared by both windows. `init` must precede
+/// every other call into the library; it also hardcodes light mode, so dark is
+/// chosen explicitly right after. `Theme::sync_system_appearance` is
+/// deliberately never called — nothing else observes the desktop's appearance,
+/// which is what keeps Harvester dark on a light-mode system.
+fn install_widget_layer(cx: &mut App) {
+    gpui_component::init(cx);
+    Theme::change(ThemeMode::Dark, None, cx);
 }
 
 fn run_kitchen() {
-    Application::new().run(|cx: &mut App| {
-        bind_keys(cx);
-        cx.on_action(|_: &Quit, cx| cx.quit());
+    gpui_platform::application()
+        .with_assets(gpui_component_assets::Assets)
+        .run(|cx: &mut App| {
+            install_widget_layer(cx);
+            bind_keys(cx);
+            cx.on_action(|_: &Quit, cx| cx.quit());
 
-        let bounds = Bounds::centered(None, size(px(820.), px(720.)), cx);
-        let open_result = cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("Harvester — kitchen".into()),
+            let bounds = Bounds::centered(None, size(px(820.), px(720.)), cx);
+            let open_result = cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some("Harvester — kitchen".into()),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            },
-            |_, cx| cx.new(Kitchen::new),
-        );
+                },
+                |window, cx| {
+                    let kitchen = cx.new(Kitchen::new);
 
-        match open_result {
-            Ok(_) => cx.activate(true),
-            Err(error) => {
-                eprintln!("harvester: open kitchen window: {error}");
-                cx.quit();
+                    cx.new(|cx| Root::new(kitchen, window, cx))
+                },
+            );
+
+            match open_result {
+                Ok(_) => cx.activate(true),
+                Err(error) => {
+                    eprintln!("harvester: open kitchen window: {error}");
+                    cx.quit();
+                }
             }
-        }
-    });
+        });
 }
 
 fn daemon_binary() -> Result<Vec<u8>, String> {

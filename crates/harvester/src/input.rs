@@ -10,7 +10,7 @@ use gpui::{
     ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window,
+    ShapedLine, SharedString, Style, TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -598,7 +598,16 @@ impl Element for TextElement {
             Some(line) => line,
             None => return,
         };
-        if let Err(error) = line.paint(bounds.origin, window.line_height(), window, cx) {
+        // Left/None: this is a single-line input that has already been laid out
+        // at its own origin, so it does not want the aligner's help.
+        if let Err(error) = line.paint(
+            bounds.origin,
+            window.line_height(),
+            TextAlign::Left,
+            None,
+            window,
+            cx,
+        ) {
             eprintln!("harvester: paint input line: {error}");
         }
 
