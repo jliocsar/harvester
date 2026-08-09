@@ -8,7 +8,6 @@
 //! either.
 
 mod chat;
-mod input;
 mod kitchen;
 mod model_control;
 mod models;
@@ -100,7 +99,8 @@ fn main() {
                     ..Default::default()
                 },
                 |window, cx| {
-                    let workbench = cx.new(|cx| Workbench::new(argv_machine, daemon_binary, cx));
+                    let workbench =
+                        cx.new(|cx| Workbench::new(argv_machine, daemon_binary, window, cx));
 
                     cx.new(|cx| Root::new(workbench, window, cx))
                 },
@@ -145,7 +145,7 @@ fn run_kitchen() {
                     ..Default::default()
                 },
                 |window, cx| {
-                    let kitchen = cx.new(Kitchen::new);
+                    let kitchen = cx.new(|cx| Kitchen::new(window, cx));
 
                     cx.new(|cx| Root::new(kitchen, window, cx))
                 },
@@ -174,32 +174,13 @@ fn daemon_binary() -> Result<Vec<u8>, String> {
     })
 }
 
+/// Only the app-level bindings survive: `gpui_component::init` binds the
+/// Input, Table, List and Menu contexts itself, which is what replaced the
+/// vendored text input's seventeen.
 fn bind_keys(cx: &mut App) {
-    use crate::input::{
-        Backspace, Copy, Cut, Delete, End, Home, Left, Paste, Right, SelectAll, SelectLeft,
-        SelectRight, Submit,
-    };
-
     // Both modifier spellings so one build behaves natively on Linux (ctrl)
     // and macOS (cmd).
     cx.bind_keys([
-        KeyBinding::new("backspace", Backspace, Some("TextInput")),
-        KeyBinding::new("delete", Delete, Some("TextInput")),
-        KeyBinding::new("left", Left, Some("TextInput")),
-        KeyBinding::new("right", Right, Some("TextInput")),
-        KeyBinding::new("shift-left", SelectLeft, Some("TextInput")),
-        KeyBinding::new("shift-right", SelectRight, Some("TextInput")),
-        KeyBinding::new("home", Home, Some("TextInput")),
-        KeyBinding::new("end", End, Some("TextInput")),
-        KeyBinding::new("enter", Submit, Some("TextInput")),
-        KeyBinding::new("ctrl-a", SelectAll, Some("TextInput")),
-        KeyBinding::new("cmd-a", SelectAll, Some("TextInput")),
-        KeyBinding::new("ctrl-c", Copy, Some("TextInput")),
-        KeyBinding::new("cmd-c", Copy, Some("TextInput")),
-        KeyBinding::new("ctrl-x", Cut, Some("TextInput")),
-        KeyBinding::new("cmd-x", Cut, Some("TextInput")),
-        KeyBinding::new("ctrl-v", Paste, Some("TextInput")),
-        KeyBinding::new("cmd-v", Paste, Some("TextInput")),
         KeyBinding::new("ctrl-q", Quit, None),
         KeyBinding::new("cmd-q", Quit, None),
     ]);

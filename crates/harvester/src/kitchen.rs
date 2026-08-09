@@ -4,9 +4,9 @@
 //! before production use. No bridge, no daemon: pure rendering.
 
 use gpui::{div, prelude::*, px, rgb, rgba, Context, Entity, Focusable, Window};
+use gpui_component::input::{Input, InputState};
 use gpui_component::Root;
 
-use crate::input::TextInput;
 use crate::theme::{self, Tone};
 use crate::ui;
 
@@ -35,13 +35,19 @@ const PALETTE: &[(&str, u32)] = &[
 ];
 
 pub struct Kitchen {
-    prompt_input: Entity<TextInput>,
+    prompt_input: Entity<InputState>,
 }
 
 impl Kitchen {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self {
-            prompt_input: cx.new(|cx| TextInput::new("Message pi — Enter to send", cx)),
+            prompt_input: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("Message pi — Enter to send")
+                    .multi_line(true)
+                    .auto_grow(1, 8)
+                    .submit_on_enter(true)
+            }),
         }
     }
 }
@@ -98,13 +104,13 @@ impl Render for Kitchen {
 
 /// The prompt box as it composes in production (unstarted and live chat
 /// share the shape: model control + send), plus the static loading/ellipsis
-/// states. The first sample carries a real `TextInput` so focus and typing
+/// states. The first sample carries a real input so focus and typing
 /// are tastable.
 fn render_prompt_box_samples(
-    prompt_input: Entity<TextInput>,
+    prompt_input: Entity<InputState>,
     prompt_focused: bool,
 ) -> impl IntoElement {
-    // Faint placeholder standing in for a `TextInput` in the static samples.
+    // Faint placeholder standing in for an input in the static samples.
     let static_input = || {
         div()
             .text_color(rgb(theme::TEXT_FAINT))
@@ -119,7 +125,7 @@ fn render_prompt_box_samples(
         .child(labeled(
             "model · repo · machine controls + send (click to focus)",
             ui::prompt_box(prompt_focused)
-                .child(ui::prompt_box_input(prompt_input))
+                .child(ui::prompt_box_input(Input::new(&prompt_input)))
                 .child(
                     ui::prompt_box_controls()
                         .child(ui::prompt_box_control(

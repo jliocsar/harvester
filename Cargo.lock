@@ -2814,7 +2814,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "unicode-segmentation",
  "uuid",
 ]
 

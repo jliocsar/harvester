@@ -20,9 +20,9 @@ use gpui::{
     div, prelude::*, px, rgb, AnyElement, Context, Div, Entity, EventEmitter, Focusable,
     ScrollHandle, SharedString, Subscription, Window,
 };
+use gpui_component::input::{Input, InputEvent, InputState};
 use serde_json::Value;
 
-use crate::input::{PromptSubmitted, TextInput};
 use crate::model_control::ModelControl;
 use crate::models::{self, ModelChoice, ModelsState};
 use crate::theme::{self, Tone};
@@ -184,7 +184,7 @@ pub struct Chat {
     /// Focus the prompt input on the next frame (set at creation; render has
     /// the `Window` that focusing needs).
     focus_input: bool,
-    input: Entity<TextInput>,
+    input: Entity<InputState>,
     scroll: ScrollHandle,
     tokens: RequestTokens,
     _input_subscription: Subscription,
@@ -198,9 +198,10 @@ impl Chat {
         target: ChatTarget,
         machine_candidates: Vec<MachineCandidate>,
         tokens: RequestTokens,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut chat = Self::new(ChatState::Unstarted, target, tokens, cx);
+        let mut chat = Self::new(ChatState::Unstarted, target, tokens, window, cx);
 
         chat.machine_candidates = machine_candidates;
         chat.request_model_list(cx);
@@ -215,9 +216,10 @@ impl Chat {
         target: ChatTarget,
         entries: &[Value],
         tokens: RequestTokens,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut chat = Self::new(ChatState::Live { sid }, target, tokens, cx);
+        let mut chat = Self::new(ChatState::Live { sid }, target, tokens, window, cx);
 
         chat.transcript.replace_history(entries);
 
@@ -228,10 +230,20 @@ impl Chat {
         state: ChatState,
         target: ChatTarget,
         tokens: RequestTokens,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let input = cx.new(|cx| TextInput::new("Message pi — Enter to send", cx));
-        let input_subscription = cx.subscribe(&input, Self::handle_prompt_submitted);
+        // Multi-line so a prompt can hold a paragraph, but Enter still sends —
+        // `submit_on_enter` defaults to false, and without it Enter would only
+        // ever insert a newline. Shift-Enter is the newline.
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Message pi — Enter to send")
+                .multi_line(true)
+                .auto_grow(1, 8)
+                .submit_on_enter(true)
+        });
+        let input_subscription = cx.subscribe_in(&input, window, Self::handle_prompt_submitted);
 
         Self {
             state,
@@ -556,25 +568,39 @@ impl Chat {
         cx.notify();
     }
 
+    /// Enter in the prompt box. The input is multi-line, so `submit_on_enter`
+    /// is what separates a send from a newline: shift-Enter never reaches
+    /// here.
     fn handle_prompt_submitted(
         &mut self,
-        _input: Entity<TextInput>,
-        event: &PromptSubmitted,
+        _input: &Entity<InputState>,
+        event: &InputEvent,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !matches!(event, InputEvent::PressEnter { .. }) {
+            return;
+        }
+
+        self.submit_prompt(window, cx);
+    }
+
+    /// Both send paths end here: take what is typed, clear the box, route it
+    /// by state.
+    fn submit_text(&mut self, text: String, cx: &mut Context<Self>) {
         if self.exited_notice.is_some() {
             return;
         }
 
         match &self.state {
-            ChatState::Unstarted => self.start(event.0.clone(), cx),
+            ChatState::Unstarted => self.start(text, cx),
             ChatState::Live { sid } => {
                 let request = ChatRequest::Prompt {
                     sid: sid.clone(),
-                    text: event.0.clone(),
+                    text: text.clone(),
                 };
 
-                self.transcript.push_user_prompt(event.0.clone());
+                self.transcript.push_user_prompt(text);
                 cx.emit(request);
                 self.scroll.scroll_to_bottom();
                 cx.notify();
@@ -624,10 +650,16 @@ impl Chat {
 
     /// The send button's path; Enter inside the input reaches the same
     /// `PromptSubmitted` through the `Submit` action.
-    fn submit_prompt(&mut self, cx: &mut Context<Self>) {
-        self.input
-            .clone()
-            .update(cx, |input, cx| input.submit_prompt(cx));
+    fn submit_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let input = self.input.clone();
+        let text = input.read(cx).value().to_string();
+
+        if text.trim().is_empty() {
+            return;
+        }
+
+        input.update(cx, |state, cx| state.set_value("", window, cx));
+        self.submit_text(text, cx);
     }
 
     /// A tool block's header was clicked: toggle its body.
@@ -761,7 +793,7 @@ impl Chat {
             matches!(self.state, ChatState::Unstarted) && self.can_switch_machine();
 
         ui::prompt_box(input_focused)
-            .child(ui::prompt_box_input(self.input.clone()))
+            .child(ui::prompt_box_input(Input::new(&self.input)))
             .child(
                 ui::prompt_box_controls()
                     .child(
@@ -792,10 +824,9 @@ impl Chat {
                         }),
                     )
                     .child(div().flex_1())
-                    .child(
-                        ui::prompt_box_send("chat-send")
-                            .on_click(cx.listener(|chat, _, _, cx| chat.submit_prompt(cx))),
-                    ),
+                    .child(ui::prompt_box_send("chat-send").on_click(
+                        cx.listener(|chat, _, window, cx| chat.submit_prompt(window, cx)),
+                    )),
             )
     }
 

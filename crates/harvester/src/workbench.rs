@@ -90,11 +90,12 @@ impl Workbench {
     pub fn new(
         argv_machine: Option<String>,
         daemon_binary: Vec<u8>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let (fleet, events) = Fleet::start(daemon_binary);
 
-        Self::pump_bridge_events(events.bridges, cx);
+        Self::pump_bridge_events(events.bridges, window, cx);
 
         if let Some(machine_events) = events.machines {
             Self::pump_machines_events(machine_events, cx);
@@ -148,16 +149,16 @@ impl Workbench {
     /// Every bridge's events on one machine-tagged channel, pumped by a gpui
     /// task — an mpsc receiver is reactor-independent, so awaiting it from
     /// gpui's executor is exactly what the split is designed for.
-    fn pump_bridge_events(mut events: BridgeEvents, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
+    fn pump_bridge_events(mut events: BridgeEvents, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| {
             while let Some(unapplied) = events.next().await {
                 if this
-                    .update(cx, |workbench, cx| {
+                    .update_in(cx, |workbench, window, cx| {
                         // The fleet opens the event, taking the link state on
                         // the way through; what comes back is this window's.
                         let (machine, event) = workbench.fleet.observe_bridge_event(unapplied);
 
-                        workbench.handle_bridge_event(&machine, event, cx)
+                        workbench.handle_bridge_event(&machine, event, window, cx)
                     })
                     .is_err()
                 {
@@ -245,7 +246,13 @@ impl Workbench {
     /// is the bridge the event came from; sid-scoped events route by sid
     /// alone — sids are uuids, unique across machines. The fleet already took
     /// the link state off the same event.
-    fn handle_bridge_event(&mut self, machine: &str, event: BridgeEvent, cx: &mut Context<Self>) {
+    fn handle_bridge_event(
+        &mut self,
+        machine: &str,
+        event: BridgeEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match event {
             // The link state was the fleet's, and it took it; a successful
             // connect asks nothing else of this window.
@@ -253,7 +260,7 @@ impl Workbench {
             BridgeEvent::ConnectFailed { detail } => self.abort_machine_flows(machine, &detail, cx),
             BridgeEvent::Sessions(sessions) => self.handle_sessions_listed(machine, sessions),
             BridgeEvent::Attached { sid, entries } => {
-                self.handle_attached(machine, sid, entries, cx)
+                self.handle_attached(machine, sid, entries, window, cx)
             }
             BridgeEvent::HistoryReplaced { sid, entries } => {
                 self.with_chat(&sid, cx, |chat, cx| chat.replace_history(&entries, cx))
@@ -356,6 +363,7 @@ impl Workbench {
         machine: &str,
         sid: String,
         entries: Vec<Value>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // The daemon's list may predate a resume we just did; disk on the VM
@@ -377,11 +385,11 @@ impl Workbench {
         }
 
         let target = self.chat_target(machine, &sid);
-        let chat = cx.new(|cx| Chat::live(sid, target, &entries, self.tokens.clone(), cx));
+        let chat = cx.new(|cx| Chat::live(sid, target, &entries, self.tokens.clone(), window, cx));
 
         // Subscribe before the chat asks for anything: an entity cannot emit
         // to a subscriber that does not exist yet.
-        self.chat_requests = Some(cx.subscribe(&chat, Self::handle_chat_request));
+        self.chat_requests = Some(cx.subscribe_in(&chat, window, Self::handle_chat_request));
         chat.update(cx, |chat, cx| chat.request_model_controls(cx));
         self.chat = Some(chat);
     }
@@ -411,8 +419,9 @@ impl Workbench {
     /// stderr. It says so in the statusbar instead.
     fn handle_chat_request(
         &mut self,
-        chat: Entity<Chat>,
+        chat: &Entity<Chat>,
         request: &ChatRequest,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let machine = chat.read(cx).machine().to_string();
@@ -774,7 +783,12 @@ impl Workbench {
     /// behind it yet (SPEC §Flows "Start session"). The workspace's machine
     /// connects lazily when the chat's first request routes through
     /// [`Workbench::machine_ready_for`].
-    fn open_new_session_chat(&mut self, workspace_index: usize, cx: &mut Context<Self>) {
+    fn open_new_session_chat(
+        &mut self,
+        workspace_index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(workspace) = self.workspaces.get(workspace_index).cloned() else {
             return;
         };
@@ -800,11 +814,12 @@ impl Workbench {
             workspace_path: workspace.path,
         };
         let candidates = self.machine_candidates_for(&target.workspace_path);
-        let chat = cx.new(|cx| Chat::unstarted(target, candidates, self.tokens.clone(), cx));
+        let chat =
+            cx.new(|cx| Chat::unstarted(target, candidates, self.tokens.clone(), window, cx));
 
         // Subscribed before anything can be emitted — including the model
         // fetch the constructor itself starts.
-        self.chat_requests = Some(cx.subscribe(&chat, Self::handle_chat_request));
+        self.chat_requests = Some(cx.subscribe_in(&chat, window, Self::handle_chat_request));
         self.chat = Some(chat);
         cx.notify();
     }
@@ -985,8 +1000,8 @@ impl Workbench {
                         )
                         .child(
                             ui::workspace_row_add(("workspace-add", index)).on_click(cx.listener(
-                                move |workbench, _, _, cx| {
-                                    workbench.open_new_session_chat(index, cx)
+                                move |workbench, _, window, cx| {
+                                    workbench.open_new_session_chat(index, window, cx)
                                 },
                             )),
                         )
