@@ -21,6 +21,7 @@ use super::{
     flatten_harvester, handle_pi_event, report_failure, spawn_flow, BridgeContext, Event,
     SessionCursor,
 };
+use crate::dialog::DialogAnswer;
 use crate::token::RequestToken;
 
 pub(super) async fn sessions_flow(context: BridgeContext) {
@@ -487,6 +488,28 @@ pub(super) async fn set_model_flow(
     let result = pi_flow_result(&context, &sid, cmd).await;
 
     context.events.send(Event::ModelSet { sid, token, result });
+}
+
+/// `AnswerDialog`: the client's half of the dialog contract. With a client
+/// attached the daemon forwards rather than cancels, so pi stays blocked until
+/// this lands (docs/DAEMON.md §Dialogs).
+///
+/// Deliberately not [`pi_flow_result`]. That helper reads `success`, and the
+/// daemon answers every `extension_ui_response` with a bare `null` — whether
+/// it forwarded the answer or dropped it as too late. Reading a verdict out of
+/// that would report a failure for every dialog answered normally. Only a
+/// transport error means anything here, so only that is reported.
+pub(super) async fn answer_dialog_flow(
+    context: BridgeContext,
+    sid: String,
+    dialog_id: String,
+    answer: DialogAnswer,
+) {
+    let cmd = answer.to_response(&dialog_id);
+
+    if let Err(error) = context.client.pi(&sid, cmd).await {
+        report_failure(&context, "answer dialog", error.to_string());
+    }
 }
 
 /// A pi command → the `Result` the picker/statusbar events carry: `data`

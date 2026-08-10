@@ -33,6 +33,7 @@ mod bootstrap;
 pub mod bridge;
 mod client;
 mod connection;
+pub mod dialog;
 mod fleet;
 mod host;
 mod machine;
@@ -49,6 +50,7 @@ pub use client::{DaemonClient, SessionEvent};
 #[cfg(feature = "raw-protocol")]
 pub use connection::raw;
 pub use connection::{DaemonConnection, DaemonReader, DaemonWriter};
+pub use dialog::{DialogAnswer, DialogKind, DialogRequest};
 pub use fleet::{
     BridgeEvents, Fleet, FleetError, FleetEvents, MachineCandidate, MachineState, MachinesEvents,
     Unapplied,

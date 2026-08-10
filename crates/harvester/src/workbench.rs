@@ -18,12 +18,13 @@ use gpui_component::{
     h_flex, v_flex, ActiveTheme as _, Disableable as _, IconName, Root, Sizable as _,
     WindowExt as _,
 };
-use harvester_client_core::{MachineState, LOCAL_MACHINE};
+use harvester_client_core::{DialogAnswer, DialogRequest, MachineState, LOCAL_MACHINE};
 use harvester_proto::SessionStatus;
 use serde_json::Value;
 
 use crate::chat::{Chat, ChatRequest, ChatTarget};
 use crate::choices;
+use crate::dialogs::{self, DialogQueue, PendingDialog};
 use crate::store::{FleetStore, MachineSession, StoreEvent};
 use crate::ui::{self, Tone};
 use crate::workspaces::folder_name;
@@ -60,6 +61,9 @@ pub struct Workbench {
     /// Keeps [`Workbench::handle_chat_request`] subscribed for as long as the
     /// chat it belongs to is the open one; dropped with the next chat's.
     chat_requests: Option<Subscription>,
+    /// Questions an extension is blocked on. The ordering rules are the
+    /// queue's; what is left here is the window work of showing one.
+    dialogs: DialogQueue,
     /// Repaint on any table change, and act on what the store cannot finish
     /// itself. Held rather than detached so both die with this view.
     _store: [Subscription; 2],
@@ -86,6 +90,7 @@ impl Workbench {
             sessions_collapsed: false,
             chat: None,
             chat_requests: None,
+            dialogs: DialogQueue::default(),
             _store: store_subscriptions,
         }
     }
@@ -101,15 +106,24 @@ impl Workbench {
         cx: &mut Context<Self>,
     ) {
         match event {
-            // One bridge event is this view's, and it is the one that has to
-            // build something: a chat, with a window to build its input in.
-            // Every other answer is routed by the surface that wants it —
-            // the chat filters the store's events by its own sid and machine,
-            // so there is no routing table here to keep in step with it.
+            // The bridge events this view takes are the ones needing a
+            // `Window`: a chat to build its input in, a dialog to build its
+            // text box in, and a dead session's dialog to take off the screen.
+            // Every other answer is routed by the surface that wants it — the
+            // chat filters the store's events by its own sid and machine, so
+            // there is no routing table here to keep in step with it.
             StoreEvent::Bridge {
                 machine,
                 event: BridgeEvent::Attached { sid, entries },
             } => self.handle_attached(machine, sid, entries, window, cx),
+            StoreEvent::Bridge {
+                machine,
+                event: BridgeEvent::Pi { sid, event },
+            } => self.handle_pi_event(machine, sid, event, window, cx),
+            StoreEvent::Bridge {
+                event: BridgeEvent::SessionExit { sid, .. },
+                ..
+            } => self.abandon_dialogs_of(sid, window, cx),
             StoreEvent::Bridge { .. } => {}
             StoreEvent::Machines(event) => self.handle_machines_event(event, cx),
             StoreEvent::Failed(detail) => self.report(detail.clone(), window, cx),
@@ -151,6 +165,8 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.keep_only_dialogs_of(sid, window, cx);
+
         // The chat that minted this sid is already on screen with the user's
         // first prompt rendered in it, so it is promoted in place. Building a
         // fresh entity here would throw away the pane they are already
@@ -177,6 +193,115 @@ impl Workbench {
         chat.update(cx, |chat, cx| chat.request_model_controls(cx));
         self.chat = Some(chat);
         cx.notify();
+    }
+
+    /// A pi event, watched for the one kind this view owes an answer to.
+    /// Everything else on this stream is the chat's, which reads it too.
+    fn handle_pi_event(
+        &mut self,
+        machine: &str,
+        sid: &str,
+        event: &Value,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(request) = DialogRequest::parse(event) else {
+            return;
+        };
+
+        self.queue_dialog(machine, sid, request, window, cx);
+    }
+
+    fn queue_dialog(
+        &mut self,
+        machine: &str,
+        sid: &str,
+        request: DialogRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let dialog = PendingDialog::new(machine.to_string(), sid.to_string(), request, window, cx);
+
+        if !self.dialogs.push(dialog) {
+            return;
+        }
+
+        self.show_front_dialog(window, cx);
+    }
+
+    fn show_front_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dialog) = self.dialogs.front() else {
+            return;
+        };
+
+        dialogs::open(dialog, Self::answer_front_dialog, window, cx);
+    }
+
+    /// The user decided. Send it, drop the question, show whatever queued
+    /// behind it.
+    fn answer_front_dialog(
+        &mut self,
+        answer: DialogAnswer,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // The queue is also the guard against answering twice: some routes out
+        // of a dialog run more than one callback, and the second finds the
+        // question already gone rather than sending pi a second response.
+        let Some(dialog) = self.dialogs.take_front() else {
+            return;
+        };
+
+        self.send_command(
+            &dialog.machine,
+            Command::AnswerDialog {
+                sid: dialog.sid,
+                dialog_id: dialog.request.id,
+                answer,
+            },
+            cx,
+        );
+
+        // Deferred because the library closes the answered dialog *after* this
+        // callback returns, and closing pops the top of its stack — opening the
+        // next question here would close that one instead.
+        let workbench = cx.entity();
+
+        window.defer(cx, move |window, cx| {
+            workbench.update(cx, |workbench, cx| workbench.show_front_dialog(window, cx));
+        });
+    }
+
+    /// A session's questions die with its pi: there is nothing left to answer,
+    /// and nothing left to answer it to.
+    fn abandon_dialogs_of(&mut self, sid: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.retain_dialogs(|dialog| dialog.sid != sid, window, cx);
+    }
+
+    /// Attaching elsewhere detaches from whichever session asked, and an empty
+    /// room is exactly where the daemon cancels every dialog still pending
+    /// (docs/DAEMON.md §Dialogs) — so another session's question has already
+    /// been answered without us, and showing it would be a lie.
+    fn keep_only_dialogs_of(&mut self, sid: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.retain_dialogs(|dialog| dialog.sid == sid, window, cx);
+    }
+
+    /// Drop the questions `keep` rejects, replacing the modal on screen if it
+    /// was one of them.
+    fn retain_dialogs(
+        &mut self,
+        keep: impl Fn(&PendingDialog) -> bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.dialogs.retain(keep) {
+            return;
+        }
+
+        // Programmatic, so it runs no callback and nothing is sent for the
+        // question being abandoned — which is the intent: pi is not waiting.
+        window.close_dialog(cx);
+        self.show_front_dialog(window, cx);
     }
 
     fn workspace_path_of(&self, sid: &str, cx: &Context<Self>) -> String {

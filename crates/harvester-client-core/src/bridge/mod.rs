@@ -15,10 +15,8 @@
 //!   their await points, so there is no response-routing state machine here.
 //! - `attach_window` — the live events held back between `attach` and
 //!   `Attached`; pure, synchronous and tested on its own.
-//! - `dialog` — INTERIM, and a whole file so its removal is a `git rm`.
 
 mod attach_window;
-mod dialog;
 mod flows;
 
 use std::collections::HashSet;
@@ -32,13 +30,13 @@ use harvester_proto::SessionInfo;
 
 use crate::bootstrap::bootstrap_and_connect;
 use crate::client::{DaemonClient, SessionEvent};
+use crate::dialog::DialogAnswer;
 use crate::host::Host;
 use crate::token::RequestToken;
 use crate::tokio_thread::run_on_tokio_thread;
 use attach_window::{
     lock_attach_buffers, AttachEventBuffers, PushOutcome, ATTACH_EVENT_BUFFER_CAP,
 };
-use dialog::AnsweredDialogs;
 
 /// UI → bridge.
 ///
@@ -101,6 +99,17 @@ pub enum Command {
         provider: String,
         model_id: String,
         token: RequestToken,
+    },
+    /// Answer a pi dialog (passthrough `extension_ui_response`).
+    ///
+    /// Carries no token because there is no answer to correlate: pi resolves
+    /// an `extension_ui_response` with `null` and the daemon replies the same
+    /// way for an id it has already retired, so success and too-late are
+    /// indistinguishable by design (docs/DAEMON.md §Dialogs).
+    AnswerDialog {
+        sid: String,
+        dialog_id: String,
+        answer: DialogAnswer,
     },
 }
 
@@ -235,8 +244,6 @@ struct BridgeContext {
     /// The attached session's replay cursor, from the last `get_entries`
     /// (docs/SPEC.md C6). One slot, because one bridge holds one attachment.
     cursor: Arc<Mutex<Option<SessionCursor>>>,
-    /// INTERIM, with `dialog`: the dialog ids this bridge already cancelled.
-    answered_dialogs: Arc<AnsweredDialogs>,
 }
 
 /// Pi's `leafId` from a `get_entries`, tagged with the session it describes.
@@ -311,7 +318,6 @@ async fn bridge_main(
         attach_buffers: Arc::new(Mutex::new(AttachEventBuffers::default())),
         resyncing: Arc::new(Mutex::new(HashSet::new())),
         cursor: Arc::new(Mutex::new(None)),
-        answered_dialogs: Arc::new(AnsweredDialogs::default()),
     };
 
     // The sidebar renders from this; fetch immediately.
@@ -397,6 +403,11 @@ fn dispatch(command: Command, context: &BridgeContext) {
         } => spawn_flow(flows::set_model_flow(
             context, sid, provider, model_id, token,
         )),
+        Command::AnswerDialog {
+            sid,
+            dialog_id,
+            answer,
+        } => spawn_flow(flows::answer_dialog_flow(context, sid, dialog_id, answer)),
     }
 }
 
@@ -419,11 +430,13 @@ fn handle_live_pi_event(context: &BridgeContext, sid: String, event: Value) {
     }
 }
 
-/// One pi event on its way to the frontend: forwarded verbatim, and — interim
-/// — auto-cancelled first when it is a dialog request. Reached both live and
+/// One pi event on its way to the frontend, verbatim. Reached both live and
 /// from a flushed attach window, so it must not depend on the select loop.
+///
+/// Dialog requests ride this path like any other event: answering one is the
+/// frontend's obligation now (docs/SPEC.md C5), and the bridge's job is to put
+/// the question in front of it unaltered.
 fn handle_pi_event(context: &BridgeContext, sid: String, event: Value) {
-    dialog::auto_cancel_if_dialog(context, &sid, &event);
     context.events.send(Event::Pi { sid, event });
 }
 
@@ -483,7 +496,6 @@ mod tests {
                     attach_buffers: Arc::new(Mutex::new(AttachEventBuffers::default())),
                     resyncing: Arc::new(Mutex::new(HashSet::new())),
                     cursor: Arc::new(Mutex::new(None)),
-                    answered_dialogs: Arc::new(AnsweredDialogs::default()),
                 },
                 daemon: DaemonConnection::over(daemon_side, no_forward()),
                 events,

@@ -8,6 +8,7 @@
 
 mod chat;
 mod choices;
+mod dialogs;
 mod model_control;
 mod models;
 mod store;
