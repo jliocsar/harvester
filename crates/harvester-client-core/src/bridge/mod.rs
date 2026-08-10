@@ -100,6 +100,18 @@ pub enum Command {
         model_id: String,
         token: RequestToken,
     },
+    /// End a session's pi: the daemon's stop ladder (pi `abort`, then stdin
+    /// EOF, then a SIGKILL backstop). The session file survives and the same
+    /// sid resumes through `Open`, so this is a reap, not a delete.
+    ///
+    /// Carries no token because the reply is not the outcome: `stop` answers
+    /// `{"stopping": true}` the moment the ladder starts, and the authoritative
+    /// completion signal is `Event::SessionExit` — which the daemon may deliver
+    /// *before* that reply, since events and responses travel independent paths
+    /// (docs/DAEMON.md §stop).
+    Stop {
+        sid: String,
+    },
     /// Answer a pi dialog (passthrough `extension_ui_response`).
     ///
     /// Carries no token because there is no answer to correlate: pi resolves
@@ -403,6 +415,7 @@ fn dispatch(command: Command, context: &BridgeContext) {
         } => spawn_flow(flows::set_model_flow(
             context, sid, provider, model_id, token,
         )),
+        Command::Stop { sid } => spawn_flow(flows::stop_flow(context, sid)),
         Command::AnswerDialog {
             sid,
             dialog_id,

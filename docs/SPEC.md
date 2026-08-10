@@ -30,7 +30,7 @@ The whole path works end to end: bootstrap a machine over SSH, start a session, 
 | `local` machine | **Built, untested** | Works in code — detached child daemon, direct socket, local `ls`/`git` — but has never been click-tested |
 | `gpui-component` migration | **Built, unexercised** | The hand-rolled widget layer is the library's (C11) and the god view is an observable store (C12): the window root, the prompt input, every modal, every list row, the transcript's markdown, and now the palette — `theme.rs` and `kitchen.rs` are deleted and every colour comes from `cx.theme()`. Nothing has been click-tested since the input step, and this one changed every colour on screen. |
 | Dialogs as modals | **Built, unexercised** | An `extension_ui_request` is a modal the user answers: `select` → a button per option, `confirm` → yes/no, `input`/`editor` → a text box. The bridge's interim auto-cancel is deleted, so the obligation `DAEMON.md` §Dialogs states is now discharged by a human (C5). Never seen on screen — the exe-dev extension's startup `select` is the live repro (`HARNESS_RESEARCH.md`). |
-| Stop a session | **Deferred** | Complete in harvesterd's `ops.rs`; the bridge has no `Stop` command and nothing sends one |
+| Stop a session | **Half built** | Complete in harvesterd's `ops.rs` and now in the bridge (`Command::Stop` → `stop_flow`); no UI sends one, so a pi still cannot be stopped from the client. Where the affordance goes is undecided (sidebar row vs prompt box) |
 | Session rename | **Deferred** | No `set_session_name` call, no UI |
 | Cost/token statusbar | **Deferred** | `get_session_stats` is never fetched |
 | Machine create/delete UI | **Deferred** | Provider `create`/`delete` + a `create_fields` modal; unordered |

@@ -490,6 +490,23 @@ pub(super) async fn set_model_flow(
     context.events.send(Event::ModelSet { sid, token, result });
 }
 
+/// `Stop`: hand the session to the daemon's stop ladder and stop caring.
+///
+/// Nothing is published on success. The reply says only that the ladder
+/// started, and the outcome the frontend renders — `Event::SessionExit` —
+/// arrives on the session stream, possibly before this response (DAEMON.md
+/// §stop). Publishing anything here would be a second, earlier, less true
+/// account of the same fact.
+///
+/// There is no detach either: the exit already runs `forget_attachment`.
+pub(super) async fn stop_flow(context: BridgeContext, sid: String) {
+    let stop = context.client.harvester(HarvesterCmd::Stop { sid }).await;
+
+    if let Err(detail) = flatten_harvester(stop) {
+        report_failure(&context, "stop session", detail);
+    }
+}
+
 /// `AnswerDialog`: the client's half of the dialog contract. With a client
 /// attached the daemon forwards rather than cancels, so pi stays blocked until
 /// this lands (docs/DAEMON.md §Dialogs).
