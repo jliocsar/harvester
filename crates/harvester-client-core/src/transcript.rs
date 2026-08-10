@@ -95,6 +95,10 @@ impl ToolBlock {
 pub enum Item {
     Message(Message),
     Tool(ToolBlock),
+    /// A turn that ended badly, and why. Its own variant because it is not
+    /// something pi *said* — rendering it as an assistant message would put
+    /// words in the agent's mouth.
+    Failure(String),
 }
 
 /// One session's conversation. Built from history, advanced by live events.
@@ -253,6 +257,12 @@ impl Transcript {
                 text,
             }));
         }
+
+        // After the text, not instead of it: a turn can stream a partial answer
+        // and *then* fail, and both halves are things the user needs.
+        if let Some(failure) = message_failure(message) {
+            self.items.push(Item::Failure(failure));
+        }
     }
 
     /// A new running block. Pi emits the assistant `message_end` first, so the
@@ -381,6 +391,13 @@ fn extend_items(items: &mut Vec<Item>, entries: &[Value]) {
             continue;
         }
 
+        // Pi persists its failure messages, so a reopened session has to read
+        // them back the same way the live stream does — otherwise the history
+        // is quietly shorter than the conversation the user had.
+        if let Some(failure) = message_failure(message) {
+            items.push(Item::Failure(failure));
+        }
+
         let Some(Value::Array(blocks)) = message.get("content") else {
             continue;
         };
@@ -497,6 +514,35 @@ fn extract_diff(result: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Why a turn ended badly, or `None` for one that ended well.
+///
+/// Pi reports a failed or aborted turn as an assistant message whose text is
+/// the **empty string**, with the reason beside it in `errorMessage` /
+/// `stopReason` (verified: pi 0.83.0 `pi-agent-core/dist/agent.js`, the
+/// `failureMessage` it builds and then persists). So a turn that failed is
+/// shaped exactly like a turn that said nothing, and reading the reason out is
+/// the only thing separating them. Skip this and a hard failure — an expired
+/// token, a refused model — renders as an empty pane the user retypes into.
+fn message_failure(message: &Value) -> Option<String> {
+    let stop_reason = message.get("stopReason").and_then(Value::as_str)?;
+
+    if !matches!(stop_reason, "error" | "aborted") {
+        return None;
+    }
+
+    let reason = message
+        .get("errorMessage")
+        .and_then(Value::as_str)
+        .filter(|reason| !reason.trim().is_empty());
+
+    // A `stopReason` with nothing to explain it is still the difference between
+    // "pi had nothing to say" and "pi never got to answer".
+    Some(match reason {
+        Some(reason) => reason.to_string(),
+        None => format!("turn {stop_reason}"),
+    })
+}
+
 /// Text of a pi message: text blocks verbatim, thinking and tool calls skipped
 /// (tool calls render as blocks, not as inline text).
 fn message_text(message: &Value) -> String {
@@ -559,7 +605,7 @@ mod tests {
             .iter()
             .filter_map(|item| match item {
                 Item::Tool(block) => Some(block),
-                Item::Message(_) => None,
+                Item::Message(_) | Item::Failure(_) => None,
             })
             .collect()
     }
@@ -871,9 +917,116 @@ mod tests {
             .iter()
             .filter_map(|item| match item {
                 Item::Message(message) => Some(message.text.as_str()),
-                Item::Tool(_) => None,
+                Item::Tool(_) | Item::Failure(_) => None,
             })
             .collect()
+    }
+
+    fn failures(transcript: &Transcript) -> Vec<&str> {
+        transcript
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                Item::Failure(detail) => Some(detail.as_str()),
+                Item::Message(_) | Item::Tool(_) => None,
+            })
+            .collect()
+    }
+
+    /// Verbatim from a real session file: three prompts, three turns that died
+    /// at the provider, and an empty pane that said so in no way whatsoever.
+    fn failed_turn(reason: &str) -> Value {
+        json!({
+            "role": "assistant",
+            "content": [{"type": "text", "text": ""}],
+            "stopReason": "error",
+            "errorMessage": reason,
+        })
+    }
+
+    /// The bug this variant exists for: pi's failure message carries no text,
+    /// so the emptiness guard dropped the whole turn and a hard failure looked
+    /// exactly like a pane nobody had typed in.
+    #[test]
+    fn a_turn_that_failed_says_why() {
+        let mut transcript = Transcript::new(&[user_entry("hi bb")]);
+
+        transcript.apply(&json!({
+            "type": "message_end",
+            "message": failed_turn("Provided authentication token is expired."),
+        }));
+
+        assert_eq!(
+            failures(&transcript),
+            ["Provided authentication token is expired."]
+        );
+    }
+
+    /// Pi writes those same failures to the session file, so reopening a
+    /// session must not be quieter than watching it live was.
+    #[test]
+    fn a_failure_survives_a_reopen() {
+        let transcript = Transcript::new(&[
+            user_entry("hi bb"),
+            json!({"message": failed_turn("Provided authentication token is expired.")}),
+        ]);
+
+        assert_eq!(message_texts(&transcript), ["hi bb"]);
+        assert_eq!(
+            failures(&transcript),
+            ["Provided authentication token is expired."]
+        );
+    }
+
+    /// A turn can stream a partial answer and then fail. Losing either half
+    /// misrepresents what happened.
+    #[test]
+    fn a_partial_answer_survives_the_failure_that_followed_it() {
+        let mut transcript = Transcript::new(&[]);
+
+        transcript.apply(&json!({
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "content": text_content("here is half an answer"),
+                "stopReason": "error",
+                "errorMessage": "stream closed",
+            },
+        }));
+
+        assert_eq!(message_texts(&transcript), ["here is half an answer"]);
+        assert_eq!(failures(&transcript), ["stream closed"]);
+    }
+
+    /// A `stopReason` with nothing to explain it still separates "pi had
+    /// nothing to say" from "pi never got to answer".
+    #[test]
+    fn a_failure_with_no_message_still_reports_the_stop_reason() {
+        let mut transcript = Transcript::new(&[]);
+
+        transcript.apply(&json!({
+            "type": "message_end",
+            "message": {"role": "assistant", "content": [], "stopReason": "aborted"},
+        }));
+
+        assert_eq!(failures(&transcript), ["turn aborted"]);
+    }
+
+    /// The guard that keeps every ordinary turn from growing a failure line.
+    #[test]
+    fn a_turn_that_ended_well_reports_nothing() {
+        let mut transcript = Transcript::new(&[]);
+
+        transcript.apply(&json!({
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "content": text_content("all done"),
+                "stopReason": "endTurn",
+            },
+        }));
+
+        assert!(failures(&transcript).is_empty());
     }
 
     /// The reason the cursor is worth having: a repair fetches only what came

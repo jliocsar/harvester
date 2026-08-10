@@ -23,7 +23,6 @@ use gpui::{
 use gpui_component::input::{Input, InputEvent, InputState};
 use serde_json::Value;
 
-use crate::choices;
 use crate::model_control::ModelControl;
 use crate::models::{self, ModelChoice, ModelsState};
 use crate::store::{FleetStore, StoreEvent};
@@ -36,6 +35,10 @@ use harvester_client_core::{Pending, RequestToken, RequestTokens};
 /// Cap on the session name derived from the first prompt's first line — enough
 /// to recognize, short enough for pi's session list and the sidebar.
 const SESSION_NAME_MAX_CHARS: usize = 48;
+
+/// The unstarted chat's "no model chosen" row: pi launches with its own
+/// default, and saying so is more honest than naming a model we did not pick.
+const DEFAULT_MODEL_ROW: &str = "default (pi chooses)";
 
 /// One (machine key, display label) a chat could run on.
 pub type MachineCandidate = (String, String);
@@ -513,67 +516,39 @@ impl Chat {
         }
     }
 
-    /// A started chat's model is already on its launch line or in its pi; only
-    /// an unstarted one is still choosing. A list that has not loaded opens
-    /// nothing: a click while it is still fetching is a click on nothing rather
-    /// than an empty modal.
+    /// Every model this chat can offer, in row order.
     ///
     /// Only a chat with no session yet offers the "default (pi chooses)" row —
     /// a running session always has a concrete model (SPEC §Flows "Switch
     /// model") — and that is derived from the state, not stored: a stored
     /// answer would be one more thing that could disagree with it.
-    pub fn open_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    ///
+    /// The picked model travels with the row rather than as an index into a
+    /// list that may be refetched while the dropdown is open, so a pick always
+    /// applies the model the user actually read.
+    fn model_picks(&self) -> Vec<Option<ModelChoice>> {
         if matches!(self.state, ChatState::Starting { .. }) {
-            return;
-        }
-
-        let choices = self.model.choices().to_vec();
-
-        if choices.is_empty() {
-            return;
+            return Vec::new();
         }
 
         let offer_default = matches!(self.state, ChatState::Unstarted);
-        let current = self.current_model.clone();
-        // The picked model travels with the row rather than as an index into a
-        // list that may be refetched behind the modal — the pick then always
-        // applies to the model the user actually read.
-        let picks: Vec<Option<ModelChoice>> = offer_default
+
+        offer_default
             .then_some(None)
             .into_iter()
-            .chain(choices.iter().cloned().map(Some))
-            .collect();
-        let rows = picks
-            .iter()
-            .map(|pick| choices::ChoiceRow {
-                label: match pick {
-                    Some(choice) => choice.name.clone(),
-                    None => "default (pi chooses)".into(),
-                },
-                selected: match (pick, &current) {
-                    (Some(choice), Some(current)) => {
-                        choice.provider == current.provider && choice.id == current.id
-                    }
-                    (None, None) => true,
-                    _ => false,
-                },
-            })
-            .collect();
+            .chain(self.model.choices().iter().cloned().map(Some))
+            .collect()
+    }
 
-        choices::open(
-            "Choose model",
-            choices::ChoiceList::Searchable,
-            rows,
-            move |chat, index, _, cx| {
-                let Some(pick) = picks.get(index).cloned() else {
-                    return;
-                };
-
-                chat.pick_model(pick, cx);
-            },
-            window,
-            cx,
-        );
+    /// Whether `pick` is the model this chat is already on.
+    fn is_current_model(&self, pick: &Option<ModelChoice>) -> bool {
+        match (pick, &self.current_model) {
+            (Some(choice), Some(current)) => {
+                choice.provider == current.provider && choice.id == current.id
+            }
+            (None, None) => true,
+            _ => false,
+        }
     }
 
     /// A picker row was clicked; `None` is the "default (pi chooses)" row.
@@ -603,45 +578,6 @@ impl Chat {
         }
 
         cx.notify();
-    }
-
-    /// The workspaces sharing this chat's path, the current destination
-    /// checked. Offered only while unstarted and at least two of them exist —
-    /// below that the control reads as the fixed destination.
-    pub fn open_machine_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !matches!(self.state, ChatState::Unstarted) || !self.can_switch_machine(cx) {
-            return;
-        }
-
-        let candidates = self.machine_candidates(cx);
-        let rows = candidates
-            .iter()
-            .map(|(machine, label)| choices::ChoiceRow {
-                label: label.clone().into(),
-                selected: machine == &self.target.machine,
-            })
-            .collect();
-        // The keys travel with the pick, so a listing landing behind the modal
-        // cannot move a row out from under the click.
-        let keys: Vec<String> = candidates
-            .into_iter()
-            .map(|(machine, _label)| machine)
-            .collect();
-
-        choices::open(
-            "Choose machine",
-            choices::ChoiceList::Short,
-            rows,
-            move |chat, index, _, cx| {
-                let Some(machine) = keys.get(index).cloned() else {
-                    return;
-                };
-
-                chat.pick_machine(machine, cx);
-            },
-            window,
-            cx,
-        );
     }
 
     fn can_switch_machine(&self, cx: &Context<Self>) -> bool {
@@ -840,6 +776,7 @@ impl Chat {
         match item {
             Item::Message(message) => render_message(index, message, cx).into_any_element(),
             Item::Tool(block) => self.render_tool_block(index, block, cx).into_any_element(),
+            Item::Failure(detail) => render_failure(detail, cx).into_any_element(),
         }
     }
 
@@ -934,33 +871,19 @@ impl Chat {
         let machine_label = self.machine_label(cx);
 
         ui::prompt_box(input_focused, cx)
-            .child(ui::prompt_box_input(Input::new(&self.input)))
+            .child(ui::prompt_box_input(
+                Input::new(&self.input).appearance(false).p_0(),
+            ))
             .child(
                 ui::prompt_box_controls()
-                    .child(
-                        ui::prompt_box_control("chat-model", model_label, model_enabled, cx).when(
-                            model_enabled,
-                            |control| {
-                                control.on_click(cx.listener(|chat, _, window, cx| {
-                                    chat.open_model_picker(window, cx)
-                                }))
-                            },
-                        ),
-                    )
+                    .child(self.render_model_control(model_label, model_enabled, cx))
                     .child(ui::prompt_box_control(
                         "chat-repo",
                         folder_name(&self.target.workspace_path).to_string().into(),
                         false,
                         cx,
                     ))
-                    .child(
-                        ui::prompt_box_control("chat-machine", machine_label, machine_enabled, cx)
-                            .when(machine_enabled, |control| {
-                                control.on_click(cx.listener(|chat, _, window, cx| {
-                                    chat.open_machine_picker(window, cx)
-                                }))
-                            }),
-                    )
+                    .child(self.render_machine_control(machine_label, machine_enabled, cx))
                     .child(div().flex_1())
                     .child(ui::prompt_box_send("chat-send", cx).on_click(
                         cx.listener(|chat, _, window, cx| chat.submit_prompt(window, cx)),
@@ -984,6 +907,89 @@ impl Chat {
             // claim about which model the session is on.
             _ => ("model".into(), !self.model.choices().is_empty()),
         }
+    }
+
+    /// The model control, and the list it drops. A control with nothing to
+    /// offer renders as the bare label: a dropdown that opens onto no rows is
+    /// worse than one that does not open.
+    fn render_model_control(
+        &self,
+        label: SharedString,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let control = ui::prompt_box_control("chat-model", label, enabled, cx);
+        let picks = self.model_picks();
+
+        if !enabled || picks.is_empty() {
+            return control.into_any_element();
+        }
+
+        let rows = picks
+            .iter()
+            .map(|pick| ui::DropdownRow {
+                label: match pick {
+                    Some(choice) => choice.name.clone(),
+                    None => DEFAULT_MODEL_ROW.into(),
+                },
+                selected: self.is_current_model(pick),
+            })
+            .collect();
+        let chat = cx.entity();
+
+        ui::prompt_box_dropdown("chat-model-dropdown", control, rows, move |index, _, cx| {
+            let Some(pick) = picks.get(index).cloned() else {
+                return;
+            };
+
+            chat.update(cx, |chat, cx| chat.pick_model(pick, cx));
+        })
+        .into_any_element()
+    }
+
+    /// The machine control, and the workspaces sharing this chat's path. Only
+    /// an unstarted chat drops a list — a running session never moves.
+    fn render_machine_control(
+        &self,
+        label: SharedString,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let control = ui::prompt_box_control("chat-machine", label, enabled, cx);
+
+        if !enabled {
+            return control.into_any_element();
+        }
+
+        let candidates = self.machine_candidates(cx);
+        let rows = candidates
+            .iter()
+            .map(|(machine, label)| ui::DropdownRow {
+                label: label.clone().into(),
+                selected: machine == &self.target.machine,
+            })
+            .collect();
+        // The keys travel with the pick, so a listing landing while the list is
+        // open cannot move a row out from under the click.
+        let keys: Vec<String> = candidates
+            .into_iter()
+            .map(|(machine, _label)| machine)
+            .collect();
+        let chat = cx.entity();
+
+        ui::prompt_box_dropdown(
+            "chat-machine-dropdown",
+            control,
+            rows,
+            move |index, _, cx| {
+                let Some(machine) = keys.get(index).cloned() else {
+                    return;
+                };
+
+                chat.update(cx, |chat, cx| chat.pick_machine(machine, cx));
+            },
+        )
+        .into_any_element()
     }
 
     /// The unstarted body: empty, except when the model fetch failed — which
@@ -1059,6 +1065,14 @@ fn render_message(index: usize, message: &Message, cx: &App) -> Div {
             cx,
         ),
     }
+}
+
+/// A turn that ended badly. Authored as "pi" because it is that turn's
+/// outcome, but in the failed tone and without markdown — the reason is a
+/// provider's error string, not prose, and running it through a renderer that
+/// eats `*` and `#` would corrupt exactly the detail being reported.
+fn render_failure(detail: &str, cx: &App) -> Div {
+    ui::chat_message("pi", Tone::Failed, detail.to_string(), false, cx)
 }
 
 /// Cap on the compact-args summary in unknown-tool labels; the full args

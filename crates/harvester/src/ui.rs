@@ -8,12 +8,18 @@
 //! (`.on_click`, extra children); behavior stays with the caller, looks stay
 //! here.
 
+use std::rc::Rc;
 use std::sync::OnceLock;
 
-use gpui::{div, prelude::*, px, rems, App, Div, ElementId, FontWeight, SharedString, Stateful};
+use gpui::{
+    div, prelude::*, px, rems, Anchor, App, Div, ElementId, FontWeight, SharedString, Stateful,
+    Window,
+};
 use gpui_component::highlighter::HighlightTheme;
+use gpui_component::popover::Popover;
 use gpui_component::text::{TextView, TextViewStyle};
 use gpui_component::ActiveTheme as _;
+use gpui_component::Selectable;
 
 /// Statusbar height; the workbench and the statusbar frame must agree.
 const STATUSBAR_HEIGHT: f32 = 26.;
@@ -205,13 +211,28 @@ pub fn prompt_box(focused: bool, cx: &App) -> Div {
         .border_color(if focused {
             cx.theme().ring
         } else {
-            cx.theme().border
+            cx.theme().border.opacity(PROMPT_BOX_BORDER_OPACITY)
         })
         .flex()
         .flex_col()
 }
 
-/// The prompt box's input slot: padding around the caller's `Input`.
+/// How far the prompt box's resting border is faded. The theme's `border` is
+/// drawn to separate panels, and at full strength around the one card floating
+/// over the chat it reads as a boxed-in field. The box should be findable when
+/// looked for and quiet otherwise; focus still brings the full `ring`.
+const PROMPT_BOX_BORDER_OPACITY: f32 = 0.5;
+
+/// The prompt box's input slot: the padding around the caller's `Input`, and
+/// the only padding there should be.
+///
+/// The `Input` inside must be built with `.appearance(false).p_0()`. The
+/// prompt box *is* the field's frame: the library's own border and background
+/// drawn inside it read as a second box nested in the first, and its own
+/// padding then insets the text a second time from a frame that already has
+/// this slot's. `.p_0()` lands because `Input` refines the caller's style
+/// after its own (`input/input.rs:540-563`), and its multi-line editor reads
+/// the padding after that, so the text and its scrollbar stay aligned.
 pub fn prompt_box_input(input: impl IntoElement) -> Div {
     div().px_3().pt_3().pb_2().child(input)
 }
@@ -220,6 +241,125 @@ pub fn prompt_box_input(input: impl IntoElement) -> Div {
 /// `flex_1` spacer, then `prompt_box_send`.
 pub fn prompt_box_controls() -> Div {
     div().px_3().pb_2().flex().items_center().gap_2()
+}
+
+/// One row of an in-place dropdown.
+pub struct DropdownRow {
+    pub label: SharedString,
+    /// The choice already in effect — it carries the check mark.
+    pub selected: bool,
+}
+
+/// Cap on an open dropdown, so a long model list scrolls within the window
+/// rather than growing past it.
+const DROPDOWN_MAX_HEIGHT: f32 = 280.;
+
+/// Least width of an open dropdown, so a list of short labels does not open as
+/// a sliver beneath a wide control.
+const DROPDOWN_MIN_WIDTH: f32 = 200.;
+
+/// Width of a dropdown row's check-mark gutter. Fixed, so the labels of picked
+/// and unpicked rows line up with each other.
+const DROPDOWN_CHECK_WIDTH: f32 = 12.;
+
+/// A [`Popover`] trigger that has no selected look.
+///
+/// `Popover::trigger` demands [`Selectable`], which the library implements for
+/// its own widgets and not for a styled `div`. The prompt box's controls are
+/// divs and stay that way — one text run and a caret, not buttons — so this
+/// carries the trait without the appearance it usually implies.
+#[derive(IntoElement)]
+struct PlainTrigger(Stateful<Div>);
+
+impl RenderOnce for PlainTrigger {
+    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+        self.0
+    }
+}
+
+impl Selectable for PlainTrigger {
+    fn selected(self, _selected: bool) -> Self {
+        self
+    }
+
+    fn is_selected(&self) -> bool {
+        false
+    }
+}
+
+/// A prompt-box control that opens its choices in place; `picked` runs with
+/// the index of the row chosen.
+///
+/// Anchored at the trigger's bottom-left, which opens the list *upward*: the
+/// prompt box sits at the bottom of the pane, so a list dropping downward
+/// would open past the window edge and be snapped back over the control it
+/// belongs to.
+pub fn prompt_box_dropdown(
+    id: &'static str,
+    trigger: Stateful<Div>,
+    rows: Vec<DropdownRow>,
+    picked: impl Fn(usize, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    // Shared rather than moved: the content closure runs on every render of an
+    // open dropdown, so it can only borrow what it is built from.
+    let rows = Rc::new(rows);
+    let picked = Rc::new(picked);
+
+    Popover::new(id)
+        .anchor(Anchor::BottomLeft)
+        .trigger(PlainTrigger(trigger))
+        .content(move |_, _, cx| {
+            let popover = cx.entity();
+            let rows = rows.clone();
+            let picked = picked.clone();
+
+            div()
+                .id("dropdown-rows")
+                .flex()
+                .flex_col()
+                .min_w(px(DROPDOWN_MIN_WIDTH))
+                .max_h(px(DROPDOWN_MAX_HEIGHT))
+                .overflow_y_scroll()
+                .children(rows.iter().enumerate().map(|(index, row)| {
+                    let popover = popover.clone();
+                    let picked = picked.clone();
+
+                    dropdown_row(index, row, cx).on_click(move |_, window, cx| {
+                        // Dismissed before the pick runs, so the list is gone
+                        // by the time whatever the pick starts renders.
+                        popover.update(cx, |state, cx| state.dismiss(window, cx));
+                        picked(index, window, cx);
+                    })
+                }))
+        })
+}
+
+/// One dropdown row: a check-mark gutter, the label, and a hover highlight.
+fn dropdown_row(index: usize, row: &DropdownRow, cx: &App) -> Stateful<Div> {
+    div()
+        .id(("dropdown-row", index))
+        .flex()
+        .items_center()
+        .gap_2()
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .text_xs()
+        .cursor_pointer()
+        .hover(|style| style.bg(cx.theme().accent))
+        .child(
+            div()
+                .flex_none()
+                .w(px(DROPDOWN_CHECK_WIDTH))
+                .text_color(cx.theme().muted_foreground)
+                .child(if row.selected { "✓" } else { "" }),
+        )
+        .child(
+            div()
+                .overflow_hidden()
+                .text_ellipsis()
+                .child(row.label.clone()),
+        )
 }
 
 /// A flat dropdown control inside the prompt box (the model picker trigger):

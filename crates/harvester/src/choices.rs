@@ -1,15 +1,16 @@
 //! The one-of-many modal: pick a row, the dialog closes, the owner is told
 //! which row it was.
 //!
-//! Three surfaces are the same thing — the chat's model list, the chat's
-//! machine switch, and the add-workspace machine step — so they are one view
-//! rather than three renderers. A view, and not a builder closure, because
-//! `gpui-component` builds a dialog's body from the *root* view's render:
-//! reaching for the workbench or the chat there would be reading an entity
-//! that is mid-update, which gpui panics on (SPEC C11).
+//! One surface left — the add-workspace machine step. The chat's two pickers
+//! were modals too until they became in-place dropdowns
+//! ([`ui::prompt_box_dropdown`](crate::ui::prompt_box_dropdown)); what remains
+//! here is the case that is genuinely a step in a flow rather than a control
+//! with a list behind it.
 //!
-//! The rows themselves are `gpui-component`'s virtualized [`List`], so a long
-//! model list is searchable and costs only the rows on screen.
+//! A view, and not a builder closure, because `gpui-component` builds a
+//! dialog's body from the *root* view's render: reaching for the workbench
+//! there would be reading an entity that is mid-update, which gpui panics on
+//! (SPEC C11).
 
 use gpui::{
     prelude::*, App, Context, Entity, EventEmitter, SharedString, Subscription, Task, Window,
@@ -21,32 +22,13 @@ use gpui_component::{IconName, WindowExt as _};
 /// The row the user picked, as an index into the rows the caller passed in.
 pub struct ChoicePicked(pub usize);
 
-/// Fixed height for a searchable choice list. A list that arrives
-/// asynchronously (models being fetched) must not resize the dialog under the
-/// pointer between one click and the next.
+/// Cap on the list's height; a longer one scrolls inside the dialog.
 const CHOICE_LIST_HEIGHT: f32 = 280.;
 
 pub struct ChoiceRow {
     pub label: SharedString,
     /// The row that is already in effect — it carries the check mark.
     pub selected: bool,
-}
-
-/// How a choice list presents itself.
-///
-/// The two cases travel together: a handful of machines is entirely on screen
-/// and searching it would be noise, while a model list is long enough to
-/// scroll, arrives late, and is worth filtering.
-#[derive(Clone, Copy)]
-pub enum ChoiceList {
-    Short,
-    Searchable,
-}
-
-impl ChoiceList {
-    fn is_searchable(self) -> bool {
-        matches!(self, ChoiceList::Searchable)
-    }
 }
 
 /// The rows, and which of them the search query leaves standing.
@@ -128,7 +110,6 @@ impl ListDelegate for ChoiceDelegate {
 
 pub struct Choices {
     list: Entity<ListState<ChoiceDelegate>>,
-    presentation: ChoiceList,
     _picked: Subscription,
 }
 
@@ -157,12 +138,7 @@ impl Choices {
 
 impl Render for Choices {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let list = List::new(&self.list).search_placeholder("Filter…");
-
-        match self.presentation {
-            ChoiceList::Short => list.max_h(gpui::px(CHOICE_LIST_HEIGHT)),
-            ChoiceList::Searchable => list.h(gpui::px(CHOICE_LIST_HEIGHT)),
-        }
+        List::new(&self.list).max_h(gpui::px(CHOICE_LIST_HEIGHT))
     }
 }
 
@@ -170,22 +146,17 @@ impl Render for Choices {
 /// user chose, after the dialog is gone.
 pub fn open<T: 'static>(
     title: &'static str,
-    presentation: ChoiceList,
     rows: Vec<ChoiceRow>,
     picked: impl Fn(&mut T, usize, &mut Window, &mut Context<T>) + 'static,
     window: &mut Window,
     cx: &mut Context<T>,
 ) {
     let choices = cx.new(|cx| {
-        let list = cx.new(|cx| {
-            ListState::new(ChoiceDelegate::new(rows), window, cx)
-                .searchable(presentation.is_searchable())
-        });
+        let list = cx.new(|cx| ListState::new(ChoiceDelegate::new(rows), window, cx));
 
         Choices {
             _picked: cx.subscribe_in(&list, window, Choices::handle_list_event),
             list,
-            presentation,
         }
     });
 

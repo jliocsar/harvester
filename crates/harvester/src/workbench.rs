@@ -602,7 +602,6 @@ impl Workbench {
 
         choices::open(
             "Add workspace — choose machine",
-            choices::ChoiceList::Short,
             rows,
             move |workbench, index, window, cx| {
                 let Some(machine) = keys.get(index).cloned() else {
