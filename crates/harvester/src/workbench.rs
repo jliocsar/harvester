@@ -137,7 +137,7 @@ impl Workbench {
                 self.handle_workspace_validated(*token, error.clone(), cx)
             }
             // Consumed by the store; it does not pass these on.
-            machines::Event::Listed(_)
+            machines::Event::Listed { .. }
             | machines::Event::Probed { .. }
             | machines::Event::ProviderFailed { .. } => {}
         }
@@ -676,7 +676,14 @@ impl Workbench {
 
     /// The machines section: the hardcoded `local` row first (SPEC §Machine —
     /// connection support lands with the local-daemon stage), then provider
-    /// machines, then ad-hoc SSH destinations. All rows read-only.
+    /// machines, then the tracked machines their providers no longer list, then
+    /// ad-hoc SSH destinations. All rows read-only.
+    ///
+    /// The missing rows are why this section is not simply the listing. A
+    /// deleted machine that some workspace still points at would otherwise have
+    /// no row anywhere, and its workspace would go on reading as healthy while
+    /// nothing ever connected (SPEC §Build state, "A dead workspace says
+    /// nothing").
     fn render_machine_list(&self, cx: &Context<Self>) -> impl IntoElement {
         let store = self.store.read(cx);
         let provider_rows: Vec<_> = store
@@ -689,6 +696,20 @@ impl Workbench {
                     row.label.clone().into(),
                     Some(row.provider.clone().into()),
                     &row.key,
+                    cx,
+                )
+            })
+            .collect();
+        let missing_rows: Vec<_> = store
+            .missing_tracked_machines()
+            .into_iter()
+            .enumerate()
+            .map(|(index, machine)| {
+                self.render_machine_row(
+                    ("missing-machine", index),
+                    store.label(&machine).into(),
+                    Some("no longer listed".into()),
+                    &machine,
                     cx,
                 )
             })
@@ -720,6 +741,7 @@ impl Workbench {
                 cx,
             ))
             .children(provider_rows)
+            .children(missing_rows)
             .children(ad_hoc_rows)
     }
 
@@ -744,18 +766,19 @@ impl Workbench {
         ))
     }
 
-    /// The dot is the machine's whole story now that rows carry no link
-    /// text (SPEC §UI machine dots): green = daemon connected, yellow =
-    /// connecting/bootstrapping, red = connect failed/lost or the worker's
-    /// `ssh <machine> true` probe says unreachable, gray = no daemon link
-    /// yet (reachable or simply not probed — indistinguishable without
-    /// connecting). Never provider-reported status (SPEC §Machine).
+    /// The dot is the machine's whole story now that rows carry no link text
+    /// (SPEC §UI machine dots): green = daemon connected, yellow =
+    /// connecting/bootstrapping, red = connect failed/lost, the worker's `ssh
+    /// <machine> true` probe says unreachable, or the machine is gone from its
+    /// provider's listing; filled gray = probed fine, nothing has connected
+    /// yet; hollow gray = nothing is known at all. Never provider-reported
+    /// status (SPEC §Machine).
     ///
     /// One `match` over one value: the precedence between a probe verdict and
     /// a daemon link used to live here, in a renderer, reading two maps. It
     /// is the fleet's invariant now.
-    fn machine_dot(&self, key: &str, cx: &Context<Self>) -> Tone {
-        present_machine(self.store.read(cx).state(key), key).tone
+    fn machine_dot(&self, key: &str, cx: &Context<Self>) -> ui::Dot {
+        present_machine(self.store.read(cx).state(key), key).dot
     }
 
     /// One session row's presentation, resolved against the store before the
@@ -796,7 +819,8 @@ impl Workbench {
     ) -> impl IntoElement {
         let sid = row.sid;
         let body = stacked_row(
-            row.tone,
+            // A session's status is always known — it came from a listing.
+            ui::Dot::Solid(row.tone),
             row.title,
             Some(row.subtitle),
             row.opening.then(|| "opening…".into()),
@@ -841,7 +865,7 @@ impl Workbench {
         let display = present_machine(self.store.read(cx).state(machine), machine);
 
         match display.pane_message {
-            Some(message) => (message, display.tone),
+            Some(message) => (message, display.dot.tone()),
             None => (NO_ARGV_MACHINE_HINT.to_string(), Tone::Idle),
         }
     }
@@ -880,7 +904,7 @@ impl Workbench {
         let machine = store.argv_machine()?;
         let display = present_machine(store.state(machine), machine);
 
-        Some((display.statusbar_link?, display.tone))
+        Some((display.statusbar_link?, display.dot.tone()))
     }
 }
 
@@ -942,7 +966,7 @@ fn sidebar_row(id: impl Into<gpui::ElementId>) -> ListItem {
 /// beside the title, the quieter detail line under it, and an optional note
 /// (`opening…`) at the end of the title line.
 fn stacked_row(
-    dot: Tone,
+    dot: ui::Dot,
     title: SharedString,
     detail: Option<SharedString>,
     note: Option<SharedString>,
@@ -995,7 +1019,7 @@ fn sidebar_empty_note(text: &'static str, cx: &App) -> Div {
 /// The strings differ per surface because they are different sentences, not
 /// because the state means different things.
 struct MachineDisplay {
-    tone: Tone,
+    dot: ui::Dot,
     /// The content pane's sentence when this machine is the one on screen.
     /// `None` for the probe-only states: nothing about a daemon to report.
     pane_message: Option<String>,
@@ -1006,34 +1030,48 @@ struct MachineDisplay {
 fn present_machine(state: MachineState<'_>, machine: &str) -> MachineDisplay {
     match state {
         MachineState::Connecting => MachineDisplay {
-            tone: Tone::Pending,
+            dot: ui::Dot::Solid(Tone::Pending),
             pane_message: Some(format!("connecting to {machine}…")),
             statusbar_link: Some("connecting…".to_string()),
         },
         MachineState::Connected { daemon_version } => MachineDisplay {
-            tone: Tone::Live,
+            dot: ui::Dot::Solid(Tone::Live),
             pane_message: Some("select a session".to_string()),
             statusbar_link: Some(format!("{machine} · harvesterd {daemon_version}")),
         },
         MachineState::ConnectFailed { detail } => MachineDisplay {
-            tone: Tone::Failed,
+            dot: ui::Dot::Solid(Tone::Failed),
             pane_message: Some(detail.to_string()),
             statusbar_link: Some("connect failed".to_string()),
         },
         MachineState::ConnectionLost => MachineDisplay {
-            tone: Tone::Failed,
+            dot: ui::Dot::Solid(Tone::Failed),
             pane_message: Some("connection lost".to_string()),
             statusbar_link: Some("connection lost".to_string()),
+        },
+        // The one state a *listing* reports, and the only sentence that names
+        // the machine rather than the daemon — there was never a daemon.
+        MachineState::Missing => MachineDisplay {
+            dot: ui::Dot::Solid(Tone::Failed),
+            pane_message: Some(format!("{machine} is no longer listed by its provider")),
+            statusbar_link: Some("no longer listed".to_string()),
         },
         // A probe verdict is not a link: unreachable still reads as failed,
         // but there is nothing to say about a daemon nobody has reached for.
         MachineState::Unreachable => MachineDisplay {
-            tone: Tone::Failed,
+            dot: ui::Dot::Solid(Tone::Failed),
             pane_message: None,
             statusbar_link: None,
         },
-        MachineState::Unknown | MachineState::Reachable => MachineDisplay {
-            tone: Tone::Idle,
+        MachineState::Reachable => MachineDisplay {
+            dot: ui::Dot::Solid(Tone::Idle),
+            pane_message: None,
+            statusbar_link: None,
+        },
+        // Hollow, not grey: nothing has probed or connected, so this is the
+        // absence of a verdict rather than a quiet one.
+        MachineState::Unknown => MachineDisplay {
+            dot: ui::Dot::Hollow(Tone::Idle),
             pane_message: None,
             statusbar_link: None,
         },

@@ -105,12 +105,35 @@ pub fn section_chevron(expanded: bool) -> Div {
 }
 
 /// The one dot: a machine's link, a session's liveness, a tool call's status.
-pub fn status_dot(tone: Tone, cx: &App) -> Div {
-    div()
-        .flex_none()
-        .size(px(6.))
-        .rounded_full()
-        .bg(tone.color(cx))
+/// A status dot: its colour, and whether it stands for evidence or the absence
+/// of any.
+///
+/// `Hollow` exists because one machine state — never probed, never connected —
+/// is not a verdict at all, and rendering it as a filled grey dot made it
+/// indistinguishable from "probed fine, nothing has connected yet". An outline
+/// says *no information* without spending a colour the palette does not have.
+#[derive(Clone, Copy)]
+pub enum Dot {
+    Solid(Tone),
+    Hollow(Tone),
+}
+
+impl Dot {
+    /// The colour, for the text a dot's row or link is coloured to match.
+    pub fn tone(self) -> Tone {
+        match self {
+            Dot::Solid(tone) | Dot::Hollow(tone) => tone,
+        }
+    }
+}
+
+pub fn status_dot(dot: Dot, cx: &App) -> Div {
+    let base = div().flex_none().size(px(6.)).rounded_full();
+
+    match dot {
+        Dot::Solid(tone) => base.bg(tone.color(cx)),
+        Dot::Hollow(tone) => base.border_1().border_color(tone.color(cx)),
+    }
 }
 
 /// Assistant prose, rendered as markdown.
@@ -331,7 +354,8 @@ pub fn tool_block_header(
         .gap_2()
         .cursor_pointer()
         .hover(|style| style.bg(cx.theme().list_hover))
-        .child(status_dot(dot, cx))
+        // A tool call's dot is always a verdict — pending is still evidence.
+        .child(status_dot(Dot::Solid(dot), cx))
         .child(label.flex_1().min_w(px(0.)))
         .child(
             div()

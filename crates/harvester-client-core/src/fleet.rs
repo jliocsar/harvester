@@ -30,7 +30,7 @@
 //! and renders it; there is no second field to keep in sync, and no way to
 //! claim a link without holding the bridge that backs it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -108,15 +108,19 @@ impl Link {
 /// the states only a bridge can be in are exactly the ones the table can only
 /// build while holding that bridge.
 ///
-/// The first three are what a probe can say; the last four are what a bridge
-/// can say. A machine moves up into the bridge half when a bridge is started
-/// for it and never falls back out — a probe is weaker evidence than an actual
-/// connection, and a machine that failed to connect stays visibly failed until
-/// something retries it.
+/// Three sources speak here. [`MachineState::Missing`] is what the provider
+/// *listing* says; the next three are what a probe says; the last four are what
+/// a bridge says. A machine moves up into the bridge half when a bridge is
+/// started for it and never falls back out — a probe is weaker evidence than an
+/// actual connection, and a machine that failed to connect stays visibly failed
+/// until something retries it.
 #[derive(Debug)]
 pub enum MachineState<'a> {
-    /// Never probed and never connected. Indistinguishable from "reachable"
-    /// without connecting, which is why both render the same.
+    /// The machine's provider listed, and this machine was not in it: deleted
+    /// upstream. Distinct from [`MachineState::Unreachable`], which is a
+    /// machine that still exists and did not answer.
+    Missing,
+    /// Never probed and never connected.
     Unknown,
     Reachable,
     /// The probe failed. Not a veto: connecting is still allowed to try, since
@@ -248,6 +252,9 @@ pub struct Fleet {
     machines: HashMap<String, Machine>,
     /// Provider machines from the worker's last listing cycle, sorted by key.
     provider_rows: Vec<MachineRow>,
+    /// The providers whose listings can be believed — see [`Fleet::is_missing`]
+    /// and `machines::Event::Listed`. Empty until the first cycle reports.
+    listed_providers: HashSet<String>,
     /// The machines worker's command sender; `None` if its thread failed.
     host_commands: Option<UnboundedSender<machines::Command>>,
     /// The machines a frontend told the fleet to care about (see
@@ -280,6 +287,7 @@ impl Fleet {
             bridge_events: bridge_sender,
             machines: HashMap::new(),
             provider_rows: Vec::new(),
+            listed_providers: HashSet::new(),
             host_commands,
             tracked: Vec::new(),
         };
@@ -341,6 +349,10 @@ impl Fleet {
     /// listed yet) is skipped without an error, and the next listing cycle
     /// retries it. A machine whose bridge already failed is *not* retried here
     /// — retouching it is the retry (see [`Fleet::ensure_connection`]).
+    ///
+    /// Quiet is right *here* and wrong for the user, which is the split:
+    /// skipping is provisional, and whether a skip is permanent is a question
+    /// only the listing can answer ([`Fleet::missing_tracked_machines`]).
     fn auto_connect_tracked(&mut self) {
         for machine in self.connectable_tracked_machines() {
             if let Err(error) = self.ensure_connection(&machine) {
@@ -506,7 +518,10 @@ impl Fleet {
     /// material — is the frontend's.
     fn record_machines_event(&mut self, event: &machines::Event) {
         match event {
-            machines::Event::Listed(rows) => self.handle_listed(rows),
+            machines::Event::Listed {
+                rows,
+                listed_providers,
+            } => self.handle_listed(rows, listed_providers),
             machines::Event::Probed { key, reachable } => self.handle_probed(key, *reachable),
             machines::Event::ProviderFailed { .. }
             | machines::Event::HomeResolved { .. }
@@ -515,11 +530,12 @@ impl Fleet {
         }
     }
 
-    fn handle_listed(&mut self, rows: &[MachineRow]) {
+    fn handle_listed(&mut self, rows: &[MachineRow], listed_providers: &[String]) {
         let mut rows = rows.to_vec();
 
         rows.sort_by(|a, b| a.key.cmp(&b.key));
         self.provider_rows = rows;
+        self.listed_providers = listed_providers.iter().cloned().collect();
         // A machine that vanished from the listing is gone; a provider-key
         // tracked machine that just appeared in it becomes resolvable, so
         // connect it and its sessions show up.
@@ -540,10 +556,50 @@ impl Fleet {
     // --- what the frontend reads ------------------------------------------
 
     /// The one value a frontend renders a machine from.
+    ///
+    /// A live bridge outranks the listing — we are talking to the machine,
+    /// whatever its provider says about it. Nothing weaker does: a probe
+    /// verdict for a deleted machine is stale by construction, and reporting
+    /// it is exactly the silence [`MachineState::Missing`] exists to break.
     pub fn state(&self, machine: &str) -> MachineState<'_> {
-        self.machines
+        let state = self
+            .machines
             .get(machine)
-            .map_or(MachineState::Unknown, Machine::state)
+            .map_or(MachineState::Unknown, Machine::state);
+
+        if state.is_live() || !self.is_missing(machine) {
+            return state;
+        }
+
+        MachineState::Missing
+    }
+
+    /// The machine's provider listed successfully and did not include it, so
+    /// it was deleted upstream.
+    ///
+    /// A provider that has never listed says nothing about its machines, so an
+    /// absent row is not evidence until it has — otherwise one broken provider
+    /// would report its whole fleet as deleted. Only provider machines can go
+    /// missing: `local` always exists, and nothing lists an ad-hoc SSH
+    /// destination to leave it out of.
+    fn is_missing(&self, machine: &str) -> bool {
+        let MachineRef::Provider(key) = MachineRef::parse(machine) else {
+            return false;
+        };
+
+        self.listed_providers.contains(&key.provider) && self.provider_row(machine).is_none()
+    }
+
+    /// The tracked machines that no longer exist — a frontend's cue to show
+    /// them anyway. Without this they vanish from the sidebar (which lists the
+    /// *listing*) while their workspaces go on looking healthy, and the client
+    /// sits there connecting to nothing with no way to find out why.
+    pub fn missing_tracked_machines(&self) -> Vec<String> {
+        self.tracked
+            .iter()
+            .filter(|machine| self.is_missing(machine))
+            .cloned()
+            .collect()
     }
 
     /// Whether a bridge was ever started for this machine — the question
@@ -679,9 +735,20 @@ mod tests {
             bridge_events,
             machines: HashMap::new(),
             provider_rows: Vec::new(),
+            listed_providers: HashSet::new(),
             host_commands: None,
             tracked: Vec::new(),
         }
+    }
+
+    /// One listing cycle as the worker reports it: every provider that
+    /// contributed a row has, by construction, listed successfully.
+    fn list(fleet: &mut Fleet, rows: &[MachineRow]) {
+        let mut providers: Vec<String> = rows.iter().map(|row| row.provider.clone()).collect();
+
+        providers.sort();
+        providers.dedup();
+        fleet.handle_listed(rows, &providers);
     }
 
     fn provider_row(key: &str, target: Option<&str>) -> MachineRow {
@@ -895,10 +962,13 @@ mod tests {
     fn a_listed_provider_machine_resolves_to_its_target() {
         let mut fleet = fleet();
 
-        fleet.handle_listed(&[provider_row(
-            "exe-dev/bloggy",
-            Some("exedev@bloggy.exe.dev"),
-        )]);
+        list(
+            &mut fleet,
+            &[provider_row(
+                "exe-dev/bloggy",
+                Some("exedev@bloggy.exe.dev"),
+            )],
+        );
 
         let Ok(ConnectDecision::Spawn(Host::Ssh(target))) =
             fleet.connect_decision("exe-dev/bloggy")
@@ -914,7 +984,7 @@ mod tests {
         // The argv ssh escape hatch: such machines list, but stay unreachable.
         let mut fleet = fleet();
 
-        fleet.handle_listed(&[provider_row("exe-dev/legacy", None)]);
+        list(&mut fleet, &[provider_row("exe-dev/legacy", None)]);
 
         assert!(fleet.connect_decision("exe-dev/legacy").is_err());
     }
@@ -1051,10 +1121,13 @@ mod tests {
     fn candidates_are_local_plus_resolvable_machines() {
         let mut fleet = fleet();
 
-        fleet.handle_listed(&[
-            provider_row("exe-dev/bloggy", Some("exedev@bloggy")),
-            provider_row("exe-dev/legacy", None),
-        ]);
+        list(
+            &mut fleet,
+            &[
+                provider_row("exe-dev/bloggy", Some("exedev@bloggy")),
+                provider_row("exe-dev/legacy", None),
+            ],
+        );
         fleet.track_machines(vec!["exedev@vm".to_string()]);
 
         assert_eq!(
@@ -1077,13 +1150,110 @@ mod tests {
         );
     }
 
+    // --- a machine that was deleted upstream -------------------------------
+
+    #[test]
+    fn a_machine_its_provider_stopped_listing_is_missing() {
+        let mut fleet = fleet();
+
+        list(
+            &mut fleet,
+            &[provider_row("exe-dev/gone", Some("exedev@gone"))],
+        );
+        list(
+            &mut fleet,
+            &[provider_row("exe-dev/kept", Some("exedev@kept"))],
+        );
+
+        assert!(matches!(fleet.state("exe-dev/gone"), MachineState::Missing));
+    }
+
+    #[test]
+    fn a_machine_whose_provider_never_listed_is_only_unknown() {
+        // The misdiagnosis this rule exists to prevent: one provider failing
+        // its very first `list` must not report its whole fleet as deleted.
+        let fleet = fleet();
+
+        assert!(matches!(
+            fleet.state("exe-dev/bloggy"),
+            MachineState::Unknown
+        ));
+    }
+
+    #[test]
+    fn only_provider_machines_can_go_missing() {
+        let mut fleet = fleet();
+
+        // A listing that mentions neither of them, since nothing lists either.
+        list(
+            &mut fleet,
+            &[provider_row("exe-dev/kept", Some("exedev@kept"))],
+        );
+
+        assert!(matches!(fleet.state(LOCAL_MACHINE), MachineState::Unknown));
+        assert!(matches!(fleet.state("exedev@vm"), MachineState::Unknown));
+    }
+
+    #[test]
+    fn a_live_bridge_outranks_a_listing_that_dropped_the_machine() {
+        let mut fleet = fleet();
+
+        list(
+            &mut fleet,
+            &[provider_row("exe-dev/kept", Some("exedev@kept"))],
+        );
+        with_link(
+            &mut fleet,
+            "exe-dev/gone",
+            Link::Connected {
+                daemon_version: "0.1.0".to_string(),
+            },
+        );
+
+        assert!(matches!(
+            fleet.state("exe-dev/gone"),
+            MachineState::Connected { .. }
+        ));
+    }
+
+    #[test]
+    fn a_stale_probe_verdict_does_not_outrank_a_listing() {
+        let mut fleet = fleet();
+
+        list(
+            &mut fleet,
+            &[provider_row("exe-dev/kept", Some("exedev@kept"))],
+        );
+        fleet.handle_probed("exe-dev/gone", true);
+
+        assert!(matches!(fleet.state("exe-dev/gone"), MachineState::Missing));
+    }
+
+    #[test]
+    fn missing_tracked_machines_are_the_tracked_ones_only() {
+        let mut fleet = fleet();
+
+        // Neither is listed, but only one is something a workspace points at,
+        // and an untracked ghost is not worth a sidebar row.
+        list(
+            &mut fleet,
+            &[provider_row("exe-dev/kept", Some("exedev@kept"))],
+        );
+        fleet.track_machines(vec!["exe-dev/gone".to_string()]);
+
+        assert_eq!(fleet.missing_tracked_machines(), vec!["exe-dev/gone"]);
+    }
+
     #[test]
     fn a_label_falls_back_to_the_key_id_until_the_provider_lists() {
         let mut fleet = fleet();
 
         assert_eq!(fleet.label("exe-dev/bloggy"), "bloggy");
 
-        fleet.handle_listed(&[provider_row("exe-dev/bloggy", Some("exedev@bloggy"))]);
+        list(
+            &mut fleet,
+            &[provider_row("exe-dev/bloggy", Some("exedev@bloggy"))],
+        );
 
         assert_eq!(fleet.label("exe-dev/bloggy"), "exe-dev/bloggy label");
         assert_eq!(fleet.label("exedev@vm"), "exedev@vm");

@@ -70,7 +70,15 @@ pub enum Command {
 pub enum Event {
     /// One full provider-machine listing cycle finished; replaces the
     /// previous provider-machine set wholesale.
-    Listed(Vec<MachineRow>),
+    Listed {
+        rows: Vec<MachineRow>,
+        /// Every provider whose `list` has succeeded at least once, this cycle
+        /// or an earlier one. A provider absent from here has never reported,
+        /// so its machines' absence from `rows` proves nothing — which is the
+        /// whole difference between "that machine was deleted" and "that
+        /// provider is broken".
+        listed_providers: Vec<String>,
+    },
     /// A provider failed `info` or `list` this cycle; statusbar material.
     ProviderFailed { provider: String, detail: String },
     /// One machine's probe answered.
@@ -196,7 +204,16 @@ async fn worker_main(mut commands: UnboundedReceiver<Command>, events: Unbounded
                 provider_rows = rows;
                 provider_machines = provider_rows.values().flatten().cloned().collect();
 
-                if events.send(Event::Listed(provider_machines.clone())).is_err() {
+                let mut listed_providers: Vec<String> = provider_rows.keys().cloned().collect();
+
+                listed_providers.sort();
+
+                let listed = Event::Listed {
+                    rows: provider_machines.clone(),
+                    listed_providers,
+                };
+
+                if events.send(listed).is_err() {
                     break;
                 }
 
@@ -249,6 +266,11 @@ fn spawn_list_cycle(
 /// provider's control plane would otherwise unlist its machines for a full
 /// interval — and since workspaces resolve their machine key through this
 /// list, those workspaces become unopenable meanwhile.
+///
+/// The *key set* is load-bearing too, and is what [`Event::Listed`] reports as
+/// `listed_providers`: a provider is keyed here only once it has listed
+/// successfully, and drops out when discovery stops finding its executable at
+/// all. So "keyed here" is exactly "this provider's listing can be believed".
 type ProviderRows = std::collections::HashMap<String, Vec<MachineRow>>;
 
 /// One listing cycle: discover, then protocol-gate and `list` every provider

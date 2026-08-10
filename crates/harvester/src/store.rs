@@ -225,7 +225,7 @@ impl FleetStore {
         match event {
             // The listing and the probes were the fleet's, and it took them —
             // but a listing renames machines, which every label reads through.
-            machines::Event::Listed(_) | machines::Event::Probed { .. } => cx.notify(),
+            machines::Event::Listed { .. } | machines::Event::Probed { .. } => cx.notify(),
             machines::Event::ProviderFailed { provider, detail } => {
                 self.fail(format!("provider {provider}: {detail}"), cx)
             }
@@ -470,6 +470,10 @@ impl FleetStore {
 
     pub fn provider_machines(&self) -> &[machines::MachineRow] {
         self.fleet.provider_machines()
+    }
+
+    pub fn missing_tracked_machines(&self) -> Vec<String> {
+        self.fleet.missing_tracked_machines()
     }
 
     pub fn ad_hoc_machines(&self) -> Vec<String> {
