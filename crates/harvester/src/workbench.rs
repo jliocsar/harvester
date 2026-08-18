@@ -10,6 +10,8 @@
 
 mod picker;
 
+use std::collections::HashMap;
+
 use gpui::{div, prelude::*, px, App, Context, Div, Entity, SharedString, Subscription, Window};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::list::ListItem;
@@ -18,13 +20,16 @@ use gpui_component::{
     h_flex, v_flex, ActiveTheme as _, Disableable as _, IconName, Root, Sizable as _,
     WindowExt as _,
 };
-use harvester_client_core::{DialogAnswer, DialogRequest, MachineState, LOCAL_MACHINE};
+use harvester_client_core::{
+    DialogAnswer, DialogKey, DialogObligation, DialogObligations, DialogRequest, DialogRoom,
+    EnqueueResult, MachineState, Retirement, LOCAL_MACHINE,
+};
 use harvester_proto::SessionStatus;
 use serde_json::Value;
 
 use crate::chat::{Chat, ChatRequest, ChatTarget};
 use crate::choices;
-use crate::dialogs::{self, DialogQueue, PendingDialog};
+use crate::dialogs;
 use crate::store::{FleetStore, MachineSession, StoreEvent};
 use crate::ui::{self, Tone};
 use crate::workspaces::folder_name;
@@ -61,9 +66,11 @@ pub struct Workbench {
     /// Keeps [`Workbench::handle_chat_request`] subscribed for as long as the
     /// chat it belongs to is the open one; dropped with the next chat's.
     chat_requests: Option<Subscription>,
-    /// Questions an extension is blocked on. The ordering rules are the
-    /// queue's; what is left here is the window work of showing one.
-    dialogs: DialogQueue,
+    /// Questions an extension is blocked on. The window-free obligation
+    /// state owns ordering and retirement; this map is only the input state
+    /// needed by text-dialog modals.
+    dialogs: DialogObligations,
+    dialog_inputs: HashMap<DialogKey, Entity<gpui_component::input::InputState>>,
     /// Repaint on any table change, and act on what the store cannot finish
     /// itself. Held rather than detached so both die with this view.
     _store: [Subscription; 2],
@@ -90,7 +97,8 @@ impl Workbench {
             sessions_collapsed: false,
             chat: None,
             chat_requests: None,
-            dialogs: DialogQueue::default(),
+            dialogs: DialogObligations::default(),
+            dialog_inputs: HashMap::new(),
             _store: store_subscriptions,
         }
     }
@@ -123,7 +131,11 @@ impl Workbench {
             StoreEvent::Bridge {
                 event: BridgeEvent::SessionExit { sid, .. },
                 ..
-            } => self.abandon_dialogs_of(sid, window, cx),
+            } => self.retire_dialog_session(sid, window, cx),
+            StoreEvent::Bridge {
+                machine,
+                event: BridgeEvent::Disconnected,
+            } => self.leave_dialog_machine(machine, window, cx),
             StoreEvent::Bridge { .. } => {}
             StoreEvent::Machines(event) => self.handle_machines_event(event, cx),
             StoreEvent::Failed(detail) => self.report(detail.clone(), window, cx),
@@ -165,7 +177,7 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.keep_only_dialogs_of(sid, window, cx);
+        self.enter_dialog_room(machine, sid, window, cx);
 
         // The chat that minted this sid is already on screen with the user's
         // first prompt rendered in it, so it is promoted in place. Building a
@@ -220,21 +232,29 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let dialog = PendingDialog::new(machine.to_string(), sid.to_string(), request, window, cx);
+        let dialog = DialogObligation::new(machine.to_string(), sid.to_string(), request);
+        let result = self.dialogs.enqueue(dialog.clone());
 
-        if !self.dialogs.push(dialog) {
+        if !matches!(result, EnqueueResult::Visible | EnqueueResult::Queued) {
             return;
         }
 
-        self.show_front_dialog(window, cx);
+        if let Some(input) = dialogs::create_input(&dialog.request.kind, window, cx) {
+            self.dialog_inputs.insert(dialog.key(), input);
+        }
+
+        if result == EnqueueResult::Visible {
+            self.show_front_dialog(window, cx);
+        }
     }
 
     fn show_front_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(dialog) = self.dialogs.front() else {
+        let Some(dialog) = self.dialogs.front().cloned() else {
             return;
         };
+        let input = self.dialog_inputs.get(&dialog.key()).cloned();
 
-        dialogs::open(dialog, Self::answer_front_dialog, window, cx);
+        dialogs::open(&dialog, input, Self::answer_front_dialog, window, cx);
     }
 
     /// The user decided. Send it, drop the question, show whatever queued
@@ -245,19 +265,21 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // The queue is also the guard against answering twice: some routes out
-        // of a dialog run more than one callback, and the second finds the
-        // question already gone rather than sending pi a second response.
-        let Some(dialog) = self.dialogs.take_front() else {
+        // The obligation state is also the guard against answering twice:
+        // some modal routes can run more than one callback, and the second
+        // finds no front obligation rather than sending Pi a second response.
+        let Some(answered) = self.dialogs.answer_front(answer) else {
             return;
         };
+        let dialog = answered.obligation;
+        self.dialog_inputs.remove(&dialog.key());
 
         self.send_command(
             &dialog.machine,
             Command::AnswerDialog {
                 sid: dialog.sid,
                 dialog_id: dialog.request.id,
-                answer,
+                answer: answered.answer,
             },
             cx,
         );
@@ -272,34 +294,57 @@ impl Workbench {
         });
     }
 
-    /// A session's questions die with its pi: there is nothing left to answer,
-    /// and nothing left to answer it to.
-    fn abandon_dialogs_of(&mut self, sid: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.retain_dialogs(|dialog| dialog.sid != sid, window, cx);
-    }
-
-    /// Attaching elsewhere detaches from whichever session asked, and an empty
-    /// room is exactly where the daemon cancels every dialog still pending
-    /// (docs/DAEMON.md §Dialogs) — so another session's question has already
-    /// been answered without us, and showing it would be a lie.
-    fn keep_only_dialogs_of(&mut self, sid: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.retain_dialogs(|dialog| dialog.sid == sid, window, cx);
-    }
-
-    /// Drop the questions `keep` rejects, replacing the modal on screen if it
-    /// was one of them.
-    fn retain_dialogs(
+    /// The attached room changed. Old obligations are retired without a
+    /// client-generated cancellation: the daemon's empty-room policy owns
+    /// that answer.
+    fn enter_dialog_room(
         &mut self,
-        keep: impl Fn(&PendingDialog) -> bool,
+        machine: &str,
+        sid: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.dialogs.retain(keep) {
+        let retirement = self
+            .dialogs
+            .enter_room(DialogRoom::new(machine.to_string(), sid.to_string()));
+
+        self.apply_dialog_retirement(retirement, window, cx);
+    }
+
+    /// A session's questions die with its Pi: there is nothing left to answer,
+    /// and nothing left to answer it to.
+    fn retire_dialog_session(&mut self, sid: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let retirement = self.dialogs.retire_session(sid);
+
+        self.apply_dialog_retirement(retirement, window, cx);
+    }
+
+    /// A bridge disconnect empties its room. Do not answer here; the daemon's
+    /// empty-room cancellation is the policy, and a transport may already be
+    /// gone by the time this event lands.
+    fn leave_dialog_machine(&mut self, machine: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let retirement = self.dialogs.leave_machine(machine);
+
+        self.apply_dialog_retirement(retirement, window, cx);
+    }
+
+    fn apply_dialog_retirement(
+        &mut self,
+        retirement: Retirement,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for dialog in retirement.retired {
+            self.dialog_inputs.remove(&dialog.key());
+        }
+
+        if !retirement.front_removed {
             return;
         }
 
-        // Programmatic, so it runs no callback and nothing is sent for the
-        // question being abandoned — which is the intent: pi is not waiting.
+        // Programmatic, so it runs no callback and nothing is sent for a
+        // retired question. The next front, if any, belongs to the new room
+        // and is the only modal that may remain visible.
         window.close_dialog(cx);
         self.show_front_dialog(window, cx);
     }

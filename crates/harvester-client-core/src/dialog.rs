@@ -28,7 +28,7 @@ use serde_json::{json, Value};
 const DIALOG_METHODS: [&str; 4] = ["select", "confirm", "input", "editor"];
 
 /// A question an extension is blocked on.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DialogRequest {
     /// Pi's dialog id, echoed back in the answer. The only correlation there
     /// is — a response carries no method.
@@ -38,7 +38,7 @@ pub struct DialogRequest {
 }
 
 /// Which of pi's four dialogs this is, carrying only what that one needs.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DialogKind {
     /// One of `options`. Pi wants the chosen string back, not its index.
     Select { options: Vec<String> },
@@ -56,7 +56,7 @@ pub enum DialogKind {
 }
 
 /// What the user decided.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DialogAnswer {
     /// `select`, `input` and `editor` all answer with a string.
     Value(String),

@@ -34,6 +34,7 @@ pub mod bridge;
 mod client;
 mod connection;
 pub mod dialog;
+mod dialog_obligation;
 mod fleet;
 mod host;
 mod machine;
@@ -51,6 +52,10 @@ pub use client::{DaemonClient, SessionEvent};
 pub use connection::raw;
 pub use connection::{DaemonConnection, DaemonReader, DaemonWriter};
 pub use dialog::{DialogAnswer, DialogKind, DialogRequest};
+pub use dialog_obligation::{
+    AnsweredDialog, DialogKey, DialogObligation, DialogObligations, DialogRoom, EnqueueResult,
+    Retirement,
+};
 pub use fleet::{
     BridgeEvents, Fleet, FleetError, FleetEvents, MachineCandidate, MachineState, MachinesEvents,
     Unapplied,
