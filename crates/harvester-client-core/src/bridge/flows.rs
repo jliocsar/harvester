@@ -389,11 +389,16 @@ async fn detach_previous(context: &BridgeContext, attached: &mut Option<String>,
 
     let detach = context
         .client
-        .harvester(HarvesterCmd::Detach { sid: previous_sid })
+        .harvester(HarvesterCmd::Detach {
+            sid: previous_sid.clone(),
+        })
         .await;
 
-    if let Err(detail) = flatten_harvester(detach) {
-        report_failure(context, "detach", detail);
+    match flatten_harvester(detach) {
+        Ok(_) => context
+            .events
+            .send(Event::AttachmentLeft { sid: previous_sid }),
+        Err(detail) => report_failure(context, "detach", detail),
     }
 }
 

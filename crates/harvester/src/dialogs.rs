@@ -14,8 +14,8 @@
 use std::rc::Rc;
 
 use gpui::{prelude::*, px, App, Context, Entity, SharedString, Window};
-use gpui_component::button::Button;
-use gpui_component::dialog::{DialogButtonProps, DialogClose};
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::dialog::{DialogAction, DialogClose, DialogFooter};
 use gpui_component::input::{Input, InputState};
 use gpui_component::{v_flex, WindowExt as _};
 use harvester_client_core::bridge::{Command, Event as BridgeEvent};
@@ -87,6 +87,10 @@ impl DialogCoordinator {
         match event {
             StoreEvent::Bridge {
                 machine,
+                event: BridgeEvent::AttachmentLeft { sid },
+            } => self.retire_room(machine, sid, window, cx),
+            StoreEvent::Bridge {
+                machine,
                 event: BridgeEvent::Attached { sid, .. },
             } => self.enter_room(machine, sid, window, cx),
             StoreEvent::Bridge {
@@ -96,7 +100,7 @@ impl DialogCoordinator {
             StoreEvent::Bridge {
                 machine,
                 event: BridgeEvent::SessionExit { sid, .. },
-            } => self.retire_session(machine, sid, window, cx),
+            } => self.retire_room(machine, sid, window, cx),
             StoreEvent::Bridge {
                 machine,
                 event: BridgeEvent::Disconnected,
@@ -256,14 +260,14 @@ impl DialogCoordinator {
         self.apply_retirement(retirement, window, cx);
     }
 
-    fn retire_session(
+    fn retire_room(
         &mut self,
         machine: &str,
         sid: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let retirement = self.obligations.retire_session(machine, sid);
+        let retirement = self.obligations.retire_room(machine, sid);
 
         self.apply_retirement(retirement, window, cx);
     }
@@ -452,9 +456,13 @@ fn open_select<T: 'static>(
             .child(v_flex().gap_2().children(rows))
             // A custom footer replaces the library's OK button, which would be
             // meaningless here: picking *is* confirming.
-            .footer(
+            .footer(DialogFooter::new().child(
                 DialogClose::new().child(Button::new("dialog-dismiss").outline().label("Cancel")),
-            )
+            ))
+            // Root maps bare Enter to ConfirmDialog. A select is confirmed only
+            // by an option button, never by the dialog frame's default
+            // `on_ok: true`.
+            .on_ok(|_, _, _| false)
             .on_cancel({
                 let answer = answer.clone();
 
@@ -486,13 +494,12 @@ fn open_confirm<T: 'static>(
             .width(px(DIALOG_WIDTH))
             .close_button(false)
             .child(message.clone())
-            // Before the callbacks: `button_props` replaces the whole struct
-            // they are stored in, so setting it after would drop them.
-            .button_props(
-                DialogButtonProps::default()
-                    .ok_text("Yes")
-                    .cancel_text("No")
-                    .show_cancel(true),
+            .footer(
+                DialogFooter::new()
+                    .child(DialogClose::new().child(Button::new("dialog-no").label("No")))
+                    .child(
+                        DialogAction::new().child(Button::new("dialog-yes").primary().label("Yes")),
+                    ),
             )
             .on_ok(move |_, window, cx| confirmed(DialogAnswer::Confirmed(true), window, cx))
             .on_cancel(move |_, window, cx| declined(dismissal.clone(), window, cx))
@@ -522,11 +529,13 @@ fn open_text<T: 'static>(
             .width(px(DIALOG_WIDTH))
             .close_button(false)
             .child(Input::new(&shown))
-            .button_props(
-                DialogButtonProps::default()
-                    .ok_text("Send")
-                    .cancel_text("Cancel")
-                    .show_cancel(true),
+            .footer(
+                DialogFooter::new()
+                    .child(DialogClose::new().child(Button::new("dialog-cancel").label("Cancel")))
+                    .child(
+                        DialogAction::new()
+                            .child(Button::new("dialog-send").primary().label("Send")),
+                    ),
             )
             .on_ok(move |_, window, cx| {
                 let value = typed.read(cx).value().to_string();

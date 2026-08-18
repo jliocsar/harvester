@@ -187,6 +187,9 @@ pub fn open<T: 'static>(
             .title(title)
             .close_button(false)
             .child(choices.clone())
+            // Enter belongs to the focused List, which emits ChoicePicked.
+            // A bare dialog ConfirmDialog must not skip that guarded callback.
+            .on_ok(|_, _, _| false)
             .on_cancel(move |_, window, cx| {
                 owner.update(cx, |owner, cx| dismissed(owner, window, cx))
             })

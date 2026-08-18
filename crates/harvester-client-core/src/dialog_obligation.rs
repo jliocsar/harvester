@@ -126,10 +126,10 @@ impl DialogObligations {
         self.retire(|obligation| obligation.machine != machine)
     }
 
-    /// Pi's authoritative session-exit event retires only the matching room.
-    /// Session ids are routed with a machine rather than assumed globally
-    /// unique, just like every other bridge event.
-    pub fn retire_session(&mut self, machine: &str, sid: &str) -> Retirement {
+    /// Leaving an attachment or Pi's authoritative session exit retires only
+    /// the matching room. Session ids are routed with a machine rather than
+    /// assumed globally unique, just like every other bridge event.
+    pub fn retire_room(&mut self, machine: &str, sid: &str) -> Retirement {
         let room = DialogRoom::new(machine.to_string(), sid.to_string());
 
         if self.rooms_by_machine.get(machine) == Some(&room) {
@@ -320,7 +320,7 @@ mod tests {
         obligations.enqueue(question("vm", "sid-1", "d-1"));
         obligations.enqueue(question("vm", "sid-1", "d-2"));
 
-        let retirement = obligations.retire_session("vm", "sid-1");
+        let retirement = obligations.retire_room("vm", "sid-1");
         assert!(retirement.front_removed);
         assert_eq!(retirement.retired.len(), 2);
         assert!(obligations.front().is_none());
@@ -404,14 +404,14 @@ mod tests {
     }
 
     #[test]
-    fn disconnect_and_exit_retire_only_the_matching_machine_room() {
+    fn attachment_leave_and_disconnect_retire_only_the_matching_machine_room() {
         let mut obligations = DialogObligations::default();
         obligations.enter_room(room("machine-a", "shared-sid"));
         obligations.enter_room(room("machine-b", "shared-sid"));
         obligations.enqueue(question("machine-a", "shared-sid", "dialog-a"));
         obligations.enqueue(question("machine-b", "shared-sid", "dialog-b"));
 
-        let retirement = obligations.retire_session("machine-b", "shared-sid");
+        let retirement = obligations.retire_room("machine-b", "shared-sid");
 
         assert!(!retirement.front_removed);
         assert_eq!(retirement.retired.len(), 1);

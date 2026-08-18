@@ -147,6 +147,12 @@ pub enum Event {
         sid: String,
         entries: Vec<Value>,
     },
+    /// This bridge successfully detached from its previous session. Emitted
+    /// before the flow creates or attaches its replacement, so frontend state
+    /// tied to that exact attachment room can retire immediately.
+    AttachmentLeft {
+        sid: String,
+    },
     /// The same `get_entries` snapshot, but as a repair after events were lost
     /// (a daemon `event_gap`, or our own attach window overflowing) for a
     /// session the frontend already has a chat for.
@@ -541,6 +547,21 @@ mod tests {
             request
         }
 
+        async fn serve_harvester_failure(&mut self, detail: &str) -> Value {
+            let request = tokio::time::timeout(QUIET, self.daemon.reader.next_line_for_test())
+                .await
+                .expect("the bridge sent no request");
+            let response = json!({
+                "id": request["id"],
+                "type": "harvester_response",
+                "response": {"success": false, "error": detail},
+            });
+
+            self.daemon.writer.send_json_for_test(response).await;
+
+            request
+        }
+
         /// `create_session` → `attach` → `get_entries`, the whole `Open` chain.
         async fn serve_open(&mut self) -> Vec<String> {
             let mut commands = Vec::new();
@@ -566,6 +587,68 @@ mod tests {
     /// Both envelopes name their command in the same place.
     fn command_name(request: &Value) -> String {
         request["cmd"]["type"].as_str().unwrap_or("?").to_string()
+    }
+
+    #[tokio::test]
+    async fn a_successful_detach_announces_the_exact_room_before_open_continues() {
+        let mut harness = Harness::new();
+
+        *harness.context.attached.lock().await = Some("01H-first".to_string());
+        spawn_flow(flows::open_flow(
+            harness.context.clone(),
+            "01H-second".to_string(),
+            "/work".to_string(),
+        ));
+
+        assert_eq!(command_name(&harness.serve_one().await), "detach");
+
+        let (_, event) = tokio::time::timeout(QUIET, harness.events.recv())
+            .await
+            .expect("the successful detach was not published")
+            .expect("bridge event channel closed");
+
+        assert!(matches!(
+            event,
+            Event::AttachmentLeft { sid } if sid == "01H-first"
+        ));
+        assert_eq!(
+            command_name(&harness.serve_one().await),
+            "create_session",
+            "the replacement open continues after retirement is published"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_detach_reports_failure_without_announcing_room_retirement() {
+        let mut harness = Harness::new();
+
+        *harness.context.attached.lock().await = Some("01H-first".to_string());
+        spawn_flow(flows::open_flow(
+            harness.context.clone(),
+            "01H-second".to_string(),
+            "/work".to_string(),
+        ));
+
+        assert_eq!(
+            command_name(&harness.serve_harvester_failure("refused").await),
+            "detach"
+        );
+
+        let (_, event) = tokio::time::timeout(QUIET, harness.events.recv())
+            .await
+            .expect("detach failure was not reported")
+            .expect("bridge event channel closed");
+
+        assert!(matches!(
+            event,
+            Event::RequestFailed { detail } if detail == "detach: refused"
+        ));
+        assert!(
+            tokio::time::timeout(QUIET, harness.events.recv())
+                .await
+                .is_err(),
+            "a failed detach must not retire its attachment room"
+        );
     }
 
     #[tokio::test]

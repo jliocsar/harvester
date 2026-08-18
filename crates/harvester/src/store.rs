@@ -25,9 +25,9 @@ pub use crate::catalog::MachineSession;
 /// What the store cannot finish on its own.
 ///
 /// Deliberately not a vocabulary of its own: a bridge event the tables have
-/// taken their share of is passed on *verbatim*, because the only thing left
-/// in it is pi's, and translating pi is what this codebase does not do
-/// (SPEC §Architecture, "the client speaks Pi").
+/// taken their share of is passed on *verbatim*. That preserves internal
+/// lifecycle signals and, critically, never translates Pi into a second
+/// vocabulary (SPEC §Architecture, "the client speaks Pi").
 pub enum StoreEvent {
     /// A bridge event, after the fleet took the link state and the tables took
     /// the session status and the open guard.
@@ -183,9 +183,10 @@ impl FleetStore {
                 result: Err(detail),
                 ..
             } => self.fail(format!("set_model: {detail}"), cx),
-            // A chat's answers. No table here has a stake in them, and the
-            // chat that does repaints itself.
+            // View-owned lifecycle and chat answers. No table here has a
+            // stake in them, so their subscribers receive them unchanged.
             BridgeEvent::Sessions(_)
+            | BridgeEvent::AttachmentLeft { .. }
             | BridgeEvent::HistoryReplaced { .. }
             | BridgeEvent::HistoryExtended { .. }
             | BridgeEvent::Pi { .. }

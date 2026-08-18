@@ -681,6 +681,9 @@ impl FolderPicker {
                 .title("Add workspace")
                 .close_button(false)
                 .child(picker.clone())
+                // Enter belongs to the focused directory List. The workspace
+                // closes only after validation emits WorkspacePicked.
+                .on_ok(|_, _, _| false)
                 .on_cancel(move |_, window, cx| {
                     owner.update(cx, |owner, cx| dismissed(owner, window, cx))
                 })
