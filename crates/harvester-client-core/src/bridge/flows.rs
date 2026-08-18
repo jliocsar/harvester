@@ -51,7 +51,9 @@ pub(super) async fn open_flow(context: BridgeContext, sid: String, cwd: String) 
     let attached = context.attached.clone();
     let mut attachment = attached.lock().await;
 
-    detach_previous(&context, &mut attachment, &sid).await;
+    if !detach_previous(&context, &mut attachment, &sid).await {
+        return;
+    }
 
     let create = context
         .client
@@ -332,7 +334,9 @@ pub(super) async fn start_session_flow(
     let attached = context.attached.clone();
     let mut attached = attached.lock().await;
 
-    detach_previous(&context, &mut attached, &sid).await;
+    if !detach_previous(&context, &mut attached, &sid).await {
+        return;
+    }
 
     let create = context
         .client
@@ -377,16 +381,23 @@ pub(super) async fn start_session_flow(
 }
 
 /// One chat pane means one attachment: leaving the previous session keeps
-/// the daemon from streaming events nobody renders.
-async fn detach_previous(context: &BridgeContext, attached: &mut Option<String>, next_sid: &str) {
-    let Some(previous_sid) = attached.take() else {
-        return;
+/// the daemon from streaming events nobody renders. A refused detach aborts
+/// the transition and preserves the previous attachment; proceeding would
+/// leave two rooms attached while the bridge remembered only the replacement.
+async fn detach_previous(
+    context: &BridgeContext,
+    attached: &mut Option<String>,
+    next_sid: &str,
+) -> bool {
+    let Some(previous_sid) = attached.as_ref() else {
+        return true;
     };
 
     if previous_sid == next_sid {
-        return;
+        return true;
     }
 
+    let previous_sid = previous_sid.clone();
     let detach = context
         .client
         .harvester(HarvesterCmd::Detach {
@@ -395,10 +406,19 @@ async fn detach_previous(context: &BridgeContext, attached: &mut Option<String>,
         .await;
 
     match flatten_harvester(detach) {
-        Ok(_) => context
-            .events
-            .send(Event::AttachmentLeft { sid: previous_sid }),
-        Err(detail) => report_failure(context, "detach", detail),
+        Ok(_) => {
+            *attached = None;
+            context
+                .events
+                .send(Event::AttachmentLeft { sid: previous_sid });
+
+            true
+        }
+        Err(detail) => {
+            report_failure(context, "detach", detail);
+
+            false
+        }
     }
 }
 

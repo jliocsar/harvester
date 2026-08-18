@@ -649,6 +649,32 @@ mod tests {
                 .is_err(),
             "a failed detach must not retire its attachment room"
         );
+        harness
+            .assert_silent("a failed detach must abort the replacement open")
+            .await;
+        assert_eq!(
+            harness.context.attached.lock().await.as_deref(),
+            Some("01H-first"),
+            "the bridge must keep tracking the room it failed to leave"
+        );
+    }
+
+    #[tokio::test]
+    async fn opening_the_attached_session_does_not_detach_it_first() {
+        let mut harness = Harness::new();
+
+        *harness.context.attached.lock().await = Some("01H-same".to_string());
+        spawn_flow(flows::open_flow(
+            harness.context.clone(),
+            "01H-same".to_string(),
+            "/work".to_string(),
+        ));
+
+        assert_eq!(
+            command_name(&harness.serve_one().await),
+            "create_session",
+            "an idempotent reopen keeps the existing attachment until attach confirms"
+        );
     }
 
     #[tokio::test]
