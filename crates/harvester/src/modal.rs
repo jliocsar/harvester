@@ -1,15 +1,5 @@
-//! Harvester's narrow arbitration layer over gpui-component's global Root
-//! dialog stack.
-//!
-//! Root stores every dialog in one vector and `close_dialog` always pops its
-//! top. Harvester therefore permits exactly one of its modal flows to own that
-//! stack at a time: Pi's FIFO obligations, the repo picker, or the
-//! forget-machine confirmation. A generation tagged lease makes delayed
-//! callbacks from a completed flow harmless.
-
 use gpui::{Context, EventEmitter};
 
-/// The only Harvester flows that place dialogs on Root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ModalOwner {
     PiDialogs,
@@ -17,18 +7,14 @@ pub(crate) enum ModalOwner {
     ForgetMachine,
 }
 
-/// Proof that one flow currently owns Root's dialog stack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ModalLease {
     owner: ModalOwner,
     generation: u64,
 }
 
-/// Emitted after a valid lease releases Root for another flow.
 pub(crate) struct ModalAvailable;
 
-/// Window-free ownership state. It deliberately knows nothing about dialog
-/// bodies, queues, or callbacks; those remain with the flows themselves.
 #[derive(Debug, Default)]
 struct ModalArbiter {
     active: Option<ModalLease>,
@@ -69,9 +55,6 @@ impl ModalArbiter {
     }
 }
 
-/// GPUI entity shared by the Pi-dialog coordinator and the user-initiated
-/// flows. `ModalAvailable` is only a wake-up; each flow still has to acquire a
-/// fresh lease before it may touch Root.
 #[derive(Default)]
 pub(crate) struct ModalCoordinator {
     arbiter: ModalArbiter,
@@ -89,10 +72,6 @@ impl ModalCoordinator {
             return;
         }
 
-        // Pi is the only waiting flow: every other flow starts from a user
-        // click, which Root's focus trap prevents while Pi owns a dialog.
-        // Avoiding a Pi-release event also avoids synchronously re-entering the
-        // Pi coordinator that initiated that release.
         if lease.owner != ModalOwner::PiDialogs {
             cx.emit(ModalAvailable);
         }

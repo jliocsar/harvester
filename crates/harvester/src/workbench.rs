@@ -1,10 +1,3 @@
-//! The window composition shell (docs/SPEC.md C12).
-//!
-//! Workbench owns the current chat selection and the orchestration that truly
-//! needs the root window: constructing a chat input, raising fleet failures,
-//! and placing Root's overlay layers. Sidebar, add-repository, dialog, and chat
-//! flows own themselves behind narrow event seams.
-
 mod forget_machine_flow;
 mod machine_presentation;
 mod picker;
@@ -28,27 +21,16 @@ use crate::modal::ModalCoordinator;
 use crate::store::{FleetStore, StoreEvent};
 use crate::ui::{self, Tone};
 
-/// The empty content pane when there is no argv machine to report on. New
-/// session is the only way in, and it always opens — the machine and the
-/// repository are picked inside the chat it opens.
 const NO_CHAT_HINT: &str = "start a new session to begin";
 
 pub struct Workbench {
-    /// FleetStore is the single observable store. The shell reads it for the
-    /// empty pane/statusbar and for root-window chat orchestration.
     store: Entity<FleetStore>,
     sidebar: Entity<Sidebar>,
     add_repo_flow: Entity<AddRepoFlow>,
     forget_machine_flow: Entity<ForgetMachineFlow>,
-    /// Retained for its store subscription and modal lifecycle; the Root
-    /// overlay itself remains placed by this view.
     _dialogs: Entity<DialogCoordinator>,
-    /// The current conversation, whether or not a session exists behind it.
     chat: Option<Entity<Chat>>,
-    /// Bridge requests and flow requests from the current chat. They die with
-    /// it, so an abandoned unstarted pane cannot route through this shell.
     chat_subscriptions: Option<[Subscription; 2]>,
-    /// Store repaint/event, sidebar-intent and the two flow subscriptions.
     _subscriptions: [Subscription; 5],
 }
 
@@ -85,9 +67,6 @@ impl Workbench {
         }
     }
 
-    /// The only bridge event the shell owns builds or promotes a chat and
-    /// therefore needs a `Window`. Dialog events are consumed by
-    /// [`DialogCoordinator`]; chat answers are consumed by [`Chat`].
     fn handle_store_event(
         &mut self,
         _store: &Entity<FleetStore>,
@@ -105,9 +84,6 @@ impl Workbench {
         }
     }
 
-    /// `StoreEvent` subscribers run while FleetStore is emitting. Attached may
-    /// need to update the store's opening catalog, so finish that source update
-    /// before constructing or promoting the chat.
     fn defer_attached(
         &self,
         machine: String,
@@ -125,9 +101,6 @@ impl Workbench {
         });
     }
 
-    /// Sidebar events are emitted while the sidebar entity is leased. Some
-    /// intents immediately change its selected-session highlight, so dispatch
-    /// after that lease ends rather than re-entering the child entity.
     fn handle_sidebar_intent(
         &mut self,
         _sidebar: &Entity<Sidebar>,
@@ -170,11 +143,6 @@ impl Workbench {
             .update(cx, |flow, cx| flow.open(machine, window, cx));
     }
 
-    /// The machine is gone from the client's own configuration by the time this
-    /// lands, so a chat still pointed at it has no bridge to send down and no
-    /// sidebar row to return to. Dropping the entity is the whole teardown —
-    /// its subscriptions and its pending requests die with it, the same way an
-    /// abandoned unstarted chat is discarded.
     fn handle_machine_forgotten(
         &mut self,
         _flow: &Entity<ForgetMachineFlow>,
@@ -197,8 +165,6 @@ impl Workbench {
         cx.notify();
     }
 
-    /// A repository the folder picker validated and stored: the chat that
-    /// asked for it selects it, which is the whole point of the detour.
     fn handle_repo_added(
         &mut self,
         _flow: &Entity<AddRepoFlow>,
@@ -231,8 +197,6 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // The chat that minted this sid is already on screen with the first
-        // prompt rendered. Promote it in place rather than rebuilding it.
         if let Some(chat) = self.take_starting_chat(sid, cx) {
             chat.update(cx, |chat, cx| {
                 chat.promote_to_live(sid.to_string(), entries, cx);
@@ -253,9 +217,6 @@ impl Workbench {
         self.install_chat(chat, window, cx);
     }
 
-    /// Adopt a chat as the current one: subscribe to both of its seams, then
-    /// ask it for what its prompt strip reports. The order matters — an entity
-    /// cannot emit to a subscriber that does not exist yet.
     fn install_chat(&mut self, chat: Entity<Chat>, window: &mut Window, cx: &mut Context<Self>) {
         let subscriptions = [
             cx.subscribe_in(&chat, window, Self::handle_chat_request),
@@ -284,9 +245,6 @@ impl Workbench {
             .to_string()
     }
 
-    /// Chat intents route against the bridge that is live now. The chat owns
-    /// request state and rejects stale answers; the shell only supplies the
-    /// window-level route and user-visible refusal.
     fn handle_chat_request(
         &mut self,
         chat: &Entity<Chat>,
@@ -483,10 +441,6 @@ impl Workbench {
         Some(chat)
     }
 
-    /// New session, always available: the chat opens on the defaults the store
-    /// derives (SPEC §Flows "Start session") and the user re-picks in the
-    /// prompt strip if they were wrong. An unstarted chat that is already on
-    /// screen is left alone — reopening it would only discard what is typed.
     fn open_new_session_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let already_unstarted = self.chat.as_ref().is_some_and(|chat| {
             let chat = chat.read(cx);
@@ -505,8 +459,6 @@ impl Workbench {
         self.install_chat(chat, window, cx);
     }
 
-    /// The chat's repo picker asked for a folder walk. It needs Root's dialog
-    /// stack, which is this shell's to lend out.
     fn handle_chat_flow_request(
         &mut self,
         _chat: &Entity<Chat>,
@@ -611,8 +563,6 @@ impl Render for Workbench {
                     .child(self.render_content(cx)),
             )
             .child(self.render_statusbar(cx))
-            // Root owns these stacks but renders neither. Placement remains a
-            // top-level shell responsibility.
             .children(Root::render_dialog_layer(window, cx))
             .children(Root::render_notification_layer(window, cx))
     }

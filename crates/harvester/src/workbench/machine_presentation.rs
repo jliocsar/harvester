@@ -1,21 +1,10 @@
-//! Consistent presentation for one machine state across the sidebar, empty
-//! pane, and statusbar.
-
 use harvester_client_core::MachineState;
 
 use crate::ui::{self, Tone};
 
-/// Everything the UI says about one machine's link, decided in one place.
-///
-/// The strings differ per surface because they are different sentences, not
-/// because the state means different things. Choosing the tone once prevents a
-/// failed state from becoming red in one surface and gray in another.
 pub(super) struct MachinePresentation {
     pub dot: ui::Dot,
-    /// The content pane's sentence when this machine is the one on screen.
-    /// `None` for probe-only states: nothing about a daemon can be reported.
     pub pane_message: Option<String>,
-    /// The statusbar's link text, under the same rule.
     pub statusbar_link: Option<String>,
 }
 
@@ -41,8 +30,6 @@ pub(super) fn present_machine(state: MachineState<'_>, machine: &str) -> Machine
             pane_message: Some("connection lost".to_string()),
             statusbar_link: Some("connection lost".to_string()),
         },
-        // A listing is authoritative only after its provider has spoken. The
-        // fleet owns that precedence; presentation only names the verdict.
         MachineState::Missing => MachinePresentation {
             dot: ui::Dot::Solid(Tone::Failed),
             pane_message: Some(format!("{machine} is no longer listed by its provider")),

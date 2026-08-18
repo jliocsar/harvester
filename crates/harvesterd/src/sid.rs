@@ -1,24 +1,8 @@
-//! `Sid` — a session id that has been checked against pi's charset.
-//!
-//! A sid arrives as an unvalidated remote string and is then used in five
-//! roles: pid-table key, path component (`<sid>.stderr.log`), argv element,
-//! envelope field and wire field. Validating once, at the edge, is what keeps
-//! every one of those roles honest — the type is the proof that it happened.
-
 use std::borrow::Borrow;
 use std::fmt;
 
 use serde::Serialize;
 
-/// Pi's own session-id rule, verbatim from `assertValidSessionId`
-/// (`session-manager.ts:212`, pi 0.83.0):
-/// `^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$`.
-///
-/// Deliberately pi's charset and not "uuidv7", even though Harvester's own
-/// clients mint uuidv7: a narrower rule here would make every non-uuid session
-/// already on disk — pi's own naming is wider — unresumable through Harvester.
-/// Hand-rolled rather than a regex crate: three char classes do not earn a
-/// dependency in a binary that ships as a static musl blob.
 fn is_valid_session_id(candidate: &str) -> bool {
     let alphanumeric = |character: char| character.is_ascii_alphanumeric();
 
@@ -29,18 +13,11 @@ fn is_valid_session_id(candidate: &str) -> bool {
             .all(|character| alphanumeric(character) || matches!(character, '.' | '_' | '-'))
 }
 
-/// A validated session id. The wire representation is the plain string it
-/// always was (`#[serde(transparent)]`), so the protocol is unchanged; the
-/// newtype exists purely so an unchecked string cannot reach a path, an argv
-/// or the pid table.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct Sid(String);
 
 impl Sid {
-    /// The one gate. `Err` carries the message the client is answered with.
-    /// Takes a `&str` (rather than the owned string off the wire) so a caller
-    /// that must echo the *rejected* sid back still owns it.
     pub fn parse(raw: &str) -> Result<Sid, String> {
         if !is_valid_session_id(raw) {
             return Err(format!(
@@ -58,7 +35,6 @@ impl Sid {
     }
 }
 
-/// So a `HashMap<Sid, _>` can be looked up by `&str` without allocating.
 impl Borrow<str> for Sid {
     fn borrow(&self) -> &str {
         &self.0
@@ -77,7 +53,6 @@ impl From<Sid> for String {
     }
 }
 
-/// Pi's charset rule, plus the wire-compatibility guarantee the newtype makes.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,8 +110,6 @@ mod tests {
         );
     }
 
-    /// The envelope a client actually sends still decodes to the same string,
-    /// and that string still survives the gate — `Sid` changed no wire byte.
     #[test]
     fn a_wire_request_round_trips_through_the_gate() {
         let line = br#"{"id":1,"type":"pi","sid":"01H8XYZ","cmd":{"type":"get_state"}}"#;

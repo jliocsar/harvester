@@ -1,14 +1,3 @@
-//! One straight-line async flow per command (plus the two the bridge starts
-//! on its own: the first `list_sessions`, and a resync after events were
-//! lost). Responses resolve at their await points, so there is no
-//! response-routing state machine anywhere in this crate — which is the whole
-//! reason `mod.rs`'s select loop can stay a router.
-//!
-//! Every flow ends by publishing exactly one outcome: an
-//! [`Event`](super::Event) the frontend renders, or a `RequestFailed` through
-//! [`report_failure`](super::report_failure). None of them return a value —
-//! spawning a flow is fire-and-forget.
-
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -42,11 +31,6 @@ pub(super) async fn sessions_flow(context: BridgeContext) {
     }
 }
 
-/// `Open`: create-or-resume, then attach. Resume is the same call as create
-/// (DAEMON.md), and it is idempotent for a live session, so this one chain
-/// covers a running session, an exited one, and one that died while we were
-/// detached — with no client-side state to go stale. Follow-up requests queue
-/// on pi's stdin, so no readiness probe is needed.
 pub(super) async fn open_flow(context: BridgeContext, sid: String, cwd: String) {
     let attached = context.attached.clone();
     let mut attachment = attached.lock().await;
@@ -72,37 +56,19 @@ pub(super) async fn open_flow(context: BridgeContext, sid: String, cwd: String) 
         return;
     }
 
-    // Before the attach, not after: the daemon streams from the moment it
-    // lands, and `Attached` is a whole `get_entries` away. Dropped on every
-    // early return below by the guard's `Drop`.
     let registration = AttachRegistration::register(&context.attach_buffers, &sid);
 
     if !attach(&context, &mut attachment, &sid).await {
         return;
     }
 
-    // The attachment transition is done, so the guard's job is done: an async
-    // mutex may cover a state transition, never a remote call. Holding it
-    // across `get_entries` is what let one wedged pi block every later Open
-    // on this bridge for the life of the app.
     drop(attachment);
 
-    // History replay: attach → get_entries → live events (DAEMON.md §attach).
     if replay_history(&context, sid.clone(), registration).await {
         spawn_flow(resync_flow(context, sid));
     }
 }
 
-/// A repair after events were lost: the daemon's `event_gap` and our own
-/// attach-window overflow are the same situation, and `get_entries` is the same
-/// cure. It registers its own window — a resync that dropped the events
-/// arriving during its own fetch would reintroduce exactly the hole it exists
-/// to close.
-///
-/// Two things it declines to do, both of which it used to: repair a session
-/// nobody is watching (a full `get_entries` for a chat that is not on screen),
-/// and repair the same session twice at once (a burst of gaps meant a burst of
-/// concurrent refetches of one history).
 pub(super) async fn resync_flow(context: BridgeContext, sid: String) {
     if context.attached.lock().await.as_deref() != Some(sid.as_str()) {
         return;
@@ -112,10 +78,6 @@ pub(super) async fn resync_flow(context: BridgeContext, sid: String) {
         return;
     };
 
-    // A loop rather than a respawn: the retry belongs to the claim this flow
-    // already holds. It can in principle overflow again, but that needs a
-    // session outrunning the cap on every attempt — the daemon's ring in front
-    // of us is the narrower bound.
     loop {
         let registration = AttachRegistration::register(&context.attach_buffers, &sid);
 
@@ -129,16 +91,6 @@ pub(super) async fn resync_flow(context: BridgeContext, sid: String) {
     }
 }
 
-/// The repair itself (docs/SPEC.md C6): a **delta** when this session left a
-/// cursor, a full refetch otherwise. A long session then repairs by fetching
-/// the handful of entries it missed rather than its whole history.
-///
-/// A failed delta falls back to a full refetch rather than being reported. The
-/// cursor has one failure of its own — pi answering `Entry not found: <since>`
-/// for an id compaction retired — and starting over is the documented cure for
-/// it. Testing for that by matching pi's error text would be the narrower
-/// check; refetching is less code and the same answer, because a fetch that
-/// failed for any other reason fails again below and reports there.
 async fn repair_history(context: &BridgeContext, sid: &str) -> bool {
     if let Some(leaf_id) = cursor_for(context, sid) {
         if let Ok((entries, next_leaf_id)) = fetch_entries(context, sid, Some(&leaf_id)).await {
@@ -170,9 +122,6 @@ async fn repair_history(context: &BridgeContext, sid: &str) -> bool {
     true
 }
 
-/// One `get_entries`, with or without a cursor: pi's entries plus the `leafId`
-/// that becomes the next cursor (HARNESS_RESEARCH.md — "an entry id works as a
-/// durable cursor … even across client restarts").
 async fn fetch_entries(
     context: &BridgeContext,
     sid: &str,
@@ -196,10 +145,6 @@ async fn fetch_entries(
     Ok((entries, leaf_id))
 }
 
-/// This session's replay cursor, if its last fetch left one. Filtered by sid
-/// rather than cleared on attach: a cursor that names the session it came from
-/// cannot be spent on the session that replaced it, whatever order the
-/// attach and the fetch landed in.
 fn cursor_for(context: &BridgeContext, sid: &str) -> Option<String> {
     lock_cursor(&context.cursor)
         .as_ref()
@@ -207,8 +152,6 @@ fn cursor_for(context: &BridgeContext, sid: &str) -> Option<String> {
         .map(|cursor| cursor.leaf_id.clone())
 }
 
-/// A fetch with no `leafId` leaves no cursor: the next repair refetches whole,
-/// which is always correct and never worse than guessing.
 fn record_cursor(context: &BridgeContext, sid: &str, leaf_id: Option<String>) {
     *lock_cursor(&context.cursor) = leaf_id.map(|leaf_id| SessionCursor {
         sid: sid.to_string(),
@@ -216,15 +159,10 @@ fn record_cursor(context: &BridgeContext, sid: &str, leaf_id: Option<String>) {
     });
 }
 
-/// std::sync — every use is a lock/mutate/unlock with no await inside.
 fn lock_cursor(cursor: &Mutex<Option<SessionCursor>>) -> MutexGuard<'_, Option<SessionCursor>> {
     cursor.lock().expect("cursor mutex")
 }
 
-/// One repair per session at a time. RAII for the same reason
-/// [`AttachRegistration`] is: a flow that returned early — or was cancelled —
-/// leaving its sid claimed would block every later repair for the life of the
-/// bridge, which is worse than the duplicate work it prevents.
 struct ResyncGuard {
     in_flight: Arc<Mutex<HashSet<String>>>,
     sid: String,
@@ -247,15 +185,10 @@ impl Drop for ResyncGuard {
     }
 }
 
-/// std::sync — every use is a lock/mutate/unlock with no await inside.
 fn lock_resyncing(sessions: &Mutex<HashSet<String>>) -> std::sync::MutexGuard<'_, HashSet<String>> {
     sessions.lock().expect("resync mutex")
 }
 
-/// A pi that exited took its attachment with it. Without this the bridge kept
-/// believing it was attached, and the next `Open` sent a `Detach` for a session
-/// whose pi is gone — which fails, and surfaces to the user as a statusbar
-/// error for an action they never took.
 pub(super) async fn forget_attachment(context: BridgeContext, sid: String) {
     let mut attached = context.attached.lock().await;
 
@@ -264,12 +197,6 @@ pub(super) async fn forget_attachment(context: BridgeContext, sid: String) {
     }
 }
 
-/// Seed a chat with a session's whole history: the opening fetch, which has no
-/// cursor to work from because nothing has been fetched for this session yet.
-/// The repair path is [`repair_history`]. `registration` holds back the live
-/// events that race this fetch; it is released the moment the snapshot is out.
-///
-/// Returns `true` when events were lost even so and a repair is owed.
 async fn replay_history(
     context: &BridgeContext,
     sid: String,
@@ -293,11 +220,6 @@ async fn replay_history(
     deliver_buffered_events(context, sid, registration)
 }
 
-/// Release the window the instant the frontend has a chat to put it in. There
-/// is no await between the snapshot send and this, so no live event can slip in
-/// front of the events it held back. `true` means the window overflowed, so the
-/// snapshot just published is already stale — the daemon's own `event_gap`
-/// vocabulary, reused rather than inventing a second recovery.
 fn deliver_buffered_events(
     context: &BridgeContext,
     sid: String,
@@ -319,9 +241,6 @@ fn deliver_buffered_events(
     }
 }
 
-/// `StartSession`: an unstarted chat's create → attach → first-prompt chain
-/// as one straight line. `Attached` publishes with empty entries — the
-/// session file is brand new, there is no history to fetch.
 pub(super) async fn start_session_flow(
     context: BridgeContext,
     sid: String,
@@ -355,19 +274,12 @@ pub(super) async fn start_session_flow(
         return;
     }
 
-    // No `get_entries` here, so the window is empty in practice — registered
-    // anyway so that "events between attach and `Attached` are held" is a
-    // property of every attach path rather than an accident of this one.
     let registration = AttachRegistration::register(&context.attach_buffers, &sid);
 
     if !attach(&context, &mut attached, &sid).await {
         return;
     }
 
-    // Move the chat into its live state right away; the prompt's queued-ack
-    // rides its own flow (only rejection is notable).
-    // No history to fetch and so no cursor to record: the session file is
-    // brand new, and the first repair will fetch it whole.
     context.events.send(Event::Attached {
         sid: sid.clone(),
         entries: Vec::new(),
@@ -380,10 +292,6 @@ pub(super) async fn start_session_flow(
     spawn_flow(prompt_flow(context, sid, first_prompt));
 }
 
-/// One chat pane means one attachment: leaving the previous session keeps
-/// the daemon from streaming events nobody renders. A refused detach aborts
-/// the transition and preserves the previous attachment; proceeding would
-/// leave two rooms attached while the bridge remembered only the replacement.
 async fn detach_previous(
     context: &BridgeContext,
     attached: &mut Option<String>,
@@ -422,8 +330,6 @@ async fn detach_previous(
     }
 }
 
-/// The shared attach step; records the attachment on success, reports and
-/// returns false otherwise.
 async fn attach(context: &BridgeContext, attached: &mut Option<String>, sid: &str) -> bool {
     let response = context
         .client
@@ -446,14 +352,6 @@ async fn attach(context: &BridgeContext, attached: &mut Option<String>, sid: &st
     }
 }
 
-/// Accepted means queued, not completed; progress arrives as events. Only
-/// rejection is notable.
-///
-/// `streamingBehavior` is mandatory in practice: pi rejects a prompt outright
-/// while it is streaming unless one is given (agent-session.ts, pi 0.83.0), so
-/// without it every prompt typed mid-turn is dropped. `steer` matches what pi's
-/// own interactive mode does with a mid-turn message; pi ignores the field
-/// entirely when it is idle.
 pub(super) async fn prompt_flow(context: BridgeContext, sid: String, text: String) {
     match context
         .client
@@ -515,15 +413,6 @@ pub(super) async fn set_model_flow(
     context.events.send(Event::ModelSet { sid, token, result });
 }
 
-/// `Stop`: hand the session to the daemon's stop ladder and stop caring.
-///
-/// Nothing is published on success. The reply says only that the ladder
-/// started, and the outcome the frontend renders — `Event::SessionExit` —
-/// arrives on the session stream, possibly before this response (DAEMON.md
-/// §stop). Publishing anything here would be a second, earlier, less true
-/// account of the same fact.
-///
-/// There is no detach either: the exit already runs `forget_attachment`.
 pub(super) async fn stop_flow(context: BridgeContext, sid: String) {
     let stop = context.client.harvester(HarvesterCmd::Stop { sid }).await;
 
@@ -532,15 +421,6 @@ pub(super) async fn stop_flow(context: BridgeContext, sid: String) {
     }
 }
 
-/// `AnswerDialog`: the client's half of the dialog contract. With a client
-/// attached the daemon forwards rather than cancels, so pi stays blocked until
-/// this lands (docs/DAEMON.md §Dialogs).
-///
-/// Deliberately not [`pi_flow_result`]. That helper reads `success`, and the
-/// daemon answers every `extension_ui_response` with a bare `null` — whether
-/// it forwarded the answer or dropped it as too late. Reading a verdict out of
-/// that would report a failure for every dialog answered normally. Only a
-/// transport error means anything here, so only that is reported.
 pub(super) async fn answer_dialog_flow(
     context: BridgeContext,
     sid: String,
@@ -554,8 +434,6 @@ pub(super) async fn answer_dialog_flow(
     }
 }
 
-/// A pi command → the `Result` the picker/statusbar events carry: `data`
-/// verbatim on success, pi's error string otherwise.
 async fn pi_flow_result(context: &BridgeContext, sid: &str, cmd: Value) -> Result<Value, String> {
     match context.client.pi(sid, cmd).await {
         Ok(response) if pi_success(&response) => {

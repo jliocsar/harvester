@@ -1,11 +1,3 @@
-//! The one exec boundary for both machine kinds (docs/SPEC.md §Machine).
-//! Every control-plane script runs through `sh` either way — `sh -c` on this
-//! machine, `exec sh -c` on the far side of ssh — so bootstrap and workspace
-//! browsing are written once against [`Host::exec`] and cannot drift between
-//! the two, nor depend on the remote user's login shell. Only the socket
-//! connect differs (forward vs direct), and that split lives in
-//! `connection.rs`.
-
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -14,7 +6,6 @@ use tokio::process::Command;
 
 use crate::ssh::SshTarget;
 
-/// Where to run control-plane commands: this machine, or an SSH destination.
 #[derive(Debug, Clone)]
 pub enum Host {
     Local,
@@ -22,11 +13,6 @@ pub enum Host {
 }
 
 impl Host {
-    /// Runs `script` through the host's POSIX shell, optionally piping
-    /// `stdin_data` into it, and waits for completion — at most `timeout`.
-    /// Every remote op carries a deadline: ssh's ConnectTimeout only bounds
-    /// the TCP connect, so without one a wedged transport (or an unbounded
-    /// remote loop) would hang its bridge forever.
     pub(crate) async fn exec(
         &self,
         script: &str,
@@ -41,11 +27,6 @@ impl Host {
                 command
             }
             Host::Ssh(target) => {
-                // sshd runs the command through the user's *login* shell, which
-                // is only POSIX by luck — fish and csh reject the arithmetic,
-                // async subshells and `&&` chains our scripts are written in.
-                // Re-exec through `sh` so both arms really do get the POSIX
-                // shell this module promises.
                 let mut command = target.command(&[]);
                 command.arg(format!("exec sh -c {}", shell_quote(script)));
 
@@ -55,8 +36,6 @@ impl Host {
 
         match tokio::time::timeout(timeout, run(command, stdin_data)).await {
             Ok(result) => result,
-            // The timed-out child was dropped mid-wait — `kill_on_drop`
-            // reaps it; nothing lingers.
             Err(_elapsed) => Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 format!("timed out after {timeout:?}"),
@@ -65,15 +44,8 @@ impl Host {
     }
 }
 
-/// Prints the machine's home directory and nothing else. `printf` rather than
-/// `echo`, whose handling of backslashes is shell-dependent.
 pub(crate) const HOME_SCRIPT: &str = r#"printf '%s\n' "$HOME""#;
 
-/// The absolute `$HOME` a [`HOME_SCRIPT`] exec printed on its first line, or
-/// `None` if it printed nothing usable. Trimmed because a `\r` is invisible in
-/// a path and fatal in an `ssh -L` forward spec; rejected unless absolute
-/// because a relative `$HOME` sends the folder picker walking from nowhere and
-/// makes a forward spec meaningless.
 pub(crate) fn parse_home(stdout: &str) -> Option<&str> {
     stdout
         .lines()
@@ -82,10 +54,6 @@ pub(crate) fn parse_home(stdout: &str) -> Option<&str> {
         .filter(|home| home.starts_with('/'))
 }
 
-/// Single-quotes `value` for the POSIX shell (the `'\''` dance), so arbitrary
-/// characters survive the command-line round trip. Lives next to the exec
-/// boundary because that is what it protects: both the scripts sent through
-/// [`Host::exec`] and the paths interpolated into them.
 pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
@@ -97,10 +65,6 @@ pub(crate) struct ExecOutput {
 }
 
 impl ExecOutput {
-    /// The one "did this exec work?" answer: `Ok(())` on exit 0, otherwise the
-    /// crate's `Exec` error carrying `context` and the child's own diagnosis.
-    /// Every non-zero exit in the crate is reported this way, so the shape of
-    /// an exec failure cannot drift between call sites.
     pub(crate) fn require_success(&self, context: &'static str) -> crate::Result<()> {
         if self.status.success() {
             return Ok(());
@@ -117,16 +81,6 @@ impl ExecOutput {
     }
 }
 
-/// Spawn `command`, feed it `stdin_data` (EOF by dropping the handle — a mere
-/// `shutdown()` never closes a pipe fd, the same fact that bit harvesterd's
-/// stop path), and wait for completion. Callers own the deadline; the child
-/// is `kill_on_drop`, so cancelling this future kills it.
-///
-/// The stdin feed runs as its own task so writing and draining the child's
-/// output overlap. Doing them in sequence deadlocks whenever the child fills
-/// its output pipe before consuming all of stdin: it blocks writing, we block
-/// writing, and nobody reads — the multi-megabyte daemon upload is exactly the
-/// shape that hits it.
 pub(crate) async fn run(
     mut command: Command,
     stdin_data: Option<&[u8]>,
@@ -147,8 +101,6 @@ pub(crate) async fn run(
         let data = data.to_vec();
 
         tokio::spawn(async move {
-            // A broken pipe here is normal (the child exited early); its exit
-            // status is the real diagnosis, so only log the surprising part.
             if let Err(error) = stdin.write_all(&data).await {
                 eprintln!("exec: writing stdin failed: {error}");
             }
@@ -168,9 +120,6 @@ pub(crate) async fn run(
     })
 }
 
-/// `Host::Local` is a real, in-process test double for the exec boundary: the
-/// scripts these tests check are the same strings the SSH arm sends, and the
-/// only difference between the arms is which shell runs them.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,8 +140,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_quoted_value_reaches_the_shell_verbatim() {
-        // Every folder-picker path and every bootstrap script goes through this
-        // `'\''` dance, and it had no test at all.
         for value in [
             "plain",
             "with spaces",
@@ -215,8 +162,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_quoted_value_cannot_end_its_own_quoting() {
-        // The injection this exists to stop: a lone `'` closing the quote and
-        // whatever follows becoming a command of its own.
         let attempt = "'; touch /tmp/harvester-shell-quote-escaped; echo '";
 
         assert_eq!(echo(attempt).await, attempt);
@@ -241,9 +186,6 @@ mod tests {
 
     #[tokio::test]
     async fn stdin_is_fed_without_deadlocking_on_a_full_output_pipe() {
-        // Writing and draining must overlap: doing them in sequence deadlocks
-        // once the child fills its output pipe before consuming all of stdin,
-        // which is exactly the shape of the multi-megabyte daemon upload.
         let payload = vec![b'x'; 4 * 1024 * 1024];
 
         let output = Host::Local
@@ -257,8 +199,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_script_that_never_ends_is_stopped_by_its_deadline() {
-        // Every remote op carries one, because ssh's ConnectTimeout bounds only
-        // the TCP connect.
         let Err(error) = Host::Local
             .exec("sleep 30", None, Duration::from_millis(200))
             .await

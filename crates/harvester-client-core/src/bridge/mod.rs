@@ -1,21 +1,3 @@
-//! The per-machine bridge: one background thread runs a current-thread tokio
-//! runtime that owns that machine's daemon connection (this crate is tokio;
-//! gpui's executor has no tokio reactor). Frontends talk to bridges over
-//! tokio mpsc channels, which are reactor-independent and therefore awaitable
-//! straight from gpui tasks: commands go down each bridge's own sender,
-//! events from every bridge come back tagged with the machine key on one
-//! shared channel. This module is deliberately gpui-free.
-//!
-//! This file is the whole of the bridge's *shape*: the [`Command`]/[`Event`]
-//! contract a frontend codes against, the thread and its select loop, and the
-//! router that turns one command into one spawned flow. The three things it
-//! deliberately does not hold:
-//!
-//! - `flows` — one straight-line async flow per command. Responses resolve at
-//!   their await points, so there is no response-routing state machine here.
-//! - `attach_window` — the live events held back between `attach` and
-//!   `Attached`; pure, synchronous and tested on its own.
-
 mod attach_window;
 mod flows;
 
@@ -38,20 +20,8 @@ use attach_window::{
     lock_attach_buffers, AttachEventBuffers, PushOutcome, ATTACH_EVENT_BUFFER_CAP,
 };
 
-/// UI → bridge.
-///
-/// A command that is answered by one event carries the [`RequestToken`] that
-/// answer echoes (docs/SPEC.md §Decisions, C2). `Open`, `StartSession` and
-/// `Prompt` carry none: they have no reply — what they produce is the
-/// session's own event stream, which is keyed by sid and outlives the
-/// request that started it.
 #[derive(Debug)]
 pub enum Command {
-    /// Open a session: `create_session` (resume-or-create, idempotent for an
-    /// already-running sid) then attach. Deliberately carries no running flag —
-    /// the daemon owns that truth, and a client's cached copy goes stale the
-    /// moment a session exits while it is detached. Ends in `Event::Attached`
-    /// or a failure event.
     Open {
         sid: String,
         cwd: String,
@@ -60,10 +30,6 @@ pub enum Command {
         sid: String,
         text: String,
     },
-    /// Turn an unstarted chat into a real session (SPEC §Flows "Start session"):
-    /// `create_session` → `attach` → first prompt, all riding pi's in-order
-    /// stdin queue — no readiness probe. Ends in `Event::Attached` (with
-    /// empty entries — the session is brand new) or a failure event.
     StartSession {
         sid: String,
         cwd: String,
@@ -72,52 +38,27 @@ pub enum Command {
         name: String,
         first_prompt: String,
     },
-    /// Fetch the models pi would offer in `cwd` (daemon `list_models`,
-    /// uncached — costs a pi startup). Answered by `Event::ModelsListed`.
-    /// For a running session use `ListSessionModels` instead.
     ListModels {
         cwd: String,
         token: RequestToken,
     },
-    /// Fetch the models a running session offers (passthrough
-    /// `get_available_models` — no throwaway pi). Answered by
-    /// `Event::SessionModelsListed`.
     ListSessionModels {
         sid: String,
         token: RequestToken,
     },
-    /// Fetch a running session's state (passthrough `get_state`) — the chat
-    /// reads its current model from it. Answered by `Event::SessionState`.
     GetSessionState {
         sid: String,
         token: RequestToken,
     },
-    /// Switch a running session's model (passthrough `set_model`). Answered
-    /// by `Event::ModelSet`.
     SetModel {
         sid: String,
         provider: String,
         model_id: String,
         token: RequestToken,
     },
-    /// End a session's pi: the daemon's stop ladder (pi `abort`, then stdin
-    /// EOF, then a SIGKILL backstop). The session file survives and the same
-    /// sid resumes through `Open`, so this is a reap, not a delete.
-    ///
-    /// Carries no token because the reply is not the outcome: `stop` answers
-    /// `{"stopping": true}` the moment the ladder starts, and the authoritative
-    /// completion signal is `Event::SessionExit` — which the daemon may deliver
-    /// *before* that reply, since events and responses travel independent paths
-    /// (docs/DAEMON.md §stop).
     Stop {
         sid: String,
     },
-    /// Answer a pi dialog (passthrough `extension_ui_response`).
-    ///
-    /// Carries no token because there is no answer to correlate: pi resolves
-    /// an `extension_ui_response` with `null` and the daemon replies the same
-    /// way for an id it has already retired, so success and too-late are
-    /// indistinguishable by design (docs/DAEMON.md §Dialogs).
     AnswerDialog {
         sid: String,
         dialog_id: String,
@@ -125,12 +66,6 @@ pub enum Command {
     },
 }
 
-/// bridge → UI. Pi payloads stay verbatim `Value` — the client speaks Pi.
-///
-/// An event answering a command echoes that command's [`RequestToken`]; the
-/// `sid` a session-scoped answer also carries is routing (which chat renders
-/// it), not correlation. Everything else here is unsolicited — connection
-/// lifecycle and the session stream — and carries no token.
 #[derive(Debug)]
 pub enum Event {
     Connected {
@@ -140,46 +75,21 @@ pub enum Event {
         detail: String,
     },
     Sessions(Vec<SessionInfo>),
-    /// A session was opened: attach completed and history was replayed via
-    /// passthrough `get_entries`; `entries` is pi's list, verbatim. The
-    /// frontend's cue to *create* the chat for `sid`.
     Attached {
         sid: String,
         entries: Vec<Value>,
     },
-    /// This bridge successfully detached from its previous session. Emitted
-    /// before the flow creates or attaches its replacement, so frontend state
-    /// tied to that exact attachment room can retire immediately.
     AttachmentLeft {
         sid: String,
     },
-    /// The same `get_entries` snapshot, but as a repair after events were lost
-    /// (a daemon `event_gap`, or our own attach window overflowing) for a
-    /// session the frontend already has a chat for.
-    ///
-    /// Split from `Attached` because the two mean different things to a
-    /// frontend and one of them was wrong: rebuilding the chat entity on a
-    /// repair is what let a late resync clobber the chat on screen. Replace the
-    /// existing chat's entries; if there is no chat for `sid`, ignore it — the
-    /// bridge only ever repairs the session it is attached to.
     HistoryReplaced {
         sid: String,
         entries: Vec<Value>,
     },
-    /// The same repair, done cheaply: `entries` are only those *after* the
-    /// cursor the last fetch left (docs/SPEC.md C6), so they extend the
-    /// frontend's replica instead of replacing it. Same rule as
-    /// `HistoryReplaced` otherwise — ignore it when there is no chat for `sid`.
-    ///
-    /// The frontend must drop whatever it built from live events before
-    /// applying these: live events carry no entry ids, so the delta is the
-    /// authoritative account of the very span they were guessing at.
-    /// `Transcript::extend_history` is that rule, written once.
     HistoryExtended {
         sid: String,
         entries: Vec<Value>,
     },
-    /// One live pi event for an attached session, verbatim.
     Pi {
         sid: String,
         event: Value,
@@ -188,34 +98,23 @@ pub enum Event {
         sid: String,
         exit_code: Option<i32>,
     },
-    /// A request failed daemon- or pi-side. Statusbar material; the
-    /// connection itself is still healthy.
     RequestFailed {
         detail: String,
     },
-    /// A `ListModels` answered; pi's `data` verbatim (the client speaks Pi —
-    /// the workbench extracts what its picker renders). Errors render inside
-    /// the unstarted chat, not the statusbar.
     ModelsListed {
         token: RequestToken,
         result: Result<Value, String>,
     },
-    /// A `ListSessionModels` answered; pi's `data` verbatim. Errors render
-    /// in the owning chat, not the statusbar.
     SessionModelsListed {
         sid: String,
         token: RequestToken,
         result: Result<Value, String>,
     },
-    /// A `GetSessionState` answered; pi's `data` verbatim (`model` is the
-    /// field the chat reads).
     SessionState {
         sid: String,
         token: RequestToken,
         result: Result<Value, String>,
     },
-    /// A `SetModel` answered; `Ok` carries pi's `data` — the full Model
-    /// object now in effect.
     ModelSet {
         sid: String,
         token: RequestToken,
@@ -224,14 +123,10 @@ pub enum Event {
     Disconnected,
 }
 
-/// Handle to one machine's bridge thread. Its events arrive on the shared
-/// channel passed to [`start`], tagged with the machine key.
 pub struct BridgeHandle {
     pub commands: UnboundedSender<Command>,
 }
 
-/// The shared event channel's sender, bound to one machine key so bridge
-/// internals stay machine-agnostic.
 #[derive(Clone)]
 struct EventSender {
     machine: String,
@@ -240,34 +135,20 @@ struct EventSender {
 
 impl EventSender {
     fn send(&self, event: Event) {
-        // A dropped receiver just means the window closed.
         let _ = self.sender.send((self.machine.clone(), event));
     }
 }
 
-/// Everything a command flow needs; cheap to clone into its task.
 #[derive(Clone)]
 struct BridgeContext {
     client: DaemonClient,
     events: EventSender,
-    /// The one session this bridge is attached to (single chat pane). The
-    /// async mutex also *serializes* attachment changes: a second Open waits
-    /// out the first flow instead of interleaving with it.
     attached: Arc<AsyncMutex<Option<String>>>,
-    /// Live events held back while an attach flow is still fetching history.
     attach_buffers: Arc<Mutex<AttachEventBuffers>>,
-    /// Sessions with a repair already in flight, so a burst of gaps costs one
-    /// `get_entries` rather than one per gap.
     resyncing: Arc<Mutex<HashSet<String>>>,
-    /// The attached session's replay cursor, from the last `get_entries`
-    /// (docs/SPEC.md C6). One slot, because one bridge holds one attachment.
     cursor: Arc<Mutex<Option<SessionCursor>>>,
 }
 
-/// Pi's `leafId` from a `get_entries`, tagged with the session it describes.
-/// The sid is half the value: a cursor is only ever valid for the session it
-/// was fetched for, and pairing them makes spending it on another impossible
-/// rather than merely unlikely.
 struct SessionCursor {
     sid: String,
     leaf_id: String,
@@ -338,22 +219,16 @@ async fn bridge_main(
         cursor: Arc::new(Mutex::new(None)),
     };
 
-    // The sidebar renders from this; fetch immediately.
     spawn_flow(flows::sessions_flow(context.clone()));
 
     loop {
         tokio::select! {
             command = commands.recv() => match command {
-                // UI dropped the bridge; dropping the client tears down the
-                // connection and any ssh forward.
                 None => break,
                 Some(command) => dispatch(command, &context),
             },
             event = session_events.recv() => match event {
                 Some(event) => handle_session_event(&context, event),
-                // The client stopped, so this bridge is done. There is no
-                // attachment left to forget: this context and its daemon
-                // client die with the loop.
                 None => {
                     context.events.send(Event::Disconnected);
 
@@ -371,8 +246,6 @@ fn handle_session_event(context: &BridgeContext, event: SessionEvent) {
             spawn_flow(flows::forget_attachment(context.clone(), sid.clone()));
             context.events.send(Event::SessionExit { sid, exit_code });
         }
-        // Recover in the backbone, not the UI: refetch the history we just lost
-        // and republish it, which every frontend already knows how to render.
         SessionEvent::EventGap { sid, skipped } => {
             eprintln!("bridge: lost {skipped} events for session {sid}; resyncing");
             spawn_flow(flows::resync_flow(context.clone(), sid));
@@ -380,8 +253,6 @@ fn handle_session_event(context: &BridgeContext, event: SessionEvent) {
     }
 }
 
-/// Every command is its own spawned straight-line flow; the loop above never
-/// waits on the daemon, so event forwarding cannot stall behind a slow command.
 fn dispatch(command: Command, context: &BridgeContext) {
     let context = context.clone();
 
@@ -434,8 +305,6 @@ fn spawn_flow(flow: impl std::future::Future<Output = ()> + Send + 'static) {
     tokio::spawn(flow);
 }
 
-/// One event off the daemon stream: held back while its session's history is
-/// in flight, delivered otherwise.
 fn handle_live_pi_event(context: &BridgeContext, sid: String, event: Value) {
     let outcome = lock_attach_buffers(&context.attach_buffers).push(&sid, event);
 
@@ -449,17 +318,10 @@ fn handle_live_pi_event(context: &BridgeContext, sid: String, event: Value) {
     }
 }
 
-/// One pi event on its way to the frontend, verbatim. Reached both live and
-/// from a flushed attach window, so it must not depend on the select loop.
-///
-/// Dialog requests ride this path like any other event: answering one is the
-/// frontend's obligation now (docs/SPEC.md C5), and the bridge's job is to put
-/// the question in front of it unaltered.
 fn handle_pi_event(context: &BridgeContext, sid: String, event: Value) {
     context.events.send(Event::Pi { sid, event });
 }
 
-/// Transport error or daemon-reported failure → one error string.
 fn flatten_harvester(
     response: std::io::Result<harvester_proto::HarvesterResponse>,
 ) -> Result<Value, String> {
@@ -485,12 +347,8 @@ mod tests {
 
     use crate::connection::{no_forward, DaemonConnection};
 
-    /// How long to wait before concluding the bridge sent nothing. Only ever
-    /// reached by the assertions that *want* silence.
     const QUIET: Duration = Duration::from_millis(100);
 
-    /// A bridge context wired to a fake daemon over an in-memory duplex pair —
-    /// the whole reason `DaemonConnection` stopped being a `UnixStream`.
     struct Harness {
         context: BridgeContext,
         daemon: DaemonConnection,
@@ -521,8 +379,6 @@ mod tests {
             }
         }
 
-        /// The next request the bridge sent, answered with a bland success so
-        /// the flow that sent it proceeds. Panics if nothing arrives.
         async fn serve_one(&mut self) -> Value {
             let request = tokio::time::timeout(QUIET, self.daemon.reader.next_line_for_test())
                 .await
@@ -562,7 +418,6 @@ mod tests {
             request
         }
 
-        /// `create_session` → `attach` → `get_entries`, the whole `Open` chain.
         async fn serve_open(&mut self) -> Vec<String> {
             let mut commands = Vec::new();
 
@@ -584,7 +439,6 @@ mod tests {
         }
     }
 
-    /// Both envelopes name their command in the same place.
     fn command_name(request: &Value) -> String {
         request["cmd"]["type"].as_str().unwrap_or("?").to_string()
     }
@@ -679,11 +533,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_session_that_exited_is_not_detached_from_on_the_next_open() {
-        // The bridge used to remember an attachment forever: `attached` was
-        // cleared only by `detach_previous`. So opening a second session after
-        // the first one's pi exited sent a `Detach` for a dead sid, and the
-        // daemon's refusal reached the user as a statusbar error for an action
-        // they never took.
         let mut harness = Harness::new();
 
         spawn_flow(flows::open_flow(
@@ -720,9 +569,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_still_running_session_is_detached_from_on_the_next_open() {
-        // The other half: forgetting the attachment must be scoped to the
-        // session that actually exited, or one chat pane silently becomes two
-        // live attachments.
         let mut harness = Harness::new();
 
         spawn_flow(flows::open_flow(
@@ -751,9 +597,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_gap_for_a_session_nobody_watches_costs_nothing() {
-        // Every `event_gap` used to spawn a full `get_entries`, `attached`
-        // never consulted — so a session the user is not looking at still paid
-        // for a history refetch.
         let mut harness = Harness::new();
 
         handle_session_event(
@@ -771,7 +614,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_burst_of_gaps_costs_one_refetch() {
-        // N gaps used to mean N concurrent refetches of the same history.
         let mut harness = Harness::new();
 
         spawn_flow(flows::open_flow(
@@ -799,9 +641,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_repair_is_published_as_its_own_event() {
-        // `Attached` means "create the chat"; a repair means "replace its
-        // entries". A frontend that rebuilt on both clobbered the chat on
-        // screen whenever a resync landed late.
         let mut harness = Harness::new();
 
         spawn_flow(flows::open_flow(

@@ -1,8 +1,3 @@
-//! harvester-cli — dev driver for harvester-client-core. Bootstraps
-//! harvesterd on a machine, connects, and runs one command. Doubles as the
-//! protocol smoke-test tool (`raw` mode replaces the throwaway python
-//! drivers from the e2e rounds).
-
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
@@ -16,7 +11,6 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 #[command(about = "Dev driver for the Harvester client library: bootstraps \
 harvesterd over SSH, connects, and runs one command")]
 struct Cli {
-    /// Path to the static musl harvesterd binary to ship
     #[arg(
         long,
         value_name = "PATH",
@@ -24,7 +18,6 @@ struct Cli {
     )]
     daemon_bin: PathBuf,
 
-    /// SSH destination: user@host or an ssh-config alias
     dest: String,
 
     #[command(subcommand)]
@@ -33,11 +26,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum CliCommand {
-    /// Bootstrap + connect + version handshake, then exit
     Ping,
-    /// Print the daemon's session list as JSON
     ListSessions,
-    /// Pipe request JSONL from stdin, print every daemon line
     Raw,
 }
 
@@ -86,17 +76,6 @@ async fn list_sessions(connection: DaemonConnection) -> Result<(), Box<dyn std::
     Ok(())
 }
 
-/// Protocol REPL and pipe: stdin lines go to the daemon as-is, daemon lines
-/// come back to stdout as-is. Deliberately a byte pump in both directions —
-/// decoding either side would hide exactly what this tool exists to inspect:
-/// a malformed frame must reach the daemon (its parse-error response is a
-/// documented path), and a line we cannot parse must still be printed rather
-/// than ending the stream.
-///
-/// On stdin EOF the write half is dropped, which half-closes the socket; the
-/// daemon then finishes its queued responses and closes, and the printer stops
-/// on that EOF. Scripted use (`echo ... | harvester-cli <dest> raw`) therefore
-/// sees every answer instead of racing the round trip.
 async fn raw(connection: DaemonConnection) -> Result<(), Box<dyn std::error::Error>> {
     let DaemonConnection {
         mut reader,

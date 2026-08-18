@@ -1,26 +1,15 @@
-//! The window-free session/workspace catalog behind [`FleetStore`](crate::store::FleetStore).
-//!
-//! This is display state derived from Pi's session listings, not a second
-//! persistence layer. Pi's files on the machine remain authoritative; this
-//! catalog is replaced by the next listing and can be discarded at any time.
-//! Workspace configuration is the one exception: it is user configuration and
-//! is coordinated with `~/.harvester/workspaces.json` here.
-
 use harvester_client_core::LOCAL_MACHINE;
 use harvester_proto::{SessionInfo, SessionStatus};
 
 use crate::session_state::ChatTarget;
 use crate::workspaces::{self, Workspace};
 
-/// One sidebar session row, tagged with the machine whose daemon reported it.
 #[derive(Debug, Clone)]
 pub struct MachineSession {
     pub machine: String,
     pub info: SessionInfo,
 }
 
-/// The target needed to issue an open/resume command after the catalog's guard
-/// has admitted it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionOpen {
     pub machine: String,
@@ -28,8 +17,6 @@ pub struct SessionOpen {
     pub cwd: String,
 }
 
-/// Session rows, workspace configuration, and the single in-flight open guard.
-/// No GPUI types or machine connectivity live here.
 pub struct Catalog {
     sessions: Vec<MachineSession>,
     workspaces: Vec<Workspace>,
@@ -42,16 +29,10 @@ struct OpeningSession {
 }
 
 impl Catalog {
-    /// Load the user's workspace configuration. Session rows deliberately do
-    /// not load from disk: only a daemon's `list_sessions` answer can populate
-    /// them, so Pi remains the source of truth.
     pub fn load() -> Self {
         Self::from_workspaces(workspaces::load())
     }
 
-    /// Construct a catalog from already-loaded workspace configuration.
-    /// Keeping this small constructor also makes the catalog's rules directly
-    /// testable without starting GPUI or touching a user's home directory.
     pub fn from_workspaces(workspaces: Vec<Workspace>) -> Self {
         Self {
             sessions: Vec::new(),
@@ -60,9 +41,6 @@ impl Catalog {
         }
     }
 
-    /// Replace one machine's listing, then merge all machines by Pi's last
-    /// activity time. The listing is display state; it is never used to infer
-    /// or manufacture session-file contents.
     pub fn record_sessions(&mut self, machine: &str, sessions: Vec<SessionInfo>) {
         self.sessions.retain(|session| session.machine != machine);
         self.sessions
@@ -73,8 +51,6 @@ impl Catalog {
         self.sort_sessions();
     }
 
-    /// Apply a running/exited transition to a known row. An unknown sid is
-    /// ignored: the next authoritative listing will introduce it.
     pub fn set_session_status(&mut self, sid: &str, status: SessionStatus) -> bool {
         let mut changed = false;
 
@@ -88,22 +64,15 @@ impl Catalog {
         changed
     }
 
-    /// Mark the session attached to a machine as running and finish that
-    /// machine's opening guard.
     pub fn session_attached(&mut self, machine: &str, sid: &str) -> bool {
         let changed = self.set_session_status(sid, SessionStatus::Running);
         self.abandon_open_on(machine) || changed
     }
 
-    /// Mark a known session exited. The guard is intentionally not cleared by
-    /// an exit from another machine; opening is scoped to its machine.
     pub fn session_exited(&mut self, sid: &str) -> bool {
         self.set_session_status(sid, SessionStatus::Exited)
     }
 
-    /// Add a workspace once and atomically coordinate the user configuration
-    /// write before exposing it in memory. A duplicate is a no-op and does not
-    /// rewrite the file.
     pub fn add_workspace(&mut self, workspace: Workspace) -> std::io::Result<bool> {
         if self.workspaces.contains(&workspace) {
             return Ok(false);
@@ -117,19 +86,6 @@ impl Catalog {
         Ok(true)
     }
 
-    /// Forget a machine outright: the repositories stored for it leave the user
-    /// configuration, and the session rows its daemon once reported leave the
-    /// table with them.
-    ///
-    /// The file write comes first and a failure aborts the whole removal, so
-    /// what the sidebar shows and what `workspaces.json` holds cannot disagree
-    /// — the file is the only place a machine is persisted, and a machine that
-    /// survives the next launch must survive this one too.
-    ///
-    /// Session rows go because they are display state derived from a daemon
-    /// this client will never reach again: a missing machine's transcripts live
-    /// only on its own disk, and nothing client-side could render them
-    /// (docs/SPEC.md §Flows "Forget machine").
     pub fn forget_machine(&mut self, machine: &str) -> std::io::Result<()> {
         let kept = self.workspaces_without(machine);
 
@@ -144,9 +100,6 @@ impl Catalog {
         Ok(())
     }
 
-    /// The stored repositories that survive forgetting `machine`. Split out
-    /// from [`Self::forget_machine`] so the rule can be tested without writing
-    /// a real user's configuration file.
     fn workspaces_without(&self, machine: &str) -> Vec<Workspace> {
         self.workspaces
             .iter()
@@ -155,15 +108,10 @@ impl Catalog {
             .collect()
     }
 
-    /// Start or retry an open guard for a session. The guard is cleared by
-    /// [`Self::session_attached`] or a machine failure in the observable root.
     pub fn begin_open(&mut self, machine: String, sid: String) {
         self.opening = Some(OpeningSession { machine, sid });
     }
 
-    /// Whether another open may be issued. A second click on the same row is
-    /// the explicit retry escape hatch; a different row stays blocked while an
-    /// open is in flight.
     pub fn may_open_session(&mut self, sid: &str) -> bool {
         let Some(opening) = &self.opening else {
             return true;
@@ -178,8 +126,6 @@ impl Catalog {
         true
     }
 
-    /// Resolve a session by sid and install its open guard. Display indexes
-    /// never enter this path because the sidebar is a filtered view.
     pub fn open_session(&mut self, sid: &str) -> Option<SessionOpen> {
         let session = self
             .sessions
@@ -196,10 +142,6 @@ impl Catalog {
         Some(open)
     }
 
-    /// Insert the display row for a newly-created session. This is not a
-    /// client-side session journal: a later daemon listing replaces it, and a
-    /// duplicate sid is replaced rather than rendered twice while that listing
-    /// is in flight.
     pub fn insert_started_session(
         &mut self,
         machine: String,
@@ -233,9 +175,6 @@ impl Catalog {
         self.sort_sessions();
     }
 
-    /// The complete daemon-derived table. Remote rows are all visible because
-    /// the remote disk is authoritative. Local rows are scoped to workspaces
-    /// so the local daemon does not expose every repo ever used on this host.
     pub fn visible_sessions(&self) -> Vec<&MachineSession> {
         self.sessions
             .iter()
@@ -243,9 +182,6 @@ impl Catalog {
             .collect()
     }
 
-    /// How many sidebar rows a machine would take with it — the number the
-    /// forget confirmation quotes. It counts the *visible* table, because what
-    /// the dialog promises to remove is what the user can see.
     pub fn visible_session_count_on(&self, machine: &str) -> usize {
         self.visible_sessions()
             .iter()
@@ -269,8 +205,6 @@ impl Catalog {
         &self.workspaces
     }
 
-    /// The repositories stored for one machine, in the order the user added
-    /// them — the rows the chat's repo picker offers above its "Add new…".
     pub fn repos_on(&self, machine: &str) -> Vec<String> {
         self.workspaces
             .iter()
@@ -279,15 +213,6 @@ impl Catalog {
             .collect()
     }
 
-    /// Where a New session opens, given the machines the fleet can currently
-    /// reach (docs/SPEC.md §Flows "Start session"). Derived on every open and
-    /// never persisted: this is a guess at what the user wants next, and a
-    /// guess that survives restarts is a preference nobody agreed to keep.
-    ///
-    /// In order: the repo of the most recent session that is still a stored
-    /// repo on a reachable machine; else the first stored repo on a reachable
-    /// machine; else the first reachable machine with no repo picked (the
-    /// picker then offers only "Add new…"); else nothing at all.
     pub fn default_new_session_target(&self, machines: &[String]) -> ChatTarget {
         let reachable = |machine: &str| machines.iter().any(|candidate| candidate == machine);
         let recent = self.sessions.iter().find(|session| {
@@ -332,7 +257,6 @@ impl Catalog {
         self.opening.as_ref().map(|opening| opening.sid.as_str())
     }
 
-    /// Clear an open only when the failing machine owns it.
     pub fn abandon_open_on(&mut self, machine: &str) -> bool {
         if self
             .opening
@@ -367,7 +291,6 @@ impl Catalog {
     }
 }
 
-/// Wall-clock milliseconds, the units Pi's session listing orders by.
 fn unix_millis_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -588,8 +511,6 @@ mod tests {
 
     #[test]
     fn forgetting_a_machine_drops_its_session_rows_and_its_open_guard() {
-        // No stored repository, so this exercises the whole cascade without
-        // writing a configuration file: the machine is tracked from argv.
         let mut catalog = catalog(&[]);
 
         catalog.record_sessions(

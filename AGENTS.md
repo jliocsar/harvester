@@ -10,9 +10,23 @@ contract docs. Do not re-research what the docs already answer.
 2. `DAEMON.md` — client ↔ harvesterd contract (envelope, launch line, dialog policy).
 3. `PROVIDERS.md` — machine provider contract (one-shot JSON-stdio executables).
 4. `HARNESS_RESEARCH.md` — verified Pi/exe.dev facts; every claim sourced or marked UNVERIFIED.
+5. `internals/<crate>.md` — per-crate implementation notes: invariants, rationale,
+   gotchas, const meanings. This is where code comments would go — see below.
 
-When a decision changes, update the doc in the same change. Docs win over code
-comments; `SPEC.md` defers to the contract docs on conflicts.
+When a decision changes, update the doc in the same change. `SPEC.md` defers to
+the contract docs on conflicts.
+
+## No comments in code — ever
+
+This is a **zero-comment codebase**: no `//`, `///`, `//!`, or `/* */` anywhere
+in `crates/`. Everything a comment would say lives in `docs/internals/<crate>.md`
+instead, organized by module. When you write code that needs explaining, explain
+it there in the same change; when you change documented behavior, update the
+notes. History and rationale persist in `docs/`, never inline.
+
+Enforced by `crates/harvester/tests/no_comments.rs` (a string-literal-aware
+lexer over every `.rs` file; runs in `cargo test --workspace`). `src/bin/`
+spikes are exempt — throwaway code was always exempt from house rules.
 
 ## Architecture invariants (do not violate)
 
@@ -48,7 +62,8 @@ itself is broken — node version mismatch — but the source is readable).
   Command logic lives in `ops.rs` (one named function per command) and
   `passthrough.rs`. Keep it that way as the surface grows.
 - **No magic values**: any tunable number or protocol byte becomes a named
-  `const` with a doc comment (`OUTGOING_QUEUE_DEPTH`, `SESSION_EVENT_BUFFER`, `LF`).
+  `const` (`OUTGOING_QUEUE_DEPTH`, `SESSION_EVENT_BUFFER`, `LF`), with its
+  meaning recorded in `docs/internals/<crate>.md`.
 - **Factor out named handlers**: prefer `handle_x`/`create_x` extractions over
   inline branching (`handle_response_line`, `handle_dialog_request`,
   `create_pi_command` are the pattern).

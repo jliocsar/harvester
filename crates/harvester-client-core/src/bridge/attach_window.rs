@@ -1,47 +1,19 @@
-//! The attach window: the live events a session emits between its `attach`
-//! landing and its history reaching the frontend.
-//!
-//! The daemon starts streaming a session's events the instant its `attach`
-//! lands (docs/DAEMON.md §attach — deliberate, and not ours to reorder), but a
-//! frontend has nowhere to put them until `Event::Attached` publishes the
-//! `get_entries` snapshot one round trip later. An event that arrives in that
-//! window is missing from the snapshot *and* dropped by the frontend: a lost
-//! `tool_execution_end` leaves a tool card spinning for the life of that chat
-//! (streaming text self-repairs — every `message_update` carries the whole
-//! partial — tool ends do not). So the bridge holds that window back.
-//!
-//! Everything here is pure and synchronous on purpose: no daemon, no pi, no
-//! runtime — it is the one piece of the fix that can be tested on its own.
-
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
-/// How many live events one session may hold back while its history is in
-/// flight. A `get_entries` round trip is milliseconds and pi emits a few
-/// events per second, so this is orders of magnitude of headroom; the cap only
-/// exists so a wedged fetch cannot grow a `Vec` without bound.
 pub(super) const ATTACH_EVENT_BUFFER_CAP: usize = 1024;
 
-/// What the select loop should do with an event it just offered the buffers.
 pub(super) enum PushOutcome {
-    /// No flow is holding this session back — deliver it live.
     Deliver(Value),
     Buffered,
-    /// The cap was just hit: the held events are gone and the session is
-    /// marked for resync. Worth one line on stderr.
     Overflowed,
-    /// Already overflowed; dropped on the floor because the resync that
-    /// follows the flush is authoritative anyway.
     Discarded,
 }
 
-/// What an attach flow finds waiting for it once `Attached` is published.
 pub(super) enum FlushOutcome {
-    /// Deliver these, in arrival order, before anything else.
     Events(Vec<Value>),
-    /// Events were lost, so the snapshot just published is already stale.
     Overflowed,
 }
 
@@ -50,15 +22,12 @@ enum SessionBuffer {
     Overflowed,
 }
 
-/// The held-back windows, keyed by sid.
 #[derive(Default)]
 pub(super) struct AttachEventBuffers {
     by_session: HashMap<String, SessionBuffer>,
 }
 
 impl AttachEventBuffers {
-    /// Idempotent: a resync racing an open joins the window already in flight
-    /// rather than resetting it, which would discard everything held so far.
     fn register(&mut self, sid: &str) {
         self.by_session
             .entry(sid.to_string())
@@ -89,8 +58,6 @@ impl AttachEventBuffers {
         match self.by_session.remove(sid) {
             Some(SessionBuffer::Buffering(events)) => FlushOutcome::Events(events),
             Some(SessionBuffer::Overflowed) => FlushOutcome::Overflowed,
-            // Another flow for the same sid flushed first; its events are out
-            // and its `Attached` seeded the chat, so there is nothing owed.
             None => FlushOutcome::Events(Vec::new()),
         }
     }
@@ -100,24 +67,13 @@ impl AttachEventBuffers {
     }
 }
 
-/// Owns one session's registration for the length of an attach flow. RAII
-/// because the ways out are more numerous than the way through — a failed
-/// attach and a failed `get_entries` both return early, and a registration
-/// that outlives its flow swallows that session's live events for the life of
-/// the bridge, which is strictly worse than the gap it closes. Same shape as
-/// `Pending` in `client.rs` and `ForwardGuard` in `connection.rs`.
 pub(super) struct AttachRegistration {
     buffers: Arc<Mutex<AttachEventBuffers>>,
     sid: String,
-    /// Set by [`AttachRegistration::flush`], which already removed the entry;
-    /// without it a `Drop` landing after a same-sid re-registration would wipe
-    /// somebody else's window.
     flushed: bool,
 }
 
 impl AttachRegistration {
-    /// Call this *before* the `attach` request goes out — the streaming starts
-    /// the moment it lands, not when its response comes back.
     pub(super) fn register(
         buffers: &Arc<Mutex<AttachEventBuffers>>,
         sid: &str,
@@ -131,8 +87,6 @@ impl AttachRegistration {
         }
     }
 
-    /// The held events, in arrival order. Consuming `self` makes "flushed" and
-    /// "registration released" the same event.
     pub(super) fn flush(mut self) -> FlushOutcome {
         self.flushed = true;
 
@@ -150,7 +104,6 @@ impl Drop for AttachRegistration {
     }
 }
 
-/// std::sync — every use is a lock/mutate/unlock with no await inside.
 pub(super) fn lock_attach_buffers(
     buffers: &Arc<Mutex<AttachEventBuffers>>,
 ) -> std::sync::MutexGuard<'_, AttachEventBuffers> {
@@ -232,9 +185,6 @@ mod tests {
 
     #[test]
     fn a_dropped_registration_reopens_the_live_stream() {
-        // The failure mode that matters: a failed attach or a failed
-        // `get_entries` returns early, and a registration that outlived it
-        // would swallow that session's events for the life of the bridge.
         let buffers = buffers();
 
         {
@@ -304,8 +254,6 @@ mod tests {
 
     #[test]
     fn a_second_registration_joins_the_window_already_in_flight() {
-        // An `event_gap` resync racing an open: resetting the buffer here
-        // would drop everything the open flow is already holding.
         let buffers = buffers();
         let open = AttachRegistration::register(&buffers, "01H");
 

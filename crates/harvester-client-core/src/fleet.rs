@@ -1,35 +1,3 @@
-//! The fleet: every machine the client knows about, what is known about each
-//! one, and the policy that decides when to connect one.
-//!
-//! This is the layer above `bridge` and `machines`. Those two each own one
-//! machine's worth of work — a daemon connection, a provider listing, a probe.
-//! Nobody owned the questions that span machines: which machines exist, which
-//! of them have a bridge, whether a bridge should be started at all, and what
-//! a machine's dot means. Those lived in the gpui crate's `workbench.rs`,
-//! where a second frontend could not reach them.
-//!
-//! # Reactor boundary
-//!
-//! The fleet is as reactor-independent as the workers it owns, and for the
-//! same reason `bridge.rs` documents: gpui's executor has no tokio reactor, so
-//! a frontend must never be handed something it has to `await` on a tokio
-//! primitive. So every method here is *synchronous and non-blocking*: commands
-//! go out down unbounded senders (which never block and never need a reactor),
-//! and answers come back as events on the two receivers [`FleetEvents`] hands
-//! the frontend, which it pumps however it likes. The fleet itself never
-//! awaits, never spawns a task, and holds no runtime — the two worker threads
-//! it starts hold theirs.
-//!
-//! # Probe verdicts and daemon links are one state, not two
-//!
-//! They used to be two maps (`connections` and `probes`) that could disagree,
-//! with a precedence rule written only in the renderer that read them. Now one
-//! [`Machine`] row is either probed or linked, the [`BridgeHandle`] lives
-//! inside the linked half, and the precedence rule is enforced where the row is
-//! written ([`Machine::record_probe`]). A frontend reads one [`MachineState`]
-//! and renders it; there is no second field to keep in sync, and no way to
-//! claim a link without holding the bridge that backs it.
-
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -41,43 +9,19 @@ use crate::machine::{MachineRef, LOCAL_MACHINE};
 use crate::machines::{self, MachineRow};
 use crate::ssh::SshTarget;
 
-/// One machine's row in the fleet table. A machine has either a bridge or a
-/// probe verdict, never both — the handle lives *inside* the linked half, so
-/// "has a link" and "has somewhere to send" are one fact and cannot drift
-/// apart. Absence from the table is the third case (nothing known at all),
-/// which is why it needs no variant here.
 enum Machine {
-    /// Harvester's own `ssh <machine> true` probe answered, and nothing has
-    /// tried to connect.
     Probed { reachable: bool },
-    /// A bridge was started (in any outcome). The handle is kept after a
-    /// failure so a command sent to a dying machine still has somewhere to go
-    /// — the send is a no-op once the thread is gone — and so retouching the
-    /// machine can replace it.
     Linked { bridge: BridgeHandle, link: Link },
 }
 
-/// What a bridge has said about its daemon. Reachable only through
-/// [`Machine::Linked`], so nothing can claim a link without holding one.
 enum Link {
-    /// Up, bootstrapping or handshaking.
     Connecting,
-    Connected {
-        daemon_version: String,
-    },
-    /// The bridge reported why it could not connect. The detail is the user's
-    /// only diagnosis, so it is carried, not discarded.
-    Failed {
-        detail: String,
-    },
-    /// Connected once, then lost the daemon.
+    Connected { daemon_version: String },
+    Failed { detail: String },
     Lost,
 }
 
 impl Machine {
-    /// A probe verdict never overwrites a daemon link — an actual connection
-    /// outranks `ssh <machine> true`. The invariant used to live only in the
-    /// renderer that read the two maps this table replaced.
     fn record_probe(&mut self, reachable: bool) {
         if let Machine::Probed { .. } = self {
             *self = Machine::Probed { reachable };
@@ -104,40 +48,19 @@ impl Link {
     }
 }
 
-/// What a frontend renders one machine from: a borrowed view of its row, so
-/// the states only a bridge can be in are exactly the ones the table can only
-/// build while holding that bridge.
-///
-/// Three sources speak here. [`MachineState::Missing`] is what the provider
-/// *listing* says; the next three are what a probe says; the last four are what
-/// a bridge says. A machine moves up into the bridge half when a bridge is
-/// started for it and never falls back out — a probe is weaker evidence than an
-/// actual connection, and a machine that failed to connect stays visibly failed
-/// until something retries it.
 #[derive(Debug)]
 pub enum MachineState<'a> {
-    /// The machine's provider listed, and this machine was not in it: deleted
-    /// upstream. Distinct from [`MachineState::Unreachable`], which is a
-    /// machine that still exists and did not answer.
     Missing,
-    /// Never probed and never connected.
     Unknown,
     Reachable,
-    /// The probe failed. Not a veto: connecting is still allowed to try, since
-    /// the probe may simply be older than the machine booting.
     Unreachable,
     Connecting,
-    Connected {
-        daemon_version: &'a str,
-    },
-    ConnectFailed {
-        detail: &'a str,
-    },
+    Connected { daemon_version: &'a str },
+    ConnectFailed { detail: &'a str },
     ConnectionLost,
 }
 
 impl MachineState<'_> {
-    /// The bridge is usable: connected, or on its way and queueing commands.
     pub fn is_live(&self) -> bool {
         matches!(
             self,
@@ -146,32 +69,17 @@ impl MachineState<'_> {
     }
 }
 
-/// A machine a workspace can be added on, or a session spawned on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineCandidate {
-    /// The stored machine string — what a workspace records and a bridge keys.
     pub key: String,
-    /// What a frontend shows for it.
     pub label: String,
 }
 
-/// Why a fleet operation could not be carried out.
-///
-/// Every variant renders the exact sentence the statusbar showed before this
-/// type existed. The human-readable reason *is* the payload: a frontend that
-/// collapsed this to "not connectable" would throw away the only diagnosis a
-/// user gets for a machine that will not come up.
 #[derive(Debug)]
 pub enum FleetError {
-    /// No host to exec on: a provider machine whose provider has not listed it
-    /// (yet, or at all).
     NotConnectable { machine: String },
-    /// The bridge thread itself would not start.
     BridgeStart { machine: String, detail: String },
-    /// The machines worker never started, so there is no runtime to exec host
-    /// ops on and the caller has nothing to wait for.
     HostWorkerMissing,
-    /// The machines worker's thread ended.
     HostWorkerStopped,
 }
 
@@ -192,82 +100,40 @@ impl std::fmt::Display for FleetError {
 
 impl std::error::Error for FleetError {}
 
-/// The two event streams a frontend pumps, handed over once at
-/// [`Fleet::start`]. Separate from the [`Fleet`] itself because a frontend owns
-/// *how* it pumps them (a gpui task, a tokio task, a thread), and separate from
-/// each other so two pumps can own one apiece.
 pub struct FleetEvents {
-    /// Every bridge's events, tagged with the machine key.
     pub bridges: BridgeEvents,
-    /// The machines worker's events; `None` if its thread failed to start (the
-    /// machines list then stays empty — the reason is on stderr).
     pub machines: Option<MachinesEvents>,
 }
 
-/// An event straight off a worker, which the fleet has not seen yet.
-///
-/// Opaque on purpose: the only way to reach the value inside is to hand it to
-/// the fleet, which applies it on the way through. The receivers used to be
-/// handed over bare and the fleet was fed by convention — so [`MachineState`]
-/// was correct only while a frontend remembered to call the record method
-/// *before* rendering, and a frontend that forgot got a machine table that
-/// silently stopped tracking reality. This makes that order unrepresentable
-/// instead of merely documented.
 pub struct Unapplied<T>(T);
 
-/// Every bridge's events on one channel. An mpsc receiver is
-/// reactor-independent, so awaiting this from a reactor-free executor is
-/// exactly what the split is designed for (see the module docs).
 pub struct BridgeEvents(UnboundedReceiver<(String, bridge::Event)>);
 
 impl BridgeEvents {
-    /// The next event, `None` once every bridge is gone. Feed it to
-    /// [`Fleet::observe_bridge_event`] — nothing else can open it.
     pub async fn next(&mut self) -> Option<Unapplied<(String, bridge::Event)>> {
         self.0.recv().await.map(Unapplied)
     }
 }
 
-/// The machines worker's events: the provider listing, the probe verdicts, and
-/// the host-op answers that belong to whoever asked.
 pub struct MachinesEvents(UnboundedReceiver<machines::Event>);
 
 impl MachinesEvents {
-    /// The next event, `None` once the worker's thread has ended. Feed it to
-    /// [`Fleet::observe_machines_event`] — nothing else can open it.
     pub async fn next(&mut self) -> Option<Unapplied<machines::Event>> {
         self.0.recv().await.map(Unapplied)
     }
 }
 
-/// Owns the bridge pool, the machine table, the probe verdicts and the
-/// connect policy. Synchronous throughout — see the module docs.
 pub struct Fleet {
-    /// The embedded musl harvesterd, shared by every bridge's bootstrap.
     daemon_binary: Arc<Vec<u8>>,
-    /// Cloned into each bridge so every machine's events land on one channel.
     bridge_events: UnboundedSender<(String, bridge::Event)>,
-    /// Every machine the client has an opinion about — probed, connected, or
-    /// both. Absent means nothing is known yet.
     machines: HashMap<String, Machine>,
-    /// Provider machines from the worker's last listing cycle, sorted by key.
     provider_rows: Vec<MachineRow>,
-    /// The providers whose listings can be believed — see [`Fleet::is_missing`]
-    /// and `machines::Event::Listed`. Empty until the first cycle reports.
     listed_providers: HashSet<String>,
-    /// The machines worker's command sender; `None` if its thread failed.
     host_commands: Option<UnboundedSender<machines::Command>>,
-    /// The machines a frontend told the fleet to care about (see
-    /// [`Fleet::track_machines`]), deduplicated and sorted. The ad-hoc subset
-    /// is derived from it on read, never stored: it was a second copy that only
-    /// one site recomputed, so any other way of changing `tracked` desynced it.
     tracked: Vec<String>,
 }
 
 impl Fleet {
-    /// Starts the machines worker and hands back the event streams. Nothing
-    /// connects here: bridges are lazy, and which machines earn one is
-    /// [`Fleet::track_machines`]'s and [`Fleet::ensure_connection`]'s call.
     pub fn start(daemon_binary: Vec<u8>) -> (Fleet, FleetEvents) {
         let (bridge_sender, bridge_receiver) = unbounded_channel();
         let worker = match machines::start() {
@@ -299,15 +165,6 @@ impl Fleet {
         (fleet, events)
     }
 
-    // --- what the frontend tells the fleet ---------------------------------
-
-    /// The machines the client cares about: every stored workspace's machine,
-    /// plus the argv destination. Call it again whenever that set changes.
-    ///
-    /// Two policies hang off this list, both of them the fleet's:
-    /// the ad-hoc destinations the worker should probe, and the background
-    /// connects that make a reopened client show its sessions again without
-    /// being asked (docs/SPEC.md §Flows "Reopen client").
     pub fn track_machines(&mut self, machines: Vec<String>) {
         let mut tracked = machines;
 
@@ -322,15 +179,10 @@ impl Fleet {
 
     fn publish_ad_hoc_machines(&self) {
         if let Some(commands) = &self.host_commands {
-            // A dead worker means no probes; the dots stay unknown.
             let _ = commands.send(machines::Command::SetAdHocMachines(self.ad_hoc_machines()));
         }
     }
 
-    /// Drops every machine the client no longer knows about — untracked and
-    /// unlisted. Without it a machine deleted upstream stayed `Connected`
-    /// forever and kept being counted; dropping the row drops its
-    /// [`BridgeHandle`], which is what actually stops the bridge thread.
     fn forget_unknown_machines(&mut self) {
         let Fleet {
             machines,
@@ -344,15 +196,6 @@ impl Fleet {
         });
     }
 
-    /// Connects every tracked machine that has no bridge yet and resolves to a
-    /// host. Quiet by design: an unresolvable machine (a provider that has not
-    /// listed yet) is skipped without an error, and the next listing cycle
-    /// retries it. A machine whose bridge already failed is *not* retried here
-    /// — retouching it is the retry (see [`Fleet::ensure_connection`]).
-    ///
-    /// Quiet is right *here* and wrong for the user, which is the split:
-    /// skipping is provisional, and whether a skip is permanent is a question
-    /// only the listing can answer ([`Fleet::missing_tracked_machines`]).
     fn auto_connect_tracked(&mut self) {
         for machine in self.connectable_tracked_machines() {
             if let Err(error) = self.ensure_connection(&machine) {
@@ -361,9 +204,6 @@ impl Fleet {
         }
     }
 
-    /// Split out from [`Fleet::auto_connect_tracked`] both to end the borrow of
-    /// `self.tracked` before connecting and because it is the whole policy —
-    /// testable without starting a thread.
     fn connectable_tracked_machines(&self) -> Vec<String> {
         self.tracked
             .iter()
@@ -373,8 +213,6 @@ impl Fleet {
             .collect()
     }
 
-    /// Lazily connects: reuses a live bridge, respawns a failed or lost one
-    /// (retouching a machine is the retry), spawns a fresh one otherwise.
     pub fn ensure_connection(&mut self, machine: &str) -> Result<(), FleetError> {
         match self.connect_decision(machine)? {
             ConnectDecision::Reuse => Ok(()),
@@ -382,7 +220,6 @@ impl Fleet {
         }
     }
 
-    /// The connect policy, decided before anything is spawned.
     fn connect_decision(&self, machine: &str) -> Result<ConnectDecision, FleetError> {
         if self.state(machine).is_live() {
             return Ok(ConnectDecision::Reuse);
@@ -408,11 +245,6 @@ impl Fleet {
             }
         };
 
-        // The mirror of [`Machine::record_probe`], and the half that was
-        // written nowhere: a daemon link always supersedes a probe verdict, so
-        // an `Unreachable` dot gives way to `Connecting` rather than vetoing it.
-        // Replacing any previous handle is what makes retouching a failed
-        // machine the retry.
         self.machines.insert(
             machine.to_string(),
             Machine::Linked {
@@ -424,18 +256,12 @@ impl Fleet {
         Ok(())
     }
 
-    /// Routes a command to the machine's bridge. A dead or missing bridge
-    /// needs no handling: the link events drive the visible state.
     pub fn send(&self, machine: &str, command: bridge::Command) {
         if let Some(Machine::Linked { bridge, .. }) = self.machines.get(machine) {
             let _ = bridge.commands.send(command);
         }
     }
 
-    /// Routes a host op (`$HOME`, `ls`, `git rev-parse`) to the machines
-    /// worker. These never touch a daemon — docs/SPEC.md §Workspace, "no
-    /// daemon or provider involvement" — which is why they do not go through a
-    /// bridge and do not need one to exist.
     pub fn send_host_command(&self, command: machines::Command) -> Result<(), FleetError> {
         let Some(commands) = &self.host_commands else {
             return Err(FleetError::HostWorkerMissing);
@@ -448,13 +274,6 @@ impl Fleet {
         Ok(())
     }
 
-    // --- what the fleet learns from the workers ----------------------------
-
-    /// Applies one bridge event to the machine table and hands it back for the
-    /// frontend to route. Consuming the [`Unapplied`] wrapper is what makes
-    /// this the only way to observe the stream at all: the fleet cannot be
-    /// skipped, so the link state a frontend renders is never older than the
-    /// event that changed it.
     pub fn observe_bridge_event(
         &mut self,
         event: Unapplied<(String, bridge::Event)>,
@@ -466,8 +285,6 @@ impl Fleet {
         (machine, event)
     }
 
-    /// Applies one machines-worker event and hands it back, for the same reason
-    /// and on the same terms as [`Fleet::observe_bridge_event`].
     pub fn observe_machines_event(&mut self, event: Unapplied<machines::Event>) -> machines::Event {
         let Unapplied(event) = event;
 
@@ -476,10 +293,6 @@ impl Fleet {
         event
     }
 
-    /// The link half of one bridge's event stream. Everything else in
-    /// [`bridge::Event`] is session or request traffic the fleet has no
-    /// opinion about, so this takes the event by reference and leaves the
-    /// frontend's own routing untouched.
     fn record_bridge_event(&mut self, machine: &str, event: &bridge::Event) {
         match event {
             bridge::Event::Connected { daemon_version } => self.set_link(
@@ -499,9 +312,6 @@ impl Fleet {
         }
     }
 
-    /// Only ever called for a machine whose bridge we started, so the row
-    /// exists and is linked; the `else` is there so a stray event cannot panic
-    /// a frontend.
     fn set_link(&mut self, machine: &str, link: Link) {
         let Some(Machine::Linked { link: current, .. }) = self.machines.get_mut(machine) else {
             eprintln!("fleet: link event for {machine}, which has no bridge");
@@ -512,10 +322,6 @@ impl Fleet {
         *current = link;
     }
 
-    /// The fleet's half of the machines worker's event stream: the provider
-    /// listing and the probe verdicts. The rest — the host-op answers, which
-    /// belong to whoever asked, and the provider failure, which is statusbar
-    /// material — is the frontend's.
     fn record_machines_event(&mut self, event: &machines::Event) {
         match event {
             machines::Event::Listed {
@@ -537,9 +343,6 @@ impl Fleet {
         rows.sort_by(|a, b| a.key.cmp(&b.key));
         self.provider_rows = rows;
         self.listed_providers = listed_providers.iter().cloned().collect();
-        // A machine that vanished from the listing is gone; a provider-key
-        // tracked machine that just appeared in it becomes resolvable, so
-        // connect it and its sessions show up.
         self.forget_unknown_machines();
         self.auto_connect_tracked();
     }
@@ -554,14 +357,6 @@ impl Fleet {
         }
     }
 
-    // --- what the frontend reads ------------------------------------------
-
-    /// The one value a frontend renders a machine from.
-    ///
-    /// A live bridge outranks the listing — we are talking to the machine,
-    /// whatever its provider says about it. Nothing weaker does: a probe
-    /// verdict for a deleted machine is stale by construction, and reporting
-    /// it is exactly the silence [`MachineState::Missing`] exists to break.
     pub fn state(&self, machine: &str) -> MachineState<'_> {
         let state = self
             .machines
@@ -575,14 +370,6 @@ impl Fleet {
         MachineState::Missing
     }
 
-    /// The machine's provider listed successfully and did not include it, so
-    /// it was deleted upstream.
-    ///
-    /// A provider that has never listed says nothing about its machines, so an
-    /// absent row is not evidence until it has — otherwise one broken provider
-    /// would report its whole fleet as deleted. Only provider machines can go
-    /// missing: `local` always exists, and nothing lists an ad-hoc SSH
-    /// destination to leave it out of.
     fn is_missing(&self, machine: &str) -> bool {
         let MachineRef::Provider(key) = MachineRef::parse(machine) else {
             return false;
@@ -591,10 +378,6 @@ impl Fleet {
         self.listed_providers.contains(&key.provider) && self.provider_row(machine).is_none()
     }
 
-    /// The tracked machines that no longer exist — a frontend's cue to show
-    /// them anyway. Without this they vanish from the sidebar (which lists the
-    /// *listing*) while their workspaces go on looking healthy, and the client
-    /// sits there connecting to nothing with no way to find out why.
     pub fn missing_tracked_machines(&self) -> Vec<String> {
         self.tracked
             .iter()
@@ -603,17 +386,10 @@ impl Fleet {
             .collect()
     }
 
-    /// Whether a bridge was ever started for this machine — the question
-    /// `state` deliberately cannot answer on its own any more.
     fn is_linked(&self, machine: &str) -> bool {
         matches!(self.machines.get(machine), Some(Machine::Linked { .. }))
     }
 
-    /// Machine string → the host its execs run on, through the one place that
-    /// decides what a machine string means ([`MachineRef`]). A provider
-    /// machine resolves through the worker's last listing, so an error means
-    /// the key is unknown (not listed yet) or the machine uses the
-    /// unsupported argv ssh form.
     pub fn host_for(&self, machine: &str) -> Result<Host, FleetError> {
         let host = match MachineRef::parse(machine) {
             MachineRef::Local => Some(Host::Local),
@@ -629,9 +405,6 @@ impl Fleet {
         })
     }
 
-    /// Display label for a stored machine string: the provider machine's
-    /// label when listed, the key's id half as a fallback, the string itself
-    /// for ad-hoc destinations and `local`.
     pub fn label(&self, machine: &str) -> String {
         match MachineRef::parse(machine) {
             MachineRef::Provider(key) => self
@@ -646,15 +419,10 @@ impl Fleet {
         self.provider_rows.iter().find(|row| row.key == machine)
     }
 
-    /// Provider machines from the last listing cycle, sorted by key.
     pub fn provider_machines(&self) -> &[MachineRow] {
         &self.provider_rows
     }
 
-    /// The tracked ad-hoc SSH destinations — their own sidebar rows, since no
-    /// provider lists them, and the set the worker probes alongside provider
-    /// machines. `local` has no SSH to probe and provider machines are probed
-    /// off the worker's own listing, so neither belongs here.
     pub fn ad_hoc_machines(&self) -> Vec<String> {
         self.tracked
             .iter()
@@ -665,12 +433,6 @@ impl Fleet {
             .collect()
     }
 
-    /// Machines a workspace can be added on (or a session spawned on).
-    ///
-    /// "Connectable" is [`Fleet::host_for`] and nothing else. It used to be
-    /// spelled twice — once as "resolves to a host" and once as a re-derived
-    /// provider-target filter here — and the two disagreed about ad-hoc
-    /// destinations.
     pub fn machine_candidates(&self) -> Vec<MachineCandidate> {
         std::iter::once(LOCAL_MACHINE.to_string())
             .chain(self.provider_rows.iter().map(|row| row.key.clone()))
@@ -683,9 +445,6 @@ impl Fleet {
             .collect()
     }
 
-    /// How many machines have a bridge at all — the denominator a frontend
-    /// counts connections against. Probe-only machines do not count: nobody
-    /// asked them to connect.
     pub fn linked_machine_count(&self) -> usize {
         self.machines
             .values()
@@ -709,13 +468,9 @@ impl Fleet {
     }
 }
 
-/// What [`Fleet::ensure_connection`] should do about a machine, decided before
-/// a thread is spawned — which is what makes the connect policy testable.
 #[derive(Debug)]
 enum ConnectDecision {
-    /// A live bridge already exists; commands queue on it.
     Reuse,
-    /// No usable bridge: start one against this host.
     Spawn(Host),
 }
 
@@ -723,12 +478,7 @@ enum ConnectDecision {
 mod tests {
     use super::*;
 
-    /// A fleet with no workers: `start` would spawn a machines thread, and
-    /// none of the policy under test needs one. Everything below drives the
-    /// table through the same methods the event pump does.
     fn fleet() -> Fleet {
-        // Nothing here spawns a bridge, so the sender is never used and the
-        // dropped receiver costs nothing.
         let (bridge_events, _events) = unbounded_channel();
 
         Fleet {
@@ -742,8 +492,6 @@ mod tests {
         }
     }
 
-    /// One listing cycle as the worker reports it: every provider that
-    /// contributed a row has, by construction, listed successfully.
     fn list(fleet: &mut Fleet, rows: &[MachineRow]) {
         let mut providers: Vec<String> = rows.iter().map(|row| row.provider.clone()).collect();
 
@@ -764,9 +512,6 @@ mod tests {
         }
     }
 
-    /// A linked row, bridge and all. The handle is a bare sender whose
-    /// receiver is dropped — a bridge whose thread has ended looks exactly
-    /// like this, and the type no longer allows a link without one.
     fn with_link(fleet: &mut Fleet, machine: &str, link: Link) {
         fleet.machines.insert(
             machine.to_string(),
@@ -778,8 +523,6 @@ mod tests {
             },
         );
     }
-
-    // --- probe verdict vs daemon link -------------------------------------
 
     #[test]
     fn a_probe_verdict_is_the_state_when_nothing_is_linked() {
@@ -799,8 +542,6 @@ mod tests {
 
     #[test]
     fn a_probe_never_overwrites_a_daemon_link() {
-        // The invariant that used to live only in the renderer reading two
-        // maps: an actual connection outranks `ssh <machine> true`.
         let mut fleet = fleet();
 
         for linked in [
@@ -834,8 +575,6 @@ mod tests {
 
     #[test]
     fn a_connect_failure_keeps_its_reason() {
-        // The detail is the user's only diagnosis; losing it to a tidier enum
-        // was the trade this type exists to refuse.
         let mut fleet = fleet();
 
         with_link(&mut fleet, "vm", Link::Connecting);
@@ -855,9 +594,6 @@ mod tests {
 
     #[test]
     fn observing_an_event_is_what_applies_it() {
-        // The public path a frontend actually walks: there is no way to take
-        // the event without the table taking it first, which is the point —
-        // the machine table used to be correct only by convention.
         let mut fleet = fleet();
 
         with_link(&mut fleet, "vm", Link::Connecting);
@@ -891,8 +627,6 @@ mod tests {
         );
     }
 
-    // --- the connect policy ------------------------------------------------
-
     #[test]
     fn a_live_bridge_is_reused() {
         let mut fleet = fleet();
@@ -914,8 +648,6 @@ mod tests {
 
     #[test]
     fn a_failed_or_lost_bridge_is_respawned() {
-        // Retouching a machine is the retry — the whole reason the failed
-        // state stays in the table rather than being cleared.
         let mut fleet = fleet();
 
         for dead in [
@@ -935,7 +667,6 @@ mod tests {
 
     #[test]
     fn an_unreachable_probe_does_not_veto_connecting() {
-        // The probe may simply be older than the machine finishing its boot.
         let mut fleet = fleet();
 
         fleet.handle_probed("exedev@vm", false);
@@ -982,7 +713,6 @@ mod tests {
 
     #[test]
     fn a_listed_provider_machine_without_a_target_stays_unconnectable() {
-        // The argv ssh escape hatch: such machines list, but stay unreachable.
         let mut fleet = fleet();
 
         list(&mut fleet, &[provider_row("exe-dev/legacy", None)]);
@@ -997,8 +727,6 @@ mod tests {
             Ok(ConnectDecision::Spawn(Host::Local))
         ));
     }
-
-    // --- what tracking a machine implies -----------------------------------
 
     #[test]
     fn only_ad_hoc_machines_join_the_probe_set() {
@@ -1040,8 +768,6 @@ mod tests {
 
     #[test]
     fn auto_connect_does_not_retry_a_machine_that_already_has_a_bridge() {
-        // Including a failed one: retouching it is the retry, and a listing
-        // cycle every five minutes is not a retouch.
         let mut fleet = fleet();
 
         fleet.tracked = vec![LOCAL_MACHINE.to_string()];
@@ -1058,8 +784,6 @@ mod tests {
 
     #[test]
     fn a_probed_machine_is_still_auto_connectable() {
-        // Probe-only entries live in the same table as linked ones now, so
-        // "already in the table" must not be mistaken for "already connected".
         let mut fleet = fleet();
 
         fleet.tracked = vec!["exedev@vm".to_string()];
@@ -1090,9 +814,6 @@ mod tests {
 
     #[test]
     fn a_machine_nobody_tracks_or_lists_any_more_is_forgotten() {
-        // It used to stay `Connected` forever and keep being counted. The row
-        // owns the bridge handle, so forgetting it is also what stops the
-        // bridge thread of a machine deleted upstream.
         let mut fleet = fleet();
 
         with_link(&mut fleet, "exedev@vm", Link::Connecting);
@@ -1115,8 +836,6 @@ mod tests {
         assert_eq!(fleet.linked_machine_count(), 0);
         assert!(matches!(fleet.state("exedev@vm"), MachineState::Unknown));
     }
-
-    // --- what the frontend reads ------------------------------------------
 
     #[test]
     fn candidates_are_local_plus_resolvable_machines() {
@@ -1151,8 +870,6 @@ mod tests {
         );
     }
 
-    // --- a machine that was deleted upstream -------------------------------
-
     #[test]
     fn a_machine_its_provider_stopped_listing_is_missing() {
         let mut fleet = fleet();
@@ -1171,8 +888,6 @@ mod tests {
 
     #[test]
     fn a_machine_whose_provider_never_listed_is_only_unknown() {
-        // The misdiagnosis this rule exists to prevent: one provider failing
-        // its very first `list` must not report its whole fleet as deleted.
         let fleet = fleet();
 
         assert!(matches!(
@@ -1185,7 +900,6 @@ mod tests {
     fn only_provider_machines_can_go_missing() {
         let mut fleet = fleet();
 
-        // A listing that mentions neither of them, since nothing lists either.
         list(
             &mut fleet,
             &[provider_row("exe-dev/kept", Some("exedev@kept"))],
@@ -1234,8 +948,6 @@ mod tests {
     fn missing_tracked_machines_are_the_tracked_ones_only() {
         let mut fleet = fleet();
 
-        // Neither is listed, but only one is something a workspace points at,
-        // and an untracked ghost is not worth a sidebar row.
         list(
             &mut fleet,
             &[provider_row("exe-dev/kept", Some("exedev@kept"))],

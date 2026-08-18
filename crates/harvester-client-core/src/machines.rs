@@ -1,23 +1,3 @@
-//! The machines worker: one background thread (same tokio-on-a-thread shape
-//! as `bridge.rs`) that owns everything that execs on a machine *without* a
-//! daemon — the one-shot provider executables, the SSH probes and the folder
-//! picker's path work are all tokio-process work, which gpui's executor
-//! cannot run.
-//!
-//! It enumerates `~/.harvester/providers/` (docs/PROVIDERS.md), lists each
-//! provider's machines on a slow cycle, and drives the sidebar dots with
-//! Harvester's own `ssh <machine> true` probe on a faster cycle — never with
-//! provider-reported status (docs/SPEC.md §Machine).
-//!
-//! It also answers the host ops the repo picker needs (`$HOME`, `ls`,
-//! `git rev-parse --git-dir`) and the one the chat's branch indicator needs
-//! (`git rev-parse --abbrev-ref HEAD`). Those are plain [`Host`] execs — docs/SPEC.md §Workspace:
-//! "no daemon or provider involvement" — so they are keyed by `Host`, not by
-//! machine key, and correlate their replies with a [`RequestToken`] rather
-//! than by echoing the path back. Routing them through a machine's bridge is
-//! what used to make adding a workspace on a fresh machine wait out a full
-//! harvesterd bootstrap.
-
 use crate::host::Host;
 use crate::provider::{
     discover_providers, install_bundled_providers, MachineKey, Provider, ProviderMachine,
@@ -30,42 +10,27 @@ use crate::workspace::{
 };
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-/// Probe cadence for the sidebar dots. A warm multiplexed probe is one
-/// network round trip, so this is cheap.
 const PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
-/// Ceiling on the liveness probe: ssh's ConnectTimeout=10 bounds only the TCP
-/// connect, so auth and the exec itself need their own stop.
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-/// Provider `list` cadence — machine sets change rarely, and each cycle
-/// costs one control-plane exec per provider (exe-dev: an `ssh exe.dev ls`).
 const LIST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// UI → worker. Every command that is answered carries the token its answer
-/// echoes; `SetAdHocMachines` has no answer, so it carries none.
 #[derive(Debug)]
 pub enum Command {
-    /// The full set of ad-hoc machines (argv destination + legacy workspace
-    /// dests) the worker should probe alongside provider machines.
     SetAdHocMachines(Vec<String>),
-    /// The machine's `$HOME` — the folder picker's start directory. Answered
-    /// by [`Event::HomeResolved`].
-    ResolveHome { host: Host, token: RequestToken },
-    /// List a directory for the folder picker. Answered by
-    /// [`Event::DirListed`].
+    ResolveHome {
+        host: Host,
+        token: RequestToken,
+    },
     ListDir {
         host: Host,
         path: String,
         token: RequestToken,
     },
-    /// `git -C <path> rev-parse --git-dir` on the machine. Answered by
-    /// [`Event::WorkspaceValidated`].
     ValidateWorkspace {
         host: Host,
         path: String,
         token: RequestToken,
     },
-    /// `git -C <path> rev-parse --abbrev-ref HEAD` on the machine — the chat
-    /// prompt strip's branch indicator. Answered by [`Event::BranchResolved`].
     ResolveBranch {
         host: Host,
         path: String,
@@ -73,59 +38,43 @@ pub enum Command {
     },
 }
 
-/// worker → UI. The three host-op answers carry the token of the request
-/// that asked for them and nothing else identifying: a frontend applies the
-/// answer only while that token is the one it still has outstanding.
 #[derive(Debug)]
 pub enum Event {
-    /// One full provider-machine listing cycle finished; replaces the
-    /// previous provider-machine set wholesale.
     Listed {
         rows: Vec<MachineRow>,
-        /// Every provider whose `list` has succeeded at least once, this cycle
-        /// or an earlier one. A provider absent from here has never reported,
-        /// so its machines' absence from `rows` proves nothing — which is the
-        /// whole difference between "that machine was deleted" and "that
-        /// provider is broken".
         listed_providers: Vec<String>,
     },
-    /// A provider failed `info` or `list` this cycle; statusbar material.
-    ProviderFailed { provider: String, detail: String },
-    /// One machine's probe answered.
-    Probed { key: String, reachable: bool },
-    /// A `ResolveHome` answered.
+    ProviderFailed {
+        provider: String,
+        detail: String,
+    },
+    Probed {
+        key: String,
+        reachable: bool,
+    },
     HomeResolved {
         token: RequestToken,
         result: Result<String, String>,
     },
-    /// A `ListDir` answered; errors render inside the picker, not the
-    /// statusbar.
     DirListed {
         token: RequestToken,
         result: Result<Vec<RemoteDirEntry>, String>,
     },
-    /// A `ValidateWorkspace` answered; `None` means the path is a git repo.
     WorkspaceValidated {
         token: RequestToken,
         error: Option<String>,
     },
-    /// A `ResolveBranch` answered. A failure is the indicator's business
-    /// alone — it shows nothing and blocks nothing.
     BranchResolved {
         token: RequestToken,
         result: Result<String, String>,
     },
 }
 
-/// One provider machine as the sidebar needs it.
 #[derive(Debug, Clone)]
 pub struct MachineRow {
-    /// `<provider>/<id>` — how workspaces reference it and bridges key it.
     pub key: String,
     pub label: String,
     pub provider: String,
-    /// Resolved connection target; `None` for the argv ssh escape hatch
-    /// (unsupported yet) — such machines list, but stay unreachable.
     pub target: Option<SshTarget>,
 }
 
@@ -155,32 +104,22 @@ fn run_worker_thread(commands: UnboundedReceiver<Command>, events: UnboundedSend
 }
 
 async fn worker_main(mut commands: UnboundedReceiver<Command>, events: UnboundedSender<Event>) {
-    // First run drops the bundled exe-dev provider in place; a failure only
-    // costs the default provider, discovery still runs.
     if let Err(error) = install_bundled_providers() {
         eprintln!("harvester: install bundled providers: {error}");
     }
 
-    // This worker is the client's one startup point inside client-core, and
-    // it runs before any bridge binds a forward — the moment to reclaim the
-    // socket files a previously killed client could not clean up itself.
     crate::connection::sweep_leaked_forward_sockets().await;
 
     let mut ad_hoc_machines: Vec<String> = Vec::new();
     let mut provider_rows = ProviderRows::new();
     let mut provider_machines: Vec<MachineRow> = Vec::new();
-    // Listing runs off the loop and reports back here, so a slow provider
-    // never delays a probe tick or a command.
     let (listed_sender, mut listed_receiver) = unbounded_channel();
-    // Both intervals fire immediately on the first tick, so startup does one
-    // list cycle and one probe cycle without extra code.
     let mut list_tick = tokio::time::interval(LIST_INTERVAL);
     let mut probe_tick = tokio::time::interval(PROBE_INTERVAL);
 
     loop {
         tokio::select! {
             command = commands.recv() => match command {
-                // UI dropped the worker handle — window closed.
                 None => break,
                 Some(Command::SetAdHocMachines(machines)) => {
                     ad_hoc_machines = machines;
@@ -242,8 +181,6 @@ async fn worker_main(mut commands: UnboundedReceiver<Command>, events: Unbounded
                     break;
                 }
 
-                // Fresh rows get their dots right away instead of waiting
-                // out the probe interval.
                 probe_provider_machines(&provider_machines, &events);
             }
             _ = probe_tick.tick() => {
@@ -254,11 +191,6 @@ async fn worker_main(mut commands: UnboundedReceiver<Command>, events: Unbounded
     }
 }
 
-/// Every host op rides its own task and reports as it lands: a `$HOME` on a
-/// cold machine costs a full SSH handshake, and the loop must keep probing,
-/// listing and answering commands meanwhile. Concurrent ops are fine — they
-/// are one-shot execs that share nothing, and each answer carries the token
-/// that tells them apart.
 fn spawn_host_op(
     events: &UnboundedSender<Event>,
     op: impl std::future::Future<Output = Event> + Send + 'static,
@@ -266,14 +198,10 @@ fn spawn_host_op(
     let events = events.clone();
 
     tokio::spawn(async move {
-        // A dropped receiver just means the window closed.
         let _ = events.send(op.await);
     });
 }
 
-/// Run one listing cycle detached. A provider executable that hangs is bounded
-/// only by its own kill-timeout, which is far longer than a probe interval —
-/// so the cycle must not sit in the select loop.
 fn spawn_list_cycle(
     previous: ProviderRows,
     events: UnboundedSender<Event>,
@@ -286,21 +214,8 @@ fn spawn_list_cycle(
     });
 }
 
-/// Each provider's rows from its last *successful* listing. Keeping them per
-/// provider is what makes a failed cycle survivable: a single blip on one
-/// provider's control plane would otherwise unlist its machines for a full
-/// interval — and since workspaces resolve their machine key through this
-/// list, those workspaces become unopenable meanwhile.
-///
-/// The *key set* is load-bearing too, and is what [`Event::Listed`] reports as
-/// `listed_providers`: a provider is keyed here only once it has listed
-/// successfully, and drops out when discovery stops finding its executable at
-/// all. So "keyed here" is exactly "this provider's listing can be believed".
 type ProviderRows = std::collections::HashMap<String, Vec<MachineRow>>;
 
-/// One listing cycle: discover, then protocol-gate and `list` every provider
-/// concurrently. A provider that fails reports and keeps its previous rows;
-/// `None` means discovery itself failed, so the caller changes nothing at all.
 async fn list_provider_machines(
     previous: &ProviderRows,
     events: &UnboundedSender<Event>,
@@ -314,8 +229,6 @@ async fn list_provider_machines(
         }
     };
 
-    // Concurrent, so the cycle costs the slowest provider rather than the sum
-    // of all of them.
     let mut listings = tokio::task::JoinSet::new();
 
     for provider in providers {
@@ -364,27 +277,17 @@ fn machine_rows(provider: &Provider, machines: Vec<ProviderMachine>) -> Vec<Mach
             .to_string(),
             label: machine.label,
             provider: provider.name.clone(),
-            // No target for the argv ssh form (unsupported yet): such machines
-            // list, but stay unreachable.
             target: machine.ssh.target().ok(),
         })
         .collect()
 }
 
 async fn list_one_provider(provider: &Provider) -> crate::Result<Vec<ProviderMachine>> {
-    // `info` gates the protocol version before the first `list` and on every
-    // cycle after — cheap next to the `list` itself, and providers can be
-    // swapped out on disk between cycles.
     provider.check_protocol().await?;
 
     provider.list_machines().await
 }
 
-/// Every probe rides its own task and streams its result as it lands: one
-/// dead machine burning its ConnectTimeout no longer stalls every later
-/// machine's dot, and the worker loop keeps answering commands meanwhile.
-/// Overlap between cycles is bounded (probe timeout < probe interval) and a
-/// duplicate probe is idempotent — the dot just updates twice.
 fn probe_machine(key: String, target: SshTarget, events: &UnboundedSender<Event>) {
     let events = events.clone();
 
@@ -396,15 +299,6 @@ fn probe_machine(key: String, target: SshTarget, events: &UnboundedSender<Event>
     });
 }
 
-/// Harvester's own machine-liveness probe (docs/SPEC.md §Machine): a plain
-/// `ssh <machine> true`, reachable iff it round-trips with exit 0. Rides the
-/// multiplexed master when one is up, so a warm probe is one round trip.
-/// Errors collapse to unreachable — that is the answer the dot renders.
-///
-/// Here rather than in the transport module because a probe is a *machine*
-/// question answered with an exec: `ssh` owns addressing, `host` owns execs,
-/// and having `ssh` reach back through `host` to `ssh` was a cycle with exactly
-/// one caller, which is this file.
 async fn probe_reachable(target: &SshTarget) -> bool {
     match Host::Ssh(target.clone())
         .exec("true", None, PROBE_TIMEOUT)
@@ -417,7 +311,6 @@ async fn probe_reachable(target: &SshTarget) -> bool {
 
 fn probe_provider_machines(machines: &[MachineRow], events: &UnboundedSender<Event>) {
     for machine in machines {
-        // No target (argv ssh form) → no probe; the dot stays unknown.
         let Some(target) = &machine.target else {
             continue;
         };

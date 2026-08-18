@@ -1,15 +1,3 @@
-//! Forget-machine orchestration: confirm, then let one file write cascade.
-//!
-//! Only a machine its provider no longer lists reaches this flow (the sidebar
-//! puts the trash on no other row), so there is nothing to disconnect and
-//! nothing on the machine to delete — the removal is entirely about what
-//! Harvester still claims to know (docs/SPEC.md §Flows "Forget machine").
-//!
-//! The flow owns one generation-tagged confirmation and one Root lease, the
-//! same shape [`AddRepoFlow`](super::repo_flow::AddRepoFlow) uses: ending a run
-//! releases the lease, so a delayed dialog callback cannot forget a second
-//! machine or free another flow's modal.
-
 use gpui::{px, Context, Entity, EventEmitter, ParentElement as _, Window};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::dialog::{DialogAction, DialogClose, DialogFooter};
@@ -18,27 +6,19 @@ use gpui_component::WindowExt as _;
 use crate::modal::{ModalCoordinator, ModalLease, ModalOwner};
 use crate::store::FleetStore;
 
-/// Same width as the Pi dialogs, for the same reason: a machine label and a
-/// sentence about it are not worth a second modal geometry.
 const CONFIRM_WIDTH: f32 = 520.;
-/// The reassurance every removal count carries. A missing machine is
-/// unreachable by definition, so this is a statement of fact, not a promise.
 const NOTHING_IS_DELETED: &str = "Nothing on the machine itself is deleted.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ConfirmationId(u64);
 
-/// A machine the user confirmed forgetting, on its way to the shell that has to
-/// close whatever is still pointed at it.
 pub(super) struct MachineForgotten {
     pub machine: String,
 }
 
-/// Window-free lifecycle guard for late dialog callbacks.
 #[derive(Debug, Default)]
 struct ForgetMachineState {
     next_confirmation: u64,
-    /// The confirmation on screen: its generation and the machine it names.
     confirming: Option<(ConfirmationId, String)>,
 }
 
@@ -61,7 +41,6 @@ impl ForgetMachineState {
         confirmation
     }
 
-    /// The machine a still-current confirmation names, if it is still current.
     fn machine_of(&self, confirmation: ConfirmationId) -> Option<&str> {
         match &self.confirming {
             Some((active, machine)) if *active == confirmation => Some(machine),
@@ -99,8 +78,6 @@ impl ForgetMachineFlow {
         }
     }
 
-    /// Ask about `machine`. A second ask while a confirmation is open is
-    /// ignored: Root holds one dialog and the lease is spent on this one.
     pub(super) fn open(&mut self, machine: String, window: &mut Window, cx: &mut Context<Self>) {
         if !self.state.is_idle() {
             return;
@@ -163,12 +140,6 @@ impl ForgetMachineFlow {
         });
     }
 
-    /// Confirmed. The store owns the cascade — one `workspaces.json` write, and
-    /// tracking, the ghost row and the machine's sessions fall out of it — so
-    /// all this flow does is end its run and say whose chat is now homeless.
-    ///
-    /// A failed write reports itself and forgets nothing, but the dialog still
-    /// closes: leaving it up would only offer the same failing button again.
     fn forget(&mut self, confirmation: ConfirmationId, cx: &mut Context<Self>) -> bool {
         let Some(machine) = self.state.machine_of(confirmation).map(str::to_string) else {
             return false;
@@ -188,7 +159,6 @@ impl ForgetMachineFlow {
         true
     }
 
-    /// Every other exit: Escape, the overlay, or Cancel.
     fn cancel(&mut self, confirmation: ConfirmationId, cx: &mut Context<Self>) -> bool {
         self.end(confirmation, cx)
     }
@@ -207,9 +177,6 @@ impl ForgetMachineFlow {
     }
 }
 
-/// What the confirmation promises to remove. The count is sidebar rows, which
-/// is all a missing machine's sessions can still be: their transcripts live on
-/// a disk this client will never reach again.
 fn removal_message(sessions: usize) -> String {
     let lead = match sessions {
         0 => "Harvester forgets the machine and the repositories stored for it.".to_string(),

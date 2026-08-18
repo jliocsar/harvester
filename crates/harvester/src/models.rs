@@ -1,21 +1,12 @@
-//! Model-domain types shared by the unstarted chat's picker (pre-session)
-//! and the live chat's (mid-session `set_model`): only what the UI renders
-//! and what a launch line or `set_model` call needs, extracted from pi's
-//! verbatim Model objects — the payloads themselves are never normalized.
-
 use serde_json::Value;
 
-/// One entry the model picker can offer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelChoice {
-    /// Display string (pi's `name`, falling back to `id`).
     pub name: String,
     pub provider: String,
     pub id: String,
 }
 
-/// One pi Model object → a picker entry. Objects without an id or provider
-/// are dropped — they could never go on a launch line or a `set_model` call.
 pub fn model_choice_from_value(model: &Value) -> Option<ModelChoice> {
     let id = model.get("id").and_then(Value::as_str)?;
     let provider = model.get("provider").and_then(Value::as_str)?;
@@ -28,7 +19,6 @@ pub fn model_choice_from_value(model: &Value) -> Option<ModelChoice> {
     })
 }
 
-/// The picker's entries from pi's verbatim `get_available_models` data.
 pub fn extract_model_choices(data: &Value) -> Vec<ModelChoice> {
     let Some(models) = data.get("models").and_then(Value::as_array) else {
         return Vec::new();

@@ -1,22 +1,7 @@
-//! The client-side obligation created by a forwarded Pi dialog.
-//!
-//! A daemon forwards a blocking dialog while a client is attached and Pi stays
-//! suspended until that dialog is answered. This module owns the small state
-//! machine around that fact: one active room per machine, which questions are
-//! owed, duplicate replay, global FIFO order, and scoped retirement when a
-//! room or session goes away. It is deliberately window-free; a GPUI modal is
-//! only an adapter for the front obligation.
-//!
-//! Empty-room cancellation remains daemon policy. Leaving a room here only
-//! retires the client's view of questions that the daemon has already
-//! cancelled (or is about to cancel); it never manufactures a cancellation
-//! answer.
-
 use std::collections::{HashMap, VecDeque};
 
 use crate::{DialogAnswer, DialogRequest};
 
-/// The machine/session pair whose attached client is receiving dialogs.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DialogRoom {
     pub machine: String,
@@ -29,7 +14,6 @@ impl DialogRoom {
     }
 }
 
-/// A blocking Pi dialog, plus the route its typed answer must take.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DialogObligation {
     pub machine: String,
@@ -58,43 +42,32 @@ impl DialogObligation {
     }
 }
 
-/// Stable identity for duplicate replay and for the GPUI adapter's input map.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DialogKey {
     pub room: DialogRoom,
     pub dialog_id: String,
 }
 
-/// Why an enqueue did not create another modal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnqueueResult {
-    /// The obligation is now the front one and should be shown.
     Visible,
-    /// The obligation is owed, but an older one is already visible.
     Queued,
-    /// The daemon replayed an obligation already present in this room.
     Duplicate,
-    /// The event came from no active room or from a room left behind.
     Ignored,
 }
 
-/// Questions removed without an answer because Pi is no longer waiting on
-/// them. The adapter uses this to discard view-only input state and to close
-/// the modal only when its front obligation was retired.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Retirement {
     pub retired: Vec<DialogObligation>,
     pub front_removed: bool,
 }
 
-/// The one answer that was accepted for the front obligation.
 #[derive(Debug, PartialEq, Eq)]
 pub struct AnsweredDialog {
     pub obligation: DialogObligation,
     pub answer: DialogAnswer,
 }
 
-/// Window-free state for the dialog obligation policy.
 #[derive(Debug, Default)]
 pub struct DialogObligations {
     rooms_by_machine: HashMap<String, DialogRoom>,
@@ -102,9 +75,6 @@ pub struct DialogObligations {
 }
 
 impl DialogObligations {
-    /// Enter one machine's attachment room. A new sid retires only that
-    /// machine's previous questions; rooms on other machines remain attached
-    /// and keep their place in the global presentation queue.
     pub fn enter_room(&mut self, room: DialogRoom) -> Retirement {
         if self.rooms_by_machine.get(&room.machine) == Some(&room) {
             return Retirement::default();
@@ -115,9 +85,6 @@ impl DialogObligations {
         self.retire(|obligation| obligation.machine != room.machine || obligation.room() == room)
     }
 
-    /// A bridge disconnect empties only that machine's room. Cancellation is
-    /// still daemon policy, so this removes client obligations without
-    /// manufacturing answers.
     pub fn leave_machine(&mut self, machine: &str) -> Retirement {
         if self.rooms_by_machine.remove(machine).is_none() {
             return Retirement::default();
@@ -126,9 +93,6 @@ impl DialogObligations {
         self.retire(|obligation| obligation.machine != machine)
     }
 
-    /// Leaving an attachment or Pi's authoritative session exit retires only
-    /// the matching room. Session ids are routed with a machine rather than
-    /// assumed globally unique, just like every other bridge event.
     pub fn retire_room(&mut self, machine: &str, sid: &str) -> Retirement {
         let room = DialogRoom::new(machine.to_string(), sid.to_string());
 
@@ -139,9 +103,6 @@ impl DialogObligations {
         self.retire(|obligation| obligation.room() != room)
     }
 
-    /// Add a forwarded request if it belongs to that machine's currently
-    /// attached room. Pi replays pending requests on attach, so identity is
-    /// room + dialog id, not the payload's complete value.
     pub fn enqueue(&mut self, obligation: DialogObligation) -> EnqueueResult {
         if self.rooms_by_machine.get(&obligation.machine) != Some(&obligation.room()) {
             return EnqueueResult::Ignored;
@@ -181,8 +142,6 @@ impl DialogObligations {
         self.pending.is_empty()
     }
 
-    /// Accept exactly one answer for this key. A duplicate callback after the
-    /// modal advances cannot consume the next front obligation.
     pub fn answer_front(
         &mut self,
         key: &DialogKey,
@@ -220,8 +179,6 @@ impl DialogObligations {
     }
 }
 
-/// The answer for Escape, an overlay dismissal, or a Cancel button. Pi's
-/// confirm has no distinct cancellation shape: false is its refusal.
 impl DialogAnswer {
     pub fn dismissal_for(request: &DialogRequest) -> Self {
         match &request.kind {

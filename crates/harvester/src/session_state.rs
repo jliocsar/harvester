@@ -1,34 +1,13 @@
-//! Window-free state machine for one Pi chat.
-//!
-//! `Chat` is a GPUI adapter around this module.  The session lifecycle, model
-//! requests and their correlation, exit state, and transcript mutations live
-//! here so they can be tested without a window and cannot accidentally grow a
-//! second (rendering) source of truth.
-//!
-//! Pi values enter and leave this module as `serde_json::Value`.  The state
-//! machine only extracts the small pieces needed for controls; Pi events and
-//! history are handed to [`Transcript`] unchanged.
-
 use serde_json::Value;
 
 use crate::models::{self, ModelChoice};
 use harvester_client_core::transcript::Transcript;
 use harvester_client_core::{Pending, RequestToken, RequestTokens};
 
-/// Cap on the session name derived from the first prompt's first line.
 const SESSION_NAME_MAX_CHARS: usize = 48;
 
-/// Pi's turn-completion event (docs/SPEC.md §Rendering pi) — not `agent_end`,
-/// after which retries and queued follow-ups may still run.
 const PI_AGENT_SETTLED: &str = "agent_settled";
 
-/// One machine and repository a chat can target.
-///
-/// Either half may be unpicked while a chat is unstarted: a client whose fleet
-/// or repo list is empty still opens a New session, it just cannot send from it
-/// yet ([`ChatTarget::is_resolved`]). A started chat is resolved by
-/// construction — the daemon launches `cd <cwd> && pi`, so neither half can
-/// move afterwards.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChatTarget {
     pub machine: String,
@@ -36,25 +15,19 @@ pub struct ChatTarget {
 }
 
 impl ChatTarget {
-    /// Nothing picked: the empty-fleet New session, before any default lands.
     pub fn unresolved() -> Self {
         Self::default()
     }
 
-    /// Whether this chat has both halves it needs to start a session. The send
-    /// button and every request that names a cwd are gated on it.
     pub fn is_resolved(&self) -> bool {
         !self.machine.is_empty() && !self.workspace_path.is_empty()
     }
 }
 
-/// Whether a Pi event ends a turn — when the branch indicator refetches,
-/// because a turn is exactly when pi may have moved the checkout.
 pub fn is_turn_settled(event: &Value) -> bool {
     event.get("type").and_then(Value::as_str) == Some(PI_AGENT_SETTLED)
 }
 
-/// The one-way lifecycle of a chat.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionPhase {
     Unstarted,
@@ -78,9 +51,6 @@ impl SessionPhase {
     }
 }
 
-/// Model-list loading has an explicit not-requested state.  It is distinct
-/// from a loaded empty list and from a failed request, which avoids using an
-/// `Option` as both a spinner and data.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum ModelsState {
     #[default]
@@ -90,23 +60,15 @@ pub enum ModelsState {
     Failed(String),
 }
 
-/// What the model label means in each lifecycle state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelSelection {
-    /// An unstarted session will let Pi choose on its launch line.
     LaunchDefault,
-    /// An unstarted session has a launch-line model selected.
     Launch(ModelChoice),
-    /// A live session is waiting for Pi's authoritative current model.
     LivePending,
-    /// Pi confirmed the model currently in effect.
     Live(ModelChoice),
-    /// Pi answered the current-model request with an error.
     LiveUnavailable,
 }
 
-/// Intents emitted by the state machine.  Routing to a machine bridge remains
-/// the GPUI/workbench concern; this type contains no sender or window.
 pub enum ChatIntent {
     ListModels {
         cwd: String,
@@ -138,21 +100,17 @@ pub enum ChatIntent {
 }
 
 impl ChatIntent {
-    /// Pre-session intents may queue while the bridge is bootstrapping.
     pub fn is_pre_session(&self) -> bool {
         matches!(self, Self::ListModels { .. } | Self::Start { .. })
     }
 }
 
-/// The state and intent surface for one chat.
 pub struct SessionState {
     phase: SessionPhase,
     target: ChatTarget,
     transcript: Transcript,
     models: ModelsState,
     selection: ModelSelection,
-    /// The branch the target repo is on, as the last exec reported it. Purely
-    /// an indicator: a failure clears it and blocks nothing.
     branch: Option<String>,
     exited: Option<String>,
     tokens: RequestTokens,
@@ -209,10 +167,6 @@ impl SessionState {
         &self.target
     }
 
-    /// Change machine only before a session exists — the daemon's launch line
-    /// fixes a running pi's cwd and host for its whole lifetime. The old model
-    /// fetch is cancelled by the caller before this reset, so its answer cannot
-    /// fill the new machine's picker.
     pub fn retarget(&mut self, machine: String) -> bool {
         if !matches!(self.phase, SessionPhase::Unstarted) || self.target.machine == machine {
             return false;
@@ -226,8 +180,6 @@ impl SessionState {
         true
     }
 
-    /// Change repository, under the same rule as [`Self::retarget`]: the model
-    /// list is asked for in a cwd, so a new repo invalidates the old answer.
     pub fn pick_repo(&mut self, path: String) -> bool {
         if !matches!(self.phase, SessionPhase::Unstarted) || self.target.workspace_path == path {
             return false;
@@ -241,14 +193,10 @@ impl SessionState {
         true
     }
 
-    /// What the branch indicator reads, or `None` when no exec has answered
-    /// for the current repo.
     pub fn branch(&self) -> Option<&str> {
         self.branch.as_deref()
     }
 
-    /// Mint the token for a branch exec, or `None` when there is no repo to
-    /// ask about. Re-asking supersedes any answer still in flight.
     pub fn request_branch(&mut self) -> Option<RequestToken> {
         if !self.target.is_resolved() {
             return None;
@@ -257,13 +205,10 @@ impl SessionState {
         Some(self.branch_request.ask(&self.tokens, ()))
     }
 
-    /// The exec could not be started, so no answer is coming.
     pub fn cancel_branch(&mut self) {
         self.branch_request.cancel();
     }
 
-    /// A branch exec answered. A failure clears the indicator rather than
-    /// reporting: the branch is never worth a sentence the user must dismiss.
     pub fn accept_branch(&mut self, token: RequestToken, result: Result<String, String>) -> bool {
         if self.branch_request.accept(token).is_none() {
             return false;
@@ -274,7 +219,6 @@ impl SessionState {
         true
     }
 
-    /// The repo the indicator described is no longer the target's.
     fn forget_branch(&mut self) {
         self.branch_request.cancel();
         self.branch = None;
@@ -307,9 +251,6 @@ impl SessionState {
         matches!(self.phase, SessionPhase::Live { .. }) && self.exited.is_none()
     }
 
-    /// The unstarted chat's model list runs a throwaway pi *in a cwd*, so a
-    /// chat with no repo picked yet has nothing to ask and stays
-    /// `NotRequested` rather than spinning on a request it never made.
     pub fn request_model_list(&mut self) -> Option<ChatIntent> {
         if !self.target.is_resolved() {
             return None;
@@ -326,7 +267,6 @@ impl SessionState {
         self.model_request.ask(&self.tokens, ())
     }
 
-    /// Request both controls needed by a live prompt box.
     pub fn request_model_controls(&mut self) -> Vec<ChatIntent> {
         let SessionPhase::Live { sid } = &self.phase else {
             return Vec::new();
@@ -340,7 +280,6 @@ impl SessionState {
         vec![ChatIntent::ModelControls { sid, models, state }]
     }
 
-    /// Apply a model-list answer. A superseded or cancelled token is stale.
     pub fn accept_models(&mut self, token: RequestToken, result: Result<Value, String>) -> bool {
         if self.model_request.accept(token).is_none() {
             return false;
@@ -354,8 +293,6 @@ impl SessionState {
         true
     }
 
-    /// The bridge failed before an answer could arrive.  Cancellation is part
-    /// of the state transition: a late answer must not revive this control.
     pub fn fail_pending(&mut self, detail: String) -> bool {
         let mut changed = false;
 
@@ -379,8 +316,6 @@ impl SessionState {
         changed
     }
 
-    /// Explicitly cancel the model fetch, useful when a chat is retargeted or
-    /// discarded.  Its old answer is stale even if the bridge later delivers it.
     pub fn cancel_model_fetch(&mut self, detail: String) -> bool {
         if !matches!(self.models, ModelsState::Loading) {
             return false;
@@ -392,8 +327,6 @@ impl SessionState {
         true
     }
 
-    /// A start command failed.  Other request failures must not rewind a live
-    /// chat or a different start.
     pub fn fail_start(&mut self) -> bool {
         if !matches!(self.phase, SessionPhase::Starting { .. }) {
             return false;
@@ -406,7 +339,6 @@ impl SessionState {
         true
     }
 
-    /// Promote the same entity after the daemon reports `Attached`.
     pub fn promote_to_live(&mut self, sid: String, entries: &[Value]) -> bool {
         if !matches!(&self.phase, SessionPhase::Starting { sid: expected, .. } if expected == &sid)
         {
@@ -464,8 +396,6 @@ impl SessionState {
         true
     }
 
-    /// Take a model choice from the picker.  Unstarted picks are local launch
-    /// settings; live picks are intents whose label changes only on Pi's answer.
     pub fn pick_model(&mut self, picked: Option<ModelChoice>) -> Option<ChatIntent> {
         match &self.phase {
             SessionPhase::Unstarted => {
@@ -490,8 +420,6 @@ impl SessionState {
         }
     }
 
-    /// A successful or failed `set_model` answer consumes its correlation
-    /// token.  Failures leave the previously confirmed model untouched.
     pub fn accept_model_set(
         &mut self,
         token: RequestToken,
@@ -531,8 +459,6 @@ impl SessionState {
         true
     }
 
-    /// Submit text through the phase machine.  Empty prompts, starting chats,
-    /// and exited sessions produce no intent.
     pub fn submit_prompt(&mut self, text: String) -> Option<ChatIntent> {
         if text.trim().is_empty() || self.exited.is_some() {
             return None;
@@ -551,9 +477,6 @@ impl SessionState {
         }
     }
 
-    /// The first prompt is what mints a session, so it is also the last moment
-    /// the target has to be complete: there is no launch line without a machine
-    /// to run on and a cwd to run in.
     fn start(&mut self, prompt: String) -> Option<ChatIntent> {
         if !self.target.is_resolved() {
             return None;
@@ -586,7 +509,6 @@ impl SessionState {
     }
 }
 
-/// Pi's `--name`, from the first non-blank line of the first prompt.
 pub fn session_name_from_prompt(prompt: &str) -> String {
     prompt
         .trim()

@@ -1,13 +1,3 @@
-//! Machine providers (docs/PROVIDERS.md): user-supplied one-shot executables
-//! in `~/.harvester/providers/` answering *what machines exist and how do I
-//! SSH into them*. Control plane only — session traffic never touches a
-//! provider. Each operation is one local exec: args (if any) as one JSON
-//! object on stdin, result as one JSON object on stdout, diagnostics on
-//! stderr (logged, never parsed).
-//!
-//! This slice implements the mandatory core (`info`, `list`); `create` and
-//! `delete` arrive with the machine-CRUD slice.
-
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -19,32 +9,18 @@ use crate::host;
 use crate::ssh::SshTarget;
 use crate::{Error, Result};
 
-/// The provider protocol version this Harvester speaks. Providers reporting
-/// anything else are rejected (docs/PROVIDERS.md §info).
 pub const SUPPORTED_PROVIDER_PROTOCOL: u64 = 1;
 
-/// Contract timeout for one provider invocation; the invocation is killed
-/// when it elapses. (`create` gets 120s by contract — constant arrives with
-/// the machine-CRUD slice.)
 const INVOKE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The default provider shipped with Harvester (docs/PROVIDERS.md §Reference
-/// implementation) — implemented in the same format as user providers, no
-/// privileged code paths.
 const BUNDLED_EXE_DEV: &str = include_str!("../../../providers/exe-dev");
 
-/// A discovered provider executable. The path is private so every invocation
-/// goes through the contract (`invoke`: timeout, exit-code rules, stderr
-/// logging).
 #[derive(Debug, Clone)]
 pub struct Provider {
-    /// The file name — the provider id, shown in the UI and the first half
-    /// of every machine key.
     pub name: String,
     path: PathBuf,
 }
 
-/// How Harvester keys a machine: `<provider>/<id>` (docs/SPEC.md §Machine).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MachineKey {
     pub provider: String,
@@ -52,9 +28,6 @@ pub struct MachineKey {
 }
 
 impl MachineKey {
-    /// Splits a stored `<provider>/<id>` string. `None` when there is no
-    /// separator — such strings are ad-hoc SSH destinations, not provider
-    /// machines (legacy workspaces.json entries, the argv destination).
     pub fn parse(stored: &str) -> Option<MachineKey> {
         let (provider, id) = stored.split_once('/')?;
 
@@ -71,9 +44,6 @@ impl std::fmt::Display for MachineKey {
     }
 }
 
-/// One machine from a provider's `list`. No status field: the dot is
-/// Harvester's own SSH probe, never the provider's word (docs/SPEC.md
-/// §Machine), so the reported status is validated and dropped.
 #[derive(Debug, Clone)]
 pub struct ProviderMachine {
     pub id: String,
@@ -81,9 +51,6 @@ pub struct ProviderMachine {
     pub ssh: SshInfo,
 }
 
-/// A machine's SSH connection info: plain host form, or the ProxyCommand-
-/// style argv escape hatch. Argv is parsed (a provider using it must still
-/// list cleanly) but not yet wired into a connection.
 #[derive(Debug, Clone)]
 pub enum SshInfo {
     Host {
@@ -91,15 +58,10 @@ pub enum SshInfo {
         user: Option<String>,
         port: Option<u16>,
     },
-    /// Nothing reads the argv yet, and the variant still has to exist:
-    /// PROVIDERS.md §list makes "such machines still list, with no target"
-    /// normative, and without a variant to decode into they would fail to
-    /// parse and vanish from the sidebar entirely.
     Argv(#[allow(dead_code)] Vec<String>),
 }
 
 impl SshInfo {
-    /// Derives the `SshTarget` all session/workspace traffic uses.
     pub fn target(&self) -> Result<SshTarget> {
         match self {
             SshInfo::Host { host, user, port } => {
@@ -130,10 +92,6 @@ fn providers_dir() -> Result<PathBuf> {
     }
 }
 
-/// Drops the bundled `exe-dev` provider into the providers dir when absent.
-/// Absence is the only trigger, so deleting the file revives it on the next
-/// launch — the supported way to disable a provider is clearing its
-/// executable bit (non-executable files are ignored by discovery).
 pub fn install_bundled_providers() -> Result<()> {
     let path = providers_dir()?.join("exe-dev");
 
@@ -147,7 +105,6 @@ pub fn install_bundled_providers() -> Result<()> {
 
     std::fs::write(&path, BUNDLED_EXE_DEV)?;
 
-    // Registered by the executable bit (docs/PROVIDERS.md §Discovery).
     let mut permissions = std::fs::metadata(&path)?.permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(&path, permissions)?;
@@ -155,9 +112,6 @@ pub fn install_bundled_providers() -> Result<()> {
     Ok(())
 }
 
-/// Enumerates `~/.harvester/providers`: executable regular files register,
-/// dotfiles and non-executables are ignored (docs/PROVIDERS.md §Discovery).
-/// A missing directory is an empty list, not an error (first run).
 pub fn discover_providers() -> Result<Vec<Provider>> {
     let dir = providers_dir()?;
 
@@ -170,10 +124,6 @@ pub fn discover_providers() -> Result<Vec<Provider>> {
     let mut providers = Vec::new();
 
     for entry in entries {
-        // One unreadable entry is not a reason to lose every provider: the
-        // caller (machines.rs) turns a discovery error into "change nothing
-        // at all", so a single dangling symlink would freeze the machine
-        // list forever. Skip and log, like the non-UTF-8 arm below.
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
@@ -194,9 +144,6 @@ pub fn discover_providers() -> Result<Vec<Provider>> {
             continue;
         }
 
-        // std::fs::metadata follows symlinks, so a symlink to an executable
-        // registers like the executable itself — and a *dangling* symlink is
-        // just an entry we cannot classify, not a discovery failure.
         let Ok(metadata) = std::fs::metadata(&path) else {
             eprintln!("harvester: skipping unreadable provider entry {path:?}");
 
@@ -219,33 +166,18 @@ pub fn discover_providers() -> Result<Vec<Provider>> {
 }
 
 impl Provider {
-    /// `info`: the protocol gate. Nothing consumes the reported identity —
-    /// the UI labels machines by the provider's file name (PROVIDERS.md
-    /// §Discovery) — so this checks the contract and returns nothing. A typed
-    /// result belongs to the slice that first needs `capabilities` /
-    /// `create_fields`, which is also the slice that defines its shape.
     pub async fn check_protocol(&self) -> Result<()> {
         let result = self.invoke("info", None).await?;
 
         check_info(&self.name, result)
     }
 
-    /// `list`: enumerate machines. Entries missing required fields are
-    /// skipped with a stderr note rather than failing the whole list.
     pub async fn list_machines(&self) -> Result<Vec<ProviderMachine>> {
         let result = self.invoke("list", None).await?;
 
         parse_machine_list(&self.name, result)
     }
 
-    /// One exec per operation, per contract: exit 0 = success and stdout
-    /// parses as the result object; non-zero = failure with an optional
-    /// `{"error"}` object surfaced verbatim. Killed at [`INVOKE_TIMEOUT`]
-    /// (`kill_on_drop` — the timeout drops the child future).
-    /// Spawning, piping and decoding are [`host::run`]'s job — the crate's one
-    /// exec helper — so this keeps only what is provider-specific: the
-    /// deadline and the contract's result classification. `stdin_data` is
-    /// carried through for the operations that take a JSON object on stdin.
     async fn invoke(&self, operation: &'static str, stdin_data: Option<&[u8]>) -> Result<Value> {
         let mut command = tokio::process::Command::new(&self.path);
         command.arg(operation);
@@ -261,7 +193,6 @@ impl Provider {
                 }
             };
 
-        // Diagnostics are logged, never parsed (docs/PROVIDERS.md §Transport).
         let stderr = output.stderr.trim();
 
         if !stderr.is_empty() {
@@ -297,55 +228,39 @@ fn provider_error(provider: &str, detail: String) -> Error {
     }
 }
 
-/// A provider's own failure object (docs/PROVIDERS.md), surfaced verbatim.
 #[derive(Deserialize)]
 struct ErrorResult {
     error: String,
 }
 
-/// The `info` result (docs/PROVIDERS.md §info). Unknown fields are ignored on
-/// purpose: an older Harvester must compose with a newer provider.
 #[derive(Deserialize)]
 struct InfoResult {
     protocol: u64,
-    /// Required by contract. Nothing consumes the reported identity — the UI
-    /// labels machines by the provider's file name — so deserializing it *is*
-    /// the validation.
     #[allow(dead_code)]
     name: String,
-    /// Required by contract (PROVIDERS.md §capabilities). The capability-driven
-    /// UI arrives with the machine-CRUD slice; until then, same story as `name`.
     #[allow(dead_code)]
     capabilities: Vec<String>,
 }
 
-/// The `list` result. Machines stay `Value` so one malformed entry can be
-/// skipped with its own serde diagnostic instead of failing the whole list.
 #[derive(Deserialize)]
 struct ListResult {
     machines: Vec<Value>,
 }
 
-/// One machine object (docs/PROVIDERS.md §list). `ssh` is one of two shapes,
-/// so it is decoded separately.
 #[derive(Deserialize)]
 struct MachineEntry {
     id: String,
     label: String,
-    /// Required by contract, advisory by design: the dot is Harvester's own
-    /// probe, so deserializing it *is* the whole of its use.
     #[allow(dead_code)]
     status: String,
     ssh: Value,
 }
 
-/// The ProxyCommand-style escape hatch.
 #[derive(Deserialize)]
 struct ArgvSshEntry {
     argv: Vec<String>,
 }
 
-/// The plain host form; `user`/`port` default to the current user and 22.
 #[derive(Deserialize)]
 struct HostSshEntry {
     host: String,
@@ -355,8 +270,6 @@ struct HostSshEntry {
     port: Option<u16>,
 }
 
-/// The protocol gate: the version must match, and the contract's other
-/// required `info` fields must be present (serde reports which one is not).
 fn check_info(provider: &str, result: Value) -> Result<()> {
     let info: InfoResult = serde_json::from_value(result)
         .map_err(|error| provider_error(provider, format!("info: {error}")))?;
@@ -375,8 +288,6 @@ fn check_info(provider: &str, result: Value) -> Result<()> {
     Ok(())
 }
 
-/// Decodes a `list` result. A malformed *entry* is skipped with serde's own
-/// diagnostic ("missing field `label`"); only a malformed *result* fails.
 fn parse_machine_list(provider: &str, result: Value) -> Result<Vec<ProviderMachine>> {
     let list: ListResult = serde_json::from_value(result)
         .map_err(|error| provider_error(provider, format!("list: {error}")))?;
@@ -405,10 +316,6 @@ fn parse_machine(entry: Value) -> serde_json::Result<ProviderMachine> {
     })
 }
 
-/// The two `ssh` shapes, tried in the contract's precedence order: `argv`
-/// first, the host form otherwise. Deliberately *not* an untagged enum —
-/// untagged reports "data did not match any variant", which throws away the
-/// diagnostic ("missing field `host`") that the caller logs.
 fn parse_ssh_info(ssh: Value) -> serde_json::Result<SshInfo> {
     if ssh.get("argv").is_some() {
         let argv: ArgvSshEntry = serde_json::from_value(ssh)?;
@@ -499,7 +406,6 @@ mod tests {
         assert_eq!(argv[0], "fly");
     }
 
-    /// The point of per-entry decoding: one bad machine costs one machine.
     #[test]
     fn a_machine_missing_a_required_field_skips_only_that_entry() {
         let entries = json!([
@@ -544,8 +450,6 @@ mod tests {
         assert!(error.to_string().contains("protocol 2"), "{error}");
     }
 
-    /// `capabilities` is required by PROVIDERS.md §info and nothing used to
-    /// check it.
     #[test]
     fn info_rejects_missing_required_fields() {
         let missing_capabilities = json!({"protocol": 1, "name": "exe.dev"});

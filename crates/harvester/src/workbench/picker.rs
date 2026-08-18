@@ -1,18 +1,3 @@
-//! The add-repository folder picker (docs/SPEC.md §Flows "Add repository"):
-//! the walk, the host ops that drive it, and its rendering.
-//!
-//! A child module of the composition shell, paired with `repo_flow`, so the
-//! add-repository path owns itself end to end. The picker is the
-//! one surface that talks to the machines worker rather than to a bridge:
-//! walking a machine's directories is plain SSH exec work (`$HOME`, `ls`,
-//! `git rev-parse`), so browsing a machine costs one round trip and never
-//! waits on a harvesterd bootstrap it would not use.
-//!
-//! Split in two on purpose. [`Walk`] is where it is, what it is waiting on,
-//! and what a click decides — no window, no entities, driven end to end in
-//! this file's tests. [`FolderPicker`] is the view: the walk plus the
-//! virtualized list its rows live in.
-
 use gpui::{
     div, prelude::*, px, App, Context, Entity, EventEmitter, IntoElement, Render, SharedString,
     Task, Window,
@@ -26,27 +11,15 @@ use harvester_client_core::{Pending, RemoteDirEntry, RequestToken, RequestTokens
 
 use crate::store::{FleetStore, StoreEvent};
 
-/// Fixed height for the entries list, so the dialog does not resize under the
-/// pointer when a listing arrives or a filter narrows it.
 const ENTRY_LIST_HEIGHT: f32 = 280.;
 
-/// The one host op a folder picker has in flight, and what its answer needs in
-/// order to be applied. One at a time: the rows and the Add button ignore
-/// clicks while a request is out, so the modal never has two answers to
-/// reconcile. The correlating token is [`Pending`]'s, not this enum's.
 #[derive(Clone)]
 enum PickerRequest {
-    /// The machine's `$HOME`, which starts the walk — one exec, no daemon.
     Home,
-    /// The directory the answer would move the picker to. The request's, never
-    /// the answer's: nothing is echoed back over the wire for it to trust.
     Listing { path: String },
-    /// The displayed directory, as it was when "Add" was clicked.
     Validation { path: String },
 }
 
-/// Owned machine-worker answer used only to defer continuation until the
-/// emitting FleetStore has finished its update.
 enum PickerAnswer {
     Home {
         token: RequestToken,
@@ -62,9 +35,6 @@ enum PickerAnswer {
     },
 }
 
-/// The one result the owning add-repository flow needs. Host operations and
-/// their answers stay inside the picker; a validated workspace crosses this
-/// seam once, as a stable machine/path value.
 pub(super) struct WorkspacePicked {
     pub machine: String,
     pub path: String,
@@ -72,8 +42,6 @@ pub(super) struct WorkspacePicked {
 
 impl EventEmitter<WorkspacePicked> for FolderPicker {}
 
-/// What the picker needs run on its machine. The picker decides *what* to ask
-/// for, resolves the current host through the store, and correlates the answer.
 #[derive(Clone)]
 struct PickerCommand {
     request: PickerRequest,
@@ -81,7 +49,6 @@ struct PickerCommand {
 }
 
 impl PickerCommand {
-    /// The worker's own vocabulary, once the picker has resolved the host.
     fn into_machines_command(self, host: harvester_client_core::Host) -> machines::Command {
         match self.request {
             PickerRequest::Home => machines::Command::ResolveHome {
@@ -102,30 +69,16 @@ impl PickerCommand {
     }
 }
 
-/// The walk itself: everything about where the picker is that does not need a
-/// window to decide. Its execs are plain host ops on the machines worker — the
-/// picker never touches that machine's daemon, so it never waits on one.
 struct Walk {
-    /// The machine being browsed — where listings and validation run.
     machine: String,
-    /// How that machine is named on screen. Snapshotted for this modal so a
-    /// provider-label refresh cannot move the location line under the user.
     machine_label: String,
-    /// Directory whose entries are displayed — what "Add" would store. Empty
-    /// until `$HOME` answers.
     path: String,
     pending: Pending<PickerRequest>,
-    /// Listing or validation failure, rendered inside the modal.
     error: Option<String>,
-    /// Minted here now that the walk drives itself from its own clicks.
     tokens: RequestTokens,
 }
 
 impl Walk {
-    /// A walk on `machine`, already asking for the `$HOME` it starts from. No
-    /// connection involved: it is plain host execs (SPEC §Workspace, "no daemon
-    /// or provider involvement"), so browsing a machine Harvester never
-    /// bootstrapped costs one round trip, not an install.
     fn opening(
         machine: String,
         machine_label: String,
@@ -144,22 +97,15 @@ impl Walk {
         (walk, command)
     }
 
-    /// Records what the walk is waiting on and hands back the command to send.
-    /// Every request goes through here, so "one at a time, matched by its
-    /// token" holds by construction.
     fn ask(&mut self, request: PickerRequest) -> PickerCommand {
         self.error = None;
 
-        // The context stays in `Pending` until its answer arrives, so the
-        // command sent to the worker carries its own copy.
         PickerCommand {
             token: self.pending.ask(&self.tokens, request.clone()),
             request,
         }
     }
 
-    /// The command never reached the worker, so no answer is coming. Without
-    /// this the modal would stay gated on a request that does not exist.
     fn request_failed(&mut self) {
         self.pending.cancel();
     }
@@ -168,16 +114,11 @@ impl Walk {
         self.pending.cancel();
     }
 
-    /// The reason a host op could not even be started, shown in the modal
-    /// rather than as a notification — the user is looking at the picker.
     fn fail(&mut self, detail: String) {
         self.pending.cancel();
         self.error = Some(detail);
     }
 
-    /// `$HOME` answered: the walk starts there, so the answer is immediately a
-    /// listing request. `None` means the answer was stale or the exec failed
-    /// (the reason is in the modal).
     fn accept_home(
         &mut self,
         token: RequestToken,
@@ -191,8 +132,6 @@ impl Walk {
 
                 Some(self.ask(PickerRequest::Listing { path: home }))
             }
-            // Nothing to browse without a start directory; the user cancels and
-            // retries (or picks another machine).
             Err(detail) => {
                 self.error = Some(detail);
 
@@ -201,9 +140,6 @@ impl Walk {
         }
     }
 
-    /// A listing answered. `Some` is the directory's entries, for the view to
-    /// display — handed back rather than stored, so the walk keeps no copy of
-    /// what is only ever rendered.
     fn accept_listing(
         &mut self,
         token: RequestToken,
@@ -220,8 +156,6 @@ impl Walk {
 
                 Some(entries)
             }
-            // Listing failed (permissions, vanished dir): keep showing the
-            // previous directory, surface the reason.
             Err(detail) => {
                 self.error = Some(detail);
 
@@ -230,8 +164,6 @@ impl Walk {
         }
     }
 
-    /// Validation answered. `Some` is the workspace to store — the walk is
-    /// spent at that point and its owning flow drops it.
     fn accept_validation(
         &mut self,
         token: RequestToken,
@@ -240,7 +172,6 @@ impl Walk {
         self.pending.accept(token)?;
 
         match error {
-            // Not a git repo: clear error in the modal, user re-picks.
             Some(detail) => {
                 self.error = Some(detail);
 
@@ -250,9 +181,6 @@ impl Walk {
         }
     }
 
-    /// Walk into a listed directory, by name — the walk holds no listing to
-    /// index into, and a name is what the row carries anyway. `None` while a
-    /// request is out, so the modal never has two answers to reconcile.
     fn open_dir(&mut self, name: &str) -> Option<PickerCommand> {
         if self.busy() {
             return None;
@@ -273,8 +201,6 @@ impl Walk {
         Some(self.ask(PickerRequest::Listing { path }))
     }
 
-    /// "Add": validate the displayed directory. The store write happens when
-    /// the answer lands.
     fn confirm(&mut self) -> Option<PickerCommand> {
         if !self.can_submit() {
             return None;
@@ -289,22 +215,14 @@ impl Walk {
         self.pending.is_waiting()
     }
 
-    /// Nothing to add before `$HOME` lands (or after it failed): the displayed
-    /// directory is what "Add" would store.
     fn can_submit(&self) -> bool {
         !self.busy() && !self.path.is_empty()
     }
 
-    /// Whether the walk has somewhere above it to go.
     fn has_parent(&self) -> bool {
         !self.path.is_empty() && self.path != "/"
     }
 
-    /// The modal's progress note, or `None` when nothing is in flight. Which
-    /// note is a question about the walk, not about the request: an empty path
-    /// means `$HOME` has not landed yet, and that is the only state the user
-    /// needs named. Everything else — a listing, and the `git rev-parse` behind
-    /// "Add", which used to show nothing at all — is "loading…".
     fn waiting_note(&self) -> Option<&'static str> {
         if !self.busy() {
             return None;
@@ -318,12 +236,9 @@ impl Walk {
     }
 }
 
-/// One row of the displayed listing.
 enum EntryRow {
-    /// The step back up; present unless the walk is at the root.
     Parent,
     Directory(SharedString),
-    /// Shown for orientation only — a walk descends into directories.
     File(SharedString),
 }
 
@@ -337,11 +252,8 @@ impl EntryRow {
     }
 }
 
-/// The rows on screen and which of them the filter leaves standing. Display
-/// state only — the walk keeps none of it.
 struct EntriesDelegate {
     rows: Vec<EntryRow>,
-    /// Indices into `rows`, in display order.
     matches: Vec<usize>,
 }
 
@@ -353,7 +265,6 @@ impl EntriesDelegate {
         }
     }
 
-    /// Directories before files, both in `ls`'s alphabetical order.
     fn show(&mut self, has_parent: bool, entries: Vec<RemoteDirEntry>) {
         let mut rows = Vec::with_capacity(entries.len() + 1);
 
@@ -433,11 +344,6 @@ impl ListDelegate for EntriesDelegate {
     }
 }
 
-/// The add-repository modal's view.
-///
-/// A view of its own, because `gpui-component` builds a dialog's body from the
-/// *root* view's render, where reading the workbench would be reading an entity
-/// that is mid-update — see [`crate::choices`] for the whole rule.
 pub(super) struct FolderPicker {
     store: Entity<FleetStore>,
     walk: Walk,
@@ -493,8 +399,6 @@ impl FolderPicker {
         cx.notify();
     }
 
-    /// A row was clicked or Entered. Files confirm to nothing — the list
-    /// reports every click, whatever the row's own disabled flag says.
     fn handle_list_event(
         &mut self,
         entries: &Entity<ListState<EntriesDelegate>>,
@@ -518,8 +422,6 @@ impl FolderPicker {
         self.dispatch(command, cx);
     }
 
-    /// Send what an action decided, and redraw either way — a click that
-    /// decided nothing (one was already out) still has a modal to repaint.
     fn dispatch(&mut self, command: Option<PickerCommand>, cx: &mut Context<Self>) {
         if let Some(command) = command {
             self.send_request(command, cx);
@@ -587,16 +489,12 @@ impl FolderPicker {
                 machines::Event::Listed { .. }
                 | machines::Event::Probed { .. }
                 | machines::Event::ProviderFailed { .. }
-                // The chat's branch indicator asked for this one.
                 | machines::Event::BranchResolved { .. },
             )
             | StoreEvent::Failed(_) => return,
         };
         let picker = cx.entity();
 
-        // A successful answer usually starts the next host command. Store
-        // events are emitted while FleetStore is leased, so continue the walk
-        // only after that source update has completed.
         window.defer(cx, move |_, cx| {
             picker.update(cx, |picker, cx| picker.handle_answer(answer, cx));
         });
@@ -662,9 +560,6 @@ impl FolderPicker {
         cx.emit(WorkspacePicked { machine, path });
     }
 
-    /// Where the picker sits on screen: `gpui-component`'s dialog, holding this
-    /// view as its body. Dismissal (Escape, a click outside, Cancel) is the
-    /// dialog's, which is why nothing here tracks whether it is open.
     pub(super) fn open_dialog<T: 'static>(
         picker: &Entity<Self>,
         dismissed: impl Fn(&mut T, &mut Window, &mut Context<T>) -> bool + 'static,
@@ -683,8 +578,6 @@ impl FolderPicker {
                 .title("Add repository")
                 .close_button(false)
                 .child(picker.clone())
-                // Enter belongs to the focused directory List. The dialog
-                // closes only after validation emits WorkspacePicked.
                 .on_ok(|_, _, _| false)
                 .on_cancel(move |_, window, cx| {
                     owner.update(cx, |owner, cx| dismissed(owner, window, cx))
@@ -692,8 +585,6 @@ impl FolderPicker {
         });
     }
 
-    /// The walk's context line: which machine, where in it, and what it is
-    /// waiting on.
     fn render_location(&self, cx: &Context<Self>) -> impl IntoElement {
         div()
             .flex()
@@ -724,8 +615,6 @@ impl FolderPicker {
             .flex()
             .justify_end()
             .gap_2()
-            // Dispatch the same action as Escape, so the button and overlay
-            // share the dialog's guarded on_cancel path.
             .child(
                 Button::new("picker-cancel")
                     .label("Cancel")
@@ -752,9 +641,6 @@ impl Render for FolderPicker {
             .flex_col()
             .gap_3()
             .child(self.render_location(cx))
-            // A home directory with a thousand entries costs the dozen on
-            // screen, and the search box filters what `ls` already returned —
-            // no second round trip.
             .child(
                 List::new(&self.entries)
                     .search_placeholder("Filter…")
@@ -772,13 +658,10 @@ impl Render for FolderPicker {
     }
 }
 
-/// Appends one entry name; `path` is always absolute (the walk starts at the
-/// remote `$HOME`), so the only special case is the root's trailing slash.
 fn join_remote_path(path: &str, name: &str) -> String {
     format!("{}/{name}", path.trim_end_matches('/'))
 }
 
-/// One step up; the root is its own parent.
 fn parent_remote_path(path: &str) -> String {
     match path.trim_end_matches('/').rfind('/') {
         Some(0) | None => "/".to_string(),
@@ -786,9 +669,6 @@ fn parent_remote_path(path: &str) -> String {
     }
 }
 
-/// The walk, end to end, with no `Workbench`, no window and no list — which is
-/// what [`Walk`] exists to make possible. The token guard itself is
-/// [`Pending`]'s, and tested there.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -885,8 +765,6 @@ mod tests {
         assert!(walk.confirm().is_none());
     }
 
-    /// A failed exec keeps the walk where it was and says why, rather than
-    /// leaving the modal gated on an answer that is not coming.
     #[test]
     fn a_failed_listing_keeps_the_previous_directory() {
         let (mut walk, home) = opening_walk();
@@ -963,8 +841,6 @@ mod tests {
 
     #[test]
     fn a_listing_carries_the_directory_it_would_move_to() {
-        // The path is the request's, not the answer's — nothing is echoed
-        // back over the wire for the walk to trust.
         let mut walk = idle_walk();
         let tokens = walk.tokens.clone();
         let token = walk.pending.ask(
@@ -985,8 +861,6 @@ mod tests {
         assert!(!walk.busy());
     }
 
-    /// The modal must not stay gated on a request that never left: a host
-    /// command the worker refused has no answer coming.
     #[test]
     fn a_request_that_never_left_stops_gating_the_modal() {
         let mut walk = idle_walk();
@@ -998,8 +872,6 @@ mod tests {
         assert!(!walk.busy());
     }
 
-    /// The `..` row exists only when there is somewhere to go, and directories
-    /// sort ahead of the files that are there for orientation.
     #[test]
     fn the_rows_put_the_parent_first_then_directories_then_files() {
         let mut delegate = EntriesDelegate::new();

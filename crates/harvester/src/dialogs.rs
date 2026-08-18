@@ -1,16 +1,3 @@
-//! The extension-dialog modal: pi asks, the user answers, pi unblocks.
-//!
-//! An extension calling `select`/`confirm`/`input`/`editor` suspends the agent
-//! until a response comes back (docs/DAEMON.md §Dialogs). The daemon only
-//! auto-cancels into an *empty* room, so with this window attached the
-//! obligation is ours — and until this module existed, Harvester discharged it
-//! by cancelling every question sight-unseen (SPEC C5).
-//!
-//! What the question *is* comes from
-//! [`DialogRequest`](harvester_client_core::DialogRequest), which owns pi's
-//! wire shape. This file owns the client obligation/modal lifecycle and how a
-//! click becomes a [`DialogAnswer`].
-
 use std::rc::Rc;
 
 use gpui::{prelude::*, px, App, Context, Entity, SharedString, Window};
@@ -27,23 +14,10 @@ use harvester_client_core::{
 use crate::modal::{ModalAvailable, ModalCoordinator, ModalLease, ModalOwner};
 use crate::store::{FleetStore, StoreEvent};
 
-/// Wide enough for a prompt an extension wrote without knowing our layout, and
-/// narrow enough to stay a dialog rather than a second window. The library's
-/// own default is 448px, which crops a `select` option of any length.
 const DIALOG_WIDTH: f32 = 520.;
-/// Visible rows for an `editor` before it scrolls. A `set_editor_text`-style
-/// body is usually a commit message, so a handful of lines is the shape.
 const EDITOR_ROWS: (usize, usize) = (6, 16);
-/// The title shown for a dialog whose own title pi omitted. It still blocks the
-/// agent, so it is shown rather than dropped.
 const UNTITLED: &str = "The agent is asking";
 
-/// Owns the complete client-side lifecycle of Pi's blocking extension dialogs.
-///
-/// The window-free [`DialogObligations`] state decides ordering, duplicate
-/// replay, answers, and retirement. This coordinator is the GPUI adapter: it
-/// subscribes to the one store, owns text inputs, places the front modal, and
-/// sends exactly one answer back through the same machine route.
 pub(crate) struct DialogCoordinator {
     store: Entity<FleetStore>,
     modals: Entity<ModalCoordinator>,
@@ -118,8 +92,6 @@ impl DialogCoordinator {
     ) {
         let coordinator = cx.entity();
 
-        // The repo picker releases from an on_cancel callback before Root does
-        // its automatic pop. Wait until that callback and pop are both done.
         window.defer(cx, move |window, cx| {
             coordinator.update(cx, |coordinator, cx| coordinator.advance(window, cx));
         });
@@ -164,8 +136,6 @@ impl DialogCoordinator {
         }
     }
 
-    /// Show the global FIFO front only after acquiring Root for Pi. While Add
-    /// Workspace owns it, obligations remain queued and no Root call occurs.
     fn advance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.displayed.is_some() {
             return;
@@ -220,8 +190,6 @@ impl DialogCoordinator {
             return false;
         }
 
-        // The key is also checked by the window-free queue. A duplicate or
-        // delayed callback from the old modal can never consume its successor.
         let Some(answered) = self.obligations.answer_front(key, answer) else {
             return false;
         };
@@ -238,9 +206,6 @@ impl DialogCoordinator {
             },
         );
 
-        // gpui-component pops after its answer callback; select performs the
-        // equivalent guarded pop in its button handler. Defer advancement so
-        // the next owner never lands beneath the modal being closed.
         self.defer_advance(window, cx);
 
         true
@@ -310,9 +275,6 @@ impl DialogCoordinator {
             return;
         }
 
-        // Only the flow that owns Root may pop it. In particular, retiring a
-        // queued Pi front while the repo picker owns the modal leaves that
-        // workspace modal untouched.
         self.displayed = None;
         window.close_dialog(cx);
         self.defer_advance(window, cx);
@@ -336,9 +298,6 @@ impl DialogCoordinator {
     }
 }
 
-/// The text box a dialog needs, if it needs one. `editor` is pi's multi-line
-/// question and `input` its single-line one, which is `InputState`'s own
-/// default.
 fn create_input(
     kind: &DialogKind,
     window: &mut Window,
@@ -364,9 +323,6 @@ fn create_input(
     }
 }
 
-/// Put `dialog` on screen. Every path out lands in `answered`, including
-/// dismissal. Its boolean tells Root whether this callback still owns the
-/// modal; delayed duplicates return false and cannot pop a successor.
 fn open<T: 'static>(
     dialog: &DialogObligation,
     input: Option<Entity<InputState>>,
@@ -374,8 +330,6 @@ fn open<T: 'static>(
     window: &mut Window,
     cx: &mut Context<T>,
 ) {
-    // `Rc` because every route out of the dialog needs it and the library's
-    // builder is an `Fn` re-run on each frame, so nothing here can be consumed.
     let answered = Rc::new(answered);
     let owner = cx.entity();
     let answer = {
@@ -414,9 +368,6 @@ fn dialog_title(title: &str) -> SharedString {
     title.to_string().into()
 }
 
-/// One button per option, because a pi `select` is a short list written by an
-/// extension author — a searchable list would be ceremony around three choices.
-/// The option's *text* is the answer; pi has no notion of an index here.
 fn open_select<T: 'static>(
     title: SharedString,
     options: Vec<String>,
@@ -454,14 +405,9 @@ fn open_select<T: 'static>(
             .width(px(DIALOG_WIDTH))
             .close_button(false)
             .child(v_flex().gap_2().children(rows))
-            // A custom footer replaces the library's OK button, which would be
-            // meaningless here: picking *is* confirming.
             .footer(DialogFooter::new().child(
                 DialogClose::new().child(Button::new("dialog-dismiss").outline().label("Cancel")),
             ))
-            // Root maps bare Enter to ConfirmDialog. A select is confirmed only
-            // by an option button, never by the dialog frame's default
-            // `on_ok: true`.
             .on_ok(|_, _, _| false)
             .on_cancel({
                 let answer = answer.clone();
@@ -471,9 +417,6 @@ fn open_select<T: 'static>(
     });
 }
 
-/// Yes/no. Dismissal answers "no" rather than cancelling, because pi resolves a
-/// cancelled `confirm` to `false` anyway — so treating Escape as a refusal
-/// loses nothing and leaves one less way for the agent to hang.
 fn open_confirm<T: 'static>(
     title: SharedString,
     message: String,
@@ -506,7 +449,6 @@ fn open_confirm<T: 'static>(
     });
 }
 
-/// `input` and `editor`: the same dialog over a different box.
 fn open_text<T: 'static>(
     title: SharedString,
     input: Entity<InputState>,
@@ -545,8 +487,5 @@ fn open_text<T: 'static>(
             .on_cancel(move |_, window, cx| cancelled(dismissal.clone(), window, cx))
     });
 
-    // `open_dialog` focuses the dialog frame it just built, not anything
-    // inside it — so the box this whole dialog exists to have filled in would
-    // need a click before it would take a keystroke.
     input.update(cx, |state, cx| state.focus(window, cx));
 }

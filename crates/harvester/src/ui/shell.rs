@@ -1,15 +1,10 @@
-//! Window-shell visuals: section headers, pane headers, and the status bar.
-
 use gpui::{div, prelude::*, px, App, Div, ElementId, FontWeight, SharedString, Stateful};
 use gpui_component::ActiveTheme as _;
 
 use super::core::{dim, faint};
 
-/// Statusbar height; the workbench and the statusbar frame must agree.
 const STATUSBAR_HEIGHT: f32 = 26.;
 
-/// Sidebar section label ("MACHINES", "SESSIONS", …). The whole row is the
-/// collapse toggle; callers add optional actions and then [`section_chevron`].
 pub fn section_header(id: impl Into<ElementId>, title: &'static str, cx: &App) -> Stateful<Div> {
     div()
         .id(id)
@@ -28,12 +23,10 @@ pub fn section_header(id: impl Into<ElementId>, title: &'static str, cx: &App) -
         .child(div().flex_1())
 }
 
-/// The section header's trailing disclosure chevron.
 pub fn section_chevron(expanded: bool) -> Div {
     div().flex_none().child(if expanded { "▾" } else { "▸" })
 }
 
-/// Chat pane header: title plus faint subtitle.
 pub fn chat_header(title: SharedString, subtitle: SharedString, cx: &App) -> Div {
     div()
         .flex_none()
@@ -60,7 +53,6 @@ pub fn chat_header(title: SharedString, subtitle: SharedString, cx: &App) -> Div
         )
 }
 
-/// The bottom statusbar container; callers add its content children.
 pub fn statusbar_frame(cx: &App) -> Div {
     div()
         .h(px(STATUSBAR_HEIGHT))

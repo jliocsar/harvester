@@ -1,9 +1,3 @@
-//! `list_sessions`: readdir pi's session dirs. No daemon state involved —
-//! the header line gives sid/cwd, the last `session_info` entry gives the name.
-//!
-//! Blocking std IO on purpose — the caller runs this on the blocking pool
-//! (`spawn_blocking`); the daemon's single runtime thread never waits on disk.
-
 use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::Path;
@@ -16,26 +10,13 @@ use crate::daemon::RunningSession;
 use crate::paths;
 use crate::sid::Sid;
 
-/// The substring every `session_info` entry must contain. Matched on raw bytes
-/// before anything is UTF-8-validated or parsed — the overwhelming majority of
-/// lines in a conversation log are messages and never match.
 const SESSION_INFO_MARKER: &[u8] = br#""session_info""#;
 
-/// Scan all per-cwd dirs (optionally filtered to one cwd). `running` is the
-/// pid table's live sessions, provided by the caller.
-///
-/// The filesystem alone is not the whole answer: pi writes a session file
-/// lazily, on the first entry, so a session spawned but never prompted has a
-/// live pi and nothing on disk. Listing only what the scan found would hide
-/// it — and a client that cannot see a session cannot stop it, so the pi would
-/// outlive every client that could have reaped it. `running` is therefore
-/// unioned in, not merely consulted for status.
 pub fn list_sessions(
     cwd_filter: Option<&str>,
     running: &HashMap<Sid, RunningSession>,
 ) -> Vec<SessionInfo> {
     let mut sessions = Vec::new();
-    // Reused across files: line reads allocate once, not per line.
     let mut line_buffer = Vec::new();
 
     let Ok(dirs) = std::fs::read_dir(paths::pi_sessions_root()) else {
@@ -66,15 +47,11 @@ pub fn list_sessions(
 
     append_fileless_running(&mut sessions, cwd_filter, running);
 
-    // Newest first — the sidebar order.
     sessions.sort_by_key(|session| std::cmp::Reverse(session.mtime_ms));
 
     sessions
 }
 
-/// The live sessions the scan could not have found, because pi has not written
-/// their file yet. Their spawn time stands in for an mtime, so they sort by
-/// last activity beside everything else.
 fn append_fileless_running(
     sessions: &mut Vec<SessionInfo>,
     cwd_filter: Option<&str>,
@@ -90,7 +67,6 @@ fn append_fileless_running(
 
         sessions.push(SessionInfo {
             sid: sid.as_str().to_string(),
-            // Pi owns session names and has written nothing to name yet.
             name: None,
             cwd: session.cwd.clone(),
             file: None,
@@ -100,7 +76,6 @@ fn append_fileless_running(
     }
 }
 
-/// Milliseconds since epoch from the direntry's own metadata (no extra stat).
 fn entry_mtime_ms(entry: &std::fs::DirEntry) -> u64 {
     entry
         .metadata()
@@ -111,15 +86,6 @@ fn entry_mtime_ms(entry: &std::fs::DirEntry) -> u64 {
         .unwrap_or(0)
 }
 
-/// Stream the file line by line instead of slurping it — session files are
-/// full conversation logs and can run to many MB; only the header and the
-/// last `session_info` entry matter. A cwd-filter miss costs one line.
-///
-/// Read as **bytes** (`read_until(LF, …)`, pi's LF-only framing), never as
-/// text: `read_line` would UTF-8-validate every byte of the whole log just to
-/// find two lines, and its `Err(InvalidData)` on one non-UTF-8 byte is
-/// indistinguishable from EOF here — which used to truncate the name scan
-/// silently. Bytes make a corrupt line just a line that fails the prefilter.
 fn read_session_file(
     path: &Path,
     mtime_ms: u64,
@@ -130,7 +96,6 @@ fn read_session_file(
     let file = std::fs::File::open(path).ok()?;
     let mut reader = std::io::BufReader::new(file);
 
-    // Line 1: `{"type":"session","version":3,"id":...,"cwd":...}`
     line_buffer.clear();
     reader.read_until(LF, line_buffer).ok()?;
     let header: Value = serde_json::from_slice(line_buffer).ok()?;
@@ -166,9 +131,6 @@ fn read_session_file(
     })
 }
 
-/// The display name: the LAST `session_info` entry wins (rename history is
-/// append-only). Every other line is rejected by a byte-level substring
-/// prefilter, so only a candidate is ever UTF-8-validated and parsed.
 fn scan_for_last_name(
     reader: &mut impl BufRead,
     path: &Path,
@@ -207,9 +169,6 @@ fn scan_for_last_name(
     name
 }
 
-/// Pi's own rule (`session-manager.ts:713-714`, "use latest, including explicit
-/// clears"): the name is trimmed, and an empty or whitespace-only one is an
-/// explicit *clear*, not a blank title.
 fn entry_display_name(entry: &Value) -> Option<String> {
     let name = entry.get("name")?.as_str()?.trim();
 
@@ -226,13 +185,10 @@ mod tests {
 
     use serde_json::json;
 
-    /// Arbitrary but stable mtime for fixtures — asserted as a passthrough,
-    /// never derived from the filesystem (which would make tests time-dependent).
     const FIXTURE_MTIME_MS: u64 = 1_700_000_000_123;
     const FIXTURE_SID: &str = "01JABCDEF0123456789ABCDEFG";
     const FIXTURE_CWD: &str = "/home/exedev/project";
 
-    /// pi session files are LF-framed JSONL: one JSON value per line.
     fn jsonl(lines: &[Value]) -> String {
         let mut out = String::new();
 
@@ -252,8 +208,6 @@ mod tests {
         json!({ "type": "session_info", "name": name })
     }
 
-    /// Write `contents` as a `.jsonl` file inside `dir` and read it back through
-    /// `read_session_file` with the given filter/running set.
     fn read_fixture_bytes(
         dir: &tempfile::TempDir,
         contents: &[u8],
@@ -287,7 +241,6 @@ mod tests {
         HashMap::new()
     }
 
-    /// A live session in the pid table, as `Daemon::running_sessions` reports it.
     fn running(raw: &str, cwd: &str, spawned_at_ms: u64) -> HashMap<Sid, RunningSession> {
         HashMap::from([(
             sid(raw),
@@ -372,8 +325,6 @@ mod tests {
         assert!(info.name.is_none());
     }
 
-    /// A later nameless `session_info` clears an earlier name: the code assigns
-    /// unconditionally, so "last entry wins" includes losing the name.
     #[test]
     fn nameless_session_info_after_named_one_clears_the_name() {
         let dir = temp_dir();
@@ -489,7 +440,6 @@ mod tests {
         assert_eq!(info.status, SessionStatus::Exited);
     }
 
-    /// Unparseable garbage mid-file must be skipped, not abort the name scan.
     #[test]
     fn garbage_line_does_not_abort_the_name_scan() {
         let dir = temp_dir();
@@ -508,8 +458,6 @@ mod tests {
         assert_eq!(info.name.as_deref(), Some("after garbage"));
     }
 
-    /// The cheap `contains("\"session_info\"")` pre-filter lets non-entries
-    /// through; the real parse behind it must reject them.
     #[test]
     fn line_merely_mentioning_session_info_is_not_treated_as_one() {
         let dir = temp_dir();
@@ -530,10 +478,6 @@ mod tests {
         assert_eq!(info.name.as_deref(), Some("real name"));
     }
 
-    /// A non-UTF-8 byte mid-file must not end the name scan. It used to:
-    /// `read_line` returns `Err(InvalidData)` there and the match treated that
-    /// identically to `Ok(0)` (EOF). Reading bytes makes it just another line
-    /// that fails the prefilter, so the last `session_info` still wins.
     #[test]
     fn invalid_utf8_line_does_not_truncate_the_name_scan() {
         let dir = temp_dir();
@@ -552,8 +496,6 @@ mod tests {
         assert_eq!(info.name.as_deref(), Some("after bad bytes"));
     }
 
-    /// Pi treats an empty name as an explicit clear (`session-manager.ts:713`),
-    /// so the sidebar must show an unnamed session, not a blank title.
     #[test]
     fn an_empty_name_clears_the_name() {
         let dir = temp_dir();
@@ -584,8 +526,6 @@ mod tests {
         assert!(info.name.is_none());
     }
 
-    /// Pi trims before storing, so surrounding whitespace is never part of the
-    /// displayed name.
     #[test]
     fn a_padded_name_is_trimmed() {
         let dir = temp_dir();
@@ -600,8 +540,6 @@ mod tests {
         assert_eq!(info.name.as_deref(), Some("padded name"));
     }
 
-    /// The last entry wins even when the file's final line has no LF — bytes
-    /// are read with `read_until`, which yields the unterminated tail too.
     #[test]
     fn a_final_line_without_a_trailing_newline_is_still_scanned() {
         let dir = temp_dir();
@@ -618,11 +556,6 @@ mod tests {
         assert_eq!(info.name.as_deref(), Some("unterminated"));
     }
 
-    /// Pi writes a session file lazily, on the first entry — so a session that
-    /// was spawned and never prompted has a live pi and nothing on disk. A
-    /// listing built from the filesystem alone cannot see it, and a client that
-    /// cannot see a session cannot stop it: the pi outlives every client that
-    /// could have reaped it. Found on a live VM, not by reading.
     #[test]
     fn a_running_session_with_no_file_yet_is_still_listed() {
         let running = running(FIXTURE_SID, FIXTURE_CWD, 4_242);
@@ -645,8 +578,6 @@ mod tests {
         );
     }
 
-    /// The scan already reported it, so the pid table must not add a second row
-    /// for the same sid — the union is by sid, not an append.
     #[test]
     fn a_running_session_already_found_on_disk_is_not_listed_twice() {
         let running = running(FIXTURE_SID, FIXTURE_CWD, 4_242);
@@ -665,8 +596,6 @@ mod tests {
         assert_eq!(sessions[0].name.as_deref(), Some("from disk"));
     }
 
-    /// A fileless session is filtered by the cwd the pid table recorded, since
-    /// there is no header line to read one from.
     #[test]
     fn a_fileless_session_honours_the_cwd_filter() {
         let running = running(FIXTURE_SID, FIXTURE_CWD, 1);

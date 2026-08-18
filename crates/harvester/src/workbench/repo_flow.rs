@@ -1,15 +1,3 @@
-//! Add-repository orchestration: hand the daemon-free host walk to
-//! [`FolderPicker`] on the machine the asking chat is already targeting.
-//!
-//! The machine is never chosen here. A repository is picked inside the chat
-//! that is about to run in one, and that chat has a machine before its repo
-//! picker opens at all — so this flow is the folder walk, its Root modal lease,
-//! and nothing else (docs/SPEC.md §Flows "Add repository").
-//!
-//! The flow owns one generation-tagged run and one lease. Ending a run drops
-//! its picker subscription, invalidates the picker, and releases the lease, so
-//! delayed host answers or modal callbacks cannot revive it.
-
 use gpui::{AppContext as _, Context, Entity, EventEmitter, Subscription, Window};
 use gpui_component::WindowExt as _;
 
@@ -20,18 +8,14 @@ use crate::store::FleetStore;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FlowId(u64);
 
-/// The stored repository a completed run produced, on its way back to the chat
-/// that asked for it.
 pub(super) struct RepoAdded {
     pub machine: String,
     pub path: String,
 }
 
-/// Window-free lifecycle guard for late picker and modal callbacks.
 #[derive(Debug, Default)]
 struct AddRepoState {
     next_flow: u64,
-    /// The run in progress: its generation and the machine being browsed.
     running: Option<(FlowId, String)>,
 }
 
@@ -95,8 +79,6 @@ impl AddRepoFlow {
         }
     }
 
-    /// Browse `machine`. A second request while a walk is open is ignored:
-    /// Root holds one dialog and the lease is already spent on this one.
     pub(super) fn open(&mut self, machine: String, window: &mut Window, cx: &mut Context<Self>) {
         if !self.state.is_idle() {
             return;
@@ -173,18 +155,12 @@ impl AddRepoFlow {
         self.store.update(cx, |store, cx| {
             store.add_workspace(picked.machine.clone(), picked.path.clone(), cx)
         });
-        // The chat that asked for this walk selects the path it validated,
-        // whether or not the store write survived — the folder is a git repo
-        // either way, and a failed write is already reported.
         cx.emit(RepoAdded {
             machine: picked.machine.clone(),
             path: picked.path.clone(),
         });
     }
 
-    /// End every exit path: Escape, overlay, Cancel, or successful validation.
-    /// Root itself is closed by the caller or by gpui-component's on_cancel
-    /// ordering.
     fn cancel(&mut self, flow: FlowId, cx: &mut Context<Self>) -> bool {
         self.end(flow, true, cx)
     }
@@ -197,11 +173,6 @@ impl AddRepoFlow {
         self.picker_events = None;
 
         if let Some(picker) = self.picker.take() {
-            // A successful validation is emitted while FolderPicker is leased,
-            // so updating it here would re-enter that entity. Its pending
-            // request is already consumed; dropping both retained handles is
-            // sufficient. Cancellation happens from Root and can invalidate
-            // the picker immediately.
             if invalidate_picker {
                 picker.update(cx, |picker, cx| picker.cancel(cx));
             }

@@ -1,5 +1,3 @@
-//! The agent prompt card and its in-place model and machine controls.
-
 use std::rc::Rc;
 
 use gpui::{div, prelude::*, px, Anchor, App, Div, ElementId, SharedString, Stateful, Window};
@@ -8,22 +6,13 @@ use gpui_component::{ActiveTheme as _, Icon, Selectable};
 
 use super::core::{dim, faint};
 
-/// How far the prompt box's resting border is faded. Focus still brings the
-/// full theme ring.
 const PROMPT_BOX_BORDER_OPACITY: f32 = 0.5;
-/// Cap an open dropdown so a long model list scrolls within the window.
 const DROPDOWN_MAX_HEIGHT: f32 = 280.;
-/// Keep short-label dropdowns from opening as a sliver beneath a wide control.
 const DROPDOWN_MIN_WIDTH: f32 = 200.;
-/// Fixed check gutter keeps picked and unpicked row labels aligned.
 const DROPDOWN_CHECK_WIDTH: f32 = 12.;
-/// Diameter of the prompt box's round send button.
 const SEND_BUTTON_SIZE: f32 = 22.;
-/// How wide one prompt-strip control may grow before its label ellipsizes;
-/// a long model or repository name must not push the others off the row.
 const PROMPT_CONTROL_MAX_WIDTH: f32 = 220.;
 
-/// The agent prompt box: one rounded card holding the input and controls row.
 pub fn prompt_box(focused: bool, cx: &App) -> Div {
     div()
         .rounded_xl()
@@ -38,36 +27,20 @@ pub fn prompt_box(focused: bool, cx: &App) -> Div {
         .flex_col()
 }
 
-/// Padding around the caller's borderless, padding-free `Input`.
 pub fn prompt_box_input(input: impl IntoElement) -> Div {
     div().px_3().pt_3().pb_2().child(input)
 }
 
-/// The prompt box's bottom row.
-///
-/// Controls sit a `gap_4` apart — wide enough that each icon reads as the
-/// prefix of the label to its right, which is what separates the controls
-/// instead of a rule or a middle dot.
 pub fn prompt_box_controls() -> Div {
     div().px_3().pb_2().flex().items_center().gap_4()
 }
 
-/// One row of an in-place dropdown.
 pub struct DropdownRow {
     pub label: SharedString,
-    /// The choice already in effect — it carries the check mark.
     pub selected: bool,
-    /// A rule above this row: what follows belongs to a different group than
-    /// what precedes it (the repo picker's "Add new…" is an action, not one
-    /// more repository).
     pub divider_above: bool,
 }
 
-/// A [`Popover`] trigger with no selected appearance.
-///
-/// `Popover::trigger` requires [`Selectable`], which the library does not
-/// implement for a styled `div`. The prompt controls stay one text run and a
-/// caret, so this local newtype carries the trait without changing their look.
 #[derive(IntoElement)]
 struct PlainTrigger(Stateful<Div>);
 
@@ -87,12 +60,6 @@ impl Selectable for PlainTrigger {
     }
 }
 
-/// A prompt-box control that opens its choices in place; `picked` receives the
-/// row index.
-///
-/// Bottom-left anchoring opens upward because the prompt box sits at the pane's
-/// bottom. A downward list would run beyond the window and snap over its own
-/// trigger.
 pub fn prompt_box_dropdown(
     id: &'static str,
     trigger: Stateful<Div>,
@@ -129,8 +96,6 @@ pub fn prompt_box_dropdown(
         })
 }
 
-/// One dropdown row: check gutter, label, and hover highlight. A row that
-/// opens a group carries the rule that separates it from the one before.
 fn dropdown_row(index: usize, row: &DropdownRow, cx: &App) -> Stateful<Div> {
     div()
         .id(("dropdown-row", index))
@@ -164,13 +129,6 @@ fn dropdown_row(index: usize, row: &DropdownRow, cx: &App) -> Stateful<Div> {
         )
 }
 
-/// A flat dropdown control inside the prompt box, prefixed by its icon.
-///
-/// The icon is given neither a size nor a color: `Icon` falls back to the
-/// ambient text style, which is this control's own `text_xs` and muted color,
-/// so the glyph and its label always match without a second set of tokens.
-/// Hover is resolved after layout and so brightens the label alone, leaving
-/// the icon as the quiet marker of *which* control this is.
 pub fn prompt_box_control(
     id: impl Into<ElementId>,
     icon: Icon,
@@ -198,12 +156,6 @@ pub fn prompt_box_control(
     }
 }
 
-/// The prompt box's round send button. Enter in the input is the other path to
-/// the same submit.
-///
-/// Disabled is a look, not a guard: a chat with no machine or repository
-/// refuses the prompt in its own state machine, and this is how the strip says
-/// so before the user types.
 pub fn prompt_box_send(id: impl Into<ElementId>, enabled: bool, cx: &App) -> Stateful<Div> {
     let base = div()
         .id(id)

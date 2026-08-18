@@ -1,11 +1,3 @@
-//! Harvester — the desktop client (docs/SPEC.md).
-//!
-//! `harvester` is the normal launch (machines come from providers and the
-//! workspace list); `harvester <ssh-destination>` adds that destination as an
-//! ad-hoc machine (the dev workflow). Argument parsing stays manual — clap
-//! lives in harvester-cli only, and one positional argument does not earn it
-//! here either.
-
 mod assets;
 mod catalog;
 mod chat;
@@ -19,10 +11,7 @@ mod ui;
 mod workbench;
 mod workspaces;
 
-/// The musl harvesterd baked in by build.rs; empty in dev builds made without
-/// the musl artifact (then `daemon_binary` falls back to the target dir).
 const EMBEDDED_DAEMON: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/harvesterd"));
-/// Dev fallback, relative to the repo-root cwd of `cargo run -p harvester`.
 const DEV_DAEMON_PATH: &str = "target/x86_64-unknown-linux-musl/release/harvesterd";
 
 fn main() {

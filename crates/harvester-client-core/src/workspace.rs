@@ -1,29 +1,16 @@
-//! Workspace browsing (docs/SPEC.md §Workspace): directory listings for the
-//! folder picker and git validation. These are client business, never the
-//! daemon's (docs/DAEMON.md keeps path work out of the envelope) — one-shot
-//! execs against [`Host`], so the local machine and SSH machines browse with
-//! identical semantics (remote execs multiplex over the ControlMaster
-//! connection: a per-click listing costs about one network round trip).
-
 use std::time::Duration;
 
 use crate::host::{parse_home, shell_quote, Host, HOME_SCRIPT};
 use crate::{Error, Result};
 
-/// Ceiling on one picker exec — multiplexed listings take tens of ms; a
-/// wedged transport must not hang the picker forever.
 const WORKSPACE_EXEC_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// One entry from a directory listing.
 #[derive(Debug, Clone)]
 pub struct RemoteDirEntry {
     pub name: String,
     pub is_dir: bool,
 }
 
-/// The machine's `$HOME` — where the folder picker starts its walk
-/// (SPEC §Workspace). One exec, never a bootstrap: path work is client
-/// business, so the picker must not wait on a daemon it does not use.
 pub async fn resolve_home(host: &Host) -> Result<String> {
     let output = host.exec(HOME_SCRIPT, None, WORKSPACE_EXEC_TIMEOUT).await?;
 
@@ -37,10 +24,6 @@ pub async fn resolve_home(host: &Host) -> Result<String> {
         })
 }
 
-/// Lists `path` on the machine via `ls -1Ap`: one name per line, hidden
-/// entries included (dotdirs are legitimate workspace parents), a `/` suffix
-/// marking directories. Known limit: symlinked directories are listed
-/// undereferenced, so they read as plain entries — acceptable for a picker.
 pub async fn list_directory(host: &Host, path: &str) -> Result<Vec<RemoteDirEntry>> {
     let script = format!("ls -1Ap -- {}", shell_quote(path));
     let output = host.exec(&script, None, WORKSPACE_EXEC_TIMEOUT).await?;
@@ -66,8 +49,6 @@ fn parse_ls_entries(stdout: &str) -> Vec<RemoteDirEntry> {
         .collect()
 }
 
-/// Checks that `path` is a git repository — the definition of a workspace
-/// (SPEC §Workspace). The error carries git's own explanation for the UI.
 pub async fn validate_git_workspace(host: &Host, path: &str) -> Result<()> {
     let script = format!("git -C {} rev-parse --git-dir", shell_quote(path));
     let output = host.exec(&script, None, WORKSPACE_EXEC_TIMEOUT).await?;
@@ -75,11 +56,6 @@ pub async fn validate_git_workspace(host: &Host, path: &str) -> Result<()> {
     output.require_success("validate workspace")
 }
 
-/// The branch `path` is on, for the chat prompt strip's read-only indicator
-/// (SPEC §Flows "Start session"). Same client-side exec path as the picker's
-/// listing and validation — the daemon has no branch concept and is not asked
-/// for one. A detached HEAD answers the literal `HEAD`, which is reported
-/// verbatim: it is what git says the checkout is on.
 pub async fn resolve_git_branch(host: &Host, path: &str) -> Result<String> {
     let script = format!("git -C {} rev-parse --abbrev-ref HEAD", shell_quote(path));
     let output = host.exec(&script, None, WORKSPACE_EXEC_TIMEOUT).await?;

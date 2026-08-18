@@ -1,5 +1,3 @@
-//! Verbatim pi RPC passthrough (docs/DAEMON.md §The `pi` passthrough).
-
 use harvester_proto::Outgoing;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -10,34 +8,8 @@ use crate::server::{answer_later, Outbound};
 use crate::session::Session;
 use crate::sid::Sid;
 
-/// The pi commands that swap the session file under a live process. Refused by
-/// the daemon rather than left to client politeness: "one pi process = one
-/// session file, always" is architectural (CLAUDE.md, docs/DAEMON.md §The `pi`
-/// passthrough), multiple clients are a first-class guarantee — so the trusted
-/// client is not the only client — and the failure this prevents (a session
-/// file swapped under a running pi) is unrecoverable.
-///
-/// These are pi command `type` values, not `method` values like the dialog
-/// list in `session.rs`. **Pi-version-coupled**: verified against
-/// pi 0.83.0's `modes/rpc/rpc-types.ts:26,60,61,62` (the `RpcCommand` union)
-/// and its dispatch arms in `modes/rpc/rpc-mode.ts:432,600,608,616`. This is
-/// the one place the daemon deliberately knows pi's vocabulary, so re-check the
-/// strings on every pi upgrade (CLAUDE.md §Pi version discipline) — a renamed
-/// command silently disables the guard.
 const SESSION_SWAPPING_COMMANDS: &[&str] = &["new_session", "switch_session", "fork", "clone"];
 
-/// Inject a correlation id, queue the command for pi's stdin, then hand the
-/// wait to its own task — the connection loop must never head-of-line block
-/// behind a pi command (`bash`/`compact` are legitimately unbounded, and
-/// `stop` has to stay reachable). The write itself cannot block either: it
-/// only enqueues, and the session's stdin pump owns the pipe. Returns `None`
-/// when the spawned waiter will answer.
-///
-/// Deliberately no timeout: pi's contract is "every command gets a response
-/// line or the process dies", and the pump fails every registered waiter on
-/// exit (the same reject-pending-on-exit shape as pi's own RPC client). A
-/// daemon-invented timeout would fabricate failures for slow-but-fine
-/// commands and silently drop pi's real answer.
 pub fn pi_passthrough(
     daemon: &Daemon,
     id: Option<Value>,
@@ -45,9 +17,6 @@ pub fn pi_passthrough(
     mut cmd: Value,
     out_tx: &mpsc::Sender<Outbound>,
 ) -> Option<Outgoing> {
-    // Validate before anything else touches it: the sid is a remote string
-    // that becomes a pid-table key here and a path component downstream. The
-    // rejected sid is echoed back verbatim so the client can see what it sent.
     let sid = match Sid::parse(&sid) {
         Ok(sid) => sid,
         Err(rejection) => return Some(error_response(id, sid, rejection)),
@@ -59,8 +28,6 @@ pub fn pi_passthrough(
         return Some(error_response(id, sid.into(), message));
     };
 
-    // Refused before the id is injected and before anything is registered: a
-    // session-swapping command must never reach pi's stdin at all.
     if let Some(command_type) = session_swapping_command(&cmd) {
         let message = session_swap_refusal_message(command_type);
 
@@ -71,9 +38,6 @@ pub fn pi_passthrough(
         return Some(forward_dialog_answer(&session, id, sid.to_string(), &cmd));
     }
 
-    // Reject before registering anything: a non-object command cannot carry
-    // the correlation id, so its response would never route back and the
-    // waiter would pend until the session exits.
     let Some(cmd_object) = cmd.as_object_mut() else {
         return Some(error_response(
             id,
@@ -84,9 +48,6 @@ pub fn pi_passthrough(
     let request_key = daemon.next_passthrough_id();
     cmd_object.insert("id".into(), Value::String(request_key.clone()));
 
-    // Register before writing so the response cannot race the waiter. If the
-    // write fails, the stale entry is harmless: stdin is gone, so pi is
-    // exiting and the pump drains the map shortly.
     let response_rx = session.register_response_waiter(request_key);
 
     if let Err(error) = session.write_line(&cmd) {
@@ -114,9 +75,6 @@ pub fn pi_passthrough(
     None
 }
 
-/// `extension_ui_response` is fire-and-forget on pi's side — it resolves
-/// immediately with `response: null`. First answer wins: only the claim
-/// holder's answer is forwarded; the rest are dropped (docs/DAEMON.md).
 fn forward_dialog_answer(
     session: &Session,
     id: Option<Value>,
@@ -127,8 +85,6 @@ fn forward_dialog_answer(
 
     if session.remove_pending_dialog(dialog_id) {
         if let Err(error) = session.write_line(cmd) {
-            // The winning answer never reached pi — the dialog policy's
-            // invariant is at stake, so this must not vanish silently.
             eprintln!("session {sid}: dialog {dialog_id} answer write failed: {error}");
         }
     }
@@ -140,10 +96,6 @@ fn forward_dialog_answer(
     }
 }
 
-/// The command's `type` when it is one of [`SESSION_SWAPPING_COMMANDS`]. A
-/// non-object command (or one without a string `type`) is not this handler's
-/// problem — it is rejected further down for not being able to carry the
-/// correlation id.
 fn session_swapping_command(cmd: &Value) -> Option<&str> {
     let command_type = cmd.get("type").and_then(Value::as_str)?;
 
@@ -152,8 +104,6 @@ fn session_swapping_command(cmd: &Value) -> Option<&str> {
         .then_some(command_type)
 }
 
-/// Names the invariant rather than just saying no: the client author reading
-/// this needs to know it is a rule, not a bug.
 fn session_swap_refusal_message(command_type: &str) -> String {
     format!(
         "pi command '{command_type}' is refused by harvesterd: it would swap the session file \
@@ -170,8 +120,6 @@ fn error_response(id: Option<Value>, sid: String, error: String) -> Outgoing {
     }
 }
 
-/// The session-swapping denylist in isolation — no pi child, no daemon. The
-/// clause it enforces is docs/DAEMON.md §The `pi` passthrough.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,8 +139,6 @@ mod tests {
 
     #[test]
     fn the_denylist_is_exactly_the_four_documented_commands() {
-        // docs/DAEMON.md and CLAUDE.md name these four and only these four;
-        // pi 0.83.0 spells them this way (see the const's doc comment).
         assert_eq!(
             SESSION_SWAPPING_COMMANDS,
             ["new_session", "switch_session", "fork", "clone"]
@@ -213,8 +159,6 @@ mod tests {
 
     #[test]
     fn a_command_that_merely_mentions_a_denied_name_is_not_refused() {
-        // The match is on `type` alone: a prompt asking pi to fork a repo is a
-        // perfectly ordinary prompt.
         let cmd = json!({"type": "prompt", "message": "fork the upstream repo"});
 
         assert_eq!(session_swapping_command(&cmd), None);

@@ -1,11 +1,3 @@
-//! Transcript presentation: messages, markdown, tool labeling and bodies, and
-//! expansion state.
-//!
-//! The client-core [`Transcript`] remains the verbatim-derived conversation
-//! replica. This module adds only visual policy, keyed by stable tool-call ids,
-//! so a history repair can replace every item without moving expansion onto a
-//! different block.
-
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::OnceLock;
@@ -22,35 +14,22 @@ use serde_json::Value;
 use super::core::Tone;
 use super::tool_block::{self, DiffLineKind};
 
-/// Cap on the compact-args summary in unknown-tool labels; the full args are
-/// always available in the expanded body.
 const ARGS_SUMMARY_MAX_CHARS: usize = 80;
 
 type ToggleToolBlock = Rc<dyn Fn(String, &mut Window, &mut App)>;
 
-/// Stateful presentation policy for a transcript.
-///
-/// This owns exactly the state that belongs to rendering: which stable
-/// `toolCallId`s the user expanded. Session lifecycle, Pi events, prompt state,
-/// and scrolling remain in `Chat`.
 #[derive(Default)]
 pub struct TranscriptPresentation {
     expanded_tool_calls: HashSet<String>,
 }
 
 impl TranscriptPresentation {
-    /// Toggle one tool block by Pi's stable call id.
     pub fn toggle_tool_block(&mut self, tool_call_id: String) {
         if !self.expanded_tool_calls.remove(&tool_call_id) {
             self.expanded_tool_calls.insert(tool_call_id);
         }
     }
 
-    /// Render settled items plus the in-flight assistant partial.
-    ///
-    /// The supplied scroll handle is owned by `Chat`: following new events is
-    /// lifecycle/adaptation policy, while the scrollable message surface is
-    /// presentation policy.
     pub fn render(
         &self,
         transcript: &Transcript,
@@ -103,8 +82,6 @@ impl TranscriptPresentation {
         cx: &App,
     ) -> Div {
         let tone = match block.status {
-            // Running is active rather than pending: it is the live thing the
-            // user is watching on screen.
             ToolStatus::Running => Tone::Active,
             ToolStatus::Ok => Tone::Idle,
             ToolStatus::Error => Tone::Failed,
@@ -130,17 +107,12 @@ impl TranscriptPresentation {
     }
 }
 
-/// Assistant prose rendered as markdown. State lives in the window under
-/// `id`; unchanged settled text returns early, while only the one streaming
-/// partial reparses per chunk (SPEC C11).
 fn markdown(id: impl Into<ElementId>, text: impl Into<SharedString>) -> TextView {
     TextView::markdown(id, text)
         .selectable(true)
         .style(markdown_style())
 }
 
-/// The app is pinned dark, while the library's default highlight theme is
-/// light. Build the matching style once.
 fn markdown_style() -> TextViewStyle {
     static STYLE: OnceLock<TextViewStyle> = OnceLock::new();
 
@@ -154,7 +126,6 @@ fn markdown_style() -> TextViewStyle {
         .clone()
 }
 
-/// One message frame: author over body; user messages get a bubble.
 fn message_frame(
     author: &'static str,
     author_tone: Tone,
@@ -181,7 +152,6 @@ fn message_frame(
         )
 }
 
-/// User text is verbatim; only Pi's prose is markdown.
 fn render_message(index: usize, message: &Message, cx: &App) -> Div {
     match message.role {
         Role::User => message_frame("you", Tone::Active, message.text.clone(), true, cx),
@@ -195,14 +165,10 @@ fn render_message(index: usize, message: &Message, cx: &App) -> Div {
     }
 }
 
-/// A failed turn is Pi-authored but not markdown: provider error strings must
-/// preserve literal `*` and `#` characters.
 fn render_failure(detail: &str, cx: &App) -> Div {
     message_frame("pi", Tone::Failed, detail.to_string(), false, cx)
 }
 
-/// The turn in flight: its partial markdown, or an activity placeholder before
-/// the first partial arrives.
 fn render_streaming(transcript: &Transcript, cx: &App) -> Option<Div> {
     match (transcript.streaming(), transcript.is_busy()) {
         (Some(text), _) => Some(message_frame(
@@ -217,8 +183,6 @@ fn render_streaming(transcript: &Transcript, cx: &App) -> Option<Div> {
     }
 }
 
-/// Header policy for Pi 0.83.0's built-in tools. Unknown tools show a compact
-/// raw-args summary rather than inventing a vocabulary for their payloads.
 fn tool_label(block: &ToolBlock, cx: &App) -> Div {
     let label = tool_block::label();
 
@@ -275,8 +239,6 @@ fn tool_label(block: &ToolBlock, cx: &App) -> Div {
     }
 }
 
-/// Expanded-body policy: context, then edit/write diff or output snapshot.
-/// Errors always show output because that is where their message lives.
 fn render_tool_body(block: &ToolBlock, cx: &App) -> Div {
     let mut body = tool_block::body(cx).child(tool_block::context(context_line(block).into(), cx));
 
@@ -314,7 +276,6 @@ fn render_tool_body(block: &ToolBlock, cx: &App) -> Div {
     body.child(tool_block::output(block.output.clone().into(), cx))
 }
 
-/// Faint first line with enough data to identify the call in full.
 fn context_line(block: &ToolBlock) -> String {
     match block.tool_name.as_str() {
         "read" | "write" | "edit" => block.arg("path").unwrap_or_default().to_string(),
@@ -323,7 +284,6 @@ fn context_line(block: &ToolBlock) -> String {
     }
 }
 
-/// Classify Pi's numbered diff format (" 1 ctx" / "-2 old" / "+2 new").
 fn diff_line_kind(line: &str) -> DiffLineKind {
     match line.as_bytes().first() {
         Some(b'+') => DiffLineKind::Added,
@@ -346,8 +306,6 @@ fn basename(path: &str) -> &str {
     normalized.rsplit('/').next().unwrap_or(normalized)
 }
 
-/// Raw JSON summary for an unknown tool, capped by characters rather than
-/// bytes so a Unicode argument is never split.
 fn compact_args(args: &Value) -> String {
     let json = args.to_string();
 

@@ -1,6 +1,3 @@
-//! The controller layer: JSONL framing, decode, route, encode. Command logic
-//! lives in `ops.rs` (harvester) and `passthrough.rs` (pi).
-
 use std::future::Future;
 use std::sync::Arc;
 
@@ -16,17 +13,10 @@ use crate::daemon::Daemon;
 use crate::ops::{self, AttachedMap};
 use crate::passthrough;
 
-/// Outgoing lines queued per connection before backpressure kicks in.
 const OUTGOING_QUEUE_DEPTH: usize = 256;
 
-/// One line bound for a connection. Everything flows through the single
-/// writer task, so responses and events never interleave mid-line — which is
-/// also what makes it safe for spawned handlers to answer out of request order
-/// (the envelope `id` is the correlation, not arrival order).
 pub enum Outbound {
     Typed(Outgoing),
-    /// A pre-serialized wire line (no LF) shared straight from a session's
-    /// event fan-out — written as-is, never re-serialized.
     Raw(Arc<[u8]>),
 }
 
@@ -55,12 +45,6 @@ pub async fn serve_connection(daemon: Daemon, stream: UnixStream) {
         }
     }
 
-    // Detach first (that drops the forwarders' senders), then drop ours: the
-    // writer ends once the last sender is gone, having flushed everything
-    // already queued. Aborting instead would discard responses a client
-    // half-closing its stdin is still waiting to read. Clearing the map is the
-    // detach: each dropped `Attachment` leaves its session's room, so the
-    // empty-room dialog policy kicks in (docs/DAEMON.md).
     attached.clear();
     drop(out_tx);
     let _ = writer.await;
@@ -92,9 +76,6 @@ fn spawn_writer(
     })
 }
 
-/// Answer from a spawned task instead of from the connection loop. The future
-/// yields a whole `Outgoing` because the answer's *variant* differs per caller
-/// (`harvester_response` vs `pi_response`).
 pub fn answer_later(
     out_tx: &mpsc::Sender<Outbound>,
     answer: impl Future<Output = Outgoing> + Send + 'static,
@@ -106,8 +87,6 @@ pub fn answer_later(
     });
 }
 
-/// Parse one stripped frame. `None` means "nothing to dispatch" (blank line,
-/// or a parse error already reported to the client).
 async fn decode_line(line: &[u8], out_tx: &mpsc::Sender<Outbound>) -> Option<Request> {
     if line.is_empty() {
         return None;

@@ -1,10 +1,3 @@
-//! Embeds the static musl harvesterd (slice-3 verdict 3a) so the shipped
-//! desktop binary bootstraps machines with nothing else on disk.
-//!
-//! A missing musl artifact is a warning, not an error, so
-//! `cargo check --workspace` works on a fresh clone; dev builds fall back to
-//! reading the target dir at runtime (see `daemon_binary` in main.rs).
-
 use std::env;
 use std::fs;
 use std::path::PathBuf;

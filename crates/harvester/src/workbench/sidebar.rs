@@ -1,16 +1,3 @@
-//! Sidebar presentation and intent.
-//!
-//! The sidebar observes [`FleetStore`] directly and owns only its local view
-//! state (the two collapse toggles and the selected-session highlight). It
-//! emits product intents with stable values rather than asking the composition
-//! shell to interpret row indexes.
-//!
-//! Top to bottom: the New session button, the machines listing, the sessions
-//! list (docs/SPEC.md §UI "Layout"). There is no workspaces section — a
-//! repository is picked in the chat that is about to use one, and
-//! `workspaces.json` is that picker's backing store rather than a citizen with
-//! a list of its own.
-
 use gpui::{div, prelude::*, px, App, Context, Div, Entity, EventEmitter, SharedString};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::list::ListItem;
@@ -25,33 +12,15 @@ use crate::ui::{self, Tone};
 use crate::workspaces::folder_name;
 
 const SIDEBAR_WIDTH: f32 = 240.;
-/// Enough of a uuidv7 to tell sessions apart at a glance.
 const SID_PREVIEW_CHARS: usize = 8;
-/// The subtitle of a machine its provider stopped listing, and the only row
-/// kind that can be forgotten.
 const MISSING_MACHINE_DETAIL: &str = "no longer listed";
-/// What the trash button on a missing machine row says it does. "Forget" rather
-/// than "delete": nothing on the machine is touched, and there is nothing
-/// reachable to touch.
 const FORGET_MACHINE_TOOLTIP: &str = "Forget this machine";
 
-/// What a sidebar click asks the composition shell to do. Values are captured
-/// from the rendered row so a later store repaint cannot move the click to a
-/// different session.
 #[derive(Clone)]
 pub(super) enum SidebarIntent {
-    /// Open a chat with no session behind it. Where it runs is the chat's own
-    /// question now — the prompt strip picks machine and repository — so this
-    /// intent carries nothing (docs/SPEC.md §Flows "Start session").
     NewSession,
-    OpenSession {
-        sid: String,
-    },
-    /// Forget a machine its provider no longer lists, after the shell has asked
-    /// the user to confirm it (docs/SPEC.md §Flows "Forget machine").
-    ForgetMachine {
-        machine: String,
-    },
+    OpenSession { sid: String },
+    ForgetMachine { machine: String },
 }
 
 pub(super) struct Sidebar {
@@ -77,8 +46,6 @@ impl Sidebar {
         }
     }
 
-    /// The shell owns which chat is current; this is only the highlight that
-    /// presents that choice. It is not a projection of fleet state.
     pub(super) fn select_session(&mut self, sid: Option<String>, cx: &mut Context<Self>) {
         if self.selected_sid == sid {
             return;
@@ -115,9 +82,6 @@ impl Sidebar {
             })
     }
 
-    /// The sidebar's one action, and the way into every session: a chat opens
-    /// with no session behind it, and picks where it runs in its own prompt
-    /// strip. There is no machine or repository to choose here first.
     fn render_new_session_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div().px_2().pt_2().child(
             Button::new("new-session")
@@ -198,14 +162,6 @@ impl Sidebar {
             .child(stacked_row(dot, label, detail, None, cx))
     }
 
-    /// The one machine row that can be acted on. A machine its provider stopped
-    /// listing is the only one Harvester can be sure is gone, so it is the only
-    /// one worth offering to forget — every other row is still listed, and a
-    /// reachable machine's rows are not the user's to clean up here.
-    ///
-    /// The trash lives in the row's suffix, which `ListItem` renders outside
-    /// its own click gating: the row itself stays disabled, exactly as the
-    /// other machine rows are.
     fn render_missing_machine_row(
         &self,
         index: usize,

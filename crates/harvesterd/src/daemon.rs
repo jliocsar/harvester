@@ -1,29 +1,16 @@
-//! Shared daemon state: the pid table and nothing else (docs/DAEMON.md:
-//! harvesterd is stateless — pi's session files are the only source of truth).
-
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::session::{Session, SpawnArgs};
 use crate::sid::Sid;
 
-/// Namespace for request ids the daemon injects into pi commands. The pump
-/// routes a response back to its waiter by this prefix, so the mint
-/// ([`Daemon::next_passthrough_id`]) and the match (`session.rs`) must agree —
-/// hence one const rather than a literal at each site.
 pub const PASSTHROUGH_ID_PREFIX: &str = "hv-";
 
-/// What [`Daemon::spawn_session`] did. Both arms hand back the live session, so
-/// the caller never has to reconstruct the sid it just moved in.
 pub enum SpawnOutcome {
     Spawned(Arc<Session>),
-    /// The sid was already in the pid table; no second pi was spawned, which is
-    /// what keeps "one pi process = one session file" true.
     AlreadyRunning(Arc<Session>),
 }
 
-/// What the pid table knows about a live session that its file does not.
-/// Enough to list a session pi has not written anything for yet.
 pub struct RunningSession {
     pub cwd: String,
     pub spawned_at_ms: u64,
@@ -35,15 +22,8 @@ pub struct Daemon {
 }
 
 struct DaemonInner {
-    /// This process's own build fingerprint, computed once at startup and
-    /// reported in `ping` (docs/DAEMON.md §ping). Not persisted state — it is
-    /// the identity of the running image, and it dies with the process.
     build_fingerprint: String,
-    /// The pid table. std::sync on purpose: no guard is ever held across an
-    /// await, and lookups happen on every passthrough.
     sessions: Mutex<HashMap<Sid, Arc<Session>>>,
-    /// Monotonic counter behind [`Daemon::next_passthrough_id`]; private so
-    /// the id format cannot be spelled a second way.
     request_counter: std::sync::atomic::AtomicU64,
 }
 
@@ -62,8 +42,6 @@ impl Daemon {
         &self.inner.build_fingerprint
     }
 
-    /// The next `hv-<n>` id for a command the daemon injects into pi. Paired
-    /// with the pump's prefix match — see [`PASSTHROUGH_ID_PREFIX`].
     pub fn next_passthrough_id(&self) -> String {
         let request_number = self
             .inner
@@ -77,14 +55,6 @@ impl Daemon {
         self.lock_sessions().get(sid).cloned()
     }
 
-    /// Every live pi child, copied out from under the lock (no guard may cross
-    /// the `spawn_blocking` boundary the caller is headed for).
-    ///
-    /// Keyed by sid because `list_sessions` asks "is this sid running?" once
-    /// per file on disk, and `Sid: Borrow<str>` makes that a borrowed lookup.
-    /// It carries `cwd` and the spawn time as well as the key, because the pid
-    /// table is the *only* record of a session pi has not written a file for
-    /// yet — a listing built from the filesystem alone cannot see it at all.
     pub fn running_sessions(&self) -> HashMap<Sid, RunningSession> {
         self.lock_sessions()
             .iter()
@@ -99,11 +69,6 @@ impl Daemon {
             .collect()
     }
 
-    /// Check-and-spawn under one lock — the table is the per-sid single-
-    /// instance guard, so a second `create_session` for a live sid loses here.
-    /// `Err` is reserved for a genuine spawn failure; "it was already running"
-    /// is a domain outcome and says so in the type instead of being smuggled
-    /// through `io::ErrorKind::AlreadyExists` for the caller to sniff.
     pub fn spawn_session(&self, args: SpawnArgs) -> std::io::Result<SpawnOutcome> {
         let mut sessions = self.lock_sessions();
 
@@ -117,30 +82,10 @@ impl Daemon {
         Ok(SpawnOutcome::Spawned(session))
     }
 
-    /// True while `session` *is* the pid table's entry for its own sid.
-    ///
-    /// A session's identity is its `Arc` pointer, not its sid: stopping and
-    /// resuming a sid spawns a **new generation** — a different pi child, a
-    /// different `Arc<Session>` — under the same key. So a sid match alone
-    /// says "some pi for this sid is alive", which is the wrong question for
-    /// anyone holding an older handle. `Arc::ptr_eq` asks the right one, and
-    /// every "is my session still the live one?" test goes through here so the
-    /// generation rule is stated once.
-    ///
-    /// Takes the sid from the session on purpose — a caller-supplied sid could
-    /// disagree with the handle, and that pairing is exactly the invariant.
     pub fn is_current_generation(&self, session: &Arc<Session>) -> bool {
         is_current_generation_in(&self.lock_sessions(), session)
     }
 
-    /// Vacate `session`'s table entry — only if it is still the current
-    /// generation; a resumed successor is never evicted. Called by the stdout
-    /// pump *before* it broadcasts Exit.
-    ///
-    /// Tests and removes under *one* lock rather than calling
-    /// [`Daemon::is_current_generation`] and re-locking: a resume landing
-    /// between the two would make this evict the successor it just checked
-    /// was different.
     pub fn remove_session_if_same(&self, session: &Arc<Session>) {
         let mut sessions = self.lock_sessions();
 
@@ -154,8 +99,6 @@ impl Daemon {
     }
 }
 
-/// The generation rule itself, spelled once, against an already-locked table
-/// so a caller that needs check-and-act can hold the lock across both.
 fn is_current_generation_in(sessions: &HashMap<Sid, Arc<Session>>, session: &Arc<Session>) -> bool {
     sessions
         .get(session.sid.as_str())
