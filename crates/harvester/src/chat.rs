@@ -6,7 +6,7 @@
 //! components with a shared vocabulary, because everything the user touches is
 //! the same on both sides of that line: the same pane, the same prompt box,
 //! the same model control, the same input. What actually differs is small and
-//! named in [`ChatState`]: what a model pick *means* (a launch-line argument
+//! named in [`SessionPhase`] and [`ModelSelection`]: what a model pick *means* (a launch-line argument
 //! versus a `set_model` the running pi must confirm), and whether the machine
 //! can still be changed.
 //!
@@ -23,18 +23,14 @@ use gpui::{
 use gpui_component::input::{Input, InputEvent, InputState};
 use serde_json::Value;
 
-use crate::model_control::ModelControl;
-use crate::models::{self, ModelChoice, ModelsState};
+use crate::models::ModelChoice;
+use crate::session_state::{self, ModelSelection, ModelsState, SessionPhase, SessionState};
 use crate::store::{FleetStore, StoreEvent};
 use crate::ui::{self, Tone};
 use crate::workspaces::folder_name;
 use harvester_client_core::bridge::Event as BridgeEvent;
-use harvester_client_core::transcript::{Item, Message, Role, ToolBlock, ToolStatus, Transcript};
-use harvester_client_core::{Pending, RequestToken, RequestTokens};
-
-/// Cap on the session name derived from the first prompt's first line — enough
-/// to recognize, short enough for pi's session list and the sidebar.
-const SESSION_NAME_MAX_CHARS: usize = 48;
+use harvester_client_core::transcript::{Item, Message, Role, ToolBlock, ToolStatus};
+use harvester_client_core::RequestToken;
 
 /// The unstarted chat's "no model chosen" row: pi launches with its own
 /// default, and saying so is more honest than naming a model we did not pick.
@@ -43,157 +39,28 @@ const DEFAULT_MODEL_ROW: &str = "default (pi chooses)";
 /// One (machine key, display label) a chat could run on.
 pub type MachineCandidate = (String, String);
 
-/// How far along the path from "a typed prompt" to "a pi process" this chat is.
-///
-/// The states are ordered and one-way: a chat never goes back to unstarted,
-/// because the sid it minted names a session file that now exists.
-enum ChatState {
-    /// No session anywhere yet. The machine is still switchable and a model
-    /// pick is just an argument for a launch line that has not been written.
-    Unstarted,
-    /// The create → attach → prompt chain is out and its sid is minted, but no
-    /// pi has answered yet. Input is closed here on purpose: a second prompt
-    /// would mint a second sid and start a second pi for one turn.
-    Starting {
-        sid: String,
-        /// Pi's `--name`, held for the sidebar row that `Attached` synthesizes.
-        name: String,
-    },
-    /// Attached: `sid` names a pi the daemon has spawned. Whether that pi is
-    /// still alive is [`Chat::exited_notice`]'s question, not this one's.
-    Live { sid: String },
-}
+pub use session_state::{ChatIntent as ChatRequest, ChatTarget};
 
-impl ChatState {
-    /// The session id, once one exists. `None` is the unstarted chat — no pi,
-    /// no session file, nothing on any machine to name.
-    fn sid(&self) -> Option<&str> {
-        match self {
-            ChatState::Unstarted => None,
-            ChatState::Starting { sid, .. } | ChatState::Live { sid } => Some(sid),
-        }
-    }
-}
-
-/// Where a chat runs. The machine is switchable only while unstarted — a
-/// running session never moves — so this is near-immutable by construction.
-///
-/// Two fields, both keys: how the machine is *named* is the store's answer,
-/// read whenever this chat renders. It used to be a third field here, taken
-/// once at open, and a label a provider resolved later never reached the pane
-/// (SPEC C12).
-pub struct ChatTarget {
-    /// Machine key; the workbench routes every request by it. Deliberately the
-    /// key and not a command sender: `Fleet` replaces a machine's bridge
-    /// wholesale on reconnect, so a sender cloned at attach time is dead the
-    /// moment the machine comes back, and every prompt sent through it was
-    /// swallowed with one line on stderr (found in review). A key cannot go
-    /// stale.
-    pub machine: String,
-    /// The session's cwd — pi's working directory, and the repository the
-    /// prompt box names.
-    pub workspace_path: String,
-}
-
-/// What a chat asks of its machine's bridge. The chat emits; the workbench
-/// looks up the live bridge and sends — see [`ChatTarget::machine`] for why the
-/// chat may not hold the sender itself. Intents rather than `bridge::Command`s
-/// because the workbench is the layer that knows a request's routing (and
-/// because a `Command` is not `Clone`, so an event cannot carry one).
-///
-/// The sid rides along on the variants that have one, so the workbench never
-/// has to ask a chat for a session id that its state says may not exist.
-pub enum ChatRequest {
-    /// Unstarted only: the models pi would offer in this chat's cwd, from a
-    /// throwaway pi (the running session's list is `ModelControls`).
-    ListModels {
-        cwd: String,
-        token: RequestToken,
-    },
-    /// Unstarted → starting: the create → attach → prompt chain, as the launch
-    /// line's arguments rather than a built `Command` — the chat owns what pi
-    /// is asked for, the workbench owns which bridge is asked.
-    Start {
-        sid: String,
-        cwd: String,
-        provider: Option<String>,
-        model: Option<String>,
-        name: String,
-        first_prompt: String,
-    },
-    Prompt {
-        sid: String,
-        text: String,
-    },
-    SetModel {
-        sid: String,
-        provider: String,
-        model_id: String,
-        token: RequestToken,
-    },
-    /// The prompt box's model control, filled at open: the session's model
-    /// list and its current model. Both queue on pi's in-order stdin.
-    ModelControls {
-        sid: String,
-        models: RequestToken,
-        state: RequestToken,
-    },
-}
-
-impl ChatRequest {
-    /// Whether this request is the unstarted chat's. The two halves reach a
-    /// machine differently — an unstarted chat connects lazily and lets its
-    /// commands queue behind the bootstrap, while a live one refuses to send
-    /// into a bridge that is not up — and this is the one place that says so.
-    pub fn is_pre_session(&self) -> bool {
-        matches!(
-            self,
-            ChatRequest::ListModels { .. } | ChatRequest::Start { .. }
-        )
-    }
-}
-
-impl EventEmitter<ChatRequest> for Chat {}
+impl EventEmitter<session_state::ChatIntent> for Chat {}
 
 pub struct Chat {
-    state: ChatState,
-    target: ChatTarget,
+    /// The window-free owner of the session lifecycle, model state, request
+    /// correlation and transcript. The fields below are GPUI adaptation only.
+    state: SessionState,
     /// Where this chat's machine label and its retargeting candidates come
     /// from, read on every render. Observed, so a provider listing that
     /// renames a machine or a workspace the user just added reaches this pane
     /// without anyone remembering to push it (SPEC C12).
     store: Entity<FleetStore>,
-    /// What is rendered, and the pi vocabulary behind it — client-core's, so
-    /// the wire shapes are testable without a window.
-    transcript: Transcript,
     /// Tool blocks the user has opened, by `toolCallId`. Not by position: a
     /// resync replaces every item, and expansion keyed by index would land on
     /// whatever block took that slot.
     expanded: HashSet<String>,
-    /// Set when the pi process exited; shown where the input was. Prompting
-    /// again requires a resume (re-open from the sidebar — resume is
-    /// `create_session` with the same sid).
-    exited_notice: Option<String>,
-    /// The models this chat can pick from and the modal over them, however
-    /// they were loaded (throwaway `list_models` unstarted, passthrough
-    /// `get_available_models` live).
-    model: ModelControl,
-    /// The model the prompt box names. Unstarted it is the launch line's pick,
-    /// where `None` means "let pi choose"; live it is the session's current
-    /// model (`get_state` at open, replaced by each confirmed `set_model`),
-    /// where `None` merely means the answer has not arrived yet.
-    current_model: Option<ModelChoice>,
-    /// The two answers a live chat can be waiting on. An answer carrying any
-    /// other token belongs to a request already superseded (two `set_model`s
-    /// from a fast double-pick are the live case) and is dropped.
-    session_state: Pending<()>,
-    set_model: Pending<()>,
     /// Focus the prompt input on the next frame (set at creation; render has
     /// the `Window` that focusing needs).
     focus_input: bool,
     input: Entity<InputState>,
     scroll: ScrollHandle,
-    tokens: RequestTokens,
     /// The input's Enter, the store's repaints, and the store's events. Held
     /// rather than detached so all three die with this pane.
     _subscriptions: [Subscription; 3],
@@ -209,7 +76,8 @@ impl Chat {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut chat = Self::new(ChatState::Unstarted, target, store, window, cx);
+        let tokens = store.read(cx).tokens();
+        let mut chat = Self::new(SessionState::unstarted(target, tokens), store, window, cx);
 
         chat.request_model_list(cx);
 
@@ -226,16 +94,17 @@ impl Chat {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut chat = Self::new(ChatState::Live { sid }, target, store, window, cx);
-
-        chat.transcript.replace_history(entries);
-
-        chat
+        let tokens = store.read(cx).tokens();
+        Self::new(
+            SessionState::live(sid, target, entries, tokens),
+            store,
+            window,
+            cx,
+        )
     }
 
     fn new(
-        state: ChatState,
-        target: ChatTarget,
+        state: SessionState,
         store: Entity<FleetStore>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -255,23 +124,13 @@ impl Chat {
             cx.observe(&store, |_, _, cx| cx.notify()),
             cx.subscribe(&store, Self::handle_store_event),
         ];
-        let tokens = store.read(cx).tokens();
-
         Self {
             state,
-            target,
             store,
-            transcript: Transcript::new(&[]),
             expanded: HashSet::new(),
-            exited_notice: None,
-            model: ModelControl::default(),
-            current_model: None,
-            session_state: Pending::default(),
-            set_model: Pending::default(),
             focus_input: true,
             input,
             scroll: ScrollHandle::new(),
-            tokens,
             _subscriptions: subscriptions,
         }
     }
@@ -304,7 +163,11 @@ impl Chat {
             BridgeEvent::Disconnected if self.runs_on(machine) => {
                 self.fail_pending_requests("connection lost".to_string(), cx)
             }
-            BridgeEvent::RequestFailed { .. } if self.runs_on(machine) => self.abandon_start(cx),
+            BridgeEvent::RequestFailed { .. } if self.runs_on(machine) => {
+                if self.state.fail_start() {
+                    cx.notify();
+                }
+            }
             BridgeEvent::ModelsListed { token, result } if self.runs_on(machine) => {
                 self.handle_models_listed(*token, result.clone(), cx)
             }
@@ -328,11 +191,9 @@ impl Chat {
             }
             // A failed `set_model` is the store's to report; this pane only
             // moves its label when pi confirms one.
-            BridgeEvent::ModelSet {
-                sid,
-                token,
-                result: Ok(data),
-            } if self.renders(sid) => self.handle_model_set(*token, data, cx),
+            BridgeEvent::ModelSet { sid, token, result } if self.renders(sid) => {
+                self.handle_model_set(*token, result, cx)
+            }
             _ => {}
         }
     }
@@ -343,7 +204,7 @@ impl Chat {
     /// a start still in flight on another — without it a retry mints a second
     /// sid and starts a second pi for one prompt.
     fn runs_on(&self, machine: &str) -> bool {
-        self.target.machine == machine
+        self.state.target().machine == machine
     }
 
     /// Whether this chat is the one rendering `sid`.
@@ -354,7 +215,10 @@ impl Chat {
     /// How this chat's machine is named on screen — the store's answer, never
     /// a copy of it.
     fn machine_label(&self, cx: &Context<Self>) -> SharedString {
-        self.store.read(cx).label(&self.target.machine).into()
+        self.store
+            .read(cx)
+            .label(&self.state.target().machine)
+            .into()
     }
 
     /// The machines this chat could still be retargeted to: the stored
@@ -364,29 +228,26 @@ impl Chat {
     fn machine_candidates(&self, cx: &Context<Self>) -> Vec<MachineCandidate> {
         self.store
             .read(cx)
-            .machine_candidates_for(&self.target.workspace_path)
+            .machine_candidates_for(&self.state.target().workspace_path)
     }
 
-    /// `None` for an unstarted chat — it names no session (see [`ChatState`]).
+    /// `None` for an unstarted chat — it names no session (see [`SessionPhase`]).
     pub fn sid(&self) -> Option<&str> {
         self.state.sid()
     }
 
     pub fn machine(&self) -> &str {
-        &self.target.machine
+        &self.state.target().machine
     }
 
     /// The sid this chat is waiting on `Attached` for, and the name it minted
     /// for it — what the workbench needs to synthesize the sidebar row.
     pub fn starting_session(&self) -> Option<(&str, &str)> {
-        match &self.state {
-            ChatState::Starting { sid, name } => Some((sid, name)),
-            _ => None,
-        }
+        self.state.phase().starting_session()
     }
 
     pub fn workspace_path(&self) -> &str {
-        &self.target.workspace_path
+        &self.state.target().workspace_path
     }
 
     /// Ask for what a live chat's prompt box needs. Separate from the
@@ -394,23 +255,14 @@ impl Chat {
     /// exist yet: the workbench subscribes to the chat it just created, then
     /// calls this.
     pub fn request_model_controls(&mut self, cx: &mut Context<Self>) {
-        let Some(sid) = self.state.sid().map(str::to_string) else {
-            return;
-        };
-
-        cx.emit(ChatRequest::ModelControls {
-            sid,
-            models: self.model.fetching(&self.tokens),
-            state: self.session_state.ask(&self.tokens, ()),
-        });
+        for intent in self.state.request_model_controls() {
+            cx.emit(intent);
+        }
     }
 
     /// The unstarted chat's model list: a throwaway pi in this chat's cwd.
     fn request_model_list(&mut self, cx: &mut Context<Self>) {
-        cx.emit(ChatRequest::ListModels {
-            cwd: self.target.workspace_path.clone(),
-            token: self.model.fetching(&self.tokens),
-        });
+        cx.emit(self.state.request_model_list());
     }
 
     /// The create → attach → prompt chain landed: this chat is a live session
@@ -418,13 +270,10 @@ impl Chat {
     /// where the prompt already on screen is the only history there is — so it
     /// stays rather than being blanked out from under the user.
     pub fn promote_to_live(&mut self, sid: String, entries: &[Value], cx: &mut Context<Self>) {
-        if !entries.is_empty() {
-            self.transcript.replace_history(entries);
+        if self.state.promote_to_live(sid, entries) {
+            self.scroll.scroll_to_bottom();
+            cx.notify();
         }
-
-        self.state = ChatState::Live { sid };
-        self.scroll.scroll_to_bottom();
-        cx.notify();
     }
 
     /// A resync (`event_gap`, or a reconnect's refetch) answered: the entries
@@ -434,35 +283,27 @@ impl Chat {
     /// in-flight partial message goes because the snapshot supersedes it; the
     /// next `message_update` carries the whole partial again.
     fn replace_history(&mut self, entries: &[Value], cx: &mut Context<Self>) {
-        self.transcript.replace_history(entries);
-
-        self.scroll.scroll_to_bottom();
-        cx.notify();
+        if self.state.replace_history(entries) {
+            self.scroll.scroll_to_bottom();
+            cx.notify();
+        }
     }
 
     /// The same repair, cheap: only the entries after the last fetch's cursor
     /// (docs/SPEC.md C6). The transcript owns what that means for the items it
     /// built from live events in the meantime.
     fn extend_history(&mut self, entries: &[Value], cx: &mut Context<Self>) {
-        self.transcript.extend_history(entries);
-
-        self.scroll.scroll_to_bottom();
-        cx.notify();
-    }
-
-    /// The start failed. Back to editable — a retry mints a fresh sid.
-    fn abandon_start(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.state, ChatState::Starting { .. }) {
-            self.state = ChatState::Unstarted;
+        if self.state.extend_history(entries) {
+            self.scroll.scroll_to_bottom();
             cx.notify();
         }
     }
 
     /// The machine's bridge died: nothing this chat asked for will arrive.
     pub fn fail_pending_requests(&mut self, detail: String, cx: &mut Context<Self>) {
-        self.abandon_start(cx);
-        self.model.fail(detail);
-        cx.notify();
+        if self.state.fail_pending(detail) {
+            cx.notify();
+        }
     }
 
     /// A model list answered, from either source. A chat that has since been
@@ -474,7 +315,7 @@ impl Chat {
         result: Result<Value, String>,
         cx: &mut Context<Self>,
     ) {
-        if self.model.accept(token, result) {
+        if self.state.accept_models(token, result) {
             cx.notify();
         }
     }
@@ -487,31 +328,23 @@ impl Chat {
         result: Result<Value, String>,
         cx: &mut Context<Self>,
     ) {
-        if self.session_state.accept(token).is_none() {
-            return;
-        }
-
-        match result {
-            Ok(data) => {
-                self.current_model = data.get("model").and_then(models::model_choice_from_value);
-                cx.notify();
-            }
-            Err(detail) => eprintln!(
-                "harvester: get_state ({}): {detail}",
-                self.state.sid().unwrap_or("?")
-            ),
+        if self.state.accept_session_state(token, result) {
+            cx.notify();
         }
     }
 
     /// A `set_model` succeeded; pi's `data` is the full Model object now in
     /// effect (failures surface in the statusbar, workbench-side).
-    fn handle_model_set(&mut self, token: RequestToken, data: &Value, cx: &mut Context<Self>) {
-        if self.set_model.accept(token).is_none() {
-            return;
-        }
-
-        if let Some(choice) = models::model_choice_from_value(data) {
-            self.current_model = Some(choice);
+    fn handle_model_set(
+        &mut self,
+        token: RequestToken,
+        result: &Result<Value, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .state
+            .accept_model_set(token, result.as_ref().map_err(|error| error.clone()))
+        {
             cx.notify();
         }
     }
@@ -527,26 +360,26 @@ impl Chat {
     /// list that may be refetched while the dropdown is open, so a pick always
     /// applies the model the user actually read.
     fn model_picks(&self) -> Vec<Option<ModelChoice>> {
-        if matches!(self.state, ChatState::Starting { .. }) {
+        if matches!(self.state.phase(), SessionPhase::Starting { .. }) {
             return Vec::new();
         }
 
-        let offer_default = matches!(self.state, ChatState::Unstarted);
+        let offer_default = matches!(self.state.phase(), SessionPhase::Unstarted);
 
         offer_default
             .then_some(None)
             .into_iter()
-            .chain(self.model.choices().iter().cloned().map(Some))
+            .chain(self.state.model_choices().iter().cloned().map(Some))
             .collect()
     }
 
     /// Whether `pick` is the model this chat is already on.
     fn is_current_model(&self, pick: &Option<ModelChoice>) -> bool {
-        match (pick, &self.current_model) {
-            (Some(choice), Some(current)) => {
+        match (pick, self.state.selection()) {
+            (None, ModelSelection::LaunchDefault) => true,
+            (Some(choice), ModelSelection::Launch(current) | ModelSelection::Live(current)) => {
                 choice.provider == current.provider && choice.id == current.id
             }
-            (None, None) => true,
             _ => false,
         }
     }
@@ -556,25 +389,8 @@ impl Chat {
     /// costs a `set_model` the session must confirm, so the label does not move
     /// until [`Chat::handle_model_set`] says pi agreed.
     fn pick_model(&mut self, picked: Option<ModelChoice>, cx: &mut Context<Self>) {
-        match &self.state {
-            ChatState::Unstarted => self.current_model = picked,
-            ChatState::Live { sid } => {
-                if let Some(choice) = picked {
-                    // A second pick supersedes the first: only the answer to
-                    // this token may move the label, so a slow reply for the
-                    // abandoned model cannot land on top of a newer one.
-                    let request = ChatRequest::SetModel {
-                        sid: sid.clone(),
-                        provider: choice.provider,
-                        model_id: choice.id,
-                        token: self.set_model.ask(&self.tokens, ()),
-                    };
-
-                    cx.emit(request);
-                }
-            }
-            // The launch line is already out; its model is what this session has.
-            ChatState::Starting { .. } => {}
+        if let Some(intent) = self.state.pick_model(picked) {
+            cx.emit(intent);
         }
 
         cx.notify();
@@ -589,41 +405,39 @@ impl Chat {
     /// nothing is refetched. The stale answer from the old machine is dropped
     /// by the model control's own token.
     fn pick_machine(&mut self, machine: String, cx: &mut Context<Self>) {
-        if self.target.machine == machine {
+        if self.state.target().machine == machine {
             cx.notify();
 
             return;
         }
 
-        self.target.machine = machine;
-        self.current_model = None;
-        self.request_model_list(cx);
-        cx.notify();
+        if self.state.cancel_model_fetch("machine changed".to_string()) {
+            cx.notify();
+        }
+
+        if self.state.retarget(machine) {
+            self.request_model_list(cx);
+            cx.notify();
+        }
     }
 
     /// Whether this chat's pi is still believed to be running. Based on the
     /// `session_exit` events this chat actually received, so unlike a cached
     /// list status it cannot claim "running" about a session that has died.
     pub fn is_live(&self) -> bool {
-        self.exited_notice.is_none()
+        self.state.is_live()
     }
 
     fn handle_session_exit(&mut self, exit_code: Option<i32>, cx: &mut Context<Self>) {
-        let code_text = exit_code
-            .map(|code| format!(" (exit code {code})"))
-            .unwrap_or_default();
-
-        self.transcript.end_turn();
-        self.exited_notice = Some(format!(
-            "session exited{code_text} — click it in the sidebar to resume"
-        ));
-        cx.notify();
+        if self.state.exit(exit_code) {
+            cx.notify();
+        }
     }
 
     fn handle_pi_event(&mut self, event: &Value, cx: &mut Context<Self>) {
         // `false` is an event this model does not cover (retries, compaction,
         // queue): nothing moved, so nothing is redrawn.
-        if !self.transcript.apply(event) {
+        if !self.state.apply_pi_event(event) {
             return;
         }
 
@@ -651,64 +465,11 @@ impl Chat {
     /// Both send paths end here: take what is typed, clear the box, route it
     /// by state.
     fn submit_text(&mut self, text: String, cx: &mut Context<Self>) {
-        if self.exited_notice.is_some() {
-            return;
+        if let Some(intent) = self.state.submit_prompt(text) {
+            cx.emit(intent);
+            self.scroll.scroll_to_bottom();
+            cx.notify();
         }
-
-        match &self.state {
-            ChatState::Unstarted => self.start(text, cx),
-            ChatState::Live { sid } => {
-                let request = ChatRequest::Prompt {
-                    sid: sid.clone(),
-                    text: text.clone(),
-                };
-
-                self.transcript.push_user_prompt(text);
-                cx.emit(request);
-                self.scroll.scroll_to_bottom();
-                cx.notify();
-            }
-            // The input is not rendered while starting; nothing to accept.
-            ChatState::Starting { .. } => {}
-        }
-    }
-
-    /// The first prompt: mint the sid, derive the name, resolve the launch
-    /// line's model, and hand the chain to the workbench.
-    ///
-    /// The sid is a **uuidv7 minted here** because that is pi's own session-id
-    /// format and the client is the one that mints it (docs/DAEMON.md §the pi
-    /// launch line). It sits in a gpui module only because that is where the
-    /// prompt is; nothing about it is presentation.
-    fn start(&mut self, prompt: String, cx: &mut Context<Self>) {
-        if prompt.trim().is_empty() {
-            return;
-        }
-
-        let sid = uuid::Uuid::now_v7().to_string();
-        let name = session_name_from_prompt(&prompt);
-        let (provider, model) = match &self.current_model {
-            Some(choice) => (Some(choice.provider.clone()), Some(choice.id.clone())),
-            // Nothing picked (or no list ever arrived): pi's own default.
-            None => (None, None),
-        };
-        let request = ChatRequest::Start {
-            sid: sid.clone(),
-            cwd: self.target.workspace_path.clone(),
-            provider,
-            model,
-            name: name.clone(),
-            first_prompt: prompt.clone(),
-        };
-
-        // Rendered immediately: the bridge is sending this prompt as part of
-        // the chain, so the turn is already under way and the pane should say
-        // so rather than going blank until `Attached` lands.
-        self.transcript.push_user_prompt(prompt);
-        self.state = ChatState::Starting { sid, name };
-        cx.emit(request);
-        self.scroll.scroll_to_bottom();
-        cx.notify();
     }
 
     /// The send button's path; Enter inside the input reaches the same
@@ -740,7 +501,7 @@ impl Chat {
     fn unstarted_subtitle(&self, cx: &Context<Self>) -> SharedString {
         format!(
             "{} on {}",
-            folder_name(&self.target.workspace_path),
+            folder_name(&self.state.target().workspace_path),
             self.machine_label(cx)
         )
         .into()
@@ -760,7 +521,8 @@ impl Chat {
                     .gap_3()
                     .p_3()
                     .children(
-                        self.transcript
+                        self.state
+                            .transcript()
                             .items()
                             .iter()
                             .enumerate()
@@ -820,7 +582,10 @@ impl Chat {
     /// shape when the turn settles. It parses on every chunk — bounded by the
     /// one message, and only while a turn is live.
     fn render_streaming(&self, cx: &App) -> Option<Div> {
-        match (self.transcript.streaming(), self.transcript.is_busy()) {
+        match (
+            self.state.transcript().streaming(),
+            self.state.transcript().is_busy(),
+        ) {
             (Some(text), _) => Some(ui::chat_message(
                 "pi",
                 Tone::Muted,
@@ -840,9 +605,9 @@ impl Chat {
         // The prompt box floats in the pane's padding (no separator line —
         // the card's own border is the boundary).
         let row = div().flex_none().px_3().pb_3();
-        let notice = match (&self.exited_notice, &self.state) {
-            (Some(notice), _) => Some(notice.clone()),
-            (None, ChatState::Starting { .. }) => Some("starting session…".to_string()),
+        let notice = match (self.state.exited_notice(), self.state.phase()) {
+            (Some(notice), _) => Some(notice.to_string()),
+            (None, SessionPhase::Starting { .. }) => Some("starting session…".to_string()),
             (None, _) => None,
         };
 
@@ -867,7 +632,7 @@ impl Chat {
     fn render_prompt_box(&self, input_focused: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let (model_label, model_enabled) = self.model_control_state();
         let machine_enabled =
-            matches!(self.state, ChatState::Unstarted) && self.can_switch_machine(cx);
+            matches!(self.state.phase(), SessionPhase::Unstarted) && self.can_switch_machine(cx);
         let machine_label = self.machine_label(cx);
 
         ui::prompt_box(input_focused, cx)
@@ -879,7 +644,9 @@ impl Chat {
                     .child(self.render_model_control(model_label, model_enabled, cx))
                     .child(ui::prompt_box_control(
                         "chat-repo",
-                        folder_name(&self.target.workspace_path).to_string().into(),
+                        folder_name(&self.state.target().workspace_path)
+                            .to_string()
+                            .into(),
                         false,
                         cx,
                     ))
@@ -895,17 +662,21 @@ impl Chat {
     /// list that never arrived is not an error the user must clear — pi still
     /// launches with its default — so the control just reads that way.
     fn model_control_state(&self) -> (SharedString, bool) {
-        if let Some(choice) = &self.current_model {
-            return (choice.name.clone(), !self.model.choices().is_empty());
-        }
+        let choices_available = !self.state.model_choices().is_empty();
 
-        match (self.model.state(), &self.state) {
-            (ModelsState::Loading, ChatState::Unstarted) => ("loading models…".into(), false),
-            (ModelsState::Failed(_), ChatState::Unstarted) => ("default model".into(), false),
-            (ModelsState::Loaded(_), ChatState::Unstarted) => ("default model".into(), true),
-            // Live, before `get_state` answers: a generic label rather than a
-            // claim about which model the session is on.
-            _ => ("model".into(), !self.model.choices().is_empty()),
+        match self.state.selection() {
+            ModelSelection::Launch(choice) | ModelSelection::Live(choice) => {
+                (choice.name.clone().into(), choices_available)
+            }
+            ModelSelection::LaunchDefault => match self.state.models() {
+                ModelsState::Loading => ("loading models…".into(), false),
+                ModelsState::Loaded(_) => ("default model".into(), true),
+                ModelsState::NotRequested | ModelsState::Failed(_) => {
+                    ("default model".into(), false)
+                }
+            },
+            ModelSelection::LivePending => ("model".into(), choices_available),
+            ModelSelection::LiveUnavailable => ("model unavailable".into(), choices_available),
         }
     }
 
@@ -929,7 +700,7 @@ impl Chat {
             .iter()
             .map(|pick| ui::DropdownRow {
                 label: match pick {
-                    Some(choice) => choice.name.clone(),
+                    Some(choice) => choice.name.clone().into(),
                     None => DEFAULT_MODEL_ROW.into(),
                 },
                 selected: self.is_current_model(pick),
@@ -966,7 +737,7 @@ impl Chat {
             .iter()
             .map(|(machine, label)| ui::DropdownRow {
                 label: label.clone().into(),
-                selected: machine == &self.target.machine,
+                selected: machine == &self.state.target().machine,
             })
             .collect();
         // The keys travel with the pick, so a listing landing while the list is
@@ -999,7 +770,7 @@ impl Chat {
             .flex_1()
             .min_h(px(0.))
             .p_3()
-            .children(match self.model.state() {
+            .children(match self.state.models() {
                 ModelsState::Failed(detail) => Some(
                     div()
                         .text_xs()
@@ -1013,8 +784,8 @@ impl Chat {
 
 impl Render for Chat {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let accepts_input =
-            self.exited_notice.is_none() && !matches!(self.state, ChatState::Starting { .. });
+        let accepts_input = self.state.exited_notice().is_none()
+            && !matches!(self.state.phase(), SessionPhase::Starting { .. });
 
         if self.focus_input && accepts_input {
             window.focus(&self.input.read(cx).focus_handle(cx), cx);
@@ -1022,33 +793,20 @@ impl Render for Chat {
         }
 
         let pane = div().size_full().flex().flex_col();
-        let pane = match self.state {
+        let pane = match self.state.phase() {
             // No conversation yet, so the header is what identifies the pane.
-            ChatState::Unstarted | ChatState::Starting { .. } => pane
+            SessionPhase::Unstarted | SessionPhase::Starting { .. } => pane
                 .child(ui::chat_header(
                     "New session".into(),
                     self.unstarted_subtitle(cx),
                     cx,
                 ))
                 .child(self.render_unstarted_body(cx)),
-            ChatState::Live { .. } => pane.child(self.render_messages(cx)),
+            SessionPhase::Live { .. } => pane.child(self.render_messages(cx)),
         };
 
         pane.child(self.render_bottom_row(window, cx))
     }
-}
-
-/// Pi's `--name` for the session, from the prompt that started it: its first
-/// non-blank line, capped. Presentation, not protocol — pi accepts any string.
-fn session_name_from_prompt(prompt: &str) -> String {
-    prompt
-        .trim()
-        .lines()
-        .next()
-        .unwrap_or("")
-        .chars()
-        .take(SESSION_NAME_MAX_CHARS)
-        .collect()
 }
 
 /// One settled message. The user's own text renders verbatim — it is what they
@@ -1219,43 +977,4 @@ fn compact_args(args: &Value) -> String {
     let truncated: String = json.chars().take(ARGS_SUMMARY_MAX_CHARS).collect();
 
     format!("{truncated}…")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_short_prompt_is_its_own_session_name() {
-        assert_eq!(session_name_from_prompt("fix the tests"), "fix the tests");
-    }
-
-    #[test]
-    fn only_the_first_line_names_the_session() {
-        assert_eq!(
-            session_name_from_prompt("fix the tests\nand also the docs"),
-            "fix the tests"
-        );
-    }
-
-    #[test]
-    fn a_long_first_line_is_capped() {
-        let name = session_name_from_prompt(&"x".repeat(SESSION_NAME_MAX_CHARS + 10));
-
-        assert_eq!(name.chars().count(), SESSION_NAME_MAX_CHARS);
-    }
-
-    /// Counted in characters, not bytes — `take` on chars, so a multi-byte
-    /// line is never cut mid-character and never capped early.
-    #[test]
-    fn the_cap_counts_characters_not_bytes() {
-        let name = session_name_from_prompt(&"é".repeat(SESSION_NAME_MAX_CHARS + 5));
-
-        assert_eq!(name.chars().count(), SESSION_NAME_MAX_CHARS);
-    }
-
-    #[test]
-    fn a_leading_blank_line_is_not_the_name() {
-        assert_eq!(session_name_from_prompt("\n\n  fix it  "), "fix it");
-    }
 }

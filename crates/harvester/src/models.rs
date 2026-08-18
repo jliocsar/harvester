@@ -3,26 +3,15 @@
 //! and what a launch line or `set_model` call needs, extracted from pi's
 //! verbatim Model objects — the payloads themselves are never normalized.
 
-use gpui::SharedString;
 use serde_json::Value;
 
 /// One entry the model picker can offer.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelChoice {
     /// Display string (pi's `name`, falling back to `id`).
-    pub name: SharedString,
+    pub name: String,
     pub provider: String,
     pub id: String,
-}
-
-#[derive(Default)]
-pub enum ModelsState {
-    #[default]
-    Loading,
-    Loaded(Vec<ModelChoice>),
-    /// The fetch failed; the chat stays usable — pi keeps running on its
-    /// current (or default) model.
-    Failed(String),
 }
 
 /// One pi Model object → a picker entry. Objects without an id or provider
@@ -33,7 +22,7 @@ pub fn model_choice_from_value(model: &Value) -> Option<ModelChoice> {
     let name = model.get("name").and_then(Value::as_str).unwrap_or(id);
 
     Some(ModelChoice {
-        name: name.to_string().into(),
+        name: name.to_string(),
         provider: provider.to_string(),
         id: id.to_string(),
     })
