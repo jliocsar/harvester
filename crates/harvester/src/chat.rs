@@ -14,11 +14,9 @@
 //! whole partial message — replace, never append. `agent_settled` (not
 //! `agent_end`) ends the turn.
 
-use std::collections::HashSet;
-
 use gpui::{
-    div, prelude::*, px, AnyElement, App, Context, Div, Entity, EventEmitter, Focusable,
-    ScrollHandle, SharedString, Subscription, Window,
+    div, prelude::*, px, AnyElement, App, Context, Entity, EventEmitter, Focusable, ScrollHandle,
+    SharedString, Subscription, Window,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use serde_json::Value;
@@ -29,7 +27,6 @@ use crate::store::{FleetStore, StoreEvent};
 use crate::ui::{self, Tone};
 use crate::workspaces::folder_name;
 use harvester_client_core::bridge::Event as BridgeEvent;
-use harvester_client_core::transcript::{Item, Message, Role, ToolBlock, ToolStatus};
 use harvester_client_core::RequestToken;
 
 /// The unstarted chat's "no model chosen" row: pi launches with its own
@@ -52,10 +49,9 @@ pub struct Chat {
     /// renames a machine or a workspace the user just added reaches this pane
     /// without anyone remembering to push it (SPEC C12).
     store: Entity<FleetStore>,
-    /// Tool blocks the user has opened, by `toolCallId`. Not by position: a
-    /// resync replaces every item, and expansion keyed by index would land on
-    /// whatever block took that slot.
-    expanded: HashSet<String>,
+    /// Message/tool/markdown policy and stable tool-expansion state. It reads
+    /// the client-core transcript without copying or normalizing its items.
+    transcript_presentation: ui::TranscriptPresentation,
     /// Focus the prompt input on the next frame (set at creation; render has
     /// the `Window` that focusing needs).
     focus_input: bool,
@@ -127,7 +123,7 @@ impl Chat {
         Self {
             state,
             store,
-            expanded: HashSet::new(),
+            transcript_presentation: ui::TranscriptPresentation::default(),
             focus_input: true,
             input,
             scroll: ScrollHandle::new(),
@@ -486,15 +482,6 @@ impl Chat {
         self.submit_text(text, cx);
     }
 
-    /// A tool block's header was clicked: toggle its body.
-    fn toggle_tool_block(&mut self, tool_call_id: String, cx: &mut Context<Self>) {
-        if !self.expanded.remove(&tool_call_id) {
-            self.expanded.insert(tool_call_id);
-        }
-
-        cx.notify();
-    }
-
     /// The unstarted chat's header line: which repository, on which machine.
     /// A live chat has no header — its prompt box already names both, and the
     /// conversation identifies it better than any title could.
@@ -507,96 +494,23 @@ impl Chat {
         .into()
     }
 
-    fn render_messages(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .id("chat-messages")
-            .flex_1()
-            .min_h(px(0.))
-            .overflow_y_scroll()
-            .track_scroll(&self.scroll)
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .p_3()
-                    .children(
-                        self.state
-                            .transcript()
-                            .items()
-                            .iter()
-                            .enumerate()
-                            .map(|(index, item)| self.render_item(index, item, cx)),
-                    )
-                    .children(self.render_streaming(cx)),
-            )
-    }
+    /// Adapt the transcript presentation's tool toggle back into this chat's
+    /// GPUI entity. The presentation owns expansion; the chat owns the entity
+    /// lifetime and notification that follows a click.
+    fn render_transcript(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let chat = cx.entity();
 
-    /// One conversation item. The index is the element id only — what a click
-    /// toggles is the block's `toolCallId`, which survives a resync.
-    fn render_item(&self, index: usize, item: &Item, cx: &mut Context<Self>) -> AnyElement {
-        match item {
-            Item::Message(message) => render_message(index, message, cx).into_any_element(),
-            Item::Tool(block) => self.render_tool_block(index, block, cx).into_any_element(),
-            Item::Failure(detail) => render_failure(detail, cx).into_any_element(),
-        }
-    }
-
-    fn render_tool_block(
-        &self,
-        index: usize,
-        block: &ToolBlock,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let tone = match block.status {
-            // Running is the accent, not "pending": a tool the user is
-            // watching run is the live thing on screen.
-            ToolStatus::Running => Tone::Active,
-            ToolStatus::Ok => Tone::Idle,
-            ToolStatus::Error => Tone::Failed,
-        };
-        let expanded = self.expanded.contains(&block.tool_call_id);
-        let tool_call_id = block.tool_call_id.clone();
-        let header = ui::tool_block_header(
-            ("tool-block", index),
-            tone,
-            tool_block_label(block, cx),
-            expanded,
+        self.transcript_presentation.render(
+            self.state.transcript(),
+            &self.scroll,
+            move |tool_call_id, _, cx| {
+                chat.update(cx, |chat, cx| {
+                    chat.transcript_presentation.toggle_tool_block(tool_call_id);
+                    cx.notify();
+                });
+            },
             cx,
         )
-        .on_click(
-            cx.listener(move |chat, _, _, cx| chat.toggle_tool_block(tool_call_id.clone(), cx)),
-        );
-
-        ui::tool_block(cx)
-            .child(header)
-            .when(expanded, |container| {
-                container.child(render_tool_body(block, cx))
-            })
-    }
-
-    /// The turn in flight: the partial message, or that pi is thinking.
-    ///
-    /// The partial is markdown like any other pi message, so a fence that has
-    /// opened but not closed formats as it arrives rather than snapping into
-    /// shape when the turn settles. It parses on every chunk — bounded by the
-    /// one message, and only while a turn is live.
-    fn render_streaming(&self, cx: &App) -> Option<Div> {
-        match (
-            self.state.transcript().streaming(),
-            self.state.transcript().is_busy(),
-        ) {
-            (Some(text), _) => Some(ui::chat_message(
-                "pi",
-                Tone::Muted,
-                ui::markdown("streaming-message", format!("{text}▍")),
-                false,
-                cx,
-            )),
-            // Prompt accepted, no partial yet: show that pi is working.
-            (None, true) => Some(ui::chat_message("pi", Tone::Muted, "…", false, cx)),
-            (None, false) => None,
-        }
     }
 
     /// The pane's bottom row: the prompt box, or the one sentence that
@@ -802,179 +716,9 @@ impl Render for Chat {
                     cx,
                 ))
                 .child(self.render_unstarted_body(cx)),
-            SessionPhase::Live { .. } => pane.child(self.render_messages(cx)),
+            SessionPhase::Live { .. } => pane.child(self.render_transcript(cx)),
         };
 
         pane.child(self.render_bottom_row(window, cx))
     }
-}
-
-/// One settled message. The user's own text renders verbatim — it is what they
-/// typed, and a `#` or a `*` in it is a character, not a heading or emphasis.
-/// Pi's is markdown, which is what pi writes.
-fn render_message(index: usize, message: &Message, cx: &App) -> Div {
-    match message.role {
-        Role::User => ui::chat_message("you", Tone::Active, message.text.clone(), true, cx),
-        Role::Assistant => ui::chat_message(
-            "pi",
-            Tone::Muted,
-            ui::markdown(("message", index), message.text.clone()),
-            false,
-            cx,
-        ),
-    }
-}
-
-/// A turn that ended badly. Authored as "pi" because it is that turn's
-/// outcome, but in the failed tone and without markdown — the reason is a
-/// provider's error string, not prose, and running it through a renderer that
-/// eats `*` and `#` would corrupt exactly the detail being reported.
-fn render_failure(detail: &str, cx: &App) -> Div {
-    ui::chat_message("pi", Tone::Failed, detail.to_string(), false, cx)
-}
-
-/// Cap on the compact-args summary in unknown-tool labels; the full args
-/// render in the expanded body.
-const ARGS_SUMMARY_MAX_CHARS: usize = 80;
-
-/// The header one-liner per tool (built-ins verified against pi 0.83.0:
-/// read/bash/edit/write/grep/find/ls). Bash gets a `$ command` form — pi has
-/// no human titles for calls, the command itself is the best label.
-fn tool_block_label(block: &ToolBlock, cx: &App) -> Div {
-    let label = ui::tool_block_label();
-
-    match block.tool_name.as_str() {
-        "bash" => {
-            let command = block.arg("command").unwrap_or_default();
-            let first_line = command.lines().next().unwrap_or_default().to_string();
-
-            label
-                .child(ui::tool_block_verb("$", cx))
-                .child(ui::tool_block_subject(first_line.into(), true))
-        }
-        "read" | "write" | "edit" => {
-            let verb = match block.tool_name.as_str() {
-                "read" => "Read",
-                "write" => "Write",
-                _ => "Edit",
-            };
-            let path = block.arg("path").unwrap_or_default();
-            let label = label
-                .child(ui::tool_block_verb(verb, cx))
-                .child(ui::tool_block_subject(
-                    basename(path).to_string().into(),
-                    false,
-                ));
-
-            match block.line_stats() {
-                Some((added, removed)) => label.child(ui::tool_block_stats(added, removed, cx)),
-                None => label,
-            }
-        }
-        "grep" | "find" => {
-            let verb = if block.tool_name == "grep" {
-                "Grep"
-            } else {
-                "Find"
-            };
-            let pattern = block.arg("pattern").unwrap_or_default();
-
-            label
-                .child(ui::tool_block_verb(verb, cx))
-                .child(ui::tool_block_subject(pattern.to_string().into(), true))
-        }
-        "ls" => {
-            let path = block.arg("path").unwrap_or(".");
-
-            label
-                .child(ui::tool_block_verb("List", cx))
-                .child(ui::tool_block_subject(path.to_string().into(), false))
-        }
-        _ => label
-            .child(ui::tool_block_verb(block.tool_name.clone(), cx))
-            .child(ui::tool_block_subject(
-                compact_args(&block.args).into(),
-                true,
-            )),
-    }
-}
-
-/// The expanded body: context line, then a diff (edit/write) or the output
-/// snapshot. Errors always show the output — that is where the message is.
-fn render_tool_body(block: &ToolBlock, cx: &App) -> Div {
-    let mut body =
-        ui::tool_block_body(cx).child(ui::tool_block_context(context_line(block).into(), cx));
-
-    if !matches!(block.status, ToolStatus::Error) {
-        // Edit: pi's pre-rendered numbered diff (`details.diff`).
-        if let Some(diff) = &block.diff {
-            return body.children(diff.lines().map(|line| diff_line(line, cx)));
-        }
-
-        // Write: synthesize the all-added diff from the content argument.
-        if block.tool_name == "write" {
-            if let Some(content) = block.arg("content") {
-                return body.children(content.lines().enumerate().map(|(line_index, line)| {
-                    ui::tool_block_diff_line(
-                        ui::DiffLineKind::Added,
-                        format!("+{} {line}", line_index + 1).into(),
-                        cx,
-                    )
-                }));
-            }
-        }
-    }
-
-    if block.output_truncated {
-        body = body.child(ui::tool_block_truncation_notice(cx));
-    }
-
-    if block.output.is_empty() {
-        let placeholder = match block.status {
-            ToolStatus::Running => "running…",
-            _ => "(no output)",
-        };
-
-        return body.child(ui::tool_block_output(placeholder.into(), cx));
-    }
-
-    body.child(ui::tool_block_output(block.output.clone().into(), cx))
-}
-
-/// The body's faint first line: enough to identify the call in full.
-fn context_line(block: &ToolBlock) -> String {
-    match block.tool_name.as_str() {
-        "read" | "write" | "edit" => block.arg("path").unwrap_or_default().to_string(),
-        "bash" => block.arg("command").unwrap_or_default().to_string(),
-        _ => block.args.to_string(),
-    }
-}
-
-/// One line of pi's numbered diff format (" 1 ctx" / "-2 old" / "+2 new").
-fn diff_line(line: &str, cx: &App) -> Div {
-    let kind = match line.as_bytes().first() {
-        Some(b'+') => ui::DiffLineKind::Added,
-        Some(b'-') => ui::DiffLineKind::Removed,
-        _ => ui::DiffLineKind::Context,
-    };
-
-    ui::tool_block_diff_line(kind, line.to_string().into(), cx)
-}
-
-fn basename(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
-}
-
-/// Unknown-tool label summary: the raw args JSON, capped (full args live in
-/// the expanded body's context line).
-fn compact_args(args: &Value) -> String {
-    let json = args.to_string();
-
-    if json.chars().count() <= ARGS_SUMMARY_MAX_CHARS {
-        return json;
-    }
-
-    let truncated: String = json.chars().take(ARGS_SUMMARY_MAX_CHARS).collect();
-
-    format!("{truncated}…")
 }
