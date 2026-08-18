@@ -419,7 +419,9 @@ impl SessionState {
         }
 
         self.selection = match result {
-            Ok(data) => models::model_choice_from_value(&data)
+            Ok(data) => data
+                .get("model")
+                .and_then(models::model_choice_from_value)
                 .map(ModelSelection::Live)
                 .unwrap_or(ModelSelection::LiveUnavailable),
             Err(_) => ModelSelection::LiveUnavailable,
@@ -622,6 +624,28 @@ mod tests {
         assert!(matches!(
             state.selection(),
             ModelSelection::Live(ModelChoice { id, .. }) if id == "second"
+        ));
+    }
+
+    #[test]
+    fn session_state_reads_the_current_model_from_pi_state_data() {
+        let mut state =
+            SessionState::live("sid".to_string(), target(), &[], RequestTokens::default());
+        let token = match state.request_model_controls().pop().unwrap() {
+            ChatIntent::ModelControls { state, .. } => state,
+            _ => unreachable!(),
+        };
+
+        assert!(state.accept_session_state(
+            token,
+            Ok(json!({
+                "model": {"id": "current", "provider": "test", "name": "Current"}
+            }))
+        ));
+        assert!(matches!(
+            state.selection(),
+            ModelSelection::Live(ModelChoice { id, name, .. })
+                if id == "current" && name == "Current"
         ));
     }
 }

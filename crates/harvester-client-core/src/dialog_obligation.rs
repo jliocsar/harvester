@@ -182,6 +182,10 @@ impl DialogObligations {
         self.pending.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
     /// Accept exactly one answer. A second callback after the modal was
     /// closed finds no front obligation and therefore cannot answer Pi twice.
     pub fn answer_front(&mut self, answer: DialogAnswer) -> Option<AnsweredDialog> {
