@@ -1,0 +1,112 @@
+//! Consistent presentation for one machine state across the sidebar, empty
+//! pane, and statusbar.
+
+use harvester_client_core::MachineState;
+
+use crate::ui::{self, Tone};
+
+/// Everything the UI says about one machine's link, decided in one place.
+///
+/// The strings differ per surface because they are different sentences, not
+/// because the state means different things. Choosing the tone once prevents a
+/// failed state from becoming red in one surface and gray in another.
+pub(super) struct MachinePresentation {
+    pub dot: ui::Dot,
+    /// The content pane's sentence when this machine is the one on screen.
+    /// `None` for probe-only states: nothing about a daemon can be reported.
+    pub pane_message: Option<String>,
+    /// The statusbar's link text, under the same rule.
+    pub statusbar_link: Option<String>,
+}
+
+pub(super) fn present_machine(state: MachineState<'_>, machine: &str) -> MachinePresentation {
+    match state {
+        MachineState::Connecting => MachinePresentation {
+            dot: ui::Dot::Solid(Tone::Pending),
+            pane_message: Some(format!("connecting to {machine}…")),
+            statusbar_link: Some("connecting…".to_string()),
+        },
+        MachineState::Connected { daemon_version } => MachinePresentation {
+            dot: ui::Dot::Solid(Tone::Live),
+            pane_message: Some("select a session".to_string()),
+            statusbar_link: Some(format!("{machine} · harvesterd {daemon_version}")),
+        },
+        MachineState::ConnectFailed { detail } => MachinePresentation {
+            dot: ui::Dot::Solid(Tone::Failed),
+            pane_message: Some(detail.to_string()),
+            statusbar_link: Some("connect failed".to_string()),
+        },
+        MachineState::ConnectionLost => MachinePresentation {
+            dot: ui::Dot::Solid(Tone::Failed),
+            pane_message: Some("connection lost".to_string()),
+            statusbar_link: Some("connection lost".to_string()),
+        },
+        // A listing is authoritative only after its provider has spoken. The
+        // fleet owns that precedence; presentation only names the verdict.
+        MachineState::Missing => MachinePresentation {
+            dot: ui::Dot::Solid(Tone::Failed),
+            pane_message: Some(format!("{machine} is no longer listed by its provider")),
+            statusbar_link: Some("no longer listed".to_string()),
+        },
+        MachineState::Unreachable => MachinePresentation {
+            dot: ui::Dot::Solid(Tone::Failed),
+            pane_message: None,
+            statusbar_link: None,
+        },
+        MachineState::Reachable => MachinePresentation {
+            dot: ui::Dot::Solid(Tone::Idle),
+            pane_message: None,
+            statusbar_link: None,
+        },
+        MachineState::Unknown => MachinePresentation {
+            dot: ui::Dot::Hollow(Tone::Idle),
+            pane_message: None,
+            statusbar_link: None,
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_is_an_absence_not_a_reachability_verdict() {
+        let presentation = present_machine(MachineState::Unknown, "vm");
+
+        assert!(matches!(presentation.dot, ui::Dot::Hollow(Tone::Idle)));
+        assert_eq!(presentation.pane_message, None);
+        assert_eq!(presentation.statusbar_link, None);
+    }
+
+    #[test]
+    fn missing_is_failed_and_names_the_provider_loss() {
+        let presentation = present_machine(MachineState::Missing, "provider/vm");
+
+        assert!(matches!(presentation.dot, ui::Dot::Solid(Tone::Failed)));
+        assert_eq!(
+            presentation.pane_message.as_deref(),
+            Some("provider/vm is no longer listed by its provider")
+        );
+        assert_eq!(
+            presentation.statusbar_link.as_deref(),
+            Some("no longer listed")
+        );
+    }
+
+    #[test]
+    fn a_live_bridge_names_its_daemon_version() {
+        let presentation = present_machine(
+            MachineState::Connected {
+                daemon_version: "build-1",
+            },
+            "vm",
+        );
+
+        assert!(matches!(presentation.dot, ui::Dot::Solid(Tone::Live)));
+        assert_eq!(
+            presentation.statusbar_link.as_deref(),
+            Some("vm · harvesterd build-1")
+        );
+    }
+}

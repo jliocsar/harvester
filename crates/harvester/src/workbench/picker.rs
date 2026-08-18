@@ -1,8 +1,8 @@
 //! The add-workspace folder picker (docs/SPEC.md §Flows "Add workspace"):
 //! the walk, the host ops that drive it, and its rendering.
 //!
-//! A child module of `workbench` so it can own this flow end to end without
-//! opening the workbench's state to the rest of the crate. The picker is the
+//! A child module of the composition shell, paired with `workspace_flow`, so
+//! the add-workspace path owns itself end to end. The picker is the
 //! one surface that talks to the machines worker rather than to a bridge:
 //! walking a machine's directories is plain SSH exec work (`$HOME`, `ls`,
 //! `git rev-parse`), so browsing a machine costs one round trip and never
@@ -21,9 +21,9 @@ use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
 use gpui_component::{ActiveTheme as _, Disableable as _, IndexPath, WindowExt as _};
 use harvester_client_core::machines;
-use harvester_client_core::{Host, Pending, RemoteDirEntry, RequestToken, RequestTokens};
+use harvester_client_core::{Pending, RemoteDirEntry, RequestToken, RequestTokens};
 
-use super::Workbench;
+use crate::store::{FleetStore, StoreEvent};
 
 /// Fixed height for the entries list, so the dialog does not resize under the
 /// pointer when a listing arrives or a filter narrows it.
@@ -44,33 +44,44 @@ enum PickerRequest {
     Validation { path: String },
 }
 
-/// The two things the picker cannot do for itself. Everything else — walking,
-/// gating on the outstanding request, dismissing its own dialog — it does
-/// without telling anyone.
-pub(super) enum PickerEvent {
-    /// Run this on the machine being browsed. The workbench resolves the host
-    /// and owns the machines worker, so the asking is its half of the split.
-    Send(PickerCommand),
-    /// A directory passed validation: store it and close the walk.
-    Stored { machine: String, path: String },
+/// Owned machine-worker answer used only to defer continuation until the
+/// emitting FleetStore has finished its update.
+enum PickerAnswer {
+    Home {
+        token: RequestToken,
+        result: Result<String, String>,
+    },
+    Listing {
+        token: RequestToken,
+        result: Result<Vec<RemoteDirEntry>, String>,
+    },
+    Validation {
+        token: RequestToken,
+        error: Option<String>,
+    },
 }
 
-impl EventEmitter<PickerEvent> for FolderPicker {}
+/// The one result the owning add-workspace flow needs. Host operations and
+/// their answers stay inside the picker; a validated workspace crosses this
+/// seam once, as a stable machine/path value.
+pub(super) struct WorkspacePicked {
+    pub machine: String,
+    pub path: String,
+}
+
+impl EventEmitter<WorkspacePicked> for FolderPicker {}
 
 /// What the picker needs run on its machine. The picker decides *what* to ask
-/// for and correlates the answer; the workbench resolves the [`Host`] and owns
-/// the machines worker, so it does the asking — the same decide/ask split
-/// every workbench-owned surface uses, since only the workbench holds the
-/// machines worker.
+/// for, resolves the current host through the store, and correlates the answer.
 #[derive(Clone)]
-pub(super) struct PickerCommand {
+struct PickerCommand {
     request: PickerRequest,
     token: RequestToken,
 }
 
 impl PickerCommand {
-    /// The worker's own vocabulary, once the workbench has resolved the host.
-    fn into_machines_command(self, host: Host) -> machines::Command {
+    /// The worker's own vocabulary, once the picker has resolved the host.
+    fn into_machines_command(self, host: harvester_client_core::Host) -> machines::Command {
         match self.request {
             PickerRequest::Home => machines::Command::ResolveHome {
                 host,
@@ -96,8 +107,8 @@ impl PickerCommand {
 struct Walk {
     /// The machine being browsed — where listings and validation run.
     machine: String,
-    /// How that machine is named on screen. Carried rather than looked up: the
-    /// store is the workbench's, and this walk does not have one.
+    /// How that machine is named on screen. Snapshotted for this modal so a
+    /// provider-label refresh cannot move the location line under the user.
     machine_label: String,
     /// Directory whose entries are displayed — what "Add" would store. Empty
     /// until `$HOME` answers.
@@ -138,8 +149,8 @@ impl Walk {
     fn ask(&mut self, request: PickerRequest) -> PickerCommand {
         self.error = None;
 
-        // The context stays in the `Pending` until its answer arrives, so the
-        // copy the workbench needs to build the command is made here.
+        // The context stays in `Pending` until its answer arrives, so the
+        // command sent to the worker carries its own copy.
         PickerCommand {
             token: self.pending.ask(&self.tokens, request.clone()),
             request,
@@ -215,7 +226,7 @@ impl Walk {
     }
 
     /// Validation answered. `Some` is the workspace to store — the walk is
-    /// spent at that point and the workbench drops it.
+    /// spent at that point and its owning flow drops it.
     fn accept_validation(
         &mut self,
         token: RequestToken,
@@ -423,25 +434,45 @@ impl ListDelegate for EntriesDelegate {
 /// *root* view's render, where reading the workbench would be reading an entity
 /// that is mid-update — see [`crate::choices`] for the whole rule.
 pub(super) struct FolderPicker {
+    store: Entity<FleetStore>,
     walk: Walk,
     entries: Entity<ListState<EntriesDelegate>>,
-    _confirmed: gpui::Subscription,
+    opening: Option<PickerCommand>,
+    _subscriptions: [gpui::Subscription; 2],
 }
 
 impl FolderPicker {
-    fn new(walk: Walk, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub(super) fn new(
+        machine: String,
+        store: Entity<FleetStore>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let label = store.read(cx).label(&machine);
+        let tokens = store.read(cx).tokens();
+        let (walk, home) = Walk::opening(machine, label, tokens);
         let entries =
             cx.new(|cx| ListState::new(EntriesDelegate::new(), window, cx).searchable(true));
+        let subscriptions = [
+            cx.subscribe_in(&entries, window, Self::handle_list_event),
+            cx.subscribe_in(&store, window, Self::handle_store_event),
+        ];
 
         Self {
+            store,
             walk,
-            _confirmed: cx.subscribe_in(&entries, window, Self::handle_list_event),
             entries,
+            opening: Some(home),
+            _subscriptions: subscriptions,
         }
     }
 
-    pub fn machine(&self) -> &str {
-        &self.walk.machine
+    pub(super) fn start(&mut self, cx: &mut Context<Self>) {
+        let Some(home) = self.opening.take() else {
+            return;
+        };
+
+        self.send_request(home, cx);
     }
 
     /// A row was clicked or Entered. Files confirm to nothing — the list
@@ -473,16 +504,140 @@ impl FolderPicker {
     /// decided nothing (one was already out) still has a modal to repaint.
     fn dispatch(&mut self, command: Option<PickerCommand>, cx: &mut Context<Self>) {
         if let Some(command) = command {
-            cx.emit(PickerEvent::Send(command));
+            self.send_request(command, cx);
         }
 
         cx.notify();
     }
 
+    fn send_request(&mut self, command: PickerCommand, cx: &mut Context<Self>) {
+        let host = match self.store.read(cx).host_for(&self.walk.machine) {
+            Ok(host) => host,
+            Err(detail) => {
+                self.walk.fail(detail);
+                cx.notify();
+
+                return;
+            }
+        };
+        let sent = self.store.update(cx, |store, cx| {
+            store.send_host_command(command.into_machines_command(host), cx)
+        });
+
+        if !sent {
+            self.walk.request_failed();
+            cx.notify();
+        }
+    }
+
+    fn handle_store_event(
+        &mut self,
+        _store: &Entity<FleetStore>,
+        event: &StoreEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let answer = match event {
+            StoreEvent::Machines(machines::Event::HomeResolved { token, result }) => {
+                PickerAnswer::Home {
+                    token: *token,
+                    result: result.clone(),
+                }
+            }
+            StoreEvent::Machines(machines::Event::DirListed { token, result }) => {
+                PickerAnswer::Listing {
+                    token: *token,
+                    result: result.clone(),
+                }
+            }
+            StoreEvent::Machines(machines::Event::WorkspaceValidated { token, error }) => {
+                PickerAnswer::Validation {
+                    token: *token,
+                    error: error.clone(),
+                }
+            }
+            StoreEvent::Bridge { .. }
+            | StoreEvent::Machines(
+                machines::Event::Listed { .. }
+                | machines::Event::Probed { .. }
+                | machines::Event::ProviderFailed { .. },
+            )
+            | StoreEvent::Failed(_) => return,
+        };
+        let picker = cx.entity();
+
+        // A successful answer usually starts the next host command. Store
+        // events are emitted while FleetStore is leased, so continue the walk
+        // only after that source update has completed.
+        window.defer(cx, move |_, cx| {
+            picker.update(cx, |picker, cx| picker.handle_answer(answer, cx));
+        });
+    }
+
+    fn handle_answer(&mut self, answer: PickerAnswer, cx: &mut Context<Self>) {
+        match answer {
+            PickerAnswer::Home { token, result } => self.handle_home_resolved(token, result, cx),
+            PickerAnswer::Listing { token, result } => self.handle_dir_listed(token, result, cx),
+            PickerAnswer::Validation { token, error } => {
+                self.handle_workspace_validated(token, error, cx)
+            }
+        }
+    }
+
+    fn handle_home_resolved(
+        &mut self,
+        token: RequestToken,
+        result: Result<String, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let command = self.walk.accept_home(token, result);
+
+        self.dispatch(command, cx);
+    }
+
+    fn handle_dir_listed(
+        &mut self,
+        token: RequestToken,
+        result: Result<Vec<RemoteDirEntry>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(entries) = self.walk.accept_listing(token, result) else {
+            cx.notify();
+
+            return;
+        };
+        let has_parent = self.walk.has_parent();
+
+        self.entries.update(cx, |list, cx| {
+            list.delegate_mut().show(has_parent, entries);
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    fn handle_workspace_validated(
+        &mut self,
+        token: RequestToken,
+        error: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((machine, path)) = self.walk.accept_validation(token, error) else {
+            cx.notify();
+
+            return;
+        };
+
+        cx.emit(WorkspacePicked { machine, path });
+    }
+
     /// Where the picker sits on screen: `gpui-component`'s dialog, holding this
     /// view as its body. Dismissal (Escape, a click outside, Cancel) is the
     /// dialog's, which is why nothing here tracks whether it is open.
-    fn open_dialog(picker: &Entity<Self>, window: &mut Window, cx: &mut Context<Workbench>) {
+    pub(super) fn open_dialog<T: 'static>(
+        picker: &Entity<Self>,
+        window: &mut Window,
+        cx: &mut Context<T>,
+    ) {
         let picker = picker.clone();
 
         window.open_dialog(cx, move |dialog, _, _| {
@@ -526,8 +681,8 @@ impl FolderPicker {
             .justify_end()
             .gap_2()
             .child(Button::new("picker-cancel").label("Cancel").on_click(
-                // The dialog is the picker's own; closing it is not news
-                // for the workbench.
+                // The dialog is the picker's own; cancellation has no result
+                // for the owning flow.
                 cx.listener(|_, _, window, cx| window.close_dialog(cx)),
             ))
             .child(
@@ -568,146 +723,6 @@ impl Render for FolderPicker {
                     .child(error)
             }))
             .child(self.render_buttons(cx))
-    }
-}
-
-impl Workbench {
-    /// Act on the open picker and redraw — the picker's own state, the shape
-    /// `with_chat` used to have for a sid-scoped one.
-    pub(in crate::workbench) fn with_picker(
-        &mut self,
-        cx: &mut Context<Self>,
-        act: impl FnOnce(&mut FolderPicker, &mut Context<FolderPicker>),
-    ) {
-        let Some(picker) = self.picker.clone() else {
-            return;
-        };
-
-        picker.update(cx, |picker, cx| {
-            act(picker, cx);
-            cx.notify();
-        });
-    }
-
-    /// Run what the picker asked for on the machine it is browsing. The host
-    /// is resolved here because it is the fleet's answer, and a machine that
-    /// resolves to none puts its reason in the modal rather than in a
-    /// notification — the user is looking at the dialog.
-    fn send_picker_request(&mut self, command: PickerCommand, cx: &mut Context<Self>) {
-        let host = match self.picker_host(cx) {
-            Ok(host) => host,
-            Err(detail) => {
-                self.with_picker(cx, |picker, _| picker.walk.fail(detail));
-
-                return;
-            }
-        };
-        let sent = self.store.update(cx, |store, cx| {
-            store.send_host_command(command.into_machines_command(host), cx)
-        });
-
-        if !sent {
-            self.with_picker(cx, |picker, _| picker.walk.request_failed());
-        }
-    }
-
-    /// The host the open picker browses.
-    fn picker_host(&self, cx: &Context<Self>) -> Result<Host, String> {
-        let Some(picker) = &self.picker else {
-            return Err("no picker open".to_string());
-        };
-
-        // The fleet's own sentence, carried verbatim.
-        self.store.read(cx).host_for(picker.read(cx).machine())
-    }
-
-    pub(super) fn handle_home_resolved(
-        &mut self,
-        token: RequestToken,
-        result: Result<String, String>,
-        cx: &mut Context<Self>,
-    ) {
-        self.with_picker(cx, |picker, cx| {
-            let command = picker.walk.accept_home(token, result);
-
-            picker.dispatch(command, cx);
-        });
-    }
-
-    pub(super) fn handle_dir_listed(
-        &mut self,
-        token: RequestToken,
-        result: Result<Vec<RemoteDirEntry>, String>,
-        cx: &mut Context<Self>,
-    ) {
-        self.with_picker(cx, |picker, cx| {
-            let Some(entries) = picker.walk.accept_listing(token, result) else {
-                return;
-            };
-            let has_parent = picker.walk.has_parent();
-
-            picker.entries.update(cx, |list, cx| {
-                list.delegate_mut().show(has_parent, entries);
-                cx.notify();
-            });
-        });
-    }
-
-    /// A validated workspace is stored and the picker is spent.
-    pub(super) fn handle_workspace_validated(
-        &mut self,
-        token: RequestToken,
-        error: Option<String>,
-        cx: &mut Context<Self>,
-    ) {
-        self.with_picker(cx, |picker, cx| {
-            let Some((machine, path)) = picker.walk.accept_validation(token, error) else {
-                return;
-            };
-
-            cx.emit(PickerEvent::Stored { machine, path });
-        });
-    }
-
-    /// Browse `machine`, in a dialog of its own. The picker is kept because
-    /// answers from the machines worker are routed to it; whether it is on
-    /// screen is the dialog's business, not this field's.
-    pub(super) fn open_picker(
-        &mut self,
-        machine: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let label = self.store.read(cx).label(&machine);
-        let tokens = self.store.read(cx).tokens();
-        let (walk, home) = Walk::opening(machine, label, tokens);
-        let picker = cx.new(|cx| FolderPicker::new(walk, window, cx));
-
-        cx.subscribe_in(&picker, window, Self::handle_picker_event)
-            .detach();
-        FolderPicker::open_dialog(&picker, window, cx);
-
-        self.picker = Some(picker);
-        self.send_picker_request(home, cx);
-    }
-
-    fn handle_picker_event(
-        &mut self,
-        _picker: &Entity<FolderPicker>,
-        event: &PickerEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match event {
-            PickerEvent::Send(command) => self.send_picker_request(command.clone(), cx),
-            PickerEvent::Stored { machine, path } => {
-                window.close_dialog(cx);
-                self.picker = None;
-                self.store.update(cx, |store, cx| {
-                    store.add_workspace(machine.clone(), path.clone(), cx)
-                });
-            }
-        }
     }
 }
 

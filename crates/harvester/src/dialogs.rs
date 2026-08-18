@@ -8,8 +8,8 @@
 //!
 //! What the question *is* comes from
 //! [`DialogRequest`](harvester_client_core::DialogRequest), which owns pi's
-//! wire shape. This file owns only how it looks and how a click becomes a
-//! [`DialogAnswer`].
+//! wire shape. This file owns the client obligation/modal lifecycle and how a
+//! click becomes a [`DialogAnswer`].
 
 use std::rc::Rc;
 
@@ -18,7 +18,13 @@ use gpui_component::button::Button;
 use gpui_component::dialog::{DialogButtonProps, DialogClose};
 use gpui_component::input::{Input, InputState};
 use gpui_component::{v_flex, WindowExt as _};
-use harvester_client_core::{DialogAnswer, DialogKind, DialogObligation};
+use harvester_client_core::bridge::{Command, Event as BridgeEvent};
+use harvester_client_core::{
+    DialogAnswer, DialogKey, DialogKind, DialogObligation, DialogObligations, DialogRequest,
+    DialogRoom, EnqueueResult, Retirement,
+};
+
+use crate::store::{FleetStore, StoreEvent};
 
 /// Wide enough for a prompt an extension wrote without knowing our layout, and
 /// narrow enough to stay a dialog rather than a second window. The library's
@@ -31,10 +37,191 @@ const EDITOR_ROWS: (usize, usize) = (6, 16);
 /// agent, so it is shown rather than dropped.
 const UNTITLED: &str = "The agent is asking";
 
+/// Owns the complete client-side lifecycle of Pi's blocking extension dialogs.
+///
+/// The window-free [`DialogObligations`] state decides ordering, duplicate
+/// replay, answers, and retirement. This coordinator is the GPUI adapter: it
+/// subscribes to the one store, owns text inputs, places the front modal, and
+/// sends exactly one answer back through the same machine route.
+pub(crate) struct DialogCoordinator {
+    store: Entity<FleetStore>,
+    obligations: DialogObligations,
+    inputs: std::collections::HashMap<DialogKey, Entity<InputState>>,
+    _store: gpui::Subscription,
+}
+
+impl DialogCoordinator {
+    pub(crate) fn new(
+        store: Entity<FleetStore>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let store_subscription = cx.subscribe_in(&store, window, Self::handle_store_event);
+
+        Self {
+            store,
+            obligations: DialogObligations::default(),
+            inputs: std::collections::HashMap::new(),
+            _store: store_subscription,
+        }
+    }
+
+    fn handle_store_event(
+        &mut self,
+        _store: &Entity<FleetStore>,
+        event: &StoreEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            StoreEvent::Bridge {
+                machine,
+                event: BridgeEvent::Attached { sid, .. },
+            } => self.enter_room(machine, sid, window, cx),
+            StoreEvent::Bridge {
+                machine,
+                event: BridgeEvent::Pi { sid, event },
+            } => self.handle_pi_event(machine, sid, event, window, cx),
+            StoreEvent::Bridge {
+                event: BridgeEvent::SessionExit { sid, .. },
+                ..
+            } => self.retire_session(sid, window, cx),
+            StoreEvent::Bridge {
+                machine,
+                event: BridgeEvent::Disconnected,
+            } => self.leave_machine(machine, window, cx),
+            StoreEvent::Bridge { .. } | StoreEvent::Machines(_) | StoreEvent::Failed(_) => {}
+        }
+    }
+
+    fn handle_pi_event(
+        &mut self,
+        machine: &str,
+        sid: &str,
+        event: &serde_json::Value,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(request) = DialogRequest::parse(event) else {
+            return;
+        };
+
+        self.enqueue(machine, sid, request, window, cx);
+    }
+
+    fn enqueue(
+        &mut self,
+        machine: &str,
+        sid: &str,
+        request: DialogRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let obligation = DialogObligation::new(machine.to_string(), sid.to_string(), request);
+        let result = self.obligations.enqueue(obligation.clone());
+
+        if !matches!(result, EnqueueResult::Visible | EnqueueResult::Queued) {
+            return;
+        }
+
+        if let Some(input) = create_input(&obligation.request.kind, window, cx) {
+            self.inputs.insert(obligation.key(), input);
+        }
+
+        if result == EnqueueResult::Visible {
+            self.show_front(window, cx);
+        }
+    }
+
+    fn show_front(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(obligation) = self.obligations.front().cloned() else {
+            return;
+        };
+        let input = self.inputs.get(&obligation.key()).cloned();
+
+        open(&obligation, input, Self::answer_front, window, cx);
+    }
+
+    fn answer_front(&mut self, answer: DialogAnswer, window: &mut Window, cx: &mut Context<Self>) {
+        // This pop is the duplicate-answer guard. A second callback from the
+        // same modal finds no front obligation and sends nothing.
+        let Some(answered) = self.obligations.answer_front(answer) else {
+            return;
+        };
+        let obligation = answered.obligation;
+
+        self.inputs.remove(&obligation.key());
+        self.store.read(cx).send(
+            &obligation.machine,
+            Command::AnswerDialog {
+                sid: obligation.sid,
+                dialog_id: obligation.request.id,
+                answer: answered.answer,
+            },
+        );
+
+        // gpui-component closes the answered dialog after this callback. Open
+        // the next one only after that pop, or the library would close the new
+        // front instead.
+        let coordinator = cx.entity();
+
+        window.defer(cx, move |window, cx| {
+            coordinator.update(cx, |coordinator, cx| coordinator.show_front(window, cx));
+        });
+    }
+
+    fn enter_room(
+        &mut self,
+        machine: &str,
+        sid: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let retirement = self
+            .obligations
+            .enter_room(DialogRoom::new(machine.to_string(), sid.to_string()));
+
+        self.apply_retirement(retirement, window, cx);
+    }
+
+    fn retire_session(&mut self, sid: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let retirement = self.obligations.retire_session(sid);
+
+        self.apply_retirement(retirement, window, cx);
+    }
+
+    fn leave_machine(&mut self, machine: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let retirement = self.obligations.leave_machine(machine);
+
+        self.apply_retirement(retirement, window, cx);
+    }
+
+    fn apply_retirement(
+        &mut self,
+        retirement: Retirement,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for obligation in retirement.retired {
+            self.inputs.remove(&obligation.key());
+        }
+
+        if !retirement.front_removed {
+            return;
+        }
+
+        // Programmatic close runs no answer callback. Empty-room cancellation
+        // remains daemon policy; retiring a client modal never manufactures an
+        // answer.
+        window.close_dialog(cx);
+        self.show_front(window, cx);
+    }
+}
+
 /// The text box a dialog needs, if it needs one. `editor` is pi's multi-line
 /// question and `input` its single-line one, which is `InputState`'s own
 /// default.
-pub fn create_input(
+fn create_input(
     kind: &DialogKind,
     window: &mut Window,
     cx: &mut App,
@@ -65,7 +252,7 @@ pub fn create_input(
 /// Every path out of a dialog lands in `answered`, including dismissal, which
 /// is the point: an `extension_ui_request` that goes unanswered leaves pi
 /// blocked for the life of the process.
-pub fn open<T: 'static>(
+fn open<T: 'static>(
     dialog: &DialogObligation,
     input: Option<Entity<InputState>>,
     answered: impl Fn(&mut T, DialogAnswer, &mut Window, &mut Context<T>) + 'static,
