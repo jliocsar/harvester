@@ -444,9 +444,9 @@ pub fn chat_header(title: SharedString, subtitle: SharedString, cx: &App) -> Div
 
 /// The monospace family tool-block bodies render in. gpui matches families by
 /// exact name — there is no generic "monospace" resolution — so someone has to
-/// resolve one; that someone is the **application**, at startup
-/// ([`main::resolve_mono_font_family`]), because asking the system means
-/// spawning a subprocess and a rendering module must not do that.
+/// resolve one; the desktop shell does that at application startup because
+/// asking the system means spawning a subprocess and a rendering module must
+/// not do that.
 ///
 /// Unset, it answers `Menlo`: a family every macOS ships, and on Linux a miss
 /// falls back to gpui's own default — so the components stay usable without an
