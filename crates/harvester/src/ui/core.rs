@@ -3,6 +3,8 @@ use std::sync::OnceLock;
 use gpui::{div, prelude::*, px, App, Div, SharedString};
 use gpui_component::ActiveTheme as _;
 
+pub const BASE_TEXT_SIZE: f32 = 13.;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tone {
     Muted,

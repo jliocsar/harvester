@@ -1,12 +1,9 @@
-use gpui::{px, Context, Entity, EventEmitter, ParentElement as _, Window};
-use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::dialog::{DialogAction, DialogClose, DialogFooter};
-use gpui_component::WindowExt as _;
+use gpui::{Context, Entity, EventEmitter, Window};
 
 use crate::modal::{ModalCoordinator, ModalLease, ModalOwner};
 use crate::store::FleetStore;
+use crate::ui::dialog::{open_confirmation, ActionAccent, Confirmation};
 
-const CONFIRM_WIDTH: f32 = 520.;
 const NOTHING_IS_DELETED: &str = "Nothing on the machine itself is deleted.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,10 +92,10 @@ impl ForgetMachineFlow {
         let confirmation = self.state.begin(machine);
 
         self.lease = Some(lease);
-        self.open_confirmation(confirmation, title, message, window, cx);
+        self.open_removal_confirmation(confirmation, title, message, window, cx);
     }
 
-    fn open_confirmation(
+    fn open_removal_confirmation(
         &mut self,
         confirmation: ConfirmationId,
         title: String,
@@ -106,38 +103,23 @@ impl ForgetMachineFlow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let flow = cx.entity();
+        let confirmed = cx.entity();
+        let declined = cx.entity();
+        let removal = Confirmation {
+            title: title.into(),
+            message: message.into(),
+            cancel_label: "Cancel".into(),
+            action_label: "Remove".into(),
+            action_accent: ActionAccent::Danger,
+        };
 
-        window.open_dialog(cx, move |dialog, _, _| {
-            let confirmed = flow.clone();
-            let declined = flow.clone();
-
-            dialog
-                .title(title.clone())
-                .width(px(CONFIRM_WIDTH))
-                .close_button(false)
-                .child(message.clone())
-                .footer(
-                    DialogFooter::new()
-                        .child(
-                            DialogClose::new()
-                                .child(Button::new("forget-machine-cancel").label("Cancel")),
-                        )
-                        .child(
-                            DialogAction::new().child(
-                                Button::new("forget-machine-remove")
-                                    .danger()
-                                    .label("Remove"),
-                            ),
-                        ),
-                )
-                .on_ok(move |_, _, cx| {
-                    confirmed.update(cx, |flow, cx| flow.forget(confirmation, cx))
-                })
-                .on_cancel(move |_, _, cx| {
-                    declined.update(cx, |flow, cx| flow.cancel(confirmation, cx))
-                })
-        });
+        open_confirmation(
+            removal,
+            move |_, cx| confirmed.update(cx, |flow, cx| flow.forget(confirmation, cx)),
+            move |_, cx| declined.update(cx, |flow, cx| flow.cancel(confirmation, cx)),
+            window,
+            cx,
+        );
     }
 
     fn forget(&mut self, confirmation: ConfirmationId, cx: &mut Context<Self>) -> bool {

@@ -1,11 +1,26 @@
-use gpui::{div, prelude::*, px, App, Div, ElementId, FontWeight, SharedString, Stateful};
+use gpui::{
+    div, prelude::*, px, App, ClickEvent, Div, ElementId, FontWeight, SharedString, Stateful,
+    Window,
+};
 use gpui_component::ActiveTheme as _;
 
 use super::core::{dim, faint};
 
 const STATUSBAR_HEIGHT: f32 = 26.;
 
-pub fn section_header(id: impl Into<ElementId>, title: &'static str, cx: &App) -> Stateful<Div> {
+pub fn collapsible_section(
+    id: impl Into<ElementId>,
+    title: &'static str,
+    expanded: bool,
+    on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> Stateful<Div> {
+    section_header(id, title, cx)
+        .child(section_chevron(expanded))
+        .on_click(on_toggle)
+}
+
+fn section_header(id: impl Into<ElementId>, title: &'static str, cx: &App) -> Stateful<Div> {
     div()
         .id(id)
         .px_3()
@@ -23,7 +38,7 @@ pub fn section_header(id: impl Into<ElementId>, title: &'static str, cx: &App) -
         .child(div().flex_1())
 }
 
-pub fn section_chevron(expanded: bool) -> Div {
+fn section_chevron(expanded: bool) -> Div {
     div().flex_none().child(if expanded { "▾" } else { "▸" })
 }
 

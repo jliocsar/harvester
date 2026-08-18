@@ -492,16 +492,7 @@ impl Workbench {
             None => (NO_CHAT_HINT.to_string(), Tone::Idle),
         };
 
-        content.child(
-            div()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .p_4()
-                .text_color(color.color(cx))
-                .child(hint),
-        )
+        content.child(ui::empty_pane_hint(color, hint, cx))
     }
 
     fn argv_machine_hint(&self, machine: &str, cx: &Context<Self>) -> (String, Tone) {
@@ -553,7 +544,7 @@ impl Render for Workbench {
             .flex_col()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .text_size(px(13.))
+            .text_size(px(ui::BASE_TEXT_SIZE))
             .child(
                 div()
                     .flex_1()

@@ -2,14 +2,14 @@ use gpui::{
     div, prelude::*, px, App, Context, Entity, EventEmitter, IntoElement, Render, SharedString,
     Task, Window,
 };
-use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::dialog::CancelDialog;
 use gpui_component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
 use gpui_component::{ActiveTheme as _, Disableable as _, IndexPath, WindowExt as _};
 use harvester_client_core::machines;
 use harvester_client_core::{Pending, RemoteDirEntry, RequestToken, RequestTokens};
 
 use crate::store::{FleetStore, StoreEvent};
+use crate::ui::dialog::{action_button, button_row, dismiss_button, ActionAccent};
+use crate::ui::{self, Tone};
 
 const ENTRY_LIST_HEIGHT: f32 = 280.;
 
@@ -611,26 +611,16 @@ impl FolderPicker {
     fn render_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let can_submit = self.walk.can_submit();
 
-        div()
-            .flex()
-            .justify_end()
-            .gap_2()
-            .child(
-                Button::new("picker-cancel")
-                    .label("Cancel")
-                    .on_click(|_, window, cx| window.dispatch_action(Box::new(CancelDialog), cx)),
-            )
-            .child(
-                Button::new("picker-add")
-                    .label("Add")
-                    .primary()
-                    .disabled(!can_submit)
-                    .on_click(cx.listener(|picker, _, _, cx| {
-                        let command = picker.walk.confirm();
+        button_row(
+            dismiss_button("picker-cancel", "Cancel"),
+            action_button("picker-add", "Add", ActionAccent::Primary)
+                .disabled(!can_submit)
+                .on_click(cx.listener(|picker, _, _, cx| {
+                    let command = picker.walk.confirm();
 
-                        picker.dispatch(command, cx);
-                    })),
-            )
+                    picker.dispatch(command, cx);
+                })),
+        )
     }
 }
 
@@ -647,12 +637,9 @@ impl Render for FolderPicker {
                     .h(px(ENTRY_LIST_HEIGHT)),
             )
             .children(self.walk.error.clone().map(|error| {
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().danger)
+                ui::inline_note(Tone::Failed, error, cx)
                     .overflow_hidden()
                     .text_ellipsis()
-                    .child(error)
             }))
             .child(self.render_buttons(cx))
     }

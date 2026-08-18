@@ -137,17 +137,10 @@ whole partial message — replace, never append. `agent_settled` (not
 
 ### Constants
 
-- `DEFAULT_MODEL_ROW` ("default (pi chooses)"): the unstarted chat's
-  "no model chosen" row. pi launches with its own default, and saying so is
-  more honest than naming a model Harvester did not actually pick.
-- `ADD_REPO_ROW` ("Add new…"): the repo picker's last row, for browsing to a
-  repository Harvester has not been told about yet. It is also the *only*
-  row an empty picker has, which is what makes a fresh client's first
-  session reachable.
-- `NO_MACHINE_LABEL` / `CHOOSE_MACHINE_LABEL`: what the machine control says
-  before anything is picked and when there is nothing to pick (fleet empty
-  until a provider lists).
-- `CHOOSE_REPO_LABEL`: repository control's pre-pick label.
+The prompt strip's label constants live with the policy that reads them, in
+`chat/prompt_presentation.rs` (see its own section below). `chat.rs` itself
+holds no constants: everything left in this file needs a `Window`, an
+`Entity` or the store, and none of that has a tunable number in it.
 
 ### `ChatFlowRequest`
 
@@ -284,7 +277,62 @@ repo, or nothing if it has none.
   dropdown, so a listing landing while the list is open cannot move a row
   out from under a click.
 - A control with nothing to offer renders as the bare label rather than an
-  openable-but-empty dropdown.
+  openable-but-empty dropdown. `render_dropdown_control` is where that rule
+  lives now — one free function shared by the model, machine and repository
+  controls, so "disabled or empty means no popover" cannot be decided three
+  different ways. Each `render_*_control` is left with the only part that
+  really differs: which rows exist, and what picking one does.
+- `render_dropdown_control` takes its rows already built rather than a
+  closure that builds them, so a disabled control (a live session's machine
+  and repository) still assembles rows it will not show. That is a Vec of
+  labels per repaint, deliberately traded for one code path; if a control
+  ever grows an expensive row list, laziness belongs in the caller's own
+  early return, not back in three copies of the tail.
+- The exit/starting notice and the models-failed line are
+  `ui::inline_note(tone, …)`, the same primitive the folder picker's error
+  uses — a tone-colored `text_xs` note. These two call sites keep their
+  original wrapping behavior: a failure detail is information, and
+  truncating it would hide the reason it exists to show.
+
+## crates/harvester/src/chat/prompt_presentation.rs
+
+What each prompt-strip control *says* and whether it can be opened, as pure
+functions over state — the same split `workbench/machine_presentation.rs`
+makes for machine rows. Nothing here touches a `Window`, an `Entity` or the
+store, so the policy is unit-testable without gpui machinery, and `chat.rs`
+is left with adaptation only (read the state, build the rows, wire the
+pick).
+
+- `DEFAULT_MODEL_ROW` ("default (pi chooses)"): the unstarted chat's
+  "no model chosen" row. pi launches with its own default, and saying so is
+  more honest than naming a model Harvester did not actually pick.
+- `ADD_REPO_ROW` ("Add new…"): the repo picker's last row, for browsing to a
+  repository Harvester has not been told about yet. It is also the *only*
+  row an empty picker has, which is what makes a fresh client's first
+  session reachable.
+- `NO_MACHINE_LABEL` / `CHOOSE_MACHINE_LABEL`: what the machine control says
+  before anything is picked and when there is nothing to pick (fleet empty
+  until a provider lists).
+- `CHOOSE_REPO_LABEL`: repository control's pre-pick label.
+- `model_control_state` returns the label *and* whether the control opens,
+  because those are one decision: the control may only be opened when there
+  is a list behind it. A chosen model always names itself (a launch pick a
+  refetch has not landed for yet is still what the user picked); the
+  unstarted default row is pickable only once a list actually loaded, which
+  is why `Loading`, `NotRequested` and `Failed` all render the same words
+  with the control shut.
+- `model_row_label` exists so the "default (pi chooses)" wording is written
+  once, next to the state function that decides when that row is offered.
+- `machine_control_label` takes the fleet's label for the picked machine as
+  a plain string rather than reading the store itself, which is what keeps
+  it pure. The caller asks the store unconditionally — for an unpicked
+  machine the fleet answers with an empty string that this function never
+  looks at.
+- `repo_control_label` shows the folder name, not the path: the folder is
+  what the user recognizes a repository by, and a full `/home/exedev/…` in a
+  strip capped at `PROMPT_CONTROL_MAX_WIDTH` would ellipsize away exactly
+  the end that identifies it. The dropdown's own rows still carry the full
+  paths, which is where two same-named checkouts are told apart.
 
 ## crates/harvester/src/desktop_shell.rs
 
@@ -316,8 +364,11 @@ only provide launch inputs already resolved before GPUI starts.
 
 ## crates/harvester/src/dialogs.rs
 
-The extension-dialog modal: pi asks, the user answers, pi unblocks. This is
-the client-side implementation of docs/DAEMON.md §Dialogs.
+The extension-dialog modal *policy*: pi asks, the user answers, pi unblocks.
+This is the client-side implementation of docs/DAEMON.md §Dialogs. Not one
+widget is built here — the chrome (footers, buttons, widths, input boxes)
+lives in `ui/dialog.rs`, and this file only decides which chrome a given Pi
+question deserves and what a click means to Pi.
 
 - Protocol fact: an extension calling `select`/`confirm`/`input`/`editor`
   suspends the whole agent until a response comes back. harvesterd only
@@ -334,16 +385,6 @@ the client-side implementation of docs/DAEMON.md §Dialogs.
   replay, answers, and retirement on its own. The coordinator's job is
   narrower: subscribe to the one store, own the text inputs, place the front
   modal, and send exactly one answer back through the same machine route.
-- `DIALOG_WIDTH` (520px): wide enough for a prompt an extension author wrote
-  without knowing Harvester's layout, narrow enough to still read as a dialog
-  rather than a second window. `gpui-component`'s own default (448px) crops a
-  `select` option of any real length.
-- `EDITOR_ROWS` (6, 16): visible row range for an `editor` dialog before it
-  scrolls. A `set_editor_text`-style body is usually a commit message, so a
-  handful of lines is the right initial shape.
-- `UNTITLED`: the title shown when Pi omits its own dialog title. It still
-  blocks the agent regardless, so a fallback title is shown rather than the
-  dialog being silently dropped.
 - `handle_modal_available`: the repo picker releases its modal lease from an
   `on_cancel` callback *before* Root performs its own automatic pop. The
   handler must `window.defer` past both the callback and that pop, or it can
@@ -366,30 +407,28 @@ the client-side implementation of docs/DAEMON.md §Dialogs.
   picker owns the modal must leave that unrelated workspace modal completely
   untouched.
 - `create_input`: `editor` is Pi's multi-line question kind, `input` its
-  single-line one — single-line is `InputState`'s own default, so only
-  `editor` needs explicit `multi_line`/`auto_grow` configuration.
-- `open`: wraps the `answered` callback in `Rc` because every exit path out of
-  the dialog needs a reference to it, and the library's dialog builder closure
-  is an `Fn` that gets re-run every frame, so nothing passed into it can be a
-  consumed `FnOnce`.
-- `open_select`: renders one button per option deliberately, not a searchable
-  list — a Pi `select` is a short list written by an extension author, and a
-  searchable-list UI would be ceremony around what's usually three choices.
-  The option's *text itself* is the answer; Pi has no notion of an index here.
-  The dialog's default OK button is replaced with a custom footer because
-  picking an option *is* confirming — there's nothing left for a separate OK
-  to do. `on_ok` is hard-wired to return `false` because Root maps a bare
-  Enter keypress to "confirm the dialog", but a `select` must only be
-  confirmed by clicking an actual option button.
-- `open_confirm`: dismissal (Escape / close) answers "no" rather than
+  single-line one, so the two kinds pick different `ui::dialog` input
+  builders. Which *kind* wants which box is Pi policy and stays here; how
+  either box is configured is chrome and lives in `ui/dialog.rs`.
+- `AnswerCallback` / `open`: the `answered` callback is wrapped in `Rc`
+  because every exit path out of the dialog needs a reference to it, and the
+  library's dialog builder closure is an `Fn` that gets re-run every frame, so
+  nothing passed into it can be a consumed `FnOnce`. The alias exists so the
+  three per-kind wrappers below can all take the same shared callback.
+- `open_option_list` / `open_question` / `open_text_entry`: the whole Pi-facing
+  half of dialog chrome — each takes the shared answer callback and hands
+  `ui::dialog` two plain callbacks, translating a click into the right
+  `DialogAnswer`. `ui::dialog` therefore never sees a `DialogAnswer`,
+  a `DialogKind`, or anything else from `harvester-client-core`.
+- `open_question`: dismissal (Escape / close) answers "no" rather than
   cancelling outright, because Pi resolves a cancelled `confirm` to `false`
   anyway — so treating Escape as a refusal loses no information and removes
-  one more way for the agent to hang waiting for an answer.
-- `open_text`: shared implementation for both `input` and `editor` — same
-  dialog shape, different input box. After building, it explicitly focuses
-  the input because `open_dialog` only focuses the dialog frame itself, not
-  anything inside it, and the box this whole dialog exists to have filled in
-  should not require an extra click before it accepts a keystroke.
+  one more way for the agent to hang waiting for an answer. Its labels are
+  Pi's own vocabulary ("Yes"/"No"), which is why they are passed in rather
+  than baked into the shared confirmation chrome.
+- `open_option_list`: the option's *text itself* is the answer; Pi has no
+  notion of an index here, so the chosen label round-trips straight back as a
+  `DialogAnswer::Value`.
 
 ## crates/harvester/src/main.rs
 
@@ -690,6 +729,12 @@ now — this is computed per open and never stored.
 `core` is the one place a semantic meaning becomes a color (SPEC C11) —
 everything else in `ui` should ask for a `Tone`/`Dot`, never a raw `Hsla`.
 
+- `BASE_TEXT_SIZE` (13px) is the application's body text size, set once on the
+  window root (`Workbench::render`) so every descendant inherits it. Sidebar
+  rows restate it because `ListItem` brings its own text size, and restating
+  the shared const is what keeps a row from silently drifting away from the
+  rest of the window. Anything wanting *smaller* text asks for `text_xs`
+  (the library's own token), not a second number here.
 - `Tone` is what a component is being told about its *subject*, in place of
   raw color: `Muted` (secondary label), `Idle` (backgrounded — an unprobed
   machine, a finished tool), `Active` (what the user is doing right now),
@@ -715,6 +760,68 @@ everything else in `ui` should ask for a `Tone`/`Dot`, never a raw `Hsla`.
   itself. `mono_font_family()` falls back to `"Menlo"` if the app never called
   the setter (e.g. in tests).
 
+## crates/harvester/src/ui/dialog.rs
+
+Every piece of modal chrome Harvester draws: dialog geometry, titles, the
+cancel/primary button pattern, the two dialog input boxes, and the three
+`open_*` builders that assemble them. Deliberately dumb — it knows nothing
+about Pi, obligations, modal leases, or machines, and takes plain strings plus
+callbacks that return "did this answer stick?". The three modal owners
+(`dialogs.rs`, `workbench/forget_machine_flow.rs`, `workbench/picker.rs`) all
+build their chrome from here, so a dialog cannot look different depending on
+which flow raised it.
+
+- `DIALOG_WIDTH` (520px): the one modal width in the app. Wide enough for a
+  prompt an extension author wrote without knowing Harvester's layout, narrow
+  enough to still read as a dialog rather than a second window;
+  `gpui-component`'s own default (448px) crops a `select` option of any real
+  length. A machine label and one sentence about it (the forget-machine
+  confirmation) is not worth a second modal geometry, which is why that flow
+  no longer carries a width constant of its own.
+- `EDITOR_ROWS` (6, 16): visible row range for a multi-line input before it
+  scrolls. A `set_editor_text`-style body is usually a commit message, so a
+  handful of lines is the right initial shape.
+- `UNTITLED` / `title_or_fallback`: the title shown when a caller has no title
+  to give (Pi omits its own on some dialogs). A titleless question still
+  blocks the agent, so a fallback title is shown rather than the dialog being
+  silently dropped.
+- Button-id consts: element ids are identity within one rendered tree, and
+  Harvester renders at most one modal at a time (see `modal.rs`), so the two
+  confirmation call sites deliberately share one pair of ids rather than
+  threading per-flow ids through the builder.
+- `ActionAccent`: `Primary` for the ordinary affirmative, `Danger` for an
+  action the user cannot undo from the dialog (forgetting a machine). The
+  accent is a parameter rather than a per-call `.primary()`/`.danger()` so
+  "which button is the scary one" is stated in the caller's own vocabulary.
+- `Confirmation`: the entire text of a confirmation dialog (title, message,
+  both labels, accent) as data, because the library's dialog builder closure
+  is re-run every frame and a `Button` cannot be captured and reused across
+  frames — only the strings that rebuild it can.
+- `cancel_button` vs. `dismiss_button`: a cancel button placed inside a
+  `DialogClose` footer is closed *by the footer*, so it must not also dispatch
+  anything; a cancel button rendered in a dialog *body* (the folder picker,
+  whose whole content is its own view) has no footer to do that for it and
+  therefore dispatches `CancelDialog` itself. Two functions, because getting
+  this wrong means either a dead button or a double close.
+- `button_row` is the body-side counterpart of `action_footer`: same
+  right-aligned cancel-then-action pattern, for a dialog that owns its own
+  body layout.
+- `open_select`: renders one button per option deliberately, not a searchable
+  list — a `select` is a short list written by an extension author, and a
+  searchable-list UI would be ceremony around what's usually three choices.
+  The dialog's default OK button is replaced with a cancel-only footer because
+  picking an option *is* confirming — there's nothing left for a separate OK
+  to do. `on_ok` is hard-wired to return `false` because Root maps a bare
+  Enter keypress to "confirm the dialog", but a `select` must only be
+  confirmed by clicking an actual option button. The dialog is popped by the
+  option handler itself, and only when the caller reports the answer stuck.
+- `open_text`: one shape for both single- and multi-line entry — same dialog,
+  different input box. After building, it explicitly focuses the input because
+  `open_dialog` only focuses the dialog frame itself, not anything inside it,
+  and the box this whole dialog exists to have filled in should not require an
+  extra click before it accepts a keystroke. The typed value is read at
+  submit time and handed to the caller as a `String`.
+
 ## crates/harvester/src/ui/mod.rs
 
 `ui` is Harvester's visual architecture, grouped by responsibility — not a
@@ -722,10 +829,43 @@ palette or a parallel widget library. Components are built with
 `gpui-component`, and every color must be resolved from `cx.theme()`; the
 `ui::core` submodule exports semantic *meanings* (see `Tone`/`Dot` below) and
 reusable non-color metrics only, never raw colors of its own (SPEC C11). The
-`pub use core::{...}` / `prompt::{...}` / `shell::{...}` re-exports exist to
-keep a stable `ui::…` import path for shell and prompt callers while the
-implementation stays split across cohesive modules (`core`, `prompt`, `shell`,
-`tool_block`, `transcript`) rather than one broad file.
+`pub use core::{...}` / `prompt::{...}` / `shell::{...}` / `sidebar::{...}`
+re-exports exist to keep a stable `ui::…` import path for screen-level callers
+while the implementation stays split across cohesive modules (`core`,
+`dialog`, `note`, `prompt`, `shell`, `sidebar`, `tool_block`, `transcript`)
+rather than one broad file. Only names a *screen* calls are re-exported: a builder
+used solely by other `ui` modules (`status_dot`, `section_header`) is reached
+through `super::core` / kept private to its module instead, so the flat `ui::`
+surface stays a list of what the screens actually draw with.
+`dialog` is the one submodule declared `pub mod` instead of being re-exported
+flat: its names are generic on purpose (`open_text`, `button_row`,
+`action_button`), and they only read correctly qualified as
+`ui::dialog::open_text`.
+
+## crates/harvester/src/ui/note.rs
+
+The two ways Harvester states something *about* a pane rather than in it: a
+line of tone-colored text. Both existed four times as hand-rolled divs (the
+folder picker's walk error, the chat's models-failed line and exit/starting
+notice, the workbench's empty content pane), which is how the picker ended up
+reaching for `cx.theme().danger` directly instead of `Tone::Failed` — the
+same color, but a rule broken (SPEC C11). One builder each is what keeps that
+from happening again.
+
+- `inline_note` is the in-flow variant: `text_xs` and tone-colored, nothing
+  more. Truncation is not baked in — the chat's notices always wrapped and a
+  truncated failure detail hides its reason — so a call site that wants
+  ellipsis chains `overflow_hidden().text_ellipsis()` itself, as the folder
+  picker's error line does to keep the modal's height stable.
+- `empty_pane_hint` is the centered variant for a pane with nothing in it: it
+  fills its parent and centers on both axes. It inherits the window's body
+  text size rather than shrinking to `text_xs`, because it is the only thing
+  on screen in that pane and reads as content, not as an annotation.
+- Both take a `Tone`, never a color, and both take `impl Into<SharedString>`
+  so a caller may hand over an owned `format!` result without an extra clone.
+- The statusbar's link (`workbench.rs`) is deliberately *not* one of these:
+  its size already comes from `statusbar_frame`, and folding it in would add
+  ellipsis behavior to a band that has never needed it.
 
 ## crates/harvester/src/ui/prompt.rs
 
@@ -766,7 +906,57 @@ The agent prompt card and its in-place model/machine controls.
   machine; the send button's disabled rendering is just how the strip
   communicates that *before* the user starts typing.
 
-## crates/harvester/src/ui/tool_block.rs
+## crates/harvester/src/ui/shell.rs
+
+Window chrome that is not the prompt, the transcript, or a modal: section
+headers, the chat pane's header, and the statusbar frame.
+
+- `STATUSBAR_HEIGHT` (26px): the fixed statusbar band. Tall enough for one
+  line of `text_xs` with breathing room, short enough that it reads as a
+  status strip rather than a second toolbar.
+- `collapsible_section` is the whole disclosure control — header, chevron and
+  click target in one call — because a header that toggles nothing is not a
+  thing the app has, and splitting it left every caller re-wiring the same
+  three pieces (the sidebar did it twice, identically). It takes `expanded`
+  (not `collapsed`) so the parameter reads the same way as the glyph it
+  selects, plus the caller's own click listener; the collapse *state* stays
+  with the screen that owns it, since `ui` holds no state.
+- `section_header` and `section_chevron` are private for that reason: they are
+  halves of `collapsible_section`, and a caller reaching for either one alone
+  would be building a disclosure control that cannot disclose. The chevron is
+  a text glyph (`▾`/`▸`) rather than an icon asset so it inherits the header's
+  own faint color and text size for free.
+
+## crates/harvester/src/ui/sidebar.rs
+
+The sidebar's row vocabulary — every machine and session row in the app is
+built from these three, so the two lists cannot drift apart visually. Only
+presentation lives here; which rows exist, what they say, and what a click
+means belong to `workbench/sidebar.rs`.
+
+- `SIDEBAR_ROW_INSET` (6px) is used for both the row's outer margin and its
+  inner padding, deliberately the same number: the margin is what insets the
+  hover/selection fill from the sidebar edge, and matching padding keeps the
+  label optically centered inside that fill instead of hugging its left edge.
+- `STACKED_ROW_DETAIL_INDENT` (14px) hangs the second line under the *title*
+  rather than under the dot — it is the status dot's diameter (6px, from
+  `status_dot`) plus the `gap_2` (8px) that separates the dot from the title.
+  Change either of those and this must change with them.
+- `sidebar_row` is a `ListItem` base, not a `div`: the library owns the
+  hover/selected/disabled treatments, and machine rows rely on `disabled`
+  gating the row while still rendering a live suffix button (see
+  `render_missing_machine_row`).
+- `sidebar_stacked_row` is one shape for both lists: dot + title on the first
+  line, an optional inline `note` (transient status, e.g. "opening…") after
+  the title, and an optional `detail` second line (the row's context —
+  provider, or folder · machine). Both secondary texts resolve their color
+  through `Tone::Muted` rather than `cx.theme().muted_foreground` directly,
+  so `ui` keeps its rule that a component asks for a meaning, never a theme
+  field (SPEC C11).
+- `sidebar_empty_note` is the "no sessions yet" line. It is a plain note, not
+  a row: an empty list has nothing to select, so it must not look clickable.
+
+
 
 Reusable visual primitives (frame, typography, status treatment) for one
 transcript tool-call block; tool-specific labeling and body policy live in
@@ -835,7 +1025,11 @@ narrow event seams — Workbench does not reach into them.
 `NO_CHAT_HINT` ("start a new session to begin") is the empty content pane's
 text when there is no argv machine to report on. New session is the only way
 in, and it always opens; the machine and repository are picked inside the
-chat it opens, not from the empty pane.
+chat it opens, not from the empty pane. `render_content` draws whichever hint
+wins with `ui::empty_pane_hint`, so the "nothing here yet" pane and any
+future one cannot center themselves differently. `render_statusbar` keeps its
+own `div`: `statusbar_frame` already sets that band's text size, and
+`inline_note` would hand it truncation semantics it has no need for.
 
 Field-level invariants on `Workbench`:
 - `store: Entity<FleetStore>` is the single observable store; the shell reads
@@ -919,10 +1113,6 @@ Shape mirrors `AddRepoFlow`: one generation-tagged confirmation
 so a delayed dialog callback cannot forget a second machine or free a
 different flow's modal out from under it.
 
-`CONFIRM_WIDTH = 520.` — deliberately the same width as the Pi dialogs: a
-machine label and one sentence about it isn't worth inventing a second modal
-geometry in the app.
-
 `NOTHING_IS_DELETED` — the reassurance shown on every removal confirmation. A
 missing machine is unreachable by definition, so this string is a statement
 of fact about what forgetting does, not a promise being made to the user.
@@ -933,6 +1123,13 @@ guard that rejects stale confirmations.
 
 `ForgetMachineFlow::open`: same "second ask while one is open is ignored"
 rule as `AddRepoFlow::open` — Root holds one dialog, and the lease is spent.
+
+`open_removal_confirmation`: builds nothing itself — it fills in
+`ui::dialog::Confirmation` (danger accent, "Remove"/"Cancel") and hands
+`ui::dialog::open_confirmation` two entity callbacks. Both callbacks carry the
+generation-tagged `ConfirmationId`, which is what keeps a delayed click
+harmless, and the flow shares the app-wide dialog width for free by not
+having a width of its own.
 
 `forget`: the store owns the entire cascade behind one `workspaces.json`
 write — tracking removal, the ghost sidebar row disappearing, and the
@@ -1016,7 +1213,11 @@ modal would stay gated forever on an answer that is never coming.
 
 `Walk::fail`: the reason a host op could not even be started is shown inside
 the modal rather than as a toast/notification, because the user is already
-looking directly at the picker.
+looking directly at the picker. `Render` draws it with
+`ui::inline_note(Tone::Failed, …)` with `overflow_hidden().text_ellipsis()`
+chained at the call site — the same rendering as before, but the color now
+comes from the tone vocabulary instead of `cx.theme().danger`, which is the
+rule every other screen already followed (SPEC C11).
 
 `Walk::accept_home`: `$HOME` landing immediately becomes a listing request
 for that same directory — the walk always starts by listing home. `None`
@@ -1057,6 +1258,13 @@ to the chat's branch indicator, not the picker.
 `FolderPicker::open_dialog`: Enter key handling belongs to the focused
 directory `List` (`on_ok` always returns `false`), and the dialog only closes
 once validation actually emits `WorkspacePicked` — not on every Enter press.
+
+`render_buttons`: the picker's Cancel/Add pair is the shared
+`ui::dialog::button_row`, not a footer, because this modal's body *is* this
+view and there is no `DialogFooter` to hang it from. That is also why Cancel
+is a `ui::dialog::dismiss_button` (it dispatches `CancelDialog` itself) rather
+than the footer-side `cancel_button`. The Add button's `disabled` state stays
+here: whether the walk can submit is walk state, not chrome.
 
 `join_remote_path` / `parent_remote_path`: paths are always absolute (the
 walk starts at the remote `$HOME`), so the only special case either function
@@ -1112,6 +1320,18 @@ Layout, top to bottom: New session button, machines listing, sessions list
 repository is picked inside the chat that is about to use it, and
 `workspaces.json` is that picker's backing store rather than being surfaced
 as a sidebar citizen with its own list.
+
+Row chrome is not here: `ui::sidebar_row`, `ui::sidebar_stacked_row` and
+`ui::sidebar_empty_note` own how a row *looks* (see `ui/sidebar.rs`), and
+`ui::collapsible_section` owns the two section headers, so this module is
+store data → row content → intent and nothing else. The two collapse booleans
+stay here because they are this screen's state; the header component is told
+`expanded` and handed the listener that flips it.
+
+`SessionRow` stays in this module on the same split: it is the mapping from a
+`MachineSession` to what a row should say (name-or-sid title, "folder ·
+machine" subtitle, status tone, selected/opening flags), which is screen
+policy, not presentation.
 
 Constants:
 - `SID_PREVIEW_CHARS = 8` — enough of a uuidv7 to tell sessions apart at a

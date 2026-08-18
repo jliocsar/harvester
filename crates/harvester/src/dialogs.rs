@@ -1,10 +1,8 @@
 use std::rc::Rc;
 
-use gpui::{prelude::*, px, App, Context, Entity, SharedString, Window};
-use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::dialog::{DialogAction, DialogClose, DialogFooter};
-use gpui_component::input::{Input, InputState};
-use gpui_component::{v_flex, WindowExt as _};
+use gpui::{App, Context, Entity, SharedString, Window};
+use gpui_component::input::InputState;
+use gpui_component::WindowExt as _;
 use harvester_client_core::bridge::{Command, Event as BridgeEvent};
 use harvester_client_core::{
     DialogAnswer, DialogKey, DialogKind, DialogObligation, DialogObligations, DialogRequest,
@@ -13,10 +11,12 @@ use harvester_client_core::{
 
 use crate::modal::{ModalAvailable, ModalCoordinator, ModalLease, ModalOwner};
 use crate::store::{FleetStore, StoreEvent};
+use crate::ui::dialog::{
+    create_multi_line_input, create_single_line_input, open_confirmation, open_select, open_text,
+    title_or_fallback, ActionAccent, Confirmation,
+};
 
-const DIALOG_WIDTH: f32 = 520.;
-const EDITOR_ROWS: (usize, usize) = (6, 16);
-const UNTITLED: &str = "The agent is asking";
+type AnswerCallback = Rc<dyn Fn(DialogAnswer, &mut Window, &mut App) -> bool>;
 
 pub(crate) struct DialogCoordinator {
     store: Entity<FleetStore>,
@@ -304,188 +304,115 @@ fn create_input(
     cx: &mut App,
 ) -> Option<Entity<InputState>> {
     match kind {
-        DialogKind::Input { placeholder } => {
-            let placeholder = placeholder.clone().unwrap_or_default();
-
-            Some(cx.new(|cx| InputState::new(window, cx).placeholder(placeholder)))
-        }
-        DialogKind::Editor { prefill } => {
-            let prefill = prefill.clone().unwrap_or_default();
-
-            Some(cx.new(|cx| {
-                InputState::new(window, cx)
-                    .multi_line(true)
-                    .auto_grow(EDITOR_ROWS.0, EDITOR_ROWS.1)
-                    .default_value(prefill)
-            }))
-        }
+        DialogKind::Input { placeholder } => Some(create_single_line_input(
+            placeholder.clone().unwrap_or_default(),
+            window,
+            cx,
+        )),
+        DialogKind::Editor { prefill } => Some(create_multi_line_input(
+            prefill.clone().unwrap_or_default(),
+            window,
+            cx,
+        )),
         DialogKind::Select { .. } | DialogKind::Confirm { .. } => None,
     }
 }
 
 fn open<T: 'static>(
-    dialog: &DialogObligation,
+    obligation: &DialogObligation,
     input: Option<Entity<InputState>>,
     answered: impl Fn(&mut T, DialogAnswer, &mut Window, &mut Context<T>) -> bool + 'static,
     window: &mut Window,
     cx: &mut Context<T>,
 ) {
-    let answered = Rc::new(answered);
     let owner = cx.entity();
-    let answer = {
-        let answered = answered.clone();
-
+    let answer: AnswerCallback = Rc::new(
         move |answer: DialogAnswer, window: &mut Window, cx: &mut App| {
             owner.update(cx, |owner, cx| answered(owner, answer, window, cx))
-        }
-    };
+        },
+    );
+    let title = title_or_fallback(&obligation.request.title);
+    let dismissal = DialogAnswer::dismissal_for(&obligation.request);
 
-    let title = dialog_title(&dialog.request.title);
-    let dismissal = DialogAnswer::dismissal_for(&dialog.request);
-
-    match &dialog.request.kind {
+    match &obligation.request.kind {
         DialogKind::Select { options } => {
-            open_select(title, options.clone(), dismissal, answer, window, cx)
+            open_option_list(title, options.clone(), dismissal, answer, window, cx)
         }
         DialogKind::Confirm { message } => {
-            open_confirm(title, message.clone(), dismissal, answer, window, cx)
+            open_question(title, message.clone(), dismissal, answer, window, cx)
         }
         DialogKind::Input { .. } | DialogKind::Editor { .. } => {
             let Some(input) = input else {
                 return;
             };
 
-            open_text(title, input, dismissal, answer, window, cx)
+            open_text_entry(title, input, dismissal, answer, window, cx)
         }
     }
 }
 
-fn dialog_title(title: &str) -> SharedString {
-    if title.is_empty() {
-        return UNTITLED.into();
-    }
-
-    title.to_string().into()
-}
-
-fn open_select<T: 'static>(
+fn open_option_list<T: 'static>(
     title: SharedString,
     options: Vec<String>,
     dismissal: DialogAnswer,
-    answer: impl Fn(DialogAnswer, &mut Window, &mut App) -> bool + 'static,
+    answer: AnswerCallback,
     window: &mut Window,
     cx: &mut Context<T>,
 ) {
-    let answer = Rc::new(answer);
+    let chosen = answer.clone();
 
-    window.open_dialog(cx, move |dialog, _, _| {
-        let answer = answer.clone();
-        let dismissal = dismissal.clone();
-        let rows = options.iter().enumerate().map({
-            let answer = answer.clone();
-
-            move |(index, option)| {
-                let option = option.clone();
-                let answer = answer.clone();
-
-                Button::new(("dialog-option", index))
-                    .outline()
-                    .w_full()
-                    .label(option.clone())
-                    .on_click(move |_, window, cx| {
-                        if answer(DialogAnswer::Value(option.clone()), window, cx) {
-                            window.close_dialog(cx);
-                        }
-                    })
-            }
-        });
-
-        dialog
-            .title(title.clone())
-            .width(px(DIALOG_WIDTH))
-            .close_button(false)
-            .child(v_flex().gap_2().children(rows))
-            .footer(DialogFooter::new().child(
-                DialogClose::new().child(Button::new("dialog-dismiss").outline().label("Cancel")),
-            ))
-            .on_ok(|_, _, _| false)
-            .on_cancel({
-                let answer = answer.clone();
-
-                move |_, window, cx| answer(dismissal.clone(), window, cx)
-            })
-    });
+    open_select(
+        title,
+        options,
+        move |option, window, cx| chosen(DialogAnswer::Value(option), window, cx),
+        move |window, cx| answer(dismissal.clone(), window, cx),
+        window,
+        cx,
+    );
 }
 
-fn open_confirm<T: 'static>(
+fn open_question<T: 'static>(
     title: SharedString,
     message: String,
     dismissal: DialogAnswer,
-    answer: impl Fn(DialogAnswer, &mut Window, &mut App) -> bool + 'static,
+    answer: AnswerCallback,
     window: &mut Window,
     cx: &mut Context<T>,
 ) {
-    let answer = Rc::new(answer);
+    let confirmed = answer.clone();
+    let question = Confirmation {
+        title,
+        message: message.into(),
+        cancel_label: "No".into(),
+        action_label: "Yes".into(),
+        action_accent: ActionAccent::Primary,
+    };
 
-    window.open_dialog(cx, move |dialog, _, _| {
-        let confirmed = answer.clone();
-        let declined = answer.clone();
-        let dismissal = dismissal.clone();
-
-        dialog
-            .title(title.clone())
-            .width(px(DIALOG_WIDTH))
-            .close_button(false)
-            .child(message.clone())
-            .footer(
-                DialogFooter::new()
-                    .child(DialogClose::new().child(Button::new("dialog-no").label("No")))
-                    .child(
-                        DialogAction::new().child(Button::new("dialog-yes").primary().label("Yes")),
-                    ),
-            )
-            .on_ok(move |_, window, cx| confirmed(DialogAnswer::Confirmed(true), window, cx))
-            .on_cancel(move |_, window, cx| declined(dismissal.clone(), window, cx))
-    });
+    open_confirmation(
+        question,
+        move |window, cx| confirmed(DialogAnswer::Confirmed(true), window, cx),
+        move |window, cx| answer(dismissal.clone(), window, cx),
+        window,
+        cx,
+    );
 }
 
-fn open_text<T: 'static>(
+fn open_text_entry<T: 'static>(
     title: SharedString,
     input: Entity<InputState>,
     dismissal: DialogAnswer,
-    answer: impl Fn(DialogAnswer, &mut Window, &mut App) -> bool + 'static,
+    answer: AnswerCallback,
     window: &mut Window,
     cx: &mut Context<T>,
 ) {
-    let answer = Rc::new(answer);
-    let shown = input.clone();
+    let submitted = answer.clone();
 
-    window.open_dialog(cx, move |dialog, _, _| {
-        let submitted = answer.clone();
-        let cancelled = answer.clone();
-        let dismissal = dismissal.clone();
-        let typed = shown.clone();
-
-        dialog
-            .title(title.clone())
-            .width(px(DIALOG_WIDTH))
-            .close_button(false)
-            .child(Input::new(&shown))
-            .footer(
-                DialogFooter::new()
-                    .child(DialogClose::new().child(Button::new("dialog-cancel").label("Cancel")))
-                    .child(
-                        DialogAction::new()
-                            .child(Button::new("dialog-send").primary().label("Send")),
-                    ),
-            )
-            .on_ok(move |_, window, cx| {
-                let value = typed.read(cx).value().to_string();
-
-                submitted(DialogAnswer::Value(value), window, cx)
-            })
-            .on_cancel(move |_, window, cx| cancelled(dismissal.clone(), window, cx))
-    });
-
-    input.update(cx, |state, cx| state.focus(window, cx));
+    open_text(
+        title,
+        input,
+        move |value, window, cx| submitted(DialogAnswer::Value(value), window, cx),
+        move |window, cx| answer(dismissal.clone(), window, cx),
+        window,
+        cx,
+    );
 }

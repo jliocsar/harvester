@@ -1,3 +1,5 @@
+mod prompt_presentation;
+
 use gpui::{
     div, prelude::*, px, AnyElement, App, Context, Entity, EventEmitter, Focusable, ScrollHandle,
     SharedString, Subscription, Window,
@@ -14,12 +16,9 @@ use crate::ui::{self, Tone};
 use crate::workspaces::folder_name;
 use harvester_client_core::bridge::Event as BridgeEvent;
 use harvester_client_core::{machines, MachineCandidate, RequestToken};
-
-const DEFAULT_MODEL_ROW: &str = "default (pi chooses)";
-const ADD_REPO_ROW: &str = "Add new…";
-const NO_MACHINE_LABEL: &str = "no machines";
-const CHOOSE_MACHINE_LABEL: &str = "choose machine";
-const CHOOSE_REPO_LABEL: &str = "choose repository";
+use prompt_presentation::{
+    machine_control_label, model_control_state, model_row_label, repo_control_label, ADD_REPO_ROW,
+};
 
 pub use session_state::{ChatIntent as ChatRequest, ChatTarget};
 
@@ -487,12 +486,7 @@ impl Chat {
         };
 
         if let Some(notice) = notice {
-            return row.child(
-                div()
-                    .text_xs()
-                    .text_color(Tone::Idle.color(cx))
-                    .child(notice),
-            );
+            return row.child(ui::inline_note(Tone::Idle, notice, cx));
         }
 
         let input_focused = self.input.read(cx).focus_handle(cx).is_focused(window);
@@ -535,22 +529,11 @@ impl Chat {
     }
 
     fn model_control_state(&self) -> (SharedString, bool) {
-        let choices_available = !self.state.model_choices().is_empty();
-
-        match self.state.selection() {
-            ModelSelection::Launch(choice) | ModelSelection::Live(choice) => {
-                (choice.name.clone().into(), choices_available)
-            }
-            ModelSelection::LaunchDefault => match self.state.models() {
-                ModelsState::Loading => ("loading models…".into(), false),
-                ModelsState::Loaded(_) => ("default model".into(), true),
-                ModelsState::NotRequested | ModelsState::Failed(_) => {
-                    ("default model".into(), false)
-                }
-            },
-            ModelSelection::LivePending => ("model".into(), choices_available),
-            ModelSelection::LiveUnavailable => ("model unavailable".into(), choices_available),
-        }
+        model_control_state(
+            self.state.selection(),
+            self.state.models(),
+            self.state.model_choices(),
+        )
     }
 
     fn render_model_control(
@@ -559,54 +542,44 @@ impl Chat {
         enabled: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let control =
-            ui::prompt_box_control("chat-model", Icon::new(IconName::Bot), label, enabled, cx);
         let picks = self.model_picks();
-
-        if !enabled || picks.is_empty() {
-            return control.into_any_element();
-        }
-
-        let rows = picks
+        let rows: Vec<ui::DropdownRow> = picks
             .iter()
             .map(|pick| ui::DropdownRow {
-                label: match pick {
-                    Some(choice) => choice.name.clone().into(),
-                    None => DEFAULT_MODEL_ROW.into(),
-                },
+                label: model_row_label(pick.as_ref()),
                 selected: self.is_current_model(pick),
                 divider_above: false,
             })
             .collect();
         let chat = cx.entity();
 
-        ui::prompt_box_dropdown("chat-model-dropdown", control, rows, move |index, _, cx| {
-            let Some(pick) = picks.get(index).cloned() else {
-                return;
-            };
+        render_dropdown_control(
+            "chat-model",
+            "chat-model-dropdown",
+            Icon::new(IconName::Bot),
+            label,
+            enabled,
+            rows,
+            move |index, _, cx| {
+                let Some(pick) = picks.get(index).cloned() else {
+                    return;
+                };
 
-            chat.update(cx, |chat, cx| chat.pick_model(pick, cx));
-        })
-        .into_any_element()
+                chat.update(cx, |chat, cx| chat.pick_model(pick, cx));
+            },
+            cx,
+        )
     }
 
     fn render_machine_control(&self, unstarted: bool, cx: &mut Context<Self>) -> AnyElement {
         let candidates = self.machine_candidates(cx);
-        let label = self.machine_control_label(&candidates, cx);
-        let enabled = unstarted && !candidates.is_empty();
-        let control = ui::prompt_box_control(
-            "chat-machine",
-            Icon::new(IconName::HardDrive),
-            label,
-            enabled,
-            cx,
+        let label = machine_control_label(
+            &self.state.target().machine,
+            &self.machine_label(cx),
+            &candidates,
         );
-
-        if !enabled {
-            return control.into_any_element();
-        }
-
-        let rows = candidates
+        let enabled = unstarted && !candidates.is_empty();
+        let rows: Vec<ui::DropdownRow> = candidates
             .iter()
             .map(|candidate| ui::DropdownRow {
                 label: candidate.label.clone().into(),
@@ -620,9 +593,12 @@ impl Chat {
             .collect();
         let chat = cx.entity();
 
-        ui::prompt_box_dropdown(
+        render_dropdown_control(
+            "chat-machine",
             "chat-machine-dropdown",
-            control,
+            Icon::new(IconName::HardDrive),
+            label,
+            enabled,
             rows,
             move |index, _, cx| {
                 let Some(machine) = keys.get(index).cloned() else {
@@ -631,40 +607,14 @@ impl Chat {
 
                 chat.update(cx, |chat, cx| chat.pick_machine(machine, cx));
             },
+            cx,
         )
-        .into_any_element()
-    }
-
-    fn machine_control_label(
-        &self,
-        candidates: &[MachineCandidate],
-        cx: &Context<Self>,
-    ) -> SharedString {
-        if !self.state.target().machine.is_empty() {
-            return self.machine_label(cx);
-        }
-
-        if candidates.is_empty() {
-            return NO_MACHINE_LABEL.into();
-        }
-
-        CHOOSE_MACHINE_LABEL.into()
     }
 
     fn render_repo_control(&self, unstarted: bool, cx: &mut Context<Self>) -> AnyElement {
         let path = &self.state.target().workspace_path;
-        let label: SharedString = match path.is_empty() {
-            true => CHOOSE_REPO_LABEL.into(),
-            false => folder_name(path).to_string().into(),
-        };
+        let label = repo_control_label(path);
         let enabled = unstarted && !self.state.target().machine.is_empty();
-        let control =
-            ui::prompt_box_control("chat-repo", Icon::new(IconName::Folder), label, enabled, cx);
-
-        if !enabled {
-            return control.into_any_element();
-        }
-
         let repos = self.repo_candidates(cx);
         let mut rows: Vec<ui::DropdownRow> = repos
             .iter()
@@ -683,15 +633,23 @@ impl Chat {
 
         let chat = cx.entity();
 
-        ui::prompt_box_dropdown("chat-repo-dropdown", control, rows, move |index, _, cx| {
-            let picked = repos.get(index).cloned();
+        render_dropdown_control(
+            "chat-repo",
+            "chat-repo-dropdown",
+            Icon::new(IconName::Folder),
+            label,
+            enabled,
+            rows,
+            move |index, _, cx| {
+                let picked = repos.get(index).cloned();
 
-            chat.update(cx, |chat, cx| match picked {
-                Some(repo) => chat.select_repo(repo, cx),
-                None => chat.add_repo(cx),
-            });
-        })
-        .into_any_element()
+                chat.update(cx, |chat, cx| match picked {
+                    Some(repo) => chat.select_repo(repo, cx),
+                    None => chat.add_repo(cx),
+                });
+            },
+            cx,
+        )
     }
 
     fn render_unstarted_body(&self, cx: &App) -> impl IntoElement {
@@ -700,15 +658,33 @@ impl Chat {
             .min_h(px(0.))
             .p_3()
             .children(match self.state.models() {
-                ModelsState::Failed(detail) => Some(
-                    div()
-                        .text_xs()
-                        .text_color(Tone::Failed.color(cx))
-                        .child(format!("{detail} — pi will use its default model")),
-                ),
+                ModelsState::Failed(detail) => Some(ui::inline_note(
+                    Tone::Failed,
+                    format!("{detail} — pi will use its default model"),
+                    cx,
+                )),
                 _ => None,
             })
     }
+}
+
+fn render_dropdown_control(
+    control_id: &'static str,
+    dropdown_id: &'static str,
+    icon: Icon,
+    label: SharedString,
+    enabled: bool,
+    rows: Vec<ui::DropdownRow>,
+    on_pick: impl Fn(usize, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> AnyElement {
+    let control = ui::prompt_box_control(control_id, icon, label, enabled, cx);
+
+    if !enabled || rows.is_empty() {
+        return control.into_any_element();
+    }
+
+    ui::prompt_box_dropdown(dropdown_id, control, rows, on_pick).into_any_element()
 }
 
 impl Render for Chat {

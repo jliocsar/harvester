@@ -1,7 +1,7 @@
-use gpui::{div, prelude::*, px, App, Context, Div, Entity, EventEmitter, SharedString};
+use gpui::{div, prelude::*, px, Context, Entity, EventEmitter, SharedString};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::list::ListItem;
-use gpui_component::{h_flex, v_flex, ActiveTheme as _, Icon, IconName, Sizable as _};
+use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _};
 use harvester_client_core::LOCAL_MACHINE;
 use harvester_proto::SessionStatus;
 
@@ -78,7 +78,7 @@ impl Sidebar {
                     .map(|(index, row)| self.render_session_row(index, row, cx)),
             )
             .when(empty, |list| {
-                list.child(sidebar_empty_note("no sessions yet", cx))
+                list.child(ui::sidebar_empty_note("no sessions yet", cx))
             })
     }
 
@@ -157,9 +157,9 @@ impl Sidebar {
     ) -> ListItem {
         let dot = present_machine(self.store.read(cx).state(key), key).dot;
 
-        sidebar_row(id)
+        ui::sidebar_row(id)
             .disabled(true)
-            .child(stacked_row(dot, label, detail, None, cx))
+            .child(ui::sidebar_stacked_row(dot, label, detail, None, cx))
     }
 
     fn render_missing_machine_row(
@@ -229,7 +229,7 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let sid = row.sid;
-        let body = stacked_row(
+        let body = ui::sidebar_stacked_row(
             ui::Dot::Solid(row.tone),
             row.title,
             Some(row.subtitle),
@@ -237,7 +237,7 @@ impl Sidebar {
             cx,
         );
 
-        sidebar_row(("session", index))
+        ui::sidebar_row(("session", index))
             .selected(row.selected)
             .child(body)
             .on_click(cx.listener(move |_, _, _, cx| {
@@ -258,25 +258,29 @@ impl Render for Sidebar {
             .border_r_1()
             .border_color(cx.theme().sidebar_border)
             .child(self.render_new_session_button(cx))
-            .child(
-                ui::section_header("machines-header", "machines", cx)
-                    .child(ui::section_chevron(!self.machines_collapsed))
-                    .on_click(cx.listener(|sidebar, _, _, cx| {
-                        sidebar.machines_collapsed = !sidebar.machines_collapsed;
-                        cx.notify();
-                    })),
-            )
+            .child(ui::collapsible_section(
+                "machines-header",
+                "machines",
+                !self.machines_collapsed,
+                cx.listener(|sidebar, _, _, cx| {
+                    sidebar.machines_collapsed = !sidebar.machines_collapsed;
+                    cx.notify();
+                }),
+                cx,
+            ))
             .when(!self.machines_collapsed, |sidebar| {
                 sidebar.child(self.render_machine_list(cx))
             })
-            .child(
-                ui::section_header("sessions-header", "sessions", cx)
-                    .child(ui::section_chevron(!self.sessions_collapsed))
-                    .on_click(cx.listener(|sidebar, _, _, cx| {
-                        sidebar.sessions_collapsed = !sidebar.sessions_collapsed;
-                        cx.notify();
-                    })),
-            )
+            .child(ui::collapsible_section(
+                "sessions-header",
+                "sessions",
+                !self.sessions_collapsed,
+                cx.listener(|sidebar, _, _, cx| {
+                    sidebar.sessions_collapsed = !sidebar.sessions_collapsed;
+                    cx.notify();
+                }),
+                cx,
+            ))
             .when(!self.sessions_collapsed, |sidebar| {
                 sidebar.child(self.render_session_list(cx))
             })
@@ -294,58 +298,6 @@ struct SessionRow {
 
 fn sid_preview(sid: &str) -> String {
     sid.chars().take(SID_PREVIEW_CHARS).collect()
-}
-
-fn sidebar_row(id: impl Into<gpui::ElementId>) -> ListItem {
-    ListItem::new(id)
-        .mx(px(6.))
-        .px(px(6.))
-        .py_1()
-        .rounded_md()
-        .text_size(px(13.))
-}
-
-fn stacked_row(
-    dot: ui::Dot,
-    title: SharedString,
-    detail: Option<SharedString>,
-    note: Option<SharedString>,
-    cx: &App,
-) -> Div {
-    v_flex()
-        .w_full()
-        .min_w(px(0.))
-        .child(
-            h_flex()
-                .gap_2()
-                .child(ui::status_dot(dot, cx))
-                .child(div().overflow_hidden().text_ellipsis().child(title))
-                .children(note.map(|note| {
-                    div()
-                        .flex_none()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(note)
-                })),
-        )
-        .children(detail.map(|detail| {
-            div()
-                .pl(px(14.))
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .overflow_hidden()
-                .text_ellipsis()
-                .child(detail)
-        }))
-}
-
-fn sidebar_empty_note(text: &'static str, cx: &App) -> Div {
-    div()
-        .px_3()
-        .py_1()
-        .text_xs()
-        .text_color(cx.theme().muted_foreground)
-        .child(text)
 }
 
 #[cfg(test)]
