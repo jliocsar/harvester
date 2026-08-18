@@ -22,6 +22,7 @@ use workspace_flow::AddWorkspaceFlow;
 
 use crate::chat::{Chat, ChatRequest, ChatTarget};
 use crate::dialogs::DialogCoordinator;
+use crate::modal::ModalCoordinator;
 use crate::store::{FleetStore, StoreEvent};
 use crate::ui::{self, Tone};
 
@@ -56,8 +57,9 @@ impl Workbench {
     ) -> Self {
         let store = cx.new(|cx| FleetStore::new(argv_machine, daemon_binary, cx));
         let sidebar = cx.new(|cx| Sidebar::new(store.clone(), cx));
-        let add_workspace_flow = cx.new(|_| AddWorkspaceFlow::new(store.clone()));
-        let dialogs = cx.new(|cx| DialogCoordinator::new(store.clone(), window, cx));
+        let modals = cx.new(|_| ModalCoordinator::default());
+        let add_workspace_flow = cx.new(|_| AddWorkspaceFlow::new(store.clone(), modals.clone()));
+        let dialogs = cx.new(|cx| DialogCoordinator::new(store.clone(), modals, window, cx));
         let subscriptions = [
             cx.observe(&store, |_, _, cx| cx.notify()),
             cx.subscribe_in(&store, window, Self::handle_store_event),

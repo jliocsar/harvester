@@ -2,17 +2,17 @@
 //!
 //! A daemon forwards a blocking dialog while a client is attached and Pi stays
 //! suspended until that dialog is answered. This module owns the small state
-//! machine around that fact: which room is active, which questions are owed,
-//! duplicate replay, FIFO order, and retirement when the room or session goes
-//! away. It is deliberately window-free; a GPUI modal is only an adapter for
-//! the front obligation.
+//! machine around that fact: one active room per machine, which questions are
+//! owed, duplicate replay, global FIFO order, and scoped retirement when a
+//! room or session goes away. It is deliberately window-free; a GPUI modal is
+//! only an adapter for the front obligation.
 //!
 //! Empty-room cancellation remains daemon policy. Leaving a room here only
 //! retires the client's view of questions that the daemon has already
 //! cancelled (or is about to cancel); it never manufactures a cancellation
 //! answer.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use crate::{DialogAnswer, DialogRequest};
 
@@ -97,58 +97,53 @@ pub struct AnsweredDialog {
 /// Window-free state for the dialog obligation policy.
 #[derive(Debug, Default)]
 pub struct DialogObligations {
-    room: Option<DialogRoom>,
+    rooms_by_machine: HashMap<String, DialogRoom>,
     pending: VecDeque<DialogObligation>,
 }
 
 impl DialogObligations {
-    /// Enter an attachment room. Questions from the previous room are
-    /// retired without sending answers; the daemon's empty-room policy owns
-    /// that cancellation.
+    /// Enter one machine's attachment room. A new sid retires only that
+    /// machine's previous questions; rooms on other machines remain attached
+    /// and keep their place in the global presentation queue.
     pub fn enter_room(&mut self, room: DialogRoom) -> Retirement {
-        if self.room.as_ref() == Some(&room) {
+        if self.rooms_by_machine.get(&room.machine) == Some(&room) {
             return Retirement::default();
         }
 
-        self.room = Some(room.clone());
-        self.retire(|obligation| obligation.room() == room)
+        self.rooms_by_machine
+            .insert(room.machine.clone(), room.clone());
+        self.retire(|obligation| obligation.machine != room.machine || obligation.room() == room)
     }
 
-    /// Leave every room, as when the active bridge disconnects. No
-    /// cancellation is sent here because an empty room is daemon policy, not
-    /// client policy.
-    pub fn leave_room(&mut self) -> Retirement {
-        self.room = None;
-        self.retire(|_| false)
-    }
-
-    /// A bridge can disconnect even when it is not the active dialog room.
-    /// Only that machine's loss may retire the active room.
+    /// A bridge disconnect empties only that machine's room. Cancellation is
+    /// still daemon policy, so this removes client obligations without
+    /// manufacturing answers.
     pub fn leave_machine(&mut self, machine: &str) -> Retirement {
-        let active_machine = self.room.as_ref().map(|room| room.machine.as_str());
-
-        if active_machine != Some(machine) {
+        if self.rooms_by_machine.remove(machine).is_none() {
             return Retirement::default();
         }
 
-        self.leave_room()
+        self.retire(|obligation| obligation.machine != machine)
     }
 
-    /// Pi's authoritative session-exit event retires that session's dialogs.
-    /// If it was the active room, there is no longer an attached room either.
-    pub fn retire_session(&mut self, sid: &str) -> Retirement {
-        if self.room.as_ref().is_some_and(|room| room.sid == sid) {
-            self.room = None;
+    /// Pi's authoritative session-exit event retires only the matching room.
+    /// Session ids are routed with a machine rather than assumed globally
+    /// unique, just like every other bridge event.
+    pub fn retire_session(&mut self, machine: &str, sid: &str) -> Retirement {
+        let room = DialogRoom::new(machine.to_string(), sid.to_string());
+
+        if self.rooms_by_machine.get(machine) == Some(&room) {
+            self.rooms_by_machine.remove(machine);
         }
 
-        self.retire(|obligation| obligation.sid != sid)
+        self.retire(|obligation| obligation.room() != room)
     }
 
-    /// Add a forwarded request if it belongs to the currently attached room.
-    /// Pi replays pending requests on attach, so identity is room + dialog id,
-    /// not the payload's complete value.
+    /// Add a forwarded request if it belongs to that machine's currently
+    /// attached room. Pi replays pending requests on attach, so identity is
+    /// room + dialog id, not the payload's complete value.
     pub fn enqueue(&mut self, obligation: DialogObligation) -> EnqueueResult {
-        if self.room.as_ref() != Some(&obligation.room()) {
+        if self.rooms_by_machine.get(&obligation.machine) != Some(&obligation.room()) {
             return EnqueueResult::Ignored;
         }
 
@@ -170,8 +165,8 @@ impl DialogObligations {
         }
     }
 
-    pub fn room(&self) -> Option<&DialogRoom> {
-        self.room.as_ref()
+    pub fn room(&self, machine: &str) -> Option<&DialogRoom> {
+        self.rooms_by_machine.get(machine)
     }
 
     pub fn front(&self) -> Option<&DialogObligation> {
@@ -186,9 +181,17 @@ impl DialogObligations {
         self.pending.is_empty()
     }
 
-    /// Accept exactly one answer. A second callback after the modal was
-    /// closed finds no front obligation and therefore cannot answer Pi twice.
-    pub fn answer_front(&mut self, answer: DialogAnswer) -> Option<AnsweredDialog> {
+    /// Accept exactly one answer for this key. A duplicate callback after the
+    /// modal advances cannot consume the next front obligation.
+    pub fn answer_front(
+        &mut self,
+        key: &DialogKey,
+        answer: DialogAnswer,
+    ) -> Option<AnsweredDialog> {
+        if self.pending.front().map(DialogObligation::key).as_ref() != Some(key) {
+            return None;
+        }
+
         self.pending
             .pop_front()
             .map(|obligation| AnsweredDialog { obligation, answer })
@@ -291,19 +294,22 @@ mod tests {
             EnqueueResult::Queued
         );
 
+        let first_key = obligations.front().expect("first obligation").key();
         let answered = obligations
-            .answer_front(DialogAnswer::Confirmed(true))
+            .answer_front(&first_key, DialogAnswer::Confirmed(true))
             .expect("front obligation");
         assert_eq!(answered.obligation.request.id, "d-1");
         assert_eq!(
             obligations.front().map(|dialog| dialog.request.id.as_str()),
             Some("d-2")
         );
+
+        let second_key = obligations.front().expect("second obligation").key();
         assert!(obligations
-            .answer_front(DialogAnswer::Confirmed(false))
+            .answer_front(&second_key, DialogAnswer::Confirmed(false))
             .is_some());
         assert!(obligations
-            .answer_front(DialogAnswer::Confirmed(false))
+            .answer_front(&second_key, DialogAnswer::Confirmed(false))
             .is_none());
     }
 
@@ -314,11 +320,11 @@ mod tests {
         obligations.enqueue(question("vm", "sid-1", "d-1"));
         obligations.enqueue(question("vm", "sid-1", "d-2"));
 
-        let retirement = obligations.retire_session("sid-1");
+        let retirement = obligations.retire_session("vm", "sid-1");
         assert!(retirement.front_removed);
         assert_eq!(retirement.retired.len(), 2);
         assert!(obligations.front().is_none());
-        assert!(obligations.room().is_none());
+        assert!(obligations.room("vm").is_none());
     }
 
     #[test]
@@ -330,7 +336,7 @@ mod tests {
         let retirement = obligations.enter_room(room("vm", "new"));
         assert!(retirement.front_removed);
         assert_eq!(retirement.retired[0].sid, "old");
-        assert_eq!(obligations.room(), Some(&room("vm", "new")));
+        assert_eq!(obligations.room("vm"), Some(&room("vm", "new")));
         assert_eq!(
             obligations.enqueue(question("vm", "old", "late")),
             EnqueueResult::Ignored
@@ -362,8 +368,97 @@ mod tests {
 
         let retirement = obligations.leave_machine("vm");
         assert_eq!(retirement.retired.len(), 1);
-        assert!(obligations.room().is_none());
+        assert!(obligations.room("vm").is_none());
         assert!(obligations.front().is_none());
+    }
+
+    #[test]
+    fn rooms_on_two_machines_share_one_fifo_without_retiring_each_other() {
+        let mut obligations = DialogObligations::default();
+        obligations.enter_room(room("machine-a", "sid-a"));
+        obligations.enter_room(room("machine-b", "sid-b"));
+
+        assert_eq!(
+            obligations.enqueue(question("machine-a", "sid-a", "dialog-a")),
+            EnqueueResult::Visible
+        );
+        assert_eq!(
+            obligations.enqueue(question("machine-b", "sid-b", "dialog-b")),
+            EnqueueResult::Queued
+        );
+        assert_eq!(obligations.len(), 2);
+
+        let retirement = obligations.enter_room(room("machine-b", "sid-b-2"));
+
+        assert!(!retirement.front_removed);
+        assert_eq!(retirement.retired.len(), 1);
+        assert_eq!(retirement.retired[0].request.id, "dialog-b");
+        assert_eq!(
+            obligations.front().map(|dialog| dialog.request.id.as_str()),
+            Some("dialog-a")
+        );
+        assert_eq!(
+            obligations.room("machine-a"),
+            Some(&room("machine-a", "sid-a"))
+        );
+    }
+
+    #[test]
+    fn disconnect_and_exit_retire_only_the_matching_machine_room() {
+        let mut obligations = DialogObligations::default();
+        obligations.enter_room(room("machine-a", "shared-sid"));
+        obligations.enter_room(room("machine-b", "shared-sid"));
+        obligations.enqueue(question("machine-a", "shared-sid", "dialog-a"));
+        obligations.enqueue(question("machine-b", "shared-sid", "dialog-b"));
+
+        let retirement = obligations.retire_session("machine-b", "shared-sid");
+
+        assert!(!retirement.front_removed);
+        assert_eq!(retirement.retired.len(), 1);
+        assert_eq!(retirement.retired[0].machine, "machine-b");
+        assert!(obligations.room("machine-a").is_some());
+        assert!(obligations.room("machine-b").is_none());
+
+        let retirement = obligations.leave_machine("machine-a");
+
+        assert!(retirement.front_removed);
+        assert_eq!(retirement.retired.len(), 1);
+        assert!(obligations.is_empty());
+    }
+
+    #[test]
+    fn duplicate_identity_includes_the_room() {
+        let mut obligations = DialogObligations::default();
+        obligations.enter_room(room("machine-a", "sid-a"));
+        obligations.enter_room(room("machine-b", "sid-b"));
+        obligations.enqueue(question("machine-a", "sid-a", "dialog"));
+
+        assert_eq!(
+            obligations.enqueue(question("machine-b", "sid-b", "dialog")),
+            EnqueueResult::Queued
+        );
+        assert_eq!(obligations.len(), 2);
+    }
+
+    #[test]
+    fn a_stale_modal_callback_cannot_answer_the_next_obligation() {
+        let mut obligations = DialogObligations::default();
+        obligations.enter_room(room("vm", "sid"));
+        obligations.enqueue(question("vm", "sid", "first"));
+        obligations.enqueue(question("vm", "sid", "second"));
+        let first_key = obligations.front().expect("first").key();
+
+        obligations
+            .answer_front(&first_key, DialogAnswer::Confirmed(true))
+            .expect("first answer");
+
+        assert!(obligations
+            .answer_front(&first_key, DialogAnswer::Confirmed(false))
+            .is_none());
+        assert_eq!(
+            obligations.front().map(|dialog| dialog.request.id.as_str()),
+            Some("second")
+        );
     }
 
     #[test]

@@ -24,6 +24,7 @@ use harvester_client_core::{
     DialogRoom, EnqueueResult, Retirement,
 };
 
+use crate::modal::{ModalAvailable, ModalCoordinator, ModalLease, ModalOwner};
 use crate::store::{FleetStore, StoreEvent};
 
 /// Wide enough for a prompt an extension wrote without knowing our layout, and
@@ -45,24 +46,34 @@ const UNTITLED: &str = "The agent is asking";
 /// sends exactly one answer back through the same machine route.
 pub(crate) struct DialogCoordinator {
     store: Entity<FleetStore>,
+    modals: Entity<ModalCoordinator>,
     obligations: DialogObligations,
     inputs: std::collections::HashMap<DialogKey, Entity<InputState>>,
-    _store: gpui::Subscription,
+    lease: Option<ModalLease>,
+    displayed: Option<DialogKey>,
+    _subscriptions: [gpui::Subscription; 2],
 }
 
 impl DialogCoordinator {
     pub(crate) fn new(
         store: Entity<FleetStore>,
+        modals: Entity<ModalCoordinator>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let store_subscription = cx.subscribe_in(&store, window, Self::handle_store_event);
+        let subscriptions = [
+            cx.subscribe_in(&store, window, Self::handle_store_event),
+            cx.subscribe_in(&modals, window, Self::handle_modal_available),
+        ];
 
         Self {
             store,
+            modals,
             obligations: DialogObligations::default(),
             inputs: std::collections::HashMap::new(),
-            _store: store_subscription,
+            lease: None,
+            displayed: None,
+            _subscriptions: subscriptions,
         }
     }
 
@@ -83,15 +94,31 @@ impl DialogCoordinator {
                 event: BridgeEvent::Pi { sid, event },
             } => self.handle_pi_event(machine, sid, event, window, cx),
             StoreEvent::Bridge {
+                machine,
                 event: BridgeEvent::SessionExit { sid, .. },
-                ..
-            } => self.retire_session(sid, window, cx),
+            } => self.retire_session(machine, sid, window, cx),
             StoreEvent::Bridge {
                 machine,
                 event: BridgeEvent::Disconnected,
             } => self.leave_machine(machine, window, cx),
             StoreEvent::Bridge { .. } | StoreEvent::Machines(_) | StoreEvent::Failed(_) => {}
         }
+    }
+
+    fn handle_modal_available(
+        &mut self,
+        _modals: &Entity<ModalCoordinator>,
+        _event: &ModalAvailable,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let coordinator = cx.entity();
+
+        // Add Workspace releases from an on_cancel callback before Root does
+        // its automatic pop. Wait until that callback and pop are both done.
+        window.defer(cx, move |window, cx| {
+            coordinator.update(cx, |coordinator, cx| coordinator.advance(window, cx));
+        });
     }
 
     fn handle_pi_event(
@@ -129,27 +156,74 @@ impl DialogCoordinator {
         }
 
         if result == EnqueueResult::Visible {
-            self.show_front(window, cx);
+            self.advance(window, cx);
         }
     }
 
-    fn show_front(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Show the global FIFO front only after acquiring Root for Pi. While Add
+    /// Workspace owns it, obligations remain queued and no Root call occurs.
+    fn advance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.displayed.is_some() {
+            return;
+        }
+
         let Some(obligation) = self.obligations.front().cloned() else {
+            self.release_modal(cx);
+
             return;
         };
-        let input = self.inputs.get(&obligation.key()).cloned();
 
-        open(&obligation, input, Self::answer_front, window, cx);
+        if self.lease.is_none() {
+            self.lease = self
+                .modals
+                .update(cx, |modals, _| modals.acquire(ModalOwner::PiDialogs));
+        }
+
+        let Some(lease) = self.lease else {
+            return;
+        };
+
+        if !self.modals.read(cx).owns(lease) {
+            self.lease = None;
+
+            return;
+        }
+
+        let key = obligation.key();
+        let callback_key = key.clone();
+        let input = self.inputs.get(&key).cloned();
+
+        self.displayed = Some(key);
+        open(
+            &obligation,
+            input,
+            move |coordinator, answer, window, cx| {
+                coordinator.answer_front(&callback_key, answer, window, cx)
+            },
+            window,
+            cx,
+        );
     }
 
-    fn answer_front(&mut self, answer: DialogAnswer, window: &mut Window, cx: &mut Context<Self>) {
-        // This pop is the duplicate-answer guard. A second callback from the
-        // same modal finds no front obligation and sends nothing.
-        let Some(answered) = self.obligations.answer_front(answer) else {
-            return;
+    fn answer_front(
+        &mut self,
+        key: &DialogKey,
+        answer: DialogAnswer,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.displayed.as_ref() != Some(key) {
+            return false;
+        }
+
+        // The key is also checked by the window-free queue. A duplicate or
+        // delayed callback from the old modal can never consume its successor.
+        let Some(answered) = self.obligations.answer_front(key, answer) else {
+            return false;
         };
         let obligation = answered.obligation;
 
+        self.displayed = None;
         self.inputs.remove(&obligation.key());
         self.store.read(cx).send(
             &obligation.machine,
@@ -160,14 +234,12 @@ impl DialogCoordinator {
             },
         );
 
-        // gpui-component closes the answered dialog after this callback. Open
-        // the next one only after that pop, or the library would close the new
-        // front instead.
-        let coordinator = cx.entity();
+        // gpui-component pops after its answer callback; select performs the
+        // equivalent guarded pop in its button handler. Defer advancement so
+        // the next owner never lands beneath the modal being closed.
+        self.defer_advance(window, cx);
 
-        window.defer(cx, move |window, cx| {
-            coordinator.update(cx, |coordinator, cx| coordinator.show_front(window, cx));
-        });
+        true
     }
 
     fn enter_room(
@@ -184,8 +256,14 @@ impl DialogCoordinator {
         self.apply_retirement(retirement, window, cx);
     }
 
-    fn retire_session(&mut self, sid: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let retirement = self.obligations.retire_session(sid);
+    fn retire_session(
+        &mut self,
+        machine: &str,
+        sid: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let retirement = self.obligations.retire_session(machine, sid);
 
         self.apply_retirement(retirement, window, cx);
     }
@@ -202,19 +280,55 @@ impl DialogCoordinator {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let displayed_retired = self.displayed.as_ref().is_some_and(|displayed| {
+            retirement
+                .retired
+                .iter()
+                .any(|obligation| obligation.key() == *displayed)
+        });
+
         for obligation in retirement.retired {
             self.inputs.remove(&obligation.key());
         }
 
-        if !retirement.front_removed {
+        if !retirement.front_removed || !displayed_retired {
             return;
         }
 
-        // Programmatic close runs no answer callback. Empty-room cancellation
-        // remains daemon policy; retiring a client modal never manufactures an
-        // answer.
+        let Some(lease) = self.lease else {
+            return;
+        };
+
+        if !self.modals.read(cx).owns(lease) {
+            self.lease = None;
+            self.displayed = None;
+
+            return;
+        }
+
+        // Only the flow that owns Root may pop it. In particular, retiring a
+        // queued Pi front while Add Workspace owns the modal leaves that
+        // workspace modal untouched.
+        self.displayed = None;
         window.close_dialog(cx);
-        self.show_front(window, cx);
+        self.defer_advance(window, cx);
+    }
+
+    fn defer_advance(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let coordinator = cx.entity();
+
+        window.defer(cx, move |window, cx| {
+            coordinator.update(cx, |coordinator, cx| coordinator.advance(window, cx));
+        });
+    }
+
+    fn release_modal(&mut self, cx: &mut Context<Self>) {
+        let Some(lease) = self.lease.take() else {
+            return;
+        };
+
+        self.modals
+            .update(cx, |modals, cx| modals.release(lease, cx));
     }
 }
 
@@ -246,16 +360,13 @@ fn create_input(
     }
 }
 
-/// Put `dialog` on screen. `answered` runs on the owner with what the user
-/// decided, once per dialog — the modal is already gone by then.
-///
-/// Every path out of a dialog lands in `answered`, including dismissal, which
-/// is the point: an `extension_ui_request` that goes unanswered leaves pi
-/// blocked for the life of the process.
+/// Put `dialog` on screen. Every path out lands in `answered`, including
+/// dismissal. Its boolean tells Root whether this callback still owns the
+/// modal; delayed duplicates return false and cannot pop a successor.
 fn open<T: 'static>(
     dialog: &DialogObligation,
     input: Option<Entity<InputState>>,
-    answered: impl Fn(&mut T, DialogAnswer, &mut Window, &mut Context<T>) + 'static,
+    answered: impl Fn(&mut T, DialogAnswer, &mut Window, &mut Context<T>) -> bool + 'static,
     window: &mut Window,
     cx: &mut Context<T>,
 ) {
@@ -267,7 +378,7 @@ fn open<T: 'static>(
         let answered = answered.clone();
 
         move |answer: DialogAnswer, window: &mut Window, cx: &mut App| {
-            owner.update(cx, |owner, cx| answered(owner, answer, window, cx));
+            owner.update(cx, |owner, cx| answered(owner, answer, window, cx))
         }
     };
 
@@ -306,7 +417,7 @@ fn open_select<T: 'static>(
     title: SharedString,
     options: Vec<String>,
     dismissal: DialogAnswer,
-    answer: impl Fn(DialogAnswer, &mut Window, &mut App) + 'static,
+    answer: impl Fn(DialogAnswer, &mut Window, &mut App) -> bool + 'static,
     window: &mut Window,
     cx: &mut Context<T>,
 ) {
@@ -327,8 +438,9 @@ fn open_select<T: 'static>(
                     .w_full()
                     .label(option.clone())
                     .on_click(move |_, window, cx| {
-                        window.close_dialog(cx);
-                        answer(DialogAnswer::Value(option.clone()), window, cx);
+                        if answer(DialogAnswer::Value(option.clone()), window, cx) {
+                            window.close_dialog(cx);
+                        }
                     })
             }
         });
@@ -346,11 +458,7 @@ fn open_select<T: 'static>(
             .on_cancel({
                 let answer = answer.clone();
 
-                move |_, window, cx| {
-                    answer(dismissal.clone(), window, cx);
-
-                    true
-                }
+                move |_, window, cx| answer(dismissal.clone(), window, cx)
             })
     });
 }
@@ -362,7 +470,7 @@ fn open_confirm<T: 'static>(
     title: SharedString,
     message: String,
     dismissal: DialogAnswer,
-    answer: impl Fn(DialogAnswer, &mut Window, &mut App) + 'static,
+    answer: impl Fn(DialogAnswer, &mut Window, &mut App) -> bool + 'static,
     window: &mut Window,
     cx: &mut Context<T>,
 ) {
@@ -386,16 +494,8 @@ fn open_confirm<T: 'static>(
                     .cancel_text("No")
                     .show_cancel(true),
             )
-            .on_ok(move |_, window, cx| {
-                confirmed(DialogAnswer::Confirmed(true), window, cx);
-
-                true
-            })
-            .on_cancel(move |_, window, cx| {
-                declined(dismissal.clone(), window, cx);
-
-                true
-            })
+            .on_ok(move |_, window, cx| confirmed(DialogAnswer::Confirmed(true), window, cx))
+            .on_cancel(move |_, window, cx| declined(dismissal.clone(), window, cx))
     });
 }
 
@@ -404,7 +504,7 @@ fn open_text<T: 'static>(
     title: SharedString,
     input: Entity<InputState>,
     dismissal: DialogAnswer,
-    answer: impl Fn(DialogAnswer, &mut Window, &mut App) + 'static,
+    answer: impl Fn(DialogAnswer, &mut Window, &mut App) -> bool + 'static,
     window: &mut Window,
     cx: &mut Context<T>,
 ) {
@@ -431,15 +531,9 @@ fn open_text<T: 'static>(
             .on_ok(move |_, window, cx| {
                 let value = typed.read(cx).value().to_string();
 
-                submitted(DialogAnswer::Value(value), window, cx);
-
-                true
+                submitted(DialogAnswer::Value(value), window, cx)
             })
-            .on_cancel(move |_, window, cx| {
-                cancelled(dismissal.clone(), window, cx);
-
-                true
-            })
+            .on_cancel(move |_, window, cx| cancelled(dismissal.clone(), window, cx))
     });
 
     // `open_dialog` focuses the dialog frame it just built, not anything

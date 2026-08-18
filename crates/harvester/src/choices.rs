@@ -1,5 +1,5 @@
-//! The one-of-many modal: pick a row, the dialog closes, the owner is told
-//! which row it was.
+//! The one-of-many modal: pick a row, let the owner validate it, then close
+//! only when that generation still owns the dialog.
 //!
 //! One surface left — the add-workspace machine step. The chat's two pickers
 //! were modals too until they became in-place dropdowns
@@ -11,6 +11,8 @@
 //! dialog's body from the *root* view's render: reaching for the workbench
 //! there would be reading an entity that is mid-update, which gpui panics on
 //! (SPEC C11).
+
+use std::rc::Rc;
 
 use gpui::{
     prelude::*, App, Context, Entity, EventEmitter, SharedString, Subscription, Task, Window,
@@ -142,12 +144,15 @@ impl Render for Choices {
     }
 }
 
-/// Open the modal. `picked` runs on the owner with the index of the row the
-/// user chose, after the dialog is gone.
+/// Open the modal. A `picked` callback that returns true authorizes this
+/// dialog's pop; `dismissed` does the same for Escape, overlay click, or any
+/// future Root cancellation affordance. Stale callbacks return false and
+/// cannot pop another flow's modal.
 pub fn open<T: 'static>(
     title: &'static str,
     rows: Vec<ChoiceRow>,
-    picked: impl Fn(&mut T, usize, &mut Window, &mut Context<T>) + 'static,
+    picked: impl Fn(&mut T, usize, &mut Window, &mut Context<T>) -> bool + 'static,
+    dismissed: impl Fn(&mut T, &mut Window, &mut Context<T>) -> bool + 'static,
     window: &mut Window,
     cx: &mut Context<T>,
 ) {
@@ -164,16 +169,26 @@ pub fn open<T: 'static>(
         &choices,
         window,
         move |owner, _, event: &ChoicePicked, window, cx| {
-            window.close_dialog(cx);
-            picked(owner, event.0, window, cx);
+            if picked(owner, event.0, window, cx) {
+                window.close_dialog(cx);
+            }
         },
     )
     .detach();
 
+    let owner = cx.entity();
+    let dismissed = Rc::new(dismissed);
+
     window.open_dialog(cx, move |dialog, _, _| {
+        let owner = owner.clone();
+        let dismissed = dismissed.clone();
+
         dialog
             .title(title)
             .close_button(false)
             .child(choices.clone())
+            .on_cancel(move |_, window, cx| {
+                owner.update(cx, |owner, cx| dismissed(owner, window, cx))
+            })
     });
 }

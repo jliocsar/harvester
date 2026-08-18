@@ -11,6 +11,7 @@ mod chat;
 mod choices;
 mod desktop_shell;
 mod dialogs;
+mod modal;
 mod models;
 mod session_state;
 mod store;

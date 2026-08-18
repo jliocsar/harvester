@@ -337,7 +337,13 @@ fn render_diff_line(line: &str, cx: &App) -> Div {
 }
 
 fn basename(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
+    let normalized = path.trim_end_matches('/');
+
+    if normalized.is_empty() && path.starts_with('/') {
+        return "/";
+    }
+
+    normalized.rsplit('/').next().unwrap_or(normalized)
 }
 
 /// Raw JSON summary for an unknown tool, capped by characters rather than
@@ -376,7 +382,8 @@ mod tests {
     fn basename_uses_the_last_path_component() {
         assert_eq!(basename("/tmp/repo/src/main.rs"), "main.rs");
         assert_eq!(basename("Cargo.toml"), "Cargo.toml");
-        assert_eq!(basename("/tmp/repo/"), "");
+        assert_eq!(basename("/tmp/repo/"), "repo");
+        assert_eq!(basename("/"), "/");
     }
 
     #[test]

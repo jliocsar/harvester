@@ -18,6 +18,7 @@ use gpui::{
     Task, Window,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::dialog::CancelDialog;
 use gpui_component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
 use gpui_component::{ActiveTheme as _, Disableable as _, IndexPath, WindowExt as _};
 use harvester_client_core::machines;
@@ -160,6 +161,10 @@ impl Walk {
     /// The command never reached the worker, so no answer is coming. Without
     /// this the modal would stay gated on a request that does not exist.
     fn request_failed(&mut self) {
+        self.pending.cancel();
+    }
+
+    fn cancel(&mut self) {
         self.pending.cancel();
     }
 
@@ -438,6 +443,7 @@ pub(super) struct FolderPicker {
     walk: Walk,
     entries: Entity<ListState<EntriesDelegate>>,
     opening: Option<PickerCommand>,
+    active: bool,
     _subscriptions: [gpui::Subscription; 2],
 }
 
@@ -463,16 +469,28 @@ impl FolderPicker {
             walk,
             entries,
             opening: Some(home),
+            active: true,
             _subscriptions: subscriptions,
         }
     }
 
     pub(super) fn start(&mut self, cx: &mut Context<Self>) {
+        if !self.active {
+            return;
+        }
+
         let Some(home) = self.opening.take() else {
             return;
         };
 
         self.send_request(home, cx);
+    }
+
+    pub(super) fn cancel(&mut self, cx: &mut Context<Self>) {
+        self.active = false;
+        self.opening = None;
+        self.walk.cancel();
+        cx.notify();
     }
 
     /// A row was clicked or Entered. Files confirm to nothing — the list
@@ -511,6 +529,10 @@ impl FolderPicker {
     }
 
     fn send_request(&mut self, command: PickerCommand, cx: &mut Context<Self>) {
+        if !self.active {
+            return;
+        }
+
         let host = match self.store.read(cx).host_for(&self.walk.machine) {
             Ok(host) => host,
             Err(detail) => {
@@ -537,6 +559,10 @@ impl FolderPicker {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.active {
+            return;
+        }
+
         let answer = match event {
             StoreEvent::Machines(machines::Event::HomeResolved { token, result }) => {
                 PickerAnswer::Home {
@@ -575,6 +601,10 @@ impl FolderPicker {
     }
 
     fn handle_answer(&mut self, answer: PickerAnswer, cx: &mut Context<Self>) {
+        if !self.active {
+            return;
+        }
+
         match answer {
             PickerAnswer::Home { token, result } => self.handle_home_resolved(token, result, cx),
             PickerAnswer::Listing { token, result } => self.handle_dir_listed(token, result, cx),
@@ -635,16 +665,25 @@ impl FolderPicker {
     /// dialog's, which is why nothing here tracks whether it is open.
     pub(super) fn open_dialog<T: 'static>(
         picker: &Entity<Self>,
+        dismissed: impl Fn(&mut T, &mut Window, &mut Context<T>) -> bool + 'static,
         window: &mut Window,
         cx: &mut Context<T>,
     ) {
+        let owner = cx.entity();
         let picker = picker.clone();
+        let dismissed = std::rc::Rc::new(dismissed);
 
         window.open_dialog(cx, move |dialog, _, _| {
+            let owner = owner.clone();
+            let dismissed = dismissed.clone();
+
             dialog
                 .title("Add workspace")
                 .close_button(false)
                 .child(picker.clone())
+                .on_cancel(move |_, window, cx| {
+                    owner.update(cx, |owner, cx| dismissed(owner, window, cx))
+                })
         });
     }
 
@@ -680,11 +719,13 @@ impl FolderPicker {
             .flex()
             .justify_end()
             .gap_2()
-            .child(Button::new("picker-cancel").label("Cancel").on_click(
-                // The dialog is the picker's own; cancellation has no result
-                // for the owning flow.
-                cx.listener(|_, _, window, cx| window.close_dialog(cx)),
-            ))
+            // Dispatch the same action as Escape, so the button and overlay
+            // share the dialog's guarded on_cancel path.
+            .child(
+                Button::new("picker-cancel")
+                    .label("Cancel")
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(CancelDialog), cx)),
+            )
             .child(
                 Button::new("picker-add")
                     .label("Add")
@@ -868,6 +909,23 @@ mod tests {
 
         walk.request_failed();
 
+        assert!(!walk.busy());
+    }
+
+    #[test]
+    fn cancellation_invalidates_an_outstanding_validation() {
+        let (mut walk, home) = opening_walk();
+        let listing = walk
+            .accept_home(home.token, Ok("/home/exedev".to_string()))
+            .expect("home starts the walk");
+
+        walk.accept_listing(listing.token, Ok(Vec::new()));
+
+        let validation = walk.confirm().expect("validation request");
+
+        walk.cancel();
+
+        assert!(walk.accept_validation(validation.token, None).is_none());
         assert!(!walk.busy());
     }
 
