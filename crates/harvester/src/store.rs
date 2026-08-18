@@ -10,30 +10,17 @@
 //! notification. What a view has to act on leaves as a [`StoreEvent`]; what a
 //! view only has to *see* is a `cx.notify()` away.
 
+use crate::catalog::Catalog;
+use crate::workspaces::Workspace;
 use gpui::{Context, EventEmitter};
 use harvester_client_core::bridge::{Command, Event as BridgeEvent};
 use harvester_client_core::machines;
 use harvester_client_core::{
     BridgeEvents, Fleet, Host, MachineCandidate, MachineState, MachinesEvents, RequestTokens,
-    LOCAL_MACHINE,
 };
-use harvester_proto::{SessionInfo, SessionStatus};
+use harvester_proto::SessionInfo;
 
-use crate::workspaces::{self, Workspace};
-
-/// One sidebar session row, tagged with the machine whose daemon reported it
-/// (commands about it must route back to that machine's bridge).
-pub struct MachineSession {
-    pub machine: String,
-    pub info: SessionInfo,
-}
-
-/// A session opening on a machine: what the sidebar spinner reads, and what a
-/// failure has to match before it may give up on it.
-struct OpeningSession {
-    machine: String,
-    sid: String,
-}
+pub use crate::catalog::MachineSession;
 
 /// What the store cannot finish on its own.
 ///
@@ -61,16 +48,10 @@ pub struct FleetStore {
     /// Mints the tokens that correlate every worker answer with the request
     /// that asked for it; one per process, cloned into each surface.
     tokens: RequestTokens,
-    /// All connected machines' sessions, newest first.
-    sessions: Vec<MachineSession>,
-    /// User's workspace list (`~/.harvester/workspaces.json`), all machines.
-    workspaces: Vec<Workspace>,
-    /// The session we asked a bridge to open, until `Attached` promotes it to
-    /// a chat (also the "don't double-open" guard). Carries the machine as
-    /// well as the sid because it is cleared by *that machine's* failures:
-    /// keyed by sid alone, any other machine losing its bridge cancelled this
-    /// guard, and the next click issued a duplicate `Open`.
-    opening: Option<OpeningSession>,
+    /// The window-free session/workspace catalog. It owns display ordering,
+    /// local scoping, opening guards and workspace persistence; this observable
+    /// root owns when those changes repaint and how machine events reach it.
+    catalog: Catalog,
 }
 
 impl EventEmitter<StoreEvent> for FleetStore {}
@@ -93,9 +74,7 @@ impl FleetStore {
             argv_machine: argv_machine.clone(),
             fleet,
             tokens: RequestTokens::default(),
-            sessions: Vec::new(),
-            workspaces: workspaces::load(),
-            opening: None,
+            catalog: Catalog::load(),
         };
 
         // SPEC §Flows "Reopen client": machines with stored workspaces
@@ -180,23 +159,22 @@ impl FleetStore {
             // The fleet took the link state; the dot it draws still moved.
             BridgeEvent::Connected { .. } => cx.notify(),
             BridgeEvent::ConnectFailed { .. } | BridgeEvent::Disconnected => {
-                self.abandon_open_on(machine);
+                self.catalog.abandon_open_on(machine);
                 cx.notify();
             }
             BridgeEvent::RequestFailed { detail } => {
-                self.abandon_open_on(machine);
+                self.catalog.abandon_open_on(machine);
                 self.fail(format!("{machine}: {detail}"), cx);
                 cx.notify();
             }
             BridgeEvent::Attached { sid, .. } => {
                 // The daemon's list may predate a resume we just did; disk on
                 // the VM stays authoritative, this is display state only.
-                self.set_session_status(sid, SessionStatus::Running);
-                self.abandon_open_on(machine);
+                self.catalog.session_attached(machine, sid);
                 cx.notify();
             }
             BridgeEvent::SessionExit { sid, .. } => {
-                self.set_session_status(sid, SessionStatus::Exited);
+                self.catalog.session_exited(sid);
                 cx.notify();
             }
             // The session keeps the model it had; the answer still goes on to
@@ -234,45 +212,7 @@ impl FleetStore {
     }
 
     fn record_sessions(&mut self, machine: &str, sessions: Vec<SessionInfo>) {
-        self.sessions.retain(|session| session.machine != machine);
-        self.sessions
-            .extend(sessions.into_iter().map(|info| MachineSession {
-                machine: machine.to_string(),
-                info,
-            }));
-        // Newest first by last *activity*, which is the daemon's own order
-        // (docs/DAEMON.md §list_sessions) and the only one that survives
-        // merging machines. Not by sid: a uuidv7 sorts by creation, so a
-        // session prompted five minutes ago sank below one created after it
-        // and untouched since — and pi's id charset is wider than uuidv7, so a
-        // sid already on disk may not sort chronologically at all. The sid
-        // breaks ties only to keep the order stable between listings.
-        self.sessions.sort_by(|a, b| {
-            b.info
-                .mtime_ms
-                .cmp(&a.info.mtime_ms)
-                .then_with(|| b.info.sid.cmp(&a.info.sid))
-        });
-    }
-
-    fn set_session_status(&mut self, sid: &str, status: SessionStatus) {
-        for session in &mut self.sessions {
-            if session.info.sid == sid {
-                session.info.status = status;
-            }
-        }
-    }
-
-    /// Stop waiting for an open on `machine`. An open on any other machine is
-    /// still in flight and keeps its guard.
-    fn abandon_open_on(&mut self, machine: &str) {
-        if self
-            .opening
-            .as_ref()
-            .is_some_and(|opening| opening.machine == machine)
-        {
-            self.opening = None;
-        }
+        self.catalog.record_sessions(machine, sessions);
     }
 
     /// Something the user has to be told about, on its way to a notification.
@@ -288,7 +228,12 @@ impl FleetStore {
         let machines: Vec<String> = self
             .argv_machine
             .iter()
-            .chain(self.workspaces.iter().map(|workspace| &workspace.machine))
+            .chain(
+                self.catalog
+                    .workspaces()
+                    .iter()
+                    .map(|workspace| &workspace.machine),
+            )
             .cloned()
             .collect();
 
@@ -338,80 +283,68 @@ impl FleetStore {
     pub fn add_workspace(&mut self, machine: String, path: String, cx: &mut Context<Self>) {
         let workspace = Workspace { machine, path };
 
-        if self.workspaces.contains(&workspace) {
+        let added = match self.catalog.add_workspace(workspace) {
+            Ok(added) => added,
+            Err(error) => {
+                self.fail(format!("save workspaces: {error}"), cx);
+
+                return;
+            }
+        };
+
+        if !added {
             return;
         }
 
-        self.workspaces.push(workspace);
         // A new ad-hoc machine may have entered the probe set, and the picker
         // does not connect the machine it browses (its execs need no daemon)
         // — so this is where a machine that just earned a workspace gets its
         // bridge, same rule as at launch.
         self.track_machines();
         cx.notify();
-
-        if let Err(error) = workspaces::save(&self.workspaces) {
-            self.fail(format!("save workspaces: {error}"), cx);
-        }
     }
 
     /// The open guard goes up against the session a chat just minted: the
     /// sidebar spinner reads it, and only a failure naming this machine may
     /// clear it.
     pub fn begin_start(&mut self, machine: String, sid: String, cx: &mut Context<Self>) {
-        self.opening = Some(OpeningSession { machine, sid });
+        self.catalog.begin_open(machine, sid);
         cx.notify();
     }
 
-    /// Whether an `Open` for `sid` may go out now.
-    ///
-    /// The guard is cleared by `Attached`/`RequestFailed`/`ConnectFailed`,
-    /// none of which arrive from a daemon that is live but silent — so
-    /// clicking the same row again is the escape hatch: it clears the guard
-    /// and lets the reissue through (create-or-resume + attach is idempotent).
+    /// Whether an `Open` for `sid` may go out now. The catalog owns the guard;
+    /// this observable root only exposes it to the window layer.
     pub fn may_open_session(&mut self, sid: &str) -> bool {
-        let Some(opening) = &self.opening else {
-            return true;
-        };
-
-        if opening.sid != sid {
-            return false;
-        }
-
-        self.opening = None;
-
-        true
+        self.catalog.may_open_session(sid)
     }
 
-    /// Open (or resume) a session by sid, not by index — the sidebar renders
-    /// a filtered view of the table, so display positions don't map back to it.
+    /// Open (or resume) a session by sid, not by index — the catalog resolves
+    /// the filtered table and installs the guard before the fleet sends.
     pub fn open_session(&mut self, sid: &str, cx: &mut Context<Self>) {
-        let Some(session) = self.sessions.iter().find(|session| session.info.sid == sid) else {
+        let Some(open) = self.catalog.open_session(sid) else {
             return;
         };
-        let machine = session.machine.clone();
-        let sid = session.info.sid.clone();
-        let cwd = session.info.cwd.clone();
 
-        if !self.ensure_connection(&machine, cx) {
+        if !self.ensure_connection(&open.machine, cx) {
+            self.catalog.abandon_open_on(&open.machine);
+
             return;
         }
 
-        self.opening = Some(OpeningSession {
-            machine: machine.clone(),
-            sid: sid.clone(),
-        });
-        self.fleet.send(&machine, Command::Open { sid, cwd });
+        self.fleet.send(
+            &open.machine,
+            Command::Open {
+                sid: open.sid,
+                cwd: open.cwd,
+            },
+        );
         cx.notify();
     }
 
     /// The sidebar row for a session a chat just started, synthesized so the
     /// list shows it before the daemon's next `list_sessions` confirms it.
-    ///
-    /// Newest-first (uuidv7 now is the maximum). Display state only — disk on
-    /// the VM stays truth. `file` is absent rather than blank because pi has
-    /// not written one yet, and `mtime_ms` is now because being started is
-    /// this session's last activity, which is what the list is ordered by.
+    /// The catalog keeps this display-only insertion ordered and de-duplicated;
+    /// Pi's next listing remains authoritative.
     pub fn insert_started_session(
         &mut self,
         machine: String,
@@ -420,20 +353,7 @@ impl FleetStore {
         cwd: String,
         cx: &mut Context<Self>,
     ) {
-        self.sessions.insert(
-            0,
-            MachineSession {
-                machine,
-                info: SessionInfo {
-                    sid,
-                    name: Some(name),
-                    cwd,
-                    file: None,
-                    mtime_ms: unix_millis_now(),
-                    status: SessionStatus::Running,
-                },
-            },
-        );
+        self.catalog.insert_started_session(machine, sid, name, cwd);
         cx.notify();
     }
 
@@ -493,73 +413,35 @@ impl FleetStore {
     }
 
     pub fn workspaces(&self) -> &[Workspace] {
-        &self.workspaces
+        self.catalog.workspaces()
     }
 
-    /// Machines a chat on `path` could run: the stored workspaces sharing that
-    /// path, as (machine key, display label) pairs. Derived on every read
-    /// rather than pushed into the chat, so adding a workspace or renaming a
-    /// machine reaches it without anyone remembering to say so.
+    /// Machines a chat on `path` could run: the catalog owns workspace scope,
+    /// while the fleet resolves each key to its current display label.
     pub fn machine_candidates_for(&self, path: &str) -> Vec<(String, String)> {
-        self.workspaces
-            .iter()
-            .filter(|workspace| workspace.path == path)
-            .map(|workspace| {
-                (
-                    workspace.machine.clone(),
-                    self.fleet.label(&workspace.machine),
-                )
+        self.catalog
+            .machine_candidates_for(path)
+            .into_iter()
+            .map(|machine| {
+                let label = self.fleet.label(&machine);
+
+                (machine, label)
             })
             .collect()
     }
 
-    /// The sessions the sidebar shows.
-    ///
-    /// Remote machines list everything — their disk is the only source of
-    /// truth and there is nothing client-side to scope by. The local machine
-    /// is different: the daemon would surface every repo this computer ever
-    /// ran pi in, so its list is scoped to the added workspaces. The full
-    /// list stays in memory (`list_sessions` runs once per connect); adding
-    /// a workspace reveals its sessions without a refetch.
+    /// The catalog's filtered session view. Remote rows are all visible; local
+    /// rows are limited to added local workspaces.
     pub fn visible_sessions(&self) -> Vec<&MachineSession> {
-        self.sessions
-            .iter()
-            .filter(|session| self.session_visible(session))
-            .collect()
+        self.catalog.visible_sessions()
     }
 
-    fn session_visible(&self, session: &MachineSession) -> bool {
-        if session.machine != LOCAL_MACHINE {
-            return true;
-        }
-
-        self.workspaces.iter().any(|workspace| {
-            workspace.machine == LOCAL_MACHINE && workspace.path == session.info.cwd
-        })
-    }
-
-    /// Where a session runs, as the sidebar knows it. Present by the time a
-    /// chat asks: a start inserts its row before `Attached` lands, and an open
-    /// can only have come from a row that was already there.
     pub fn session_cwd(&self, sid: &str) -> Option<&str> {
-        self.sessions
-            .iter()
-            .find(|session| session.info.sid == sid)
-            .map(|session| session.info.cwd.as_str())
+        self.catalog.session_cwd(sid)
     }
 
     /// The session with an `Open` in flight, if any — the sidebar's spinner.
     pub fn opening_sid(&self) -> Option<&str> {
-        self.opening.as_ref().map(|opening| opening.sid.as_str())
+        self.catalog.opening_sid()
     }
-}
-
-/// Wall-clock milliseconds, the units `SessionInfo::mtime_ms` is ordered by.
-/// A clock before the epoch reads as 0, which sorts the row last rather than
-/// panicking on a machine with a broken clock.
-fn unix_millis_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|since_epoch| since_epoch.as_millis() as u64)
-        .unwrap_or(0)
 }

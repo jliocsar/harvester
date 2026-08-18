@@ -6,6 +6,7 @@
 //! lives in harvester-cli only, and one positional argument does not earn it
 //! here either.
 
+mod catalog;
 mod chat;
 mod choices;
 mod dialogs;
