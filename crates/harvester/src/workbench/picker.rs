@@ -1,8 +1,8 @@
-//! The add-workspace folder picker (docs/SPEC.md §Flows "Add workspace"):
+//! The add-repository folder picker (docs/SPEC.md §Flows "Add repository"):
 //! the walk, the host ops that drive it, and its rendering.
 //!
-//! A child module of the composition shell, paired with `workspace_flow`, so
-//! the add-workspace path owns itself end to end. The picker is the
+//! A child module of the composition shell, paired with `repo_flow`, so the
+//! add-repository path owns itself end to end. The picker is the
 //! one surface that talks to the machines worker rather than to a bridge:
 //! walking a machine's directories is plain SSH exec work (`$HOME`, `ls`,
 //! `git rev-parse`), so browsing a machine costs one round trip and never
@@ -62,7 +62,7 @@ enum PickerAnswer {
     },
 }
 
-/// The one result the owning add-workspace flow needs. Host operations and
+/// The one result the owning add-repository flow needs. Host operations and
 /// their answers stay inside the picker; a validated workspace crosses this
 /// seam once, as a stable machine/path value.
 pub(super) struct WorkspacePicked {
@@ -433,7 +433,7 @@ impl ListDelegate for EntriesDelegate {
     }
 }
 
-/// The add-workspace modal's view.
+/// The add-repository modal's view.
 ///
 /// A view of its own, because `gpui-component` builds a dialog's body from the
 /// *root* view's render, where reading the workbench would be reading an entity
@@ -586,7 +586,9 @@ impl FolderPicker {
             | StoreEvent::Machines(
                 machines::Event::Listed { .. }
                 | machines::Event::Probed { .. }
-                | machines::Event::ProviderFailed { .. },
+                | machines::Event::ProviderFailed { .. }
+                // The chat's branch indicator asked for this one.
+                | machines::Event::BranchResolved { .. },
             )
             | StoreEvent::Failed(_) => return,
         };
@@ -678,10 +680,10 @@ impl FolderPicker {
             let dismissed = dismissed.clone();
 
             dialog
-                .title("Add workspace")
+                .title("Add repository")
                 .close_button(false)
                 .child(picker.clone())
-                // Enter belongs to the focused directory List. The workspace
+                // Enter belongs to the focused directory List. The dialog
                 // closes only after validation emits WorkspacePicked.
                 .on_ok(|_, _, _| false)
                 .on_cancel(move |_, window, cx| {

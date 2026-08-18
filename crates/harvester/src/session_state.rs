@@ -18,11 +18,40 @@ use harvester_client_core::{Pending, RequestToken, RequestTokens};
 /// Cap on the session name derived from the first prompt's first line.
 const SESSION_NAME_MAX_CHARS: usize = 48;
 
-/// One machine and workspace a chat can target.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Pi's turn-completion event (docs/SPEC.md §Rendering pi) — not `agent_end`,
+/// after which retries and queued follow-ups may still run.
+const PI_AGENT_SETTLED: &str = "agent_settled";
+
+/// One machine and repository a chat can target.
+///
+/// Either half may be unpicked while a chat is unstarted: a client whose fleet
+/// or repo list is empty still opens a New session, it just cannot send from it
+/// yet ([`ChatTarget::is_resolved`]). A started chat is resolved by
+/// construction — the daemon launches `cd <cwd> && pi`, so neither half can
+/// move afterwards.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChatTarget {
     pub machine: String,
     pub workspace_path: String,
+}
+
+impl ChatTarget {
+    /// Nothing picked: the empty-fleet New session, before any default lands.
+    pub fn unresolved() -> Self {
+        Self::default()
+    }
+
+    /// Whether this chat has both halves it needs to start a session. The send
+    /// button and every request that names a cwd are gated on it.
+    pub fn is_resolved(&self) -> bool {
+        !self.machine.is_empty() && !self.workspace_path.is_empty()
+    }
+}
+
+/// Whether a Pi event ends a turn — when the branch indicator refetches,
+/// because a turn is exactly when pi may have moved the checkout.
+pub fn is_turn_settled(event: &Value) -> bool {
+    event.get("type").and_then(Value::as_str) == Some(PI_AGENT_SETTLED)
 }
 
 /// The one-way lifecycle of a chat.
@@ -122,11 +151,15 @@ pub struct SessionState {
     transcript: Transcript,
     models: ModelsState,
     selection: ModelSelection,
+    /// The branch the target repo is on, as the last exec reported it. Purely
+    /// an indicator: a failure clears it and blocks nothing.
+    branch: Option<String>,
     exited: Option<String>,
     tokens: RequestTokens,
     model_request: Pending<()>,
     session_state_request: Pending<()>,
     set_model_request: Pending<()>,
+    branch_request: Pending<()>,
 }
 
 impl SessionState {
@@ -137,11 +170,13 @@ impl SessionState {
             transcript: Transcript::new(&[]),
             models: ModelsState::NotRequested,
             selection: ModelSelection::LaunchDefault,
+            branch: None,
             exited: None,
             tokens,
             model_request: Pending::default(),
             session_state_request: Pending::default(),
             set_model_request: Pending::default(),
+            branch_request: Pending::default(),
         }
     }
 
@@ -152,11 +187,13 @@ impl SessionState {
             transcript: Transcript::new(entries),
             models: ModelsState::NotRequested,
             selection: ModelSelection::LivePending,
+            branch: None,
             exited: None,
             tokens,
             model_request: Pending::default(),
             session_state_request: Pending::default(),
             set_model_request: Pending::default(),
+            branch_request: Pending::default(),
         }
     }
 
@@ -172,9 +209,10 @@ impl SessionState {
         &self.target
     }
 
-    /// Change destination only before a session exists. The old model fetch is
-    /// cancelled by the caller before this reset, so its answer cannot fill
-    /// the new machine's picker.
+    /// Change machine only before a session exists — the daemon's launch line
+    /// fixes a running pi's cwd and host for its whole lifetime. The old model
+    /// fetch is cancelled by the caller before this reset, so its answer cannot
+    /// fill the new machine's picker.
     pub fn retarget(&mut self, machine: String) -> bool {
         if !matches!(self.phase, SessionPhase::Unstarted) || self.target.machine == machine {
             return false;
@@ -183,8 +221,63 @@ impl SessionState {
         self.target.machine = machine;
         self.selection = ModelSelection::LaunchDefault;
         self.models = ModelsState::NotRequested;
+        self.forget_branch();
 
         true
+    }
+
+    /// Change repository, under the same rule as [`Self::retarget`]: the model
+    /// list is asked for in a cwd, so a new repo invalidates the old answer.
+    pub fn pick_repo(&mut self, path: String) -> bool {
+        if !matches!(self.phase, SessionPhase::Unstarted) || self.target.workspace_path == path {
+            return false;
+        }
+
+        self.target.workspace_path = path;
+        self.selection = ModelSelection::LaunchDefault;
+        self.models = ModelsState::NotRequested;
+        self.forget_branch();
+
+        true
+    }
+
+    /// What the branch indicator reads, or `None` when no exec has answered
+    /// for the current repo.
+    pub fn branch(&self) -> Option<&str> {
+        self.branch.as_deref()
+    }
+
+    /// Mint the token for a branch exec, or `None` when there is no repo to
+    /// ask about. Re-asking supersedes any answer still in flight.
+    pub fn request_branch(&mut self) -> Option<RequestToken> {
+        if !self.target.is_resolved() {
+            return None;
+        }
+
+        Some(self.branch_request.ask(&self.tokens, ()))
+    }
+
+    /// The exec could not be started, so no answer is coming.
+    pub fn cancel_branch(&mut self) {
+        self.branch_request.cancel();
+    }
+
+    /// A branch exec answered. A failure clears the indicator rather than
+    /// reporting: the branch is never worth a sentence the user must dismiss.
+    pub fn accept_branch(&mut self, token: RequestToken, result: Result<String, String>) -> bool {
+        if self.branch_request.accept(token).is_none() {
+            return false;
+        }
+
+        self.branch = result.ok();
+
+        true
+    }
+
+    /// The repo the indicator described is no longer the target's.
+    fn forget_branch(&mut self) {
+        self.branch_request.cancel();
+        self.branch = None;
     }
 
     pub fn transcript(&self) -> &Transcript {
@@ -214,11 +307,18 @@ impl SessionState {
         matches!(self.phase, SessionPhase::Live { .. }) && self.exited.is_none()
     }
 
-    pub fn request_model_list(&mut self) -> ChatIntent {
-        ChatIntent::ListModels {
+    /// The unstarted chat's model list runs a throwaway pi *in a cwd*, so a
+    /// chat with no repo picked yet has nothing to ask and stays
+    /// `NotRequested` rather than spinning on a request it never made.
+    pub fn request_model_list(&mut self) -> Option<ChatIntent> {
+        if !self.target.is_resolved() {
+            return None;
+        }
+
+        Some(ChatIntent::ListModels {
             cwd: self.target.workspace_path.clone(),
             token: self.begin_model_fetch(),
-        }
+        })
     }
 
     fn begin_model_fetch(&mut self) -> RequestToken {
@@ -274,6 +374,7 @@ impl SessionState {
 
         self.session_state_request.cancel();
         self.set_model_request.cancel();
+        self.branch_request.cancel();
 
         changed
     }
@@ -450,7 +551,14 @@ impl SessionState {
         }
     }
 
+    /// The first prompt is what mints a session, so it is also the last moment
+    /// the target has to be complete: there is no launch line without a machine
+    /// to run on and a cwd to run in.
     fn start(&mut self, prompt: String) -> Option<ChatIntent> {
+        if !self.target.is_resolved() {
+            return None;
+        }
+
         let sid = uuid::Uuid::now_v7().to_string();
         let name = session_name_from_prompt(&prompt);
         let (provider, model) = match &self.selection {
@@ -551,13 +659,75 @@ mod tests {
         assert!(state.submit_prompt("after exit".to_string()).is_none());
     }
 
+    fn model_list_token(state: &mut SessionState) -> RequestToken {
+        match state.request_model_list().expect("a repo to ask about") {
+            ChatIntent::ListModels { token, .. } => token,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn an_unresolved_target_asks_for_nothing_and_starts_nothing() {
+        let mut state = SessionState::unstarted(ChatTarget::unresolved(), RequestTokens::default());
+
+        assert!(state.request_model_list().is_none());
+        assert!(state.request_branch().is_none());
+        assert!(state.submit_prompt("go".to_string()).is_none());
+        assert!(matches!(state.models(), ModelsState::NotRequested));
+
+        assert!(state.retarget("local".to_string()));
+        assert!(state.submit_prompt("go".to_string()).is_none());
+
+        assert!(state.pick_repo("/work/repo".to_string()));
+        assert!(state.submit_prompt("go".to_string()).is_some());
+    }
+
+    #[test]
+    fn a_repo_pick_drops_the_branch_and_the_answer_it_was_waiting_on() {
+        let mut state = SessionState::unstarted(target(), RequestTokens::default());
+        let token = state.request_branch().expect("a repo to ask about");
+
+        assert!(state.accept_branch(token, Ok("main".to_string())));
+        assert_eq!(state.branch(), Some("main"));
+
+        let stale = state.request_branch().expect("a repo to ask about");
+
+        assert!(state.pick_repo("/work/other".to_string()));
+        assert_eq!(state.branch(), None);
+        assert!(!state.accept_branch(stale, Ok("main".to_string())));
+    }
+
+    #[test]
+    fn a_failed_branch_exec_clears_the_indicator_without_a_notice() {
+        let mut state = SessionState::unstarted(target(), RequestTokens::default());
+        let token = state.request_branch().expect("a repo to ask about");
+
+        assert!(state.accept_branch(token, Err("not a git repo".to_string())));
+        assert_eq!(state.branch(), None);
+        assert!(state.exited_notice().is_none());
+    }
+
+    #[test]
+    fn only_agent_settled_refreshes_the_branch() {
+        assert!(is_turn_settled(&json!({"type": "agent_settled"})));
+        assert!(!is_turn_settled(&json!({"type": "agent_end"})));
+        assert!(!is_turn_settled(&json!({"other": "shape"})));
+    }
+
+    #[test]
+    fn a_live_chat_neither_moves_machine_nor_repo() {
+        let mut state =
+            SessionState::live("sid".to_string(), target(), &[], RequestTokens::default());
+
+        assert!(!state.retarget("other".to_string()));
+        assert!(!state.pick_repo("/work/other".to_string()));
+        assert_eq!(state.target(), &target());
+    }
+
     #[test]
     fn cancelled_model_fetch_rejects_a_late_answer() {
         let mut state = SessionState::unstarted(target(), RequestTokens::default());
-        let token = match state.request_model_list() {
-            ChatIntent::ListModels { token, .. } => token,
-            _ => unreachable!(),
-        };
+        let token = model_list_token(&mut state);
 
         assert!(state.cancel_model_fetch("connection lost".to_string()));
         assert!(!state.accept_models(token, Ok(json!({"models": []}))));
@@ -567,14 +737,8 @@ mod tests {
     #[test]
     fn stale_model_answers_cannot_replace_a_newer_fetch() {
         let mut state = SessionState::unstarted(target(), RequestTokens::default());
-        let first = match state.request_model_list() {
-            ChatIntent::ListModels { token, .. } => token,
-            _ => unreachable!(),
-        };
-        let second = match state.request_model_list() {
-            ChatIntent::ListModels { token, .. } => token,
-            _ => unreachable!(),
-        };
+        let first = model_list_token(&mut state);
+        let second = model_list_token(&mut state);
 
         assert!(!state.accept_models(first, Ok(json!({"models": []}))));
         assert!(state.accept_models(

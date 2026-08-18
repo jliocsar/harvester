@@ -526,7 +526,8 @@ impl Fleet {
             machines::Event::ProviderFailed { .. }
             | machines::Event::HomeResolved { .. }
             | machines::Event::DirListed { .. }
-            | machines::Event::WorkspaceValidated { .. } => {}
+            | machines::Event::WorkspaceValidated { .. }
+            | machines::Event::BranchResolved { .. } => {}
         }
     }
 

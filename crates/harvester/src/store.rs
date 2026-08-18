@@ -11,6 +11,7 @@
 //! view only has to *see* is a `cx.notify()` away.
 
 use crate::catalog::Catalog;
+use crate::session_state::ChatTarget;
 use crate::workspaces::Workspace;
 use gpui::{Context, EventEmitter};
 use harvester_client_core::bridge::{Command, Event as BridgeEvent};
@@ -305,6 +306,36 @@ impl FleetStore {
         cx.notify();
     }
 
+    /// Forget a machine for good, and let one file write cascade.
+    ///
+    /// `workspaces.json` is the only place a machine is persisted, so removing
+    /// its entries removes the machine: [`Self::track_machines`] recomputes the
+    /// tracked set from the catalog, the fleet drops the untracked row (and
+    /// with it the bridge handle that keeps its thread alive), and the ghost
+    /// sidebar row goes with the tracked set that produced it. The catalog has
+    /// already dropped the machine's session rows by then.
+    ///
+    /// `false` when the configuration write failed — the reason is on its way
+    /// to a notification and nothing was forgotten.
+    pub fn forget_machine(&mut self, machine: &str, cx: &mut Context<Self>) -> bool {
+        if let Err(error) = self.catalog.forget_machine(machine) {
+            self.fail(format!("save workspaces: {error}"), cx);
+
+            return false;
+        }
+
+        // argv tracks its machine for the whole process, so leaving it here
+        // would re-track the row the user just asked to be rid of.
+        if self.argv_machine.as_deref() == Some(machine) {
+            self.argv_machine = None;
+        }
+
+        self.track_machines();
+        cx.notify();
+
+        true
+    }
+
     /// The open guard goes up against the session a chat just minted: the
     /// sidebar spinner reads it, and only a failure naming this machine may
     /// clear it.
@@ -413,28 +444,34 @@ impl FleetStore {
         self.fleet.linked_machine_count()
     }
 
-    pub fn workspaces(&self) -> &[Workspace] {
-        self.catalog.workspaces()
+    /// The repositories stored for one machine — the chat repo picker's rows.
+    pub fn repos_on(&self, machine: &str) -> Vec<String> {
+        self.catalog.repos_on(machine)
     }
 
-    /// Machines a chat on `path` could run: the catalog owns workspace scope,
-    /// while the fleet resolves each key to its current display label.
-    pub fn machine_candidates_for(&self, path: &str) -> Vec<(String, String)> {
-        self.catalog
-            .machine_candidates_for(path)
+    /// Where a New session opens: the catalog's rule, over the machines the
+    /// fleet can actually reach right now. Derived per open, never stored.
+    pub fn new_session_target(&self) -> ChatTarget {
+        let machines: Vec<String> = self
+            .fleet
+            .machine_candidates()
             .into_iter()
-            .map(|machine| {
-                let label = self.fleet.label(&machine);
+            .map(|candidate| candidate.key)
+            .collect();
 
-                (machine, label)
-            })
-            .collect()
+        self.catalog.default_new_session_target(&machines)
     }
 
     /// The catalog's filtered session view. Remote rows are all visible; local
     /// rows are limited to added local workspaces.
     pub fn visible_sessions(&self) -> Vec<&MachineSession> {
         self.catalog.visible_sessions()
+    }
+
+    /// The sidebar rows a machine would take with it — what the forget
+    /// confirmation counts.
+    pub fn visible_session_count_on(&self, machine: &str) -> usize {
+        self.catalog.visible_session_count_on(machine)
     }
 
     pub fn session_cwd(&self, sid: &str) -> Option<&str> {

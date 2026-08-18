@@ -6,9 +6,9 @@
 //! lives in harvester-cli only, and one positional argument does not earn it
 //! here either.
 
+mod assets;
 mod catalog;
 mod chat;
-mod choices;
 mod desktop_shell;
 mod dialogs;
 mod modal;

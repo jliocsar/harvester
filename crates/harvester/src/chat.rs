@@ -8,7 +8,8 @@
 //! the same model control, the same input. What actually differs is small and
 //! named in [`SessionPhase`] and [`ModelSelection`]: what a model pick *means* (a launch-line argument
 //! versus a `set_model` the running pi must confirm), and whether the machine
-//! can still be changed.
+//! and the repository can still be picked — a started session's launch line
+//! (`cd <repo> && pi`) fixes both for its pi's lifetime.
 //!
 //! Streaming rule (docs/SPEC.md §Rendering pi): `message_update` carries the
 //! whole partial message — replace, never append. `agent_settled` (not
@@ -19,35 +20,56 @@ use gpui::{
     SharedString, Subscription, Window,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::{Icon, IconName};
 use serde_json::Value;
 
+use crate::assets::GIT_BRANCH_ICON_PATH;
 use crate::models::ModelChoice;
 use crate::session_state::{self, ModelSelection, ModelsState, SessionPhase, SessionState};
 use crate::store::{FleetStore, StoreEvent};
 use crate::ui::{self, Tone};
 use crate::workspaces::folder_name;
 use harvester_client_core::bridge::Event as BridgeEvent;
-use harvester_client_core::RequestToken;
+use harvester_client_core::{machines, MachineCandidate, RequestToken};
 
 /// The unstarted chat's "no model chosen" row: pi launches with its own
 /// default, and saying so is more honest than naming a model we did not pick.
 const DEFAULT_MODEL_ROW: &str = "default (pi chooses)";
-
-/// One (machine key, display label) a chat could run on.
-pub type MachineCandidate = (String, String);
+/// The repo picker's last row: the folder picker, for a repository Harvester
+/// has not been told about yet. It is also the only row an empty picker has,
+/// which is what makes a fresh client's first session reachable.
+const ADD_REPO_ROW: &str = "Add new…";
+/// What the machine control says before anything is picked, and when there is
+/// nothing to pick — the fleet is empty until a provider lists.
+const NO_MACHINE_LABEL: &str = "no machines";
+const CHOOSE_MACHINE_LABEL: &str = "choose machine";
+/// What the repository control says before a repo is picked.
+const CHOOSE_REPO_LABEL: &str = "choose repository";
 
 pub use session_state::{ChatIntent as ChatRequest, ChatTarget};
 
 impl EventEmitter<session_state::ChatIntent> for Chat {}
 
+/// What a chat needs the composition shell to run on its behalf.
+///
+/// Separate from [`ChatRequest`], which is bridge traffic the shell only
+/// routes: this one needs Root's modal stack, which a pane inside the shell
+/// does not own and must not arbitrate for itself (SPEC C11).
+pub enum ChatFlowRequest {
+    /// Browse `machine` for a repository to store and then select.
+    AddRepo { machine: String },
+}
+
+impl EventEmitter<ChatFlowRequest> for Chat {}
+
 pub struct Chat {
     /// The window-free owner of the session lifecycle, model state, request
     /// correlation and transcript. The fields below are GPUI adaptation only.
     state: SessionState,
-    /// Where this chat's machine label and its retargeting candidates come
-    /// from, read on every render. Observed, so a provider listing that
-    /// renames a machine or a workspace the user just added reaches this pane
-    /// without anyone remembering to push it (SPEC C12).
+    /// Where this chat's machine label, its machine candidates and its stored
+    /// repositories come from, read on every render. Observed, so a provider
+    /// listing that renames a machine, or a repo the user just added, reaches
+    /// this pane without anyone remembering to push it (SPEC C12).
     store: Entity<FleetStore>,
     /// Message/tool/markdown policy and stable tool-expansion state. It reads
     /// the client-core transcript without copying or normalizing its items.
@@ -63,9 +85,10 @@ pub struct Chat {
 }
 
 impl Chat {
-    /// A chat with no session behind it yet, already asking for the models on
-    /// the machine behind it — the seconds the uncached `list_models` costs
-    /// hide behind the user typing.
+    /// A chat with no session behind it yet. What its prompt strip needs is
+    /// asked for by [`Chat::request_prompt_controls`], which the workbench
+    /// calls once it has subscribed — the seconds the uncached `list_models`
+    /// costs still hide behind the user typing.
     pub fn unstarted(
         target: ChatTarget,
         store: Entity<FleetStore>,
@@ -73,11 +96,8 @@ impl Chat {
         cx: &mut Context<Self>,
     ) -> Self {
         let tokens = store.read(cx).tokens();
-        let mut chat = Self::new(SessionState::unstarted(target, tokens), store, window, cx);
 
-        chat.request_model_list(cx);
-
-        chat
+        Self::new(SessionState::unstarted(target, tokens), store, window, cx)
     }
 
     /// A chat over a session that already exists: `entries` is pi's history,
@@ -131,24 +151,33 @@ impl Chat {
         }
     }
 
-    /// The store's events, filtered to this chat's own.
-    ///
-    /// Every answer pi produces for this pane arrives here rather than being
-    /// routed in from above: a chat knows which sid it renders and which
-    /// machine it runs on, and that is the whole of the routing rule (SPEC
-    /// C12). Guards rather than a total match because *whose* an event is,
-    /// is the question — the fall-through is another chat's, another
-    /// machine's, or `Attached`, which builds chats and so is the workbench's.
+    /// The store's events, routed to the two this pane asks questions of: its
+    /// machine's bridge, and the machines worker its branch indicator execs on.
     fn handle_store_event(
         &mut self,
         _store: Entity<FleetStore>,
         event: &StoreEvent,
         cx: &mut Context<Self>,
     ) {
-        let StoreEvent::Bridge { machine, event } = event else {
-            return;
-        };
+        match event {
+            StoreEvent::Bridge { machine, event } => self.handle_bridge_event(machine, event, cx),
+            // The one machines-worker answer a chat asks for itself: the branch
+            // indicator is a plain SSH exec, so it never goes near a daemon and
+            // never reaches a bridge (SPEC §Workspace).
+            StoreEvent::Machines(machines::Event::BranchResolved { token, result }) => {
+                self.handle_branch_resolved(*token, result.clone(), cx)
+            }
+            StoreEvent::Machines(_) | StoreEvent::Failed(_) => {}
+        }
+    }
 
+    /// Every answer pi produces for this pane arrives here rather than being
+    /// routed in from above: a chat knows which sid it renders and which
+    /// machine it runs on, and that is the whole of the routing rule (SPEC
+    /// C12). Guards rather than a total match because *whose* an event is,
+    /// is the question — the fall-through is another chat's, another
+    /// machine's, or `Attached`, which builds chats and so is the workbench's.
+    fn handle_bridge_event(&mut self, machine: &str, event: &BridgeEvent, cx: &mut Context<Self>) {
         match event {
             // Machine-scoped: the bridge this chat runs on died, or answered
             // the throwaway `list_models` an unstarted chat asked it for —
@@ -217,14 +246,18 @@ impl Chat {
             .into()
     }
 
-    /// The machines this chat could still be retargeted to: the stored
-    /// workspaces sharing its cwd. Derived on every read, so adding a
-    /// workspace enables the control without anyone saying so. Only ever
-    /// consulted while unstarted — a running session never moves.
+    /// Every machine this chat could run on: the whole reachable fleet, read
+    /// live, so a provider listing that adds a machine reaches the picker
+    /// without anyone pushing it. Only ever consulted while unstarted — a
+    /// running session never moves.
     fn machine_candidates(&self, cx: &Context<Self>) -> Vec<MachineCandidate> {
-        self.store
-            .read(cx)
-            .machine_candidates_for(&self.state.target().workspace_path)
+        self.store.read(cx).machine_candidates()
+    }
+
+    /// The repositories stored for the picked machine, in the order they were
+    /// added. Empty until a machine is picked — a path belongs to a machine.
+    fn repo_candidates(&self, cx: &Context<Self>) -> Vec<String> {
+        self.store.read(cx).repos_on(&self.state.target().machine)
     }
 
     /// `None` for an unstarted chat — it names no session (see [`SessionPhase`]).
@@ -246,19 +279,88 @@ impl Chat {
         &self.state.target().workspace_path
     }
 
-    /// Ask for what a live chat's prompt box needs. Separate from the
-    /// constructor because an entity cannot emit to a subscriber that does not
-    /// exist yet: the workbench subscribes to the chat it just created, then
-    /// calls this.
-    pub fn request_model_controls(&mut self, cx: &mut Context<Self>) {
+    /// Ask for everything the prompt strip reports: the model list (or, live,
+    /// the session's own model) and the branch the repo is on.
+    ///
+    /// Public, and separate from the constructor, because an entity cannot
+    /// emit to a subscriber that does not exist yet: the workbench subscribes
+    /// to the chat it just created, then calls this.
+    pub fn request_prompt_controls(&mut self, cx: &mut Context<Self>) {
+        self.request_models(cx);
+        self.request_branch(cx);
+    }
+
+    /// Which model question this chat has depends on its phase: an unstarted
+    /// one asks a throwaway pi in its cwd, a live one asks its own session,
+    /// and a starting one has nothing to ask yet.
+    fn request_models(&mut self, cx: &mut Context<Self>) {
+        match self.state.phase() {
+            SessionPhase::Unstarted => self.request_model_list(cx),
+            SessionPhase::Live { .. } => self.request_model_controls(cx),
+            SessionPhase::Starting { .. } => {}
+        }
+    }
+
+    fn request_model_controls(&mut self, cx: &mut Context<Self>) {
         for intent in self.state.request_model_controls() {
             cx.emit(intent);
         }
     }
 
     /// The unstarted chat's model list: a throwaway pi in this chat's cwd.
+    /// A chat with no repo picked has no cwd to run it in and asks nothing.
     fn request_model_list(&mut self, cx: &mut Context<Self>) {
-        cx.emit(self.state.request_model_list());
+        if let Some(intent) = self.state.request_model_list() {
+            cx.emit(intent);
+        }
+    }
+
+    /// Read the branch of the picked repo — one client-side SSH exec on the
+    /// machines worker, the same daemon-free path the folder picker walks
+    /// (SPEC §Workspace). Every failure here is silent by design: the
+    /// indicator is the only thing that depends on it, and it reports nothing
+    /// rather than blocking a prompt on a `git` call.
+    fn request_branch(&mut self, cx: &mut Context<Self>) {
+        let Some(token) = self.state.request_branch() else {
+            return;
+        };
+        let target = self.state.target().clone();
+        let host = match self.store.read(cx).host_for(&target.machine) {
+            Ok(host) => host,
+            Err(detail) => {
+                eprintln!("harvester: branch indicator: {detail}");
+                self.state.cancel_branch();
+
+                return;
+            }
+        };
+        let command = machines::Command::ResolveBranch {
+            host,
+            path: target.workspace_path,
+            token,
+        };
+        let sent = self
+            .store
+            .update(cx, |store, cx| store.send_host_command(command, cx));
+
+        if !sent {
+            self.state.cancel_branch();
+        }
+    }
+
+    fn handle_branch_resolved(
+        &mut self,
+        token: RequestToken,
+        result: Result<String, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(detail) = &result {
+            eprintln!("harvester: branch indicator: {detail}");
+        }
+
+        if self.state.accept_branch(token, result) {
+            cx.notify();
+        }
     }
 
     /// The create → attach → prompt chain landed: this chat is a live session
@@ -392,14 +494,14 @@ impl Chat {
         cx.notify();
     }
 
-    fn can_switch_machine(&self, cx: &Context<Self>) -> bool {
-        self.machine_candidates(cx).len() >= 2
-    }
-
     /// Retarget to another machine: the typed prompt survives, only the
     /// destination changes. A pick of the current machine changes nothing, so
     /// nothing is refetched. The stale answer from the old machine is dropped
     /// by the model control's own token.
+    ///
+    /// A stored repo path belongs to the machine it was stored for, so the
+    /// repo follows the machine: the new machine's first repo, or nothing when
+    /// it has none.
     fn pick_machine(&mut self, machine: String, cx: &mut Context<Self>) {
         if self.state.target().machine == machine {
             cx.notify();
@@ -407,14 +509,40 @@ impl Chat {
             return;
         }
 
-        if self.state.cancel_model_fetch("machine changed".to_string()) {
-            cx.notify();
-        }
+        self.state.cancel_model_fetch("machine changed".to_string());
 
         if self.state.retarget(machine) {
-            self.request_model_list(cx);
-            cx.notify();
+            let first_repo = self.repo_candidates(cx).first().cloned();
+
+            self.state.pick_repo(first_repo.unwrap_or_default());
+            self.request_prompt_controls(cx);
         }
+
+        cx.notify();
+    }
+
+    /// Select a stored repository. Also the landing point for a folder the
+    /// user just added, so a validated path is selected exactly the way a
+    /// stored one is.
+    pub fn select_repo(&mut self, path: String, cx: &mut Context<Self>) {
+        if self.state.pick_repo(path) {
+            self.request_prompt_controls(cx);
+        }
+
+        cx.notify();
+    }
+
+    /// The repo picker's last row: browse this machine for a repository
+    /// Harvester has not been told about. The shell runs it — the folder
+    /// picker is a Root dialog.
+    fn add_repo(&mut self, cx: &mut Context<Self>) {
+        let machine = self.state.target().machine.clone();
+
+        if machine.is_empty() {
+            return;
+        }
+
+        cx.emit(ChatFlowRequest::AddRepo { machine });
     }
 
     /// Whether this chat's pi is still believed to be running. Based on the
@@ -431,6 +559,13 @@ impl Chat {
     }
 
     fn handle_pi_event(&mut self, event: &Value, cx: &mut Context<Self>) {
+        // A settled turn is the one moment the checkout can have moved without
+        // the user touching a control, and the only thing that refreshes the
+        // branch indicator — there is no polling behind it.
+        if session_state::is_turn_settled(event) {
+            self.request_branch(cx);
+        }
+
         // `false` is an event this model does not cover (retries, compaction,
         // queue): nothing moved, so nothing is redrawn.
         if !self.state.apply_pi_event(event) {
@@ -482,10 +617,15 @@ impl Chat {
         self.submit_text(text, cx);
     }
 
-    /// The unstarted chat's header line: which repository, on which machine.
-    /// A live chat has no header — its prompt box already names both, and the
-    /// conversation identifies it better than any title could.
+    /// The unstarted chat's header line: which repository, on which machine —
+    /// or what is still missing before this chat can send anything. A live chat
+    /// has no header: its prompt box already names both, and the conversation
+    /// identifies it better than any title could.
     fn unstarted_subtitle(&self, cx: &Context<Self>) -> SharedString {
+        if !self.state.target().is_resolved() {
+            return "pick a machine and a repository below".into();
+        }
+
         format!(
             "{} on {}",
             folder_name(&self.state.target().workspace_path),
@@ -540,14 +680,21 @@ impl Chat {
     }
 
     /// One prompt box for both states (SPEC §Flows: the agent-input pattern,
-    /// `model · repository · machine`). The repository is always read-only;
-    /// the machine is read-only too once a session exists, because a running
-    /// session never moves.
+    /// `model · machine · repository · branch`).
+    ///
+    /// Machine and repository are pickers only while the chat is unstarted:
+    /// the daemon launches `cd <repo> && pi` and pi's cwd is fixed for its
+    /// lifetime, so a started session's own launch line is what locks them.
+    /// The model stays switchable — pi confirms a `set_model` at runtime — and
+    /// the branch only ever reports.
     fn render_prompt_box(&self, input_focused: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let unstarted = matches!(self.state.phase(), SessionPhase::Unstarted);
         let (model_label, model_enabled) = self.model_control_state();
-        let machine_enabled =
-            matches!(self.state.phase(), SessionPhase::Unstarted) && self.can_switch_machine(cx);
-        let machine_label = self.machine_label(cx);
+        // Nothing to send to until both halves resolve; the state machine
+        // refuses the prompt either way, this is only the strip saying so. A
+        // started session is resolved by construction, and its prompts go to a
+        // pi that already exists — the target is not consulted again.
+        let can_send = !unstarted || self.state.target().is_resolved();
 
         ui::prompt_box(input_focused, cx)
             .child(ui::prompt_box_input(
@@ -556,20 +703,29 @@ impl Chat {
             .child(
                 ui::prompt_box_controls()
                     .child(self.render_model_control(model_label, model_enabled, cx))
-                    .child(ui::prompt_box_control(
-                        "chat-repo",
-                        folder_name(&self.state.target().workspace_path)
-                            .to_string()
-                            .into(),
-                        false,
-                        cx,
-                    ))
-                    .child(self.render_machine_control(machine_label, machine_enabled, cx))
+                    .child(self.render_machine_control(unstarted, cx))
+                    .child(self.render_repo_control(unstarted, cx))
+                    .children(self.render_branch_indicator(cx))
                     .child(div().flex_1())
-                    .child(ui::prompt_box_send("chat-send", cx).on_click(
+                    .child(ui::prompt_box_send("chat-send", can_send, cx).on_click(
                         cx.listener(|chat, _, window, cx| chat.submit_prompt(window, cx)),
                     )),
             )
+    }
+
+    /// The branch the repo is on, when an exec has answered for it. Absent
+    /// otherwise: an indicator nobody can act on is not worth a placeholder
+    /// that has to be explained.
+    fn render_branch_indicator(&self, cx: &App) -> Option<impl IntoElement> {
+        let branch: SharedString = self.state.branch()?.to_string().into();
+
+        Some(ui::prompt_box_control(
+            "chat-branch",
+            Icon::default().path(GIT_BRANCH_ICON_PATH),
+            branch,
+            false,
+            cx,
+        ))
     }
 
     /// What the model control says and whether it can be clicked. Unstarted, a
@@ -603,7 +759,8 @@ impl Chat {
         enabled: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let control = ui::prompt_box_control("chat-model", label, enabled, cx);
+        let control =
+            ui::prompt_box_control("chat-model", Icon::new(IconName::Bot), label, enabled, cx);
         let picks = self.model_picks();
 
         if !enabled || picks.is_empty() {
@@ -618,6 +775,7 @@ impl Chat {
                     None => DEFAULT_MODEL_ROW.into(),
                 },
                 selected: self.is_current_model(pick),
+                divider_above: false,
             })
             .collect();
         let chat = cx.entity();
@@ -632,33 +790,38 @@ impl Chat {
         .into_any_element()
     }
 
-    /// The machine control, and the workspaces sharing this chat's path. Only
-    /// an unstarted chat drops a list — a running session never moves.
-    fn render_machine_control(
-        &self,
-        label: SharedString,
-        enabled: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let control = ui::prompt_box_control("chat-machine", label, enabled, cx);
+    /// The machine control, and the fleet it drops. Only an unstarted chat
+    /// drops a list — a running session never moves — and a client with no
+    /// machines at all says so rather than opening onto nothing.
+    fn render_machine_control(&self, unstarted: bool, cx: &mut Context<Self>) -> AnyElement {
+        let candidates = self.machine_candidates(cx);
+        let label = self.machine_control_label(&candidates, cx);
+        let enabled = unstarted && !candidates.is_empty();
+        let control = ui::prompt_box_control(
+            "chat-machine",
+            Icon::new(IconName::HardDrive),
+            label,
+            enabled,
+            cx,
+        );
 
         if !enabled {
             return control.into_any_element();
         }
 
-        let candidates = self.machine_candidates(cx);
         let rows = candidates
             .iter()
-            .map(|(machine, label)| ui::DropdownRow {
-                label: label.clone().into(),
-                selected: machine == &self.state.target().machine,
+            .map(|candidate| ui::DropdownRow {
+                label: candidate.label.clone().into(),
+                selected: candidate.key == self.state.target().machine,
+                divider_above: false,
             })
             .collect();
         // The keys travel with the pick, so a listing landing while the list is
         // open cannot move a row out from under the click.
         let keys: Vec<String> = candidates
             .into_iter()
-            .map(|(machine, _label)| machine)
+            .map(|candidate| candidate.key)
             .collect();
         let chat = cx.entity();
 
@@ -674,6 +837,70 @@ impl Chat {
                 chat.update(cx, |chat, cx| chat.pick_machine(machine, cx));
             },
         )
+        .into_any_element()
+    }
+
+    /// What the machine control says: the machine's own label once one is
+    /// picked, and otherwise whether there is anything to pick.
+    fn machine_control_label(
+        &self,
+        candidates: &[MachineCandidate],
+        cx: &Context<Self>,
+    ) -> SharedString {
+        if !self.state.target().machine.is_empty() {
+            return self.machine_label(cx);
+        }
+
+        if candidates.is_empty() {
+            return NO_MACHINE_LABEL.into();
+        }
+
+        CHOOSE_MACHINE_LABEL.into()
+    }
+
+    /// The repository control: the machine's stored repos, then "Add new…"
+    /// below a divider. A machine with nothing stored drops a list of exactly
+    /// that one row, which is how a fresh client reaches its first session.
+    fn render_repo_control(&self, unstarted: bool, cx: &mut Context<Self>) -> AnyElement {
+        let path = &self.state.target().workspace_path;
+        let label: SharedString = match path.is_empty() {
+            true => CHOOSE_REPO_LABEL.into(),
+            false => folder_name(path).to_string().into(),
+        };
+        let enabled = unstarted && !self.state.target().machine.is_empty();
+        let control =
+            ui::prompt_box_control("chat-repo", Icon::new(IconName::Folder), label, enabled, cx);
+
+        if !enabled {
+            return control.into_any_element();
+        }
+
+        let repos = self.repo_candidates(cx);
+        let mut rows: Vec<ui::DropdownRow> = repos
+            .iter()
+            .map(|repo| ui::DropdownRow {
+                label: repo.clone().into(),
+                selected: repo == path,
+                divider_above: false,
+            })
+            .collect();
+
+        rows.push(ui::DropdownRow {
+            label: ADD_REPO_ROW.into(),
+            selected: false,
+            divider_above: !repos.is_empty(),
+        });
+
+        let chat = cx.entity();
+
+        ui::prompt_box_dropdown("chat-repo-dropdown", control, rows, move |index, _, cx| {
+            let picked = repos.get(index).cloned();
+
+            chat.update(cx, |chat, cx| match picked {
+                Some(repo) => chat.select_repo(repo, cx),
+                None => chat.add_repo(cx),
+            });
+        })
         .into_any_element()
     }
 

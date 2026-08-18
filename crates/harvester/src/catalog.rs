@@ -9,6 +9,7 @@
 use harvester_client_core::LOCAL_MACHINE;
 use harvester_proto::{SessionInfo, SessionStatus};
 
+use crate::session_state::ChatTarget;
 use crate::workspaces::{self, Workspace};
 
 /// One sidebar session row, tagged with the machine whose daemon reported it.
@@ -116,6 +117,44 @@ impl Catalog {
         Ok(true)
     }
 
+    /// Forget a machine outright: the repositories stored for it leave the user
+    /// configuration, and the session rows its daemon once reported leave the
+    /// table with them.
+    ///
+    /// The file write comes first and a failure aborts the whole removal, so
+    /// what the sidebar shows and what `workspaces.json` holds cannot disagree
+    /// — the file is the only place a machine is persisted, and a machine that
+    /// survives the next launch must survive this one too.
+    ///
+    /// Session rows go because they are display state derived from a daemon
+    /// this client will never reach again: a missing machine's transcripts live
+    /// only on its own disk, and nothing client-side could render them
+    /// (docs/SPEC.md §Flows "Forget machine").
+    pub fn forget_machine(&mut self, machine: &str) -> std::io::Result<()> {
+        let kept = self.workspaces_without(machine);
+
+        if kept.len() != self.workspaces.len() {
+            workspaces::save(&kept)?;
+            self.workspaces = kept;
+        }
+
+        self.sessions.retain(|session| session.machine != machine);
+        self.abandon_open_on(machine);
+
+        Ok(())
+    }
+
+    /// The stored repositories that survive forgetting `machine`. Split out
+    /// from [`Self::forget_machine`] so the rule can be tested without writing
+    /// a real user's configuration file.
+    fn workspaces_without(&self, machine: &str) -> Vec<Workspace> {
+        self.workspaces
+            .iter()
+            .filter(|workspace| workspace.machine != machine)
+            .cloned()
+            .collect()
+    }
+
     /// Start or retry an open guard for a session. The guard is cleared by
     /// [`Self::session_attached`] or a machine failure in the observable root.
     pub fn begin_open(&mut self, machine: String, sid: String) {
@@ -204,6 +243,16 @@ impl Catalog {
             .collect()
     }
 
+    /// How many sidebar rows a machine would take with it — the number the
+    /// forget confirmation quotes. It counts the *visible* table, because what
+    /// the dialog promises to remove is what the user can see.
+    pub fn visible_session_count_on(&self, machine: &str) -> usize {
+        self.visible_sessions()
+            .iter()
+            .filter(|session| session.machine == machine)
+            .count()
+    }
+
     pub fn session_cwd(&self, sid: &str) -> Option<&str> {
         self.sessions
             .iter()
@@ -220,12 +269,63 @@ impl Catalog {
         &self.workspaces
     }
 
-    pub fn machine_candidates_for(&self, path: &str) -> Vec<String> {
+    /// The repositories stored for one machine, in the order the user added
+    /// them — the rows the chat's repo picker offers above its "Add new…".
+    pub fn repos_on(&self, machine: &str) -> Vec<String> {
         self.workspaces
             .iter()
-            .filter(|workspace| workspace.path == path)
-            .map(|workspace| workspace.machine.clone())
+            .filter(|workspace| workspace.machine == machine)
+            .map(|workspace| workspace.path.clone())
             .collect()
+    }
+
+    /// Where a New session opens, given the machines the fleet can currently
+    /// reach (docs/SPEC.md §Flows "Start session"). Derived on every open and
+    /// never persisted: this is a guess at what the user wants next, and a
+    /// guess that survives restarts is a preference nobody agreed to keep.
+    ///
+    /// In order: the repo of the most recent session that is still a stored
+    /// repo on a reachable machine; else the first stored repo on a reachable
+    /// machine; else the first reachable machine with no repo picked (the
+    /// picker then offers only "Add new…"); else nothing at all.
+    pub fn default_new_session_target(&self, machines: &[String]) -> ChatTarget {
+        let reachable = |machine: &str| machines.iter().any(|candidate| candidate == machine);
+        let recent = self.sessions.iter().find(|session| {
+            reachable(&session.machine) && self.is_stored(&session.machine, &session.info.cwd)
+        });
+
+        if let Some(session) = recent {
+            return ChatTarget {
+                machine: session.machine.clone(),
+                workspace_path: session.info.cwd.clone(),
+            };
+        }
+
+        let stored = self
+            .workspaces
+            .iter()
+            .find(|workspace| reachable(&workspace.machine));
+
+        if let Some(workspace) = stored {
+            return ChatTarget {
+                machine: workspace.machine.clone(),
+                workspace_path: workspace.path.clone(),
+            };
+        }
+
+        match machines.first() {
+            Some(machine) => ChatTarget {
+                machine: machine.clone(),
+                workspace_path: String::new(),
+            },
+            None => ChatTarget::unresolved(),
+        }
+    }
+
+    fn is_stored(&self, machine: &str, path: &str) -> bool {
+        self.workspaces
+            .iter()
+            .any(|workspace| workspace.machine == machine && workspace.path == path)
     }
 
     pub fn opening_sid(&self) -> Option<&str> {
@@ -369,6 +469,93 @@ mod tests {
         assert!(catalog.may_open_session("sid-b"));
     }
 
+    fn machines(machines: &[&str]) -> Vec<String> {
+        machines.iter().map(|machine| machine.to_string()).collect()
+    }
+
+    #[test]
+    fn a_new_session_opens_on_the_most_recent_stored_repo() {
+        let mut catalog = catalog(&[
+            workspace("machine-a", "/repo/first"),
+            workspace("machine-b", "/repo/recent"),
+        ]);
+
+        catalog.record_sessions(
+            "machine-b",
+            vec![
+                session("recent", "/repo/recent", 20, SessionStatus::Exited),
+                session("older", "/repo/first", 10, SessionStatus::Exited),
+            ],
+        );
+
+        assert_eq!(
+            catalog.default_new_session_target(&machines(&["machine-a", "machine-b"])),
+            ChatTarget {
+                machine: "machine-b".to_string(),
+                workspace_path: "/repo/recent".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_session_on_an_unstored_or_unreachable_repo_is_not_a_default() {
+        let mut catalog = catalog(&[workspace("machine-a", "/repo/first")]);
+
+        catalog.record_sessions(
+            "machine-b",
+            vec![session(
+                "elsewhere",
+                "/repo/elsewhere",
+                30,
+                SessionStatus::Exited,
+            )],
+        );
+        catalog.record_sessions(
+            "machine-gone",
+            vec![session("gone", "/repo/first", 40, SessionStatus::Exited)],
+        );
+
+        assert_eq!(
+            catalog.default_new_session_target(&machines(&["machine-a", "machine-b"])),
+            ChatTarget {
+                machine: "machine-a".to_string(),
+                workspace_path: "/repo/first".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_fleet_with_no_stored_repo_resolves_only_its_first_machine() {
+        let catalog = catalog(&[workspace("machine-gone", "/repo/first")]);
+
+        assert_eq!(
+            catalog.default_new_session_target(&machines(&["local", "machine-b"])),
+            ChatTarget {
+                machine: "local".to_string(),
+                workspace_path: String::new(),
+            }
+        );
+        assert_eq!(
+            catalog.default_new_session_target(&[]),
+            ChatTarget::unresolved()
+        );
+    }
+
+    #[test]
+    fn repos_are_offered_per_machine_in_the_order_they_were_added() {
+        let catalog = catalog(&[
+            workspace("machine-a", "/repo/first"),
+            workspace("machine-b", "/repo/other"),
+            workspace("machine-a", "/repo/second"),
+        ]);
+
+        assert_eq!(
+            catalog.repos_on("machine-a"),
+            vec!["/repo/first".to_string(), "/repo/second".to_string()]
+        );
+        assert!(catalog.repos_on("machine-c").is_empty());
+    }
+
     #[test]
     fn duplicate_workspaces_are_noops() {
         let existing = workspace("machine", "/repo");
@@ -378,6 +565,52 @@ mod tests {
             .add_workspace(existing)
             .expect("duplicate workspace does not write"));
         assert_eq!(catalog.workspaces(), &[workspace("machine", "/repo")]);
+    }
+
+    #[test]
+    fn forgetting_a_machine_keeps_only_the_other_machines_repos() {
+        let catalog = catalog(&[
+            workspace("machine-gone", "/repo/first"),
+            workspace("machine-kept", "/repo/other"),
+            workspace("machine-gone", "/repo/second"),
+        ]);
+
+        assert_eq!(
+            catalog.workspaces_without("machine-gone"),
+            vec![workspace("machine-kept", "/repo/other")]
+        );
+        assert_eq!(
+            catalog.workspaces_without("machine-unknown").len(),
+            catalog.workspaces().len(),
+            "a machine with no stored repo leaves the file alone"
+        );
+    }
+
+    #[test]
+    fn forgetting_a_machine_drops_its_session_rows_and_its_open_guard() {
+        // No stored repository, so this exercises the whole cascade without
+        // writing a configuration file: the machine is tracked from argv.
+        let mut catalog = catalog(&[]);
+
+        catalog.record_sessions(
+            "machine-gone",
+            vec![session("gone", "/repo", 20, SessionStatus::Running)],
+        );
+        catalog.record_sessions(
+            "machine-kept",
+            vec![session("kept", "/repo", 10, SessionStatus::Running)],
+        );
+        catalog.begin_open("machine-gone".to_string(), "gone".to_string());
+
+        assert_eq!(catalog.visible_session_count_on("machine-gone"), 1);
+
+        catalog
+            .forget_machine("machine-gone")
+            .expect("no stored repo means no write to fail");
+
+        assert_eq!(catalog.visible_session_count_on("machine-gone"), 0);
+        assert_eq!(catalog.visible_session_count_on("machine-kept"), 1);
+        assert_eq!(catalog.opening_sid(), None);
     }
 
     #[test]

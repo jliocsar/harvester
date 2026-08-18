@@ -74,3 +74,26 @@ pub async fn validate_git_workspace(host: &Host, path: &str) -> Result<()> {
 
     output.require_success("validate workspace")
 }
+
+/// The branch `path` is on, for the chat prompt strip's read-only indicator
+/// (SPEC §Flows "Start session"). Same client-side exec path as the picker's
+/// listing and validation — the daemon has no branch concept and is not asked
+/// for one. A detached HEAD answers the literal `HEAD`, which is reported
+/// verbatim: it is what git says the checkout is on.
+pub async fn resolve_git_branch(host: &Host, path: &str) -> Result<String> {
+    let script = format!("git -C {} rev-parse --abbrev-ref HEAD", shell_quote(path));
+    let output = host.exec(&script, None, WORKSPACE_EXEC_TIMEOUT).await?;
+
+    output.require_success("resolve branch")?;
+
+    let branch = output.stdout.trim();
+
+    if branch.is_empty() {
+        return Err(Error::Exec {
+            context: "resolve branch",
+            detail: output.describe_failure(),
+        });
+    }
+
+    Ok(branch.to_string())
+}

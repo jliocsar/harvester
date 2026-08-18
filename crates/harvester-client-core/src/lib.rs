@@ -65,7 +65,9 @@ pub use machine::{MachineRef, LOCAL_MACHINE};
 pub use ssh::SshTarget;
 pub use token::{Pending, RequestToken, RequestTokens};
 pub use transcript::Transcript;
-pub use workspace::{list_directory, resolve_home, validate_git_workspace, RemoteDirEntry};
+pub use workspace::{
+    list_directory, resolve_git_branch, resolve_home, validate_git_workspace, RemoteDirEntry,
+};
 
 pub type Result<T> = std::result::Result<T, Error>;
 

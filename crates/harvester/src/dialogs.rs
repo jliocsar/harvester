@@ -118,7 +118,7 @@ impl DialogCoordinator {
     ) {
         let coordinator = cx.entity();
 
-        // Add Workspace releases from an on_cancel callback before Root does
+        // The repo picker releases from an on_cancel callback before Root does
         // its automatic pop. Wait until that callback and pop are both done.
         window.defer(cx, move |window, cx| {
             coordinator.update(cx, |coordinator, cx| coordinator.advance(window, cx));
@@ -311,7 +311,7 @@ impl DialogCoordinator {
         }
 
         // Only the flow that owns Root may pop it. In particular, retiring a
-        // queued Pi front while Add Workspace owns the modal leaves that
+        // queued Pi front while the repo picker owns the modal leaves that
         // workspace modal untouched.
         self.displayed = None;
         window.close_dialog(cx);

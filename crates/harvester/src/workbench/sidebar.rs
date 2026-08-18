@@ -1,18 +1,25 @@
 //! Sidebar presentation and intent.
 //!
 //! The sidebar observes [`FleetStore`] directly and owns only its local view
-//! state (the three collapse toggles and the selected-session highlight). It
+//! state (the two collapse toggles and the selected-session highlight). It
 //! emits product intents with stable values rather than asking the composition
 //! shell to interpret row indexes.
+//!
+//! Top to bottom: the New session button, the machines listing, the sessions
+//! list (docs/SPEC.md §UI "Layout"). There is no workspaces section — a
+//! repository is picked in the chat that is about to use one, and
+//! `workspaces.json` is that picker's backing store rather than a citizen with
+//! a list of its own.
 
 use gpui::{div, prelude::*, px, App, Context, Div, Entity, EventEmitter, SharedString};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::list::ListItem;
-use gpui_component::{h_flex, v_flex, ActiveTheme as _, Disableable as _, IconName, Sizable as _};
+use gpui_component::{h_flex, v_flex, ActiveTheme as _, Icon, IconName, Sizable as _};
 use harvester_client_core::LOCAL_MACHINE;
 use harvester_proto::SessionStatus;
 
 use super::machine_presentation::present_machine;
+use crate::assets::TRASH_ICON_PATH;
 use crate::store::{FleetStore, MachineSession};
 use crate::ui::{self, Tone};
 use crate::workspaces::folder_name;
@@ -20,22 +27,37 @@ use crate::workspaces::folder_name;
 const SIDEBAR_WIDTH: f32 = 240.;
 /// Enough of a uuidv7 to tell sessions apart at a glance.
 const SID_PREVIEW_CHARS: usize = 8;
+/// The subtitle of a machine its provider stopped listing, and the only row
+/// kind that can be forgotten.
+const MISSING_MACHINE_DETAIL: &str = "no longer listed";
+/// What the trash button on a missing machine row says it does. "Forget" rather
+/// than "delete": nothing on the machine is touched, and there is nothing
+/// reachable to touch.
+const FORGET_MACHINE_TOOLTIP: &str = "Forget this machine";
 
 /// What a sidebar click asks the composition shell to do. Values are captured
 /// from the rendered row so a later store repaint cannot move the click to a
-/// different workspace or session.
+/// different session.
 #[derive(Clone)]
 pub(super) enum SidebarIntent {
-    AddWorkspace,
-    NewSession { machine: String, path: String },
-    OpenSession { sid: String },
+    /// Open a chat with no session behind it. Where it runs is the chat's own
+    /// question now — the prompt strip picks machine and repository — so this
+    /// intent carries nothing (docs/SPEC.md §Flows "Start session").
+    NewSession,
+    OpenSession {
+        sid: String,
+    },
+    /// Forget a machine its provider no longer lists, after the shell has asked
+    /// the user to confirm it (docs/SPEC.md §Flows "Forget machine").
+    ForgetMachine {
+        machine: String,
+    },
 }
 
 pub(super) struct Sidebar {
     store: Entity<FleetStore>,
     selected_sid: Option<String>,
     machines_collapsed: bool,
-    workspaces_collapsed: bool,
     sessions_collapsed: bool,
     _store: gpui::Subscription,
 }
@@ -50,7 +72,6 @@ impl Sidebar {
             store,
             selected_sid: None,
             machines_collapsed: false,
-            workspaces_collapsed: false,
             sessions_collapsed: false,
             _store: store_subscription,
         }
@@ -94,107 +115,20 @@ impl Sidebar {
             })
     }
 
-    fn render_workspaces_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let can_add = !self.store.read(cx).machine_candidates().is_empty();
-
-        ui::section_header("workspaces-header", "workspaces", cx)
-            .child(
-                Button::new("add-workspace")
-                    .icon(IconName::Plus)
-                    .ghost()
-                    .xsmall()
-                    .disabled(!can_add)
-                    .on_click(cx.listener(|_, _, _, cx| {
-                        cx.stop_propagation();
-                        cx.emit(SidebarIntent::AddWorkspace);
-                    })),
-            )
-            .child(ui::section_chevron(!self.workspaces_collapsed))
-            .on_click(cx.listener(|sidebar, _, _, cx| {
-                sidebar.workspaces_collapsed = !sidebar.workspaces_collapsed;
-                cx.notify();
-            }))
-    }
-
-    fn render_workspace_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let store = self.store.read(cx);
-        let rows: Vec<WorkspaceRow> = store
-            .workspaces()
-            .iter()
-            .map(|workspace| WorkspaceRow {
-                machine: workspace.machine.clone(),
-                path: workspace.path.clone(),
-                folder: folder_name(&workspace.path).to_string().into(),
-                machine_label: store.label(&workspace.machine).into(),
-            })
-            .collect();
-        let empty = rows.is_empty();
-
-        div()
-            .flex()
-            .flex_col()
-            .children(
-                rows.into_iter()
-                    .enumerate()
-                    .map(|(index, row)| self.render_workspace_row(index, row, cx)),
-            )
-            .when(empty, |list| {
-                list.child(sidebar_empty_note("no workspaces yet", cx))
-            })
-    }
-
-    fn render_workspace_row(
-        &self,
-        index: usize,
-        row: WorkspaceRow,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let machine = row.machine;
-        let path = row.path;
-
-        sidebar_row(("workspace", index))
-            .disabled(true)
-            .child(
-                h_flex()
-                    .w_full()
-                    .items_baseline()
-                    .gap_1()
-                    .child(
-                        div()
-                            .flex_none()
-                            .max_w(px(140.))
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .child(row.folder),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .child(format!("in {}", row.machine_label)),
-                    )
-                    .child(div().flex_1()),
-            )
-            .suffix({
-                let sidebar = cx.entity();
-
-                move |window, _| {
-                    let machine = machine.clone();
-                    let path = path.clone();
-
-                    Button::new(("workspace-add", index))
-                        .icon(IconName::Plus)
-                        .ghost()
-                        .xsmall()
-                        .on_click(window.listener_for(&sidebar, move |_, _, _, cx| {
-                            cx.emit(SidebarIntent::NewSession {
-                                machine: machine.clone(),
-                                path: path.clone(),
-                            });
-                        }))
-                }
-            })
+    /// The sidebar's one action, and the way into every session: a chat opens
+    /// with no session behind it, and picks where it runs in its own prompt
+    /// strip. There is no machine or repository to choose here first.
+    fn render_new_session_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div().px_2().pt_2().child(
+            Button::new("new-session")
+                .icon(IconName::Plus)
+                .label("New session")
+                .ghost()
+                .small()
+                .w_full()
+                .justify_start()
+                .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarIntent::NewSession))),
+        )
     }
 
     fn render_machine_list(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -217,15 +151,7 @@ impl Sidebar {
             .missing_tracked_machines()
             .into_iter()
             .enumerate()
-            .map(|(index, machine)| {
-                self.render_machine_row(
-                    ("missing-machine", index),
-                    store.label(&machine).into(),
-                    Some("no longer listed".into()),
-                    &machine,
-                    cx,
-                )
-            })
+            .map(|(index, machine)| self.render_missing_machine_row(index, machine, cx))
             .collect();
         let ad_hoc_rows: Vec<_> = store
             .ad_hoc_machines()
@@ -264,12 +190,55 @@ impl Sidebar {
         detail: Option<SharedString>,
         key: &str,
         cx: &Context<Self>,
-    ) -> impl IntoElement {
+    ) -> ListItem {
         let dot = present_machine(self.store.read(cx).state(key), key).dot;
 
         sidebar_row(id)
             .disabled(true)
             .child(stacked_row(dot, label, detail, None, cx))
+    }
+
+    /// The one machine row that can be acted on. A machine its provider stopped
+    /// listing is the only one Harvester can be sure is gone, so it is the only
+    /// one worth offering to forget — every other row is still listed, and a
+    /// reachable machine's rows are not the user's to clean up here.
+    ///
+    /// The trash lives in the row's suffix, which `ListItem` renders outside
+    /// its own click gating: the row itself stays disabled, exactly as the
+    /// other machine rows are.
+    fn render_missing_machine_row(
+        &self,
+        index: usize,
+        machine: String,
+        cx: &Context<Self>,
+    ) -> ListItem {
+        let label = self.store.read(cx).label(&machine);
+        let sidebar = cx.entity();
+
+        self.render_machine_row(
+            ("missing-machine", index),
+            label.into(),
+            Some(MISSING_MACHINE_DETAIL.into()),
+            &machine,
+            cx,
+        )
+        .suffix(move |_window, _cx| {
+            let sidebar = sidebar.clone();
+            let machine = machine.clone();
+
+            Button::new(("forget-machine", index))
+                .icon(Icon::default().path(TRASH_ICON_PATH))
+                .ghost()
+                .xsmall()
+                .tooltip(FORGET_MACHINE_TOOLTIP)
+                .on_click(move |_, _, cx| {
+                    let machine = machine.clone();
+
+                    sidebar.update(cx, |_, cx| {
+                        cx.emit(SidebarIntent::ForgetMachine { machine })
+                    });
+                })
+        })
     }
 
     fn session_row(&self, session: &MachineSession, cx: &Context<Self>) -> SessionRow {
@@ -332,6 +301,7 @@ impl Render for Sidebar {
             .bg(cx.theme().sidebar)
             .border_r_1()
             .border_color(cx.theme().sidebar_border)
+            .child(self.render_new_session_button(cx))
             .child(
                 ui::section_header("machines-header", "machines", cx)
                     .child(ui::section_chevron(!self.machines_collapsed))
@@ -342,10 +312,6 @@ impl Render for Sidebar {
             )
             .when(!self.machines_collapsed, |sidebar| {
                 sidebar.child(self.render_machine_list(cx))
-            })
-            .child(self.render_workspaces_header(cx))
-            .when(!self.workspaces_collapsed, |sidebar| {
-                sidebar.child(self.render_workspace_list(cx))
             })
             .child(
                 ui::section_header("sessions-header", "sessions", cx)
@@ -359,13 +325,6 @@ impl Render for Sidebar {
                 sidebar.child(self.render_session_list(cx))
             })
     }
-}
-
-struct WorkspaceRow {
-    machine: String,
-    path: String,
-    folder: SharedString,
-    machine_label: SharedString,
 }
 
 struct SessionRow {

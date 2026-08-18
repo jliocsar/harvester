@@ -2,13 +2,14 @@
 //!
 //! Workbench owns the current chat selection and the orchestration that truly
 //! needs the root window: constructing a chat input, raising fleet failures,
-//! and placing Root's overlay layers. Sidebar, add-workspace, dialog, and chat
+//! and placing Root's overlay layers. Sidebar, add-repository, dialog, and chat
 //! flows own themselves behind narrow event seams.
 
+mod forget_machine_flow;
 mod machine_presentation;
 mod picker;
+mod repo_flow;
 mod sidebar;
-mod workspace_flow;
 
 use gpui::{div, prelude::*, px, Context, Entity, Subscription, Window};
 use gpui_component::notification::NotificationType;
@@ -16,36 +17,39 @@ use gpui_component::{ActiveTheme as _, Root, WindowExt as _};
 use harvester_client_core::bridge::{Command, Event as BridgeEvent};
 use serde_json::Value;
 
+use forget_machine_flow::{ForgetMachineFlow, MachineForgotten};
 use machine_presentation::present_machine;
+use repo_flow::{AddRepoFlow, RepoAdded};
 use sidebar::{Sidebar, SidebarIntent};
-use workspace_flow::AddWorkspaceFlow;
 
-use crate::chat::{Chat, ChatRequest, ChatTarget};
+use crate::chat::{Chat, ChatFlowRequest, ChatRequest, ChatTarget};
 use crate::dialogs::DialogCoordinator;
 use crate::modal::ModalCoordinator;
 use crate::store::{FleetStore, StoreEvent};
 use crate::ui::{self, Tone};
 
-/// The empty content pane when there is no argv machine to report on — the
-/// workspace rows are the way in.
-const NO_ARGV_MACHINE_HINT: &str = "open a workspace to begin";
+/// The empty content pane when there is no argv machine to report on. New
+/// session is the only way in, and it always opens — the machine and the
+/// repository are picked inside the chat it opens.
+const NO_CHAT_HINT: &str = "start a new session to begin";
 
 pub struct Workbench {
     /// FleetStore is the single observable store. The shell reads it for the
     /// empty pane/statusbar and for root-window chat orchestration.
     store: Entity<FleetStore>,
     sidebar: Entity<Sidebar>,
-    add_workspace_flow: Entity<AddWorkspaceFlow>,
+    add_repo_flow: Entity<AddRepoFlow>,
+    forget_machine_flow: Entity<ForgetMachineFlow>,
     /// Retained for its store subscription and modal lifecycle; the Root
     /// overlay itself remains placed by this view.
     _dialogs: Entity<DialogCoordinator>,
     /// The current conversation, whether or not a session exists behind it.
     chat: Option<Entity<Chat>>,
-    /// Dies with the current chat so requests from an abandoned unstarted pane
-    /// cannot route through this shell.
-    chat_requests: Option<Subscription>,
-    /// Store repaint/event and sidebar-intent subscriptions.
-    _subscriptions: [Subscription; 3],
+    /// Bridge requests and flow requests from the current chat. They die with
+    /// it, so an abandoned unstarted pane cannot route through this shell.
+    chat_subscriptions: Option<[Subscription; 2]>,
+    /// Store repaint/event, sidebar-intent and the two flow subscriptions.
+    _subscriptions: [Subscription; 5],
 }
 
 impl Workbench {
@@ -58,21 +62,25 @@ impl Workbench {
         let store = cx.new(|cx| FleetStore::new(argv_machine, daemon_binary, cx));
         let sidebar = cx.new(|cx| Sidebar::new(store.clone(), cx));
         let modals = cx.new(|_| ModalCoordinator::default());
-        let add_workspace_flow = cx.new(|_| AddWorkspaceFlow::new(store.clone(), modals.clone()));
+        let add_repo_flow = cx.new(|_| AddRepoFlow::new(store.clone(), modals.clone()));
+        let forget_machine_flow = cx.new(|_| ForgetMachineFlow::new(store.clone(), modals.clone()));
         let dialogs = cx.new(|cx| DialogCoordinator::new(store.clone(), modals, window, cx));
         let subscriptions = [
             cx.observe(&store, |_, _, cx| cx.notify()),
             cx.subscribe_in(&store, window, Self::handle_store_event),
             cx.subscribe_in(&sidebar, window, Self::handle_sidebar_intent),
+            cx.subscribe_in(&add_repo_flow, window, Self::handle_repo_added),
+            cx.subscribe_in(&forget_machine_flow, window, Self::handle_machine_forgotten),
         ];
 
         Self {
             store,
             sidebar,
-            add_workspace_flow,
+            add_repo_flow,
+            forget_machine_flow,
             _dialogs: dialogs,
             chat: None,
-            chat_requests: None,
+            chat_subscriptions: None,
             _subscriptions: subscriptions,
         }
     }
@@ -144,12 +152,71 @@ impl Workbench {
         cx: &mut Context<Self>,
     ) {
         match intent {
-            SidebarIntent::AddWorkspace => self.open_add_workspace(window, cx),
-            SidebarIntent::NewSession { machine, path } => {
-                self.open_new_session_chat(machine, path, window, cx)
-            }
+            SidebarIntent::NewSession => self.open_new_session_chat(window, cx),
             SidebarIntent::OpenSession { sid } => self.open_session(sid, cx),
+            SidebarIntent::ForgetMachine { machine } => {
+                self.open_forget_machine(machine.clone(), window, cx)
+            }
         }
+    }
+
+    fn open_forget_machine(
+        &mut self,
+        machine: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.forget_machine_flow
+            .update(cx, |flow, cx| flow.open(machine, window, cx));
+    }
+
+    /// The machine is gone from the client's own configuration by the time this
+    /// lands, so a chat still pointed at it has no bridge to send down and no
+    /// sidebar row to return to. Dropping the entity is the whole teardown —
+    /// its subscriptions and its pending requests die with it, the same way an
+    /// abandoned unstarted chat is discarded.
+    fn handle_machine_forgotten(
+        &mut self,
+        _flow: &Entity<ForgetMachineFlow>,
+        forgotten: &MachineForgotten,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let targets_machine = self
+            .chat
+            .as_ref()
+            .is_some_and(|chat| chat.read(cx).machine() == forgotten.machine);
+
+        if !targets_machine {
+            return;
+        }
+
+        self.chat = None;
+        self.chat_subscriptions = None;
+        self.select_current_session(None, cx);
+        cx.notify();
+    }
+
+    /// A repository the folder picker validated and stored: the chat that
+    /// asked for it selects it, which is the whole point of the detour.
+    fn handle_repo_added(
+        &mut self,
+        _flow: &Entity<AddRepoFlow>,
+        added: &RepoAdded,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(chat) = self.chat.clone() else {
+            return;
+        };
+
+        if chat.read(cx).machine() != added.machine {
+            return;
+        }
+
+        let path = added.path.clone();
+
+        chat.update(cx, |chat, cx| chat.select_repo(path, cx));
     }
 
     fn report(&self, detail: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -169,7 +236,7 @@ impl Workbench {
         if let Some(chat) = self.take_starting_chat(sid, cx) {
             chat.update(cx, |chat, cx| {
                 chat.promote_to_live(sid.to_string(), entries, cx);
-                chat.request_model_controls(cx);
+                chat.request_prompt_controls(cx);
             });
             self.select_current_session(Some(sid.to_string()), cx);
 
@@ -182,17 +249,24 @@ impl Workbench {
         };
         let store = self.store.clone();
         let chat = cx.new(|cx| Chat::live(sid.to_string(), target, entries, store, window, cx));
-        let requests = cx.subscribe_in(&chat, window, Self::handle_chat_request);
 
-        chat.update(cx, |chat, cx| chat.request_model_controls(cx));
-        self.install_chat(chat, requests, cx);
+        self.install_chat(chat, window, cx);
     }
 
-    fn install_chat(&mut self, chat: Entity<Chat>, requests: Subscription, cx: &mut Context<Self>) {
+    /// Adopt a chat as the current one: subscribe to both of its seams, then
+    /// ask it for what its prompt strip reports. The order matters — an entity
+    /// cannot emit to a subscriber that does not exist yet.
+    fn install_chat(&mut self, chat: Entity<Chat>, window: &mut Window, cx: &mut Context<Self>) {
+        let subscriptions = [
+            cx.subscribe_in(&chat, window, Self::handle_chat_request),
+            cx.subscribe_in(&chat, window, Self::handle_chat_flow_request),
+        ];
         let selected_sid = chat.read(cx).sid().map(str::to_string);
 
+        chat.update(cx, |chat, cx| chat.request_prompt_controls(cx));
+
         self.chat = Some(chat);
-        self.chat_requests = Some(requests);
+        self.chat_subscriptions = Some(subscriptions);
         self.select_current_session(selected_sid, cx);
         cx.notify();
     }
@@ -381,7 +455,7 @@ impl Workbench {
         }
 
         self.chat = None;
-        self.chat_requests = None;
+        self.chat_subscriptions = None;
         self.select_current_session(None, cx);
     }
 
@@ -409,40 +483,45 @@ impl Workbench {
         Some(chat)
     }
 
-    fn open_new_session_chat(
-        &mut self,
-        machine: &str,
-        path: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let same_workspace = self.chat.as_ref().is_some_and(|chat| {
+    /// New session, always available: the chat opens on the defaults the store
+    /// derives (SPEC §Flows "Start session") and the user re-picks in the
+    /// prompt strip if they were wrong. An unstarted chat that is already on
+    /// screen is left alone — reopening it would only discard what is typed.
+    fn open_new_session_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let already_unstarted = self.chat.as_ref().is_some_and(|chat| {
             let chat = chat.read(cx);
 
-            chat.starting_session().is_none()
-                && chat.sid().is_none()
-                && chat.machine() == machine
-                && chat.workspace_path() == path
+            chat.starting_session().is_none() && chat.sid().is_none()
         });
 
-        if self.store.read(cx).opening_sid().is_some() || same_workspace {
+        if self.store.read(cx).opening_sid().is_some() || already_unstarted {
             return;
         }
 
-        let target = ChatTarget {
-            machine: machine.to_string(),
-            workspace_path: path.to_string(),
-        };
+        let target = self.store.read(cx).new_session_target();
         let store = self.store.clone();
         let chat = cx.new(|cx| Chat::unstarted(target, store, window, cx));
-        let requests = cx.subscribe_in(&chat, window, Self::handle_chat_request);
 
-        self.install_chat(chat, requests, cx);
+        self.install_chat(chat, window, cx);
     }
 
-    fn open_add_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.add_workspace_flow
-            .update(cx, |flow, cx| flow.open(window, cx));
+    /// The chat's repo picker asked for a folder walk. It needs Root's dialog
+    /// stack, which is this shell's to lend out.
+    fn handle_chat_flow_request(
+        &mut self,
+        _chat: &Entity<Chat>,
+        request: &ChatFlowRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match request {
+            ChatFlowRequest::AddRepo { machine } => self.open_add_repo(machine.clone(), window, cx),
+        }
+    }
+
+    fn open_add_repo(&mut self, machine: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.add_repo_flow
+            .update(cx, |flow, cx| flow.open(machine, window, cx));
     }
 
     fn send_command(&self, machine: &str, command: Command, cx: &Context<Self>) {
@@ -458,7 +537,7 @@ impl Workbench {
 
         let (hint, color) = match self.store.read(cx).argv_machine() {
             Some(machine) => self.argv_machine_hint(machine, cx),
-            None => (NO_ARGV_MACHINE_HINT.to_string(), Tone::Idle),
+            None => (NO_CHAT_HINT.to_string(), Tone::Idle),
         };
 
         content.child(
@@ -478,7 +557,7 @@ impl Workbench {
 
         match display.pane_message {
             Some(message) => (message, display.dot.tone()),
-            None => (NO_ARGV_MACHINE_HINT.to_string(), Tone::Idle),
+            None => (NO_CHAT_HINT.to_string(), Tone::Idle),
         }
     }
 

@@ -10,7 +10,7 @@ use gpui::{
 };
 use gpui_component::{Root, Theme, ThemeMode};
 
-use crate::{ui, workbench::Workbench};
+use crate::{assets::HarvesterAssets, ui, workbench::Workbench};
 
 actions!(harvester, [Quit]);
 
@@ -44,7 +44,7 @@ impl DesktopShell {
         install_system_mono_font_family();
 
         gpui_platform::application()
-            .with_assets(gpui_component_assets::Assets)
+            .with_assets(HarvesterAssets)
             .run(move |cx: &mut App| self.setup_application(cx));
     }
 

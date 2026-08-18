@@ -9,8 +9,9 @@
 //! Harvester's own `ssh <machine> true` probe on a faster cycle — never with
 //! provider-reported status (docs/SPEC.md §Machine).
 //!
-//! It also answers the host ops the add-workspace flow needs (`$HOME`, `ls`,
-//! `git rev-parse`). Those are plain [`Host`] execs — docs/SPEC.md §Workspace:
+//! It also answers the host ops the repo picker needs (`$HOME`, `ls`,
+//! `git rev-parse --git-dir`) and the one the chat's branch indicator needs
+//! (`git rev-parse --abbrev-ref HEAD`). Those are plain [`Host`] execs — docs/SPEC.md §Workspace:
 //! "no daemon or provider involvement" — so they are keyed by `Host`, not by
 //! machine key, and correlate their replies with a [`RequestToken`] rather
 //! than by echoing the path back. Routing them through a machine's bridge is
@@ -24,7 +25,9 @@ use crate::provider::{
 use crate::ssh::SshTarget;
 use crate::token::RequestToken;
 use crate::tokio_thread::run_on_tokio_thread;
-use crate::workspace::{list_directory, resolve_home, validate_git_workspace, RemoteDirEntry};
+use crate::workspace::{
+    list_directory, resolve_git_branch, resolve_home, validate_git_workspace, RemoteDirEntry,
+};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 /// Probe cadence for the sidebar dots. A warm multiplexed probe is one
@@ -57,6 +60,13 @@ pub enum Command {
     /// `git -C <path> rev-parse --git-dir` on the machine. Answered by
     /// [`Event::WorkspaceValidated`].
     ValidateWorkspace {
+        host: Host,
+        path: String,
+        token: RequestToken,
+    },
+    /// `git -C <path> rev-parse --abbrev-ref HEAD` on the machine — the chat
+    /// prompt strip's branch indicator. Answered by [`Event::BranchResolved`].
+    ResolveBranch {
         host: Host,
         path: String,
         token: RequestToken,
@@ -98,6 +108,12 @@ pub enum Event {
     WorkspaceValidated {
         token: RequestToken,
         error: Option<String>,
+    },
+    /// A `ResolveBranch` answered. A failure is the indicator's business
+    /// alone — it shows nothing and blocks nothing.
+    BranchResolved {
+        token: RequestToken,
+        result: Result<String, String>,
     },
 }
 
@@ -190,6 +206,15 @@ async fn worker_main(mut commands: UnboundedReceiver<Command>, events: Unbounded
                             .map(|error| error.to_string());
 
                         Event::WorkspaceValidated { token, error }
+                    })
+                }
+                Some(Command::ResolveBranch { host, path, token }) => {
+                    spawn_host_op(&events, async move {
+                        let result = resolve_git_branch(&host, &path)
+                            .await
+                            .map_err(|error| error.to_string());
+
+                        Event::BranchResolved { token, result }
                     })
                 }
             },
