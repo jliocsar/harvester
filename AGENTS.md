@@ -91,10 +91,17 @@ itself is broken — node version mismatch — but the source is readable).
   annotation rounds and respond with per-finding verdicts
   (Confirmed / Partly / Not a bug / Intended) before changing code.
 - Verify claims against docs/source before asserting; label anything unverified.
-- **exe.dev testing**: throwaway VMs are fine (`ssh exe.dev new/rm`), but NEVER
-  delete a VM you didn't create this session. VM user is `exedev`;
-  keyless LLM gateway is enabled by pre-seeding
-  `~/.pi/agent/exe-dev-llm-integration.json` = `{"version":1,"useExeIntegration":true}`.
+- **exe.dev testing**: the plan is **prepaid** (~$20/mo, roughly 50 VMs, otherwise
+  idle), so throwaway VMs are *encouraged* — go wide whenever a real VM answers a
+  question faster than reasoning about one. The standing rule is create-your-own:
+  spin up your own (`ssh exe.dev new --json --name <label>`), tear down everything
+  you created (`ssh exe.dev rm <name>`), and NEVER touch, rename, or delete a VM you
+  did not create this session. VM user is `exedev`; keyless LLM gateway is enabled by
+  pre-seeding `~/.pi/agent/exe-dev-llm-integration.json` =
+  `{"version":1,"useExeIntegration":true}`. The image tracks pi upstream (it shipped
+  0.84.2 on 2026-08-18), so pin the version this repo targets —
+  `exeuntu update pi --version 0.83.0` — before capturing anything that becomes a
+  fixture or a documented fact.
 
 ## Build & test
 
