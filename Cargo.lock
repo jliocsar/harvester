@@ -2522,6 +2522,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpui-mcp-bridge"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "gpui-mcp-proto",
+ "serde_json",
+]
+
+[[package]]
+name = "gpui-mcp-proto"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "gpui_linux"
 version = "0.1.0"
 source = "git+https://github.com/zed-industries/zed#08827f9208b4848d62f3faf86ffa15155966d63c"
@@ -2814,6 +2831,7 @@ dependencies = [
  "gpui",
  "gpui-component",
  "gpui-component-assets",
+ "gpui-mcp-bridge",
  "gpui_platform",
  "harvester-client-core",
  "harvester-proto",

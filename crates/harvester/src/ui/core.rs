@@ -1,7 +1,5 @@
-use std::sync::OnceLock;
-
 use gpui::{div, prelude::*, px, App, Div, SharedString};
-use gpui_component::ActiveTheme as _;
+use gpui_component::{ActiveTheme as _, Icon, IconName};
 
 pub const BASE_TEXT_SIZE: f32 = 13.;
 
@@ -63,12 +61,16 @@ pub fn status_dot(dot: Dot, cx: &App) -> Div {
     }
 }
 
-pub fn use_mono_font_family(family: SharedString) {
-    let _ = MONO_FONT_FAMILY.set(family);
+pub(super) fn disclosure_chevron(expanded: bool) -> Icon {
+    if expanded {
+        return Icon::new(IconName::ChevronDown).size(px(CHEVRON_SIZE));
+    }
+
+    Icon::new(IconName::ChevronRight).size(px(CHEVRON_SIZE))
 }
 
-pub(super) fn mono_font_family() -> SharedString {
-    MONO_FONT_FAMILY.get().cloned().unwrap_or("Menlo".into())
-}
+const CHEVRON_SIZE: f32 = 12.;
 
-static MONO_FONT_FAMILY: OnceLock<SharedString> = OnceLock::new();
+pub(super) fn mono_font_family(cx: &App) -> SharedString {
+    cx.theme().mono_font_family.clone()
+}

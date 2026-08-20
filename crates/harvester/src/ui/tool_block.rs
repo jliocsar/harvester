@@ -1,14 +1,15 @@
 use gpui::{div, prelude::*, px, App, Div, ElementId, SharedString, Stateful};
 use gpui_component::ActiveTheme as _;
 
-use super::core::{dim, faint, mono_font_family, status_dot, Dot, Tone};
+use super::core::{dim, disclosure_chevron, faint, mono_font_family, status_dot, Dot, Tone};
 
 pub(super) fn block(cx: &App) -> Div {
     div()
         .rounded_lg()
-        .bg(cx.theme().sidebar)
+        .bg(cx.theme().popover)
         .border_1()
         .border_color(cx.theme().border)
+        .shadow_sm()
         .flex()
         .flex_col()
         .overflow_hidden()
@@ -30,14 +31,14 @@ pub(super) fn header(
         .gap_2()
         .cursor_pointer()
         .hover(|style| style.bg(cx.theme().list_hover))
+        .active(|style| style.bg(cx.theme().muted))
         .child(status_dot(Dot::Solid(tone), cx))
         .child(label.flex_1().min_w(px(0.)))
         .child(
             div()
                 .flex_none()
-                .text_xs()
                 .text_color(faint(cx))
-                .child(if expanded { "▾" } else { "▸" }),
+                .child(disclosure_chevron(expanded)),
         )
 }
 
@@ -54,11 +55,11 @@ pub(super) fn verb(text: impl Into<SharedString>, cx: &App) -> Div {
     div().flex_none().text_color(dim(cx)).child(text.into())
 }
 
-pub(super) fn subject(text: SharedString, mono: bool) -> Div {
+pub(super) fn subject(text: SharedString, mono: bool, cx: &App) -> Div {
     div()
         .overflow_hidden()
         .text_ellipsis()
-        .when(mono, |subject| subject.font_family(mono_font_family()))
+        .when(mono, |subject| subject.font_family(mono_font_family(cx)))
         .child(text)
 }
 
@@ -90,7 +91,7 @@ pub(super) fn body(cx: &App) -> Div {
         .flex_col()
         .gap_1()
         .text_xs()
-        .font_family(mono_font_family())
+        .font_family(mono_font_family(cx))
 }
 
 pub(super) fn context(text: SharedString, cx: &App) -> Div {

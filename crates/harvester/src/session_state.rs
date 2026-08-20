@@ -390,7 +390,7 @@ impl SessionState {
             .unwrap_or_default();
         self.transcript.end_turn();
         self.exited = Some(format!(
-            "session exited{code_text} — click it in the sidebar to resume"
+            "Session exited{code_text} — click it in the sidebar to resume"
         ));
 
         true

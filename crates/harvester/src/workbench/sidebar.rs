@@ -78,7 +78,7 @@ impl Sidebar {
                     .map(|(index, row)| self.render_session_row(index, row, cx)),
             )
             .when(empty, |list| {
-                list.child(ui::sidebar_empty_note("no sessions yet", cx))
+                list.child(ui::sidebar_empty_note("No sessions yet", cx))
             })
     }
 

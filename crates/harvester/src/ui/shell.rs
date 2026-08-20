@@ -4,9 +4,9 @@ use gpui::{
 };
 use gpui_component::ActiveTheme as _;
 
-use super::core::{dim, faint};
+use super::core::{dim, disclosure_chevron, faint};
 
-const STATUSBAR_HEIGHT: f32 = 26.;
+const STATUSBAR_HEIGHT: f32 = 24.;
 
 pub fn collapsible_section(
     id: impl Into<ElementId>,
@@ -16,7 +16,7 @@ pub fn collapsible_section(
     cx: &App,
 ) -> Stateful<Div> {
     section_header(id, title, cx)
-        .child(section_chevron(expanded))
+        .child(div().flex_none().child(disclosure_chevron(expanded)))
         .on_click(on_toggle)
 }
 
@@ -24,7 +24,7 @@ fn section_header(id: impl Into<ElementId>, title: &'static str, cx: &App) -> St
     div()
         .id(id)
         .px_3()
-        .pt_3()
+        .pt_2()
         .pb_1()
         .flex()
         .items_center()
@@ -34,19 +34,16 @@ fn section_header(id: impl Into<ElementId>, title: &'static str, cx: &App) -> St
         .text_color(faint(cx))
         .cursor_pointer()
         .hover(|style| style.text_color(dim(cx)))
+        .active(|style| style.text_color(cx.theme().foreground))
         .child(title.to_uppercase())
         .child(div().flex_1())
-}
-
-fn section_chevron(expanded: bool) -> Div {
-    div().flex_none().child(if expanded { "▾" } else { "▸" })
 }
 
 pub fn chat_header(title: SharedString, subtitle: SharedString, cx: &App) -> Div {
     div()
         .flex_none()
         .px_3()
-        .py_2()
+        .py_1p5()
         .border_b_1()
         .border_color(cx.theme().border)
         .flex()

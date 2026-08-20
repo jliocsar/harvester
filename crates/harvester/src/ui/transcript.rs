@@ -3,7 +3,8 @@ use std::rc::Rc;
 use std::sync::OnceLock;
 
 use gpui::{
-    div, prelude::*, px, AnyElement, App, Div, ElementId, ScrollHandle, SharedString, Window,
+    div, prelude::*, px, relative, AnyElement, App, Div, ElementId, ScrollHandle, SharedString,
+    Window,
 };
 use gpui_component::highlighter::HighlightTheme;
 use gpui_component::text::{TextView, TextViewStyle};
@@ -15,6 +16,8 @@ use super::core::Tone;
 use super::tool_block::{self, DiffLineKind};
 
 const ARGS_SUMMARY_MAX_CHARS: usize = 80;
+const MESSAGE_LINE_HEIGHT: f32 = 1.7;
+const USER_BUBBLE_MAX_WIDTH: f32 = 0.7;
 
 type ToggleToolBlock = Rc<dyn Fn(String, &mut Window, &mut App)>;
 
@@ -126,38 +129,30 @@ fn markdown_style() -> TextViewStyle {
         .clone()
 }
 
-fn message_frame(
-    author: &'static str,
-    author_tone: Tone,
-    body: impl IntoElement,
-    bubble: bool,
-    cx: &App,
-) -> Div {
-    div()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .child(
-            div()
-                .text_xs()
-                .text_color(author_tone.color(cx))
-                .child(author),
-        )
-        .child(
-            div()
-                .when(bubble, |style| {
-                    style.bg(cx.theme().muted).rounded_md().px_3().py_2()
-                })
-                .child(body),
-        )
+fn message_frame(body: impl IntoElement, bubble: bool, cx: &App) -> Div {
+    let content = div()
+        .line_height(relative(MESSAGE_LINE_HEIGHT))
+        .when(bubble, |style| {
+            style
+                .max_w(relative(USER_BUBBLE_MAX_WIDTH))
+                .bg(cx.theme().muted)
+                .rounded_md()
+                .px_3()
+                .py_2()
+        })
+        .child(body);
+
+    if bubble {
+        return div().flex().justify_end().child(content);
+    }
+
+    content
 }
 
 fn render_message(index: usize, message: &Message, cx: &App) -> Div {
     match message.role {
-        Role::User => message_frame("you", Tone::Active, message.text.clone(), true, cx),
+        Role::User => message_frame(message.text.clone(), true, cx),
         Role::Assistant => message_frame(
-            "pi",
-            Tone::Muted,
             markdown(("message", index), message.text.clone()),
             false,
             cx,
@@ -166,19 +161,23 @@ fn render_message(index: usize, message: &Message, cx: &App) -> Div {
 }
 
 fn render_failure(detail: &str, cx: &App) -> Div {
-    message_frame("pi", Tone::Failed, detail.to_string(), false, cx)
+    message_frame(
+        div()
+            .text_color(Tone::Failed.color(cx))
+            .child(detail.to_string()),
+        false,
+        cx,
+    )
 }
 
 fn render_streaming(transcript: &Transcript, cx: &App) -> Option<Div> {
     match (transcript.streaming(), transcript.is_busy()) {
         (Some(text), _) => Some(message_frame(
-            "pi",
-            Tone::Muted,
             markdown("streaming-message", format!("{text}▍")),
             false,
             cx,
         )),
-        (None, true) => Some(message_frame("pi", Tone::Muted, "…", false, cx)),
+        (None, true) => Some(message_frame("…", false, cx)),
         (None, false) => None,
     }
 }
@@ -193,7 +192,7 @@ fn tool_label(block: &ToolBlock, cx: &App) -> Div {
 
             label
                 .child(tool_block::verb("$", cx))
-                .child(tool_block::subject(first_line.into(), true))
+                .child(tool_block::subject(first_line.into(), true, cx))
         }
         "read" | "write" | "edit" => {
             let verb = match block.tool_name.as_str() {
@@ -207,6 +206,7 @@ fn tool_label(block: &ToolBlock, cx: &App) -> Div {
                 .child(tool_block::subject(
                     basename(path).to_string().into(),
                     false,
+                    cx,
                 ));
 
             match block.line_stats() {
@@ -224,18 +224,22 @@ fn tool_label(block: &ToolBlock, cx: &App) -> Div {
 
             label
                 .child(tool_block::verb(verb, cx))
-                .child(tool_block::subject(pattern.to_string().into(), true))
+                .child(tool_block::subject(pattern.to_string().into(), true, cx))
         }
         "ls" => {
             let path = block.arg("path").unwrap_or(".");
 
             label
                 .child(tool_block::verb("List", cx))
-                .child(tool_block::subject(path.to_string().into(), false))
+                .child(tool_block::subject(path.to_string().into(), false, cx))
         }
         _ => label
             .child(tool_block::verb(block.tool_name.clone(), cx))
-            .child(tool_block::subject(compact_args(&block.args).into(), true)),
+            .child(tool_block::subject(
+                compact_args(&block.args).into(),
+                true,
+                cx,
+            )),
     }
 }
 
@@ -266,7 +270,7 @@ fn render_tool_body(block: &ToolBlock, cx: &App) -> Div {
 
     if block.output.is_empty() {
         let placeholder = match block.status {
-            ToolStatus::Running => "running…",
+            ToolStatus::Running => "Running…",
             _ => "(no output)",
         };
 

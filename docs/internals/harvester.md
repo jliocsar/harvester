@@ -273,26 +273,39 @@ repo, or nothing if it has none.
   (pi confirms `set_model` at runtime); the branch only ever reports.
 - The prompt box floats in the pane's padding with no separator line — the
   card's own border is the boundary.
-- Dropdown row keys/candidates travel with the closure that opens the
-  dropdown, so a listing landing while the list is open cannot move a row
-  out from under a click.
-- A control with nothing to offer renders as the bare label rather than an
-  openable-but-empty dropdown. `render_dropdown_control` is where that rule
-  lives now — one free function shared by the model, machine and repository
-  controls, so "disabled or empty means no popover" cannot be decided three
-  different ways. Each `render_*_control` is left with the only part that
-  really differs: which rows exist, and what picking one does.
-- `render_dropdown_control` takes its rows already built rather than a
-  closure that builds them, so a disabled control (a live session's machine
-  and repository) still assembles rows it will not show. That is a Vec of
-  labels per repaint, deliberately traded for one code path; if a control
-  ever grows an expensive row list, laziness belongs in the caller's own
-  early return, not back in three copies of the tail.
-- The exit/starting notice and the models-failed line are
-  `ui::inline_note(tone, …)`, the same primitive the folder picker's error
-  uses — a tone-colored `text_xs` note. These two call sites keep their
-  original wrapping behavior: a failure detail is information, and
-  truncating it would hide the reason it exists to show.
+- `Chat` builds no prompt-strip chrome of its own. `render_bottom_row`
+  assembles a `ui::PromptStrip` value (labels, enabled flags, rows, branch,
+  `can_send`, `focused`, notice) plus a `ui::PromptStripHandlers`, and hands
+  both to `ui::prompt_strip`. Everything visual — the ids, the icons, the
+  "disabled or empty means no popover" rule, the notice's tone — lives in
+  `ui/prompt.rs`; see that section for the contract. `chat.rs` keeps only
+  what needs the store, the state machine or an `Entity`.
+- `prompt_strip` (the `Chat` method that builds the value) is separate from
+  `create_prompt_strip_handlers` (the free function that builds the
+  callbacks) because the former borrows `&self` and the latter must *move*
+  the candidate lists into `'static` closures. `render_bottom_row` computes
+  each list once and passes it by reference to the first, by value to the
+  second — which is also what preserves the older rule that dropdown row
+  keys travel with the closure that opens the dropdown, so a listing landing
+  while the list is open cannot move a row out from under a click.
+- `model_control` / `machine_control` / `repo_control` still build rows for
+  a control that is disabled (a live session's machine and repository). That
+  is a Vec of labels per repaint, deliberately traded for one code path; if a
+  control ever grows an expensive row list, laziness belongs here in the
+  caller, not back in three copies of the render tail.
+- The lists are built even when a notice short-circuits the strip. They are
+  pure store reads, and the alternative — an early return in `chat.rs` —
+  would put the notice decision in two places, which is exactly what
+  `PromptStripNotice` exists to prevent.
+- `is_unstarted` is named that way rather than `unstarted` only because
+  `Chat::unstarted` is already the constructor for a chat with no session
+  behind it.
+- The models-failed line is `ui::inline_note(tone, …)`, the same primitive
+  the folder picker's error uses — a tone-colored `text_xs` note. It keeps
+  its original wrapping behavior: a failure detail is information, and
+  truncating it would hide the reason it exists to show. The exit/starting
+  notice is now the same primitive reached through
+  `ui::prompt_strip`.
 
 ## crates/harvester/src/chat/prompt_presentation.rs
 
@@ -336,31 +349,24 @@ pick).
 
 ## crates/harvester/src/desktop_shell.rs
 
-The cohesive GPUI desktop shell around Harvester's workbench: owns
-application-wide UI policy and window construction. The workbench itself
-stays responsible for product layout and user intent; callers of this module
-only provide launch inputs already resolved before GPUI starts.
+What is *product-specific* about starting the Harvester application: the
+window title, the window size, and the fact that the root view is a
+`Workbench`. Everything generic about starting a gpui application (fonts,
+assets, theme, quit binding, `Root`) moved to `shell_bootstrap` on the lib
+side when the gallery binary appeared — see that section for the contract.
+This module is the app-only half that stayed on the bin side, because
+`Workbench` and everything under it is bin-only.
 
 - `MAIN_WINDOW_WIDTH`/`HEIGHT` (1100×720): the centered main window's fixed
   size.
-- `install_system_mono_font_family` / `resolve_mono_font_family`: asks
-  fontconfig (`fc-match --format %{family} monospace`) for the system
-  monospace family exactly once, before anything renders. This subprocess
-  call is deliberately owned by the application shell rather than any
-  rendering code, because rendering code must never shell out. If resolution
-  fails for any reason, `ui` silently falls back to its own hardcoded
-  default (`"Menlo"`, see `core.rs`).
-- `install_widget_layer`: `gpui_component::init` must run before any other
-  call into the library. The library also hardcodes light mode on init, so
-  dark mode is set explicitly immediately after. `Theme::sync_system_appearance`
-  is deliberately never called — nothing observes the desktop's OS-level
-  appearance, which is what keeps Harvester pinned to dark mode even on a
-  light-mode system.
-- `install_application_commands`: installs the app-level Quit action under
-  both `ctrl-q` and `cmd-q` so one build behaves natively on both Linux (ctrl)
-  and macOS (cmd) without a platform-conditional binary. `gpui-component`
-  itself owns the Input/Table/List/Menu context keybindings, so this function
-  only needs to add the one app-level action.
+- `main_window_title` takes the argv machine by reference and is a free
+  function rather than a method: with the bootstrap owning the window
+  lifecycle there is nothing left for a `DesktopShell` struct to hold, and
+  the two launch inputs (`argv_machine`, `daemon_binary`) travel straight
+  into the root-view closure instead.
+- The root-view closure is where `Workbench` is constructed, so the
+  bootstrap never learns the app's view type — it only ever sees an
+  `AnyView`.
 
 ## crates/harvester/src/dialogs.rs
 
@@ -430,6 +436,380 @@ question deserves and what a click means to Pi.
   notion of an index here, so the chosen label round-trips straight back as a
   `DialogAnswer::Value`.
 
+## crates/harvester/src/gallery/ — the component gallery
+
+A dev-only second binary (`cargo run -p harvester --bin gallery`) that renders
+Harvester's `ui` components in isolation, Storybook-style. Declared as an
+explicit `[[bin]]` at `src/gallery/`, deliberately **not** under `src/bin/`:
+the `no_comments` test skips any directory named `bin` (throwaway spikes such
+as `bin/uispike.rs` were always exempt from house rules), and the gallery is
+real, maintained code that must obey them. Putting it one directory over is
+the whole trick.
+
+Module map:
+
+| module | role |
+|---|---|
+| `main.rs` | bootstrap, the `Gallery` root view, all mutable gallery state, replay scheduling |
+| `chrome.rs` | the gallery's own screen: story sidebar, stage, control dock, statusbar |
+| `story.rs` | the story/knob/preset model (pure data, no rendering) |
+| `registry.rs` | the one hand-written list of stories |
+| `stories/` | one module per `ui` submodule, each holding that group's render functions |
+| `runtime.rs` | the live state stories share with the gallery (inputs, transcripts, replay) |
+| `fixtures.rs` | runtime loading of `fixtures/*.jsonl` and folding them into `Transcript`s |
+
+### The gpui-mcp bridge
+
+`main.rs` calls `gpui_mcp_bridge::install(cx)` inside the `run_desktop_shell`
+closure. This lets the gpui-mcp MCP server attach to a running gallery and
+drive it — dump the accessibility tree, click via AT-SPI, inject keys — which
+is how agents UI-test the gallery. Deliberately gallery-only: the client
+binary never calls `install`, so shipping builds carry no bridge socket. The
+bridge itself is inert unless the process is a debug build launched with
+`GPUI_MCP=1`, so plain `cargo run --bin gallery` is unaffected. The bridge's
+gpui dependency uses the same bare zed-git source as ours and both lockfiles
+pin the same commit; a host on a mismatched gpui build is caught at attach
+time by the bridge's `hello` handshake, not at runtime by silent weirdness.
+
+`chrome.rs` carries the a11y adoption that makes the gallery agent-navigable:
+a node reaches the accessibility tree only when it has **both** `.id()` and a
+`.role()` (gpui rule; verified — without roles the whole gallery projected as
+one Window node). The sidebar is `Role::List`, story rows `Role::ListItem`
+with `aria_label(name)` + `aria_selected`, group/dock headers `Role::Button`
+with `aria_expanded`, chips `Role::Button` with `aria_selected(active)`, each
+knob a labelled `Role::Group`. gpui-component's `ListItem` implements
+`StatefulInteractiveElement`, so the aria builders chain straight through it.
+Story *content* stays invisible for now: gpui-component widgets have
+near-zero a11y adoption upstream. `tmp/gallery_walk.py` drives every story
+and a knob toggle over the MCP as the regression check.
+
+Feel: story switching and knob changes are the two things a user does dozens
+of times a minute, so both are **instant** — no animation anywhere in the
+gallery chrome. The only motion in the binary is the streaming replay, which
+is the subject of a story rather than a transition. Dark theme only (see the
+recorded gap below), `BASE_TEXT_SIZE` at the root, every color from `Tone` or
+a theme slot, and the chrome itself is built from `ui::` components
+(`sidebar_row`, `collapsible_section`, `chat_header`, `statusbar_frame`,
+`inline_note`) — the gallery dogfoods the library it catalogs.
+
+### crates/harvester/src/gallery/story.rs
+
+The model, deliberately data-only so the registry reads as a table:
+
+- `KnobValue` is the value union (`Bool` / `Choice(usize)` / `Text(String)`)
+  and `KnobKind` is the *shape* (`Choice` carries its labels). They are
+  separate types because a spec needs the labels once while a value is copied
+  per story per frame; folding the labels into the value would clone them on
+  every knob read.
+- `KnobValues` is an association list, not a `HashMap`: knob counts are
+  single-digit, order is the declaration order the dock renders in, and the
+  lookups (`flag`, `choice`, `text`, `optional_text`) all degrade to a default
+  instead of panicking, so a story that reads a knob it never declared renders
+  rather than crashes.
+- `Preset` is *a set of knob values with a name* — nothing more. That is what
+  makes presets and knobs commute: clicking a preset chip writes into the same
+  `KnobValues` a knob chip writes into, so a preset can always be adjusted
+  afterwards. Presets set every knob they care about explicitly rather than
+  diffing against a base, so preset order never matters.
+- `Story` is name + group + knobs + presets + a plain `fn` pointer. A `fn`
+  (not a boxed closure) is what keeps the registry a static list: a story
+  cannot capture state, which is exactly the property that forces shared live
+  state into `StoryRuntime` where the gallery can observe it.
+- `StoryScene` is what the render `fn` receives: the resolved knob values plus
+  the `Entity<StoryRuntime>`. This is the one deviation from the phase plan's
+  sketched signature (`&KnobValues` alone): live stories (collapse, tool-block
+  expansion, dropdown selection, replay, the real `InputState`) need state
+  that survives across frames and can notify the view, and in gpui that means
+  an entity handle, not a value.
+
+### crates/harvester/src/gallery/registry.rs
+
+`build_stories()` is the whole catalog: one `vec![]` of `Story::new(...)`, no
+macros (a macro would hide exactly the thing a reviewer wants to read). Group
+names are consts (`CORE_GROUP` … `DIALOG_GROUP`) because they are also the
+sidebar's section titles and `collapsible_section` demands `&'static str`.
+
+- `STREAMING_TRANSCRIPT_STORY` is the replay story's name, and
+  `story_index()` resolves it to an index once at start-up. The replay loop
+  keys on that index instead of a name comparison per tick, and if the story
+  is ever renamed the lookup returns `None` and the replay simply never runs —
+  no panic, no silent tick on the wrong story.
+- `group_names()` derives the sidebar's group order from the story order, so
+  adding a story to a new group needs no second edit.
+- `LIVE_TONE_INDEX` / `FAILED_TONE_INDEX` name the two `TONE_LABELS` positions
+  the presets reach for; `DEFAULT_SPEED_INDEX` is the `1x` slot of
+  `REPLAY_SPEED_LABELS`.
+
+### crates/harvester/src/gallery/stories/
+
+One module per `ui` module plus the three flagships, each exporting its knob
+*names* as consts so `registry.rs` and the render function cannot disagree
+about a string. `stories/mod.rs` holds what every story shares: `TONE_LABELS`
+and `tone_at`/`dot_at` (the choice-index → `Tone`/`Dot` mapping used by six
+stories), plus the layout primitives `story_column`, `story_row`, `caption`
+(an `inline_note`, so captions obey `Tone`), `panel` and `transcript_panel`.
+`panel` sits on the `popover` slot with `rounded_lg` and `shadow_sm` — the
+raised-surface tier of the graphite ladder — so a story's framing matches
+how real raised components (tool cards, popovers) sit on the canvas.
+`PANEL_MIN_WIDTH` (320) keeps a one-line component from collapsing to its
+text width on the stage; `TRANSCRIPT_PANEL_HEIGHT` (420) gives the transcript
+stories a fixed viewport so their internal scroll behaves like the chat's.
+
+- `core.rs`: the tone swatch grid (all six tones × solid/hollow dot × colored
+  text, `TONE_NAME_WIDTH` aligning the labels) and the single-`Dot` story.
+- `note.rs`: `inline_note` and `empty_pane_hint`; the hint gets a
+  `HINT_PANEL_HEIGHT` box because it is a `size_full` component and would
+  otherwise have no height to fill on the stage.
+- `shell.rs`: `chat_header`, `collapsible_section` (live — the expanded flag
+  lives in `StoryRuntime`, so the story demonstrates the real click), and
+  `statusbar_frame`. Section titles come from a *choice* knob rather than a
+  text knob because the component's signature is `&'static str`.
+- `sidebar.rs`: the three sidebar builders inside a `SIDEBAR_FRAME_WIDTH`
+  frame tinted with the sidebar theme slots, because a row's selected state is
+  only legible against the surface it really sits on.
+- `prompt.rs`: `prompt_box_control`, `prompt_box_send` and a live
+  `prompt_box_dropdown` whose picked index writes to
+  `StoryRuntime::dropdown_selection` — the popover is the component's real
+  popover, not a mock.
+- `prompt_strip.rs` (flagship): builds the whole `PromptStrip` value struct
+  from knobs, with the six presets from the plan (`ready`, `loading models`,
+  `models failed`, `no machines`, `starting session`, `exited`). The dropdown
+  rows are static label lists and the handlers are no-ops: the story exists to
+  show every *state* of the strip, and a working picker would need a store.
+  The input is a real `Entity<InputState>` from the runtime, so typing,
+  focus ring and auto-grow are the genuine article.
+- `transcript.rs` (flagships): the rendered story folds a fixture and renders
+  it through `TranscriptPresentation` with live tool-block expansion; the
+  streaming story renders the replay transcript plus its control row (restart
+  button, `applied / total` progress, and the paused/finished note). Play and
+  speed are knobs; restart is a button because it is an action, not a state.
+- `dialog.rs` (foundation): `Confirmation` + `button_row` + both input kinds
+  rendered **inline on the canvas**, never through `window.open_dialog`. See
+  the recorded gap below.
+
+### crates/harvester/src/gallery/runtime.rs
+
+`StoryRuntime` is the single entity holding everything a story needs to
+survive a frame: the collapsible section's flag, the dropdown's selection, the
+prompt strip's `InputState`, the dialog story's two inputs, the rendered
+transcript, and the replay. The gallery `cx.observe`s it once, so any story
+that calls `runtime.update(…, cx.notify())` re-renders the whole gallery —
+that one subscription is why story render functions can stay plain `fn`s.
+
+- `RenderedTranscript` caches the folded fixture keyed by `source_index`;
+  `ensure_rendered_source` rebuilds only when the source knob actually
+  changes, so switching *any other* knob doesn't re-parse a fixture, and it
+  resets the expansion set with it (a tool-call id from another fixture would
+  otherwise leave a random block open).
+- `ReplayTranscript` owns its own copy of the streaming events, its cursor and
+  its transcript. `restart()` rebuilds the transcript from scratch instead of
+  rewinding, because `Transcript` has no undo — replay from event zero is the
+  only faithful reset.
+- Replay timing consts: `REPLAY_FRAME_INTERVAL_MS` (260) is the wall-clock gap
+  between two fixture events at 1×; it is a *display* cadence, not the
+  capture's real timing (pi's provider batches partials, so the fixture's own
+  spacing is bursty). `REPLAY_SPEED_MULTIPLIERS` (0.5/1/4) divide it and
+  `REPLAY_SPEED_LABELS` are the same three values as knob labels — the two
+  arrays are index-parallel by construction. `REPLAY_IDLE_POLL_INTERVAL_MS`
+  (200) is how often a *paused* or unselected replay re-checks whether it
+  should start again; a paused loop must keep breathing because the knob it
+  waits on lives in the gallery, not in the task.
+- `PROMPT_INPUT_ROWS` (1–8) and the dialog placeholders mirror the app's own
+  values so the story is the real component, not a lookalike.
+
+### crates/harvester/src/gallery/fixtures.rs
+
+Fixtures are loaded **at runtime**, from
+`env!("CARGO_MANIFEST_DIR")/fixtures/*.jsonl`, not `include_str!`'d. The
+gallery is a dev tool that only ever runs from this repo, and runtime loading
+means capturing a new fixture is visible on the next `cargo run` without a
+rebuild — and, more importantly, a missing or malformed file degrades instead
+of failing the build for everyone.
+
+- Every failure path produces a `String` naming the offending path (and line
+  number for a parse failure) that the story renders through
+  `ui::empty_pane_hint(Tone::Failed, …)`, and the statusbar carries the first
+  failure of any fixture at all times. Nothing panics: the whole point of a
+  catalog is that the other 16 stories still work when one fixture is gone.
+- Parsing follows the house LF-only framing rule (`harvester_proto::{LF, CR}`,
+  split on `LF`, strip one trailing `CR`), the same as everything else that
+  reads pi JSONL.
+- **The user-prompt rule**: `Transcript::apply` deliberately ignores
+  `message_end` events whose `message.role` is `"user"` — in the app, user
+  text enters a transcript only through `push_user_prompt`, because the app
+  already knows what the user typed. A replayer has no such knowledge, so
+  `apply_event` intercepts exactly that event shape and calls
+  `push_user_prompt` with the concatenated text parts. Without it the mixed
+  fixture renders assistant turns and tool blocks with no prompts above them.
+  This is the one place the gallery is allowed to interpret a pi payload, and
+  it interprets it into the same call the app makes.
+- `TranscriptSource` maps the four preset/knob choices onto fixtures:
+  `markdown-heavy answer` → `streaming.jsonl`, `tool run` → `tools.jsonl`,
+  `mixed session` → `mixed.jsonl`, and `failed tool` → `tools.jsonl` filtered
+  to the tool-call ids whose `tool_execution_end` carried `isError: true`.
+  The filter exists so the error path gets a story of its own without a
+  second capture: it keeps every event that names a failing call and drops
+  the rest, which is enough for the block to render exactly as it does in a
+  full session.
+
+### crates/harvester/fixtures/ (provenance)
+
+Three checked-in pi session captures drive the transcript stories and
+`tests/fixtures.rs`. Each file is LF-only JSONL, one **raw pi event object**
+per line — the inner event exactly as `Transcript::apply` consumes it, never
+the harvesterd envelope.
+
+- `streaming.jsonl` — one markdown-heavy answer (headings, bullets, numbered
+  list, python fence, table, blockquote) with its 18 incremental
+  `message_update` frames; replaying line-by-line grows `streaming()` from 2
+  to 2418 chars. Frame count is provider-batched (`claude-sonnet-4-5@llm`);
+  chunky 1× replay is faithful to the wire — do not subdivide frames.
+- `tools.jsonl` — four turns, nine tool calls: `ls`, `read`, `write`, `edit`
+  (real `details.diff`/`patch`), `grep`, a **failed** `bash`
+  (`isError: true`), and `metrics_query`, an extension-registered name that
+  exercises the unrecognized-tool fallback label.
+- `mixed.jsonl` — three user turns interleaving `read`/`edit`/`bash` with
+  markdown answers.
+
+Captured 2026-08-18 against **pi 0.83.0** on a throwaway exe.dev VM (created
+and deleted the same session), keyless LLM gateway, real RPC over SSH: stdin
+held open, one `prompt` per turn, next turn only after `agent_settled`,
+shutdown by dropping stdin (exit 0). The exeuntu image had already moved to
+pi 0.84.2 and was pinned back with `exeuntu update pi --version 0.83.0`
+before capture (see `HARNESS_RESEARCH.md` §Watch).
+
+Sanitization was text substitution on the raw lines only, preserving pi's
+compact serialization byte-for-byte: provider tool-call ids (`toolu_…`) →
+`call_0001…`, provider response ids (`msg_…`) → `resp_0001…`, timestamps
+rebased so each file starts at `1767225600000` with relative offsets kept.
+Host/user/path scrubbing rules matched nothing — the pi event stream carries
+no absolute paths, hostnames, usernames, session ids, or credentials. The
+only line-level edit: RPC `{"type":"response",…}` command acks were removed —
+they are responses, not session events. `tool_execution_update` appears only
+twice per multi-turn capture (pi emits it only for long-running tool output),
+so the running-with-partial-output render path is thinly covered.
+
+### crates/harvester/src/gallery/main.rs
+
+`Gallery` owns all mutable gallery state: the story list, one `KnobValues` per
+story (so switching stories never loses your knob edits), the collapsed group
+list, the selected story, the dock flag, the runtime entity, and the text-knob
+inputs.
+
+- `GALLERY_WINDOW_WIDTH`/`HEIGHT` (1100×720) match the app's window rather
+  than being sized to the catalog, so a component rendered in a story is laid
+  out at the width it will really get.
+- Text knobs are backed by real `Entity<InputState>`s keyed by
+  `(story_index, knob_name)` and created lazily in `sync_text_knob_inputs`
+  during render (the first frame that shows the knob is the first frame that
+  has a `Window`). Each gets a `cx.observe` subscription, which is what makes
+  typing in a knob update the story on the same keystroke.
+  `selected_knob_values` then reads the *input* rather than the stored value
+  for text knobs — the input is the source of truth while it exists, so there
+  is no mirror to keep in sync. Applying a preset writes both, since that is
+  the one direction the input cannot learn about by itself.
+- Replay scheduling: `schedule_replay` spawns one `cx.spawn` loop for the
+  gallery's lifetime. Each iteration reads the delay *before* sleeping
+  (`replay_tick_delay`), so flipping the speed knob takes effect on the next
+  tick rather than at the end of a long sleep, then advances exactly one
+  event. The loop returns when the entity is gone (`update` returns `Err`),
+  which is the task's only exit — there is no cancel flag to keep in sync.
+  `replay_is_playing` gates on three things: the replay story is the selected
+  one, its `playing` knob is on, and the replay has not finished. Gating on
+  selection is what keeps a background replay from silently running to
+  completion while you are reading another story.
+- The knob-name const `PLAYING_KNOB`/`SPEED_KNOB` import is the only place the
+  gallery shell knows anything about a specific story; it is the price of
+  driving a story's animation from the shell's async task.
+
+### crates/harvester/src/gallery/chrome.rs
+
+The gallery's own screen, kept out of `main.rs` so state and layout stay
+separable. It is a sibling module of the crate root, which is why it can read
+`Gallery`'s private fields through accessors without those fields becoming
+`pub`.
+
+- Layout: the story sidebar spans the full window height; stage, dock, and
+  statusbar stack in a column to its right, so the dock and statusbar read as
+  controls *for the canvas*, not window-level chrome. `STORY_SIDEBAR_WIDTH`
+  (240) matches the app's sidebar exactly — the gallery should not invent a
+  second sidebar metric. `STAGE_MAX_WIDTH` (900)
+  caps the stage's content column so a component never stretches to a width no
+  real pane would give it. `DOCK_KNOBS_MAX_HEIGHT` (200) keeps the knob grid
+  from eating the stage when a story has eleven knobs (the prompt strip does);
+  the grid scrolls past that. `TEXT_KNOB_WIDTH` (220) is one text field.
+- `BOOL_ON_SLOT`/`BOOL_OFF_SLOT` are the two element-id slots a bool knob's
+  chip pair occupies; the ids are `(knob name, slot)` so they are unique
+  without a global counter. Bool knobs render as an explicit on/off pair
+  rather than one toggling chip because a single chip cannot show which state
+  it is *in* versus which state it *does*.
+- The chip is the gallery's one bespoke widget (there is no chip in `ui` and
+  inventing one for a dev tool would be a bad reason to grow the library);
+  its colors are theme slots only — `primary`/`primary_foreground` when
+  active, `secondary`/`border`/`muted_foreground` otherwise, with
+  `secondary_hover`/`secondary_active` (or `primary_active`) as the hover and
+  press fills so every chip answers the pointer instantly and without
+  animation. Vertical padding is `py_0p5`: chips are dense one-line controls
+  and the dock holds three rows of them.
+- Dock rows share one vertical rhythm: presets, the no-presets/no-knobs
+  captions, and the knob grid are all `px_3 py_1p5` under the shared section
+  header, so the dock's left edge and row spacing never jitter as stories
+  swap knob sets in and out.
+- The statusbar reports the story count, the selected `group · name`, and any
+  fixture failure, so a broken fixture is visible from every story, not only
+  from the one that needs it.
+
+### Recorded gaps
+
+- **Dialog stories are chrome only.** `dialog chrome` renders the
+  confirmation body, the button row and both inputs inline on the canvas; it
+  never calls `window.open_dialog`. That is deliberate (plan Q10a): the dialog
+  visual redesign is a follow-up, and it will be done *inside* the gallery,
+  against these stories. Modal behavior (focus, escape, the Root dialog stack)
+  is `modal.rs`'s business and is not what a component catalog is for.
+- **Light mode is blocked.** `ui/transcript.rs` memoizes its `TextViewStyle`
+  in a `OnceLock` with `is_dark: true` and a dark highlight theme, so a theme
+  toggle would leave the transcript rendering dark inside a light window. The
+  gallery is therefore dark-only for now (`shell_bootstrap` sets `Dark`), and
+  the fix and the gallery's theme toggle land together, later — a toggle that
+  half-works is worse than none in a tool whose job is to tell you what a
+  component looks like.
+
+## crates/harvester/src/lib.rs
+
+The lib target exists for exactly one reason: two binaries (`harvester` and
+`gallery`) share a component layer and a window bootstrap, and Cargo has no
+way to share modules between binaries other than a lib.
+
+What lives lib-side is only what both binaries need:
+
+- `ui` — the whole visual layer. It was already dependency-free with respect
+  to the rest of the crate (no `crate::` path in it pointed outside `ui`
+  before this split, and the only one added since is
+  `assets::GIT_BRANCH_ICON_PATH` for the prompt strip's branch indicator),
+  so moving it cost no rewiring.
+- `assets` — `HarvesterAssets` is the one `AssetSource` gpui accepts per
+  application, and both binaries install it.
+- `shell_bootstrap` — the shared application/window start-up.
+
+Everything else stays declared on the bin side (`main.rs`): `chat`,
+`workbench`, `dialogs`, `store`, `catalog`, `session_state`, `models`,
+`modal`, `workspaces`, `desktop_shell`. Those are the *application*, not a
+component library; the gallery must not be able to reach them, and keeping
+them bin-side is what enforces that.
+
+`main.rs` re-exports the two lib modules at the bin crate root
+(`pub use harvester::{assets, ui};`) so every existing `crate::ui::…` /
+`crate::assets::…` path in the app keeps resolving. This is deliberate: the
+alternative was rewriting several hundred import paths for no behavioral
+gain. The re-export is not a compatibility shim to be removed later — the
+app's modules genuinely treat `ui` as part of its own crate root, and the
+lib boundary is a packaging fact, not a layering statement.
+
+`build.rs` is unaffected by the split: it writes `harvesterd` into `OUT_DIR`
+once per *package*, and only `main.rs` reads it (`include_bytes!`). The lib
+and the gallery bin never touch it.
+
 ## crates/harvester/src/main.rs
 
 Harvester's desktop-client entry point (see docs/SPEC.md).
@@ -445,6 +825,10 @@ Harvester's desktop-client entry point (see docs/SPEC.md).
   been built first — `daemon_binary()` then falls back to reading
   `DEV_DAEMON_PATH` off disk (relative to the repo-root cwd of
   `cargo run -p harvester`) instead of failing outright.
+- `pub use harvester::{assets, ui};` is the bin crate root adopting the two
+  lib modules under the paths the app already uses (`crate::ui`,
+  `crate::assets`). See the `lib.rs` section for why the split exists and why
+  this re-export is the intended shape rather than a migration step.
 
 ## crates/harvester/src/modal.rs
 
@@ -598,6 +982,54 @@ else.
   machine to run on and a cwd to run in.
 - `session_name_from_prompt`: derives pi's `--name` from the first
   non-blank line of the first prompt, truncated to `SESSION_NAME_MAX_CHARS`.
+
+## crates/harvester/src/shell_bootstrap.rs
+
+Everything about starting a gpui application that is true for *any*
+Harvester window, hoisted out of `desktop_shell.rs` when the gallery binary
+needed the same start-up. Lib-side, because both binaries call it.
+
+Contract: `run_desktop_shell(shell_window, build_root_view)` never returns
+(it hands control to gpui's run loop) and does, in order: start
+`gpui_platform::application()` with `HarvesterAssets`, install the widget
+layer, install the app commands, then open one window whose root view the
+caller builds.
+
+- `ShellWindow { title, width_in_pixels, height_in_pixels }` is the entire
+  per-binary window parameterization. Bounds are always
+  `Bounds::centered`; a caller that ever needs a non-centered or
+  restored-from-disk window should extend this struct rather than reach
+  around the bootstrap.
+- `build_root_view: FnOnce(&mut Window, &mut App) -> AnyView` returns an
+  `AnyView`, not a concrete view type, deliberately: it keeps the bootstrap
+  free of any generic view parameter and keeps app-only types
+  (`Workbench`) invisible to the lib. The bootstrap wraps whatever comes
+  back in `Root` itself, so no caller can forget to — `Root` is what makes
+  modals, notifications and the dialog stack work at all (see `modal.rs`).
+- `actions!(harvester, [Quit])` lives here now. The action's namespace stays
+  `harvester` for both binaries: an action namespace is a keymap identity,
+  and the gallery is the same application wearing a different root view.
+- Fonts are not resolved here. Both font families (UI and monospace) are
+  theme slots set by `ui/theme.rs`, applied by `install_widget_layer`; the
+  old fc-match subprocess and its `OnceLock` were deleted when the theme
+  gained explicit font slots.
+- `install_widget_layer`: `gpui_component::init` must run before any other
+  call into the library. The library also hardcodes light mode on init, so
+  dark mode is set explicitly immediately after, and then
+  `ui::install_graphite_theme` replaces the library's neutral dark palette
+  with Harvester's own (see `ui/theme.rs`). `Theme::sync_system_appearance`
+  is deliberately never called — nothing observes the desktop's OS-level
+  appearance, which is what keeps Harvester pinned to dark mode even on a
+  light-mode system. The gallery inherits this, which is why it is dark-only
+  too.
+- `install_application_commands`: installs the app-level Quit action under
+  both `ctrl-q` and `cmd-q` so one build behaves natively on both Linux (ctrl)
+  and macOS (cmd) without a platform-conditional binary. `gpui-component`
+  itself owns the Input/Table/List/Menu context keybindings, so this function
+  only needs to add the one app-level action.
+- `open_shell_window` treats a failed `open_window` as fatal: there is no
+  second window to fall back to, so it reports on stderr and quits rather
+  than leaving a running application with nothing on screen.
 
 ## crates/harvester/src/store.rs
 
@@ -753,12 +1185,18 @@ everything else in `ui` should ask for a `Tone`/`Dot`, never a raw `Hsla`.
   have. `Dot::tone()` extracts the tone for text a dot's row/link should match.
   `status_dot` is the single dot implementation shared by machine links,
   session liveness, and tool status.
-- `use_mono_font_family` / `mono_font_family` / `MONO_FONT_FAMILY`: gpui
-  matches font families by exact name, so the application resolves the
-  system's monospace family once at startup (via `desktop_shell`, which shells
-  out to `fc-match`) rather than having a rendering module spawn a subprocess
-  itself. `mono_font_family()` falls back to `"Menlo"` if the app never called
-  the setter (e.g. in tests).
+- `disclosure_chevron` is the one expand/collapse marker for the whole app
+  (section headers, tool blocks): `ChevronDown` when expanded, `ChevronRight`
+  when collapsed, at `CHEVRON_SIZE` (12px — the `text_xs` line so it sits
+  optically centered next to a small-caps or `text_xs` label). It is an
+  `Icon`, not a text glyph, because glyph chevrons sit on the text baseline
+  and visibly misalign against icons elsewhere in the same row; color still
+  comes from the ambient text style, so callers keep tinting it with
+  `faint()` for free.
+- `mono_font_family(cx)`: reads the theme's `mono_font_family` slot
+  ("Geist Mono", set in `ui/theme.rs`) so every mono run in the app agrees
+  with gpui-component's own widgets. No startup resolution, no fallback
+  logic — the theme is the single owner of font names.
 
 ## crates/harvester/src/ui/dialog.rs
 
@@ -834,13 +1272,26 @@ re-exports exist to keep a stable `ui::…` import path for screen-level callers
 while the implementation stays split across cohesive modules (`core`,
 `dialog`, `note`, `prompt`, `shell`, `sidebar`, `tool_block`, `transcript`)
 rather than one broad file. Only names a *screen* calls are re-exported: a builder
-used solely by other `ui` modules (`status_dot`, `section_header`) is reached
-through `super::core` / kept private to its module instead, so the flat `ui::`
-surface stays a list of what the screens actually draw with.
+used solely by other `ui` modules (`section_header`) is reached through
+`super::core` / kept private to its module instead, so the flat `ui::`
+surface stays a list of what the screens actually draw with. `status_dot` is
+the one exception the gallery bought: it is still called by no screen
+directly (screens reach it through `sidebar_stacked_row`), but a component
+catalog has to be able to render the dot on its own, and the gallery is a
+screen in every sense that matters here.
 `dialog` is the one submodule declared `pub mod` instead of being re-exported
 flat: its names are generic on purpose (`open_text`, `button_row`,
 `action_button`), and they only read correctly qualified as
 `ui::dialog::open_text`.
+
+`ui` lives on the lib side of the crate (see the `lib.rs` section) so the
+`harvester` and `gallery` binaries share one copy. That makes this flat
+re-export surface the gallery's catalog as well as the app's import path:
+anything a story renders must be exported here. `prompt_strip` and its value
+types (`PromptStrip`, `PromptStripControl`, `PromptStripHandlers`,
+`PromptStripNotice`) are the first composite — not a primitive but a whole
+assembled strip — and the rule that only names a *screen* calls get
+re-exported still holds, since the chat screen calls exactly that one.
 
 ## crates/harvester/src/ui/note.rs
 
@@ -875,15 +1326,30 @@ The agent prompt card and its in-place model/machine controls.
   `PROMPT_BOX_BORDER_OPACITY` (0.5) fades the resting border while focus still
   gets the full theme ring; `DROPDOWN_MAX_HEIGHT` (280) caps an open dropdown
   so a long model list scrolls inside the window instead of overflowing it;
-  `DROPDOWN_MIN_WIDTH` (200) keeps short-label dropdowns (e.g. a two-word
-  model name) from opening as a sliver under a wide trigger;
-  `DROPDOWN_CHECK_WIDTH` (12) is a fixed check-mark gutter so picked/unpicked
-  row labels stay aligned; `SEND_BUTTON_SIZE` (22) is the round send button's
-  diameter; `PROMPT_CONTROL_MAX_WIDTH` (220) stops one long model/repo name
-  from pushing the other prompt-strip controls off the row.
-- `prompt_box_controls()`: controls sit `gap_4` apart deliberately — wide
-  enough that each icon reads as the prefix of the label to its right, which
-  is what visually separates the controls instead of a rule or middle dot.
+  `DROPDOWN_MAX_WIDTH` (360) caps how far one pathological row label can
+  stretch the popover — below the cap the popover fits its widest row exactly
+  (no minimum width; short lists open as narrow as their content);
+  `DROPDOWN_CHECK_WIDTH` (12) is a fixed check-mark gutter *trailing* the
+  label (label takes `flex_1`, so the mark sits at the row's right edge) —
+  reserved on every row, picked or not, so the content-sized popover cannot
+  change width when the selection moves; the mark itself is the `Check` icon
+  at gutter size, not a text glyph, so it centers in the gutter instead of
+  sitting on the baseline; `SEND_BUTTON_SIZE` (22) is the round send button's diameter
+  and `SEND_ICON_SIZE` (13) its `ArrowUp` icon; `TRIGGER_CHEVRON_SIZE` (12)
+  is the dropdown trigger's `ChevronDown`, a separate flex child rather than
+  a glyph appended to the label so truncation ellipsizes the label but never
+  eats the affordance; `PROMPT_CONTROL_MAX_WIDTH` (220) stops one long
+  model/repo name from pushing the other prompt-strip controls off the row.
+- `prompt_box` carries `shadow_md` on top of its fill and border: in the
+  graphite ladder the prompt is a raised input well over the canvas, and the
+  shadow is what separates it from the transcript behind it once the border
+  fades to half opacity at rest.
+- `prompt_box_controls()`: `pl_1p5` + each control's own `px_1p5` lands the
+  control text at the same 12px inset as the input above; `pr_3` keeps the
+  send button on that inset directly (it has no pill padding). Controls sit
+  `gap_2` apart — with the pill paddings that reads as ~20px between
+  pickers, enough that each picker's icon/label/chevron cluster reads as one
+  unit and the hover fill defines each control's extent.
 - `DropdownRow.selected`: the choice already in effect, carries the check
   mark. `DropdownRow.divider_above`: a rule above a row meaning what follows
   belongs to a different group than what precedes it (e.g. the repo picker's
@@ -895,23 +1361,95 @@ The agent prompt card and its in-place model/machine controls.
   to satisfy the trait bound.
 - `prompt_box_dropdown`: anchors `BottomLeft` and opens upward deliberately —
   the prompt box sits at the bottom of the pane, so a downward-opening list
-  would run past the window edge and snap back over its own trigger.
+  would run past the window edge and snap back over its own trigger. The
+  `Popover` itself takes a style refinement (`p_1` + `border_color:
+  secondary_active`): gpui-component's default popover chrome pads `p_3`,
+  which read as dead space around three short rows, and `refine_style` runs
+  after `popover_style()` so the refinement wins. The brighter border is the
+  elevation rule — a floating overlay gets a border one ladder step above the
+  hairline used for in-flow panels. The rows' rounded hover fill floats
+  inside that 4px edge; rows add a press fill (`secondary_hover`) one step
+  above their `accent` hover. Do not use `appearance(false)` here: it drops
+  the bg/shadow wholesale, and dismissal is governed by `overlay_closable`
+  (default true) despite what the library doc comment says.
 - `prompt_box_control`'s icon is given neither an explicit size nor color:
   `Icon` falls back to the ambient text style (this control's own `text_xs`
   and muted color), so the glyph and its label always match without a second
-  set of tokens. Hover only recolors the label text (resolved after layout),
-  leaving the icon as the quiet, stable marker of *which* control this is.
+  set of tokens. The control is a pill (`px_1p5 py_0p5 rounded_md`, inner
+  `gap_1p5` between icon, label and chevron): enabled triggers get a hover
+  fill (`secondary`) plus brighter text and a press fill (`secondary_hover`)
+  on pointer-down — `secondary`, not `accent`, because the pill sits on the
+  input well and `accent` is *darker* than the well, which made the old hover
+  dim instead of lift; the disabled branch shares the same padding so enabled
+  and disabled controls stay pixel-aligned on the row.
 - `prompt_box_send`'s `enabled` flag is a look, not a guard: a chat with no
   machine or repository selected refuses the prompt inside its own state
   machine; the send button's disabled rendering is just how the strip
   communicates that *before* the user starts typing.
 
+### `PromptStrip` — the whole bottom row as one value
+
+The `prompt_box*` builders above are the pieces; `prompt_strip` is the
+assembled bottom row, and it is the only thing `chat.rs` calls. The point of
+the split is that the strip is now renderable from a plain value with no
+`Chat`, no store and no session behind it — which is what lets the gallery
+render it in every state, and what makes "what does this strip look like
+when models failed to load" a question with one answer instead of three.
+
+- `PromptStripControl { label, enabled, rows }` is one shape for all three
+  dropdown controls. `enabled` is the caller's gating decision (see
+  `chat.rs`); `rows` are already built (`DropdownRow`), never a closure.
+- `PromptStrip` fields: `notice`, `model`, `machine`, `repo`, `branch`
+  (`None` when there is nothing to report), `can_send`, `focused`. Nothing
+  here is an `Entity`, a `Window` or a callback — the one live handle
+  `prompt_strip` takes is the `&Entity<InputState>` for the text box, which
+  gpui owns and cannot be reduced to a value.
+- `PromptStripNotice` is the short-circuit: `SessionStarting` (the session is
+  being created, there is nothing to type into yet) and
+  `SessionExited(detail)` (pi is gone; the detail is the state machine's own
+  wording). `Some(notice)` replaces the entire prompt box with one
+  `inline_note(Tone::Idle, …)`. Modeling this as an enum inside the strip —
+  rather than leaving the caller to choose between two render calls — is what
+  makes the bottom row a single render path, so a caller cannot draw a notice
+  and a prompt box at the same time or drift on the tone. `SESSION_STARTING_NOTICE`
+  ("Starting session…") is a const here for the same reason: the wording is
+  presentation, and the state machine has no business owning it.
+- `PromptStripHandlers::new(pick_model, pick_machine, pick_repo, send)`. The
+  three pickers take gpui's `Fn(usize, &mut Window, &mut App)` — the index is
+  into that control's own `rows`, the same shape `prompt_box_dropdown` takes,
+  so no adaptation happens in between. `send` is `Fn(&mut Window, &mut App)`:
+  the click event carries nothing a caller needs, and dropping it keeps
+  `gpui::ClickEvent` out of the handler surface. Fields are private with a
+  constructor so a caller passes closures rather than boxing four of them by
+  hand.
+- Element-id consts (`MODEL_CONTROL_ID` = `"chat-model"`,
+  `MODEL_DROPDOWN_ID` = `"chat-model-dropdown"`, and the machine/repo/branch/
+  send counterparts) moved here with the render code and kept their original
+  `chat-*` names: element ids are identity within one rendered tree, so the
+  names cost nothing, and keeping them byte-identical is what made the
+  extraction verifiable as a pure refactor. A second strip in the same window
+  would need ids parameterized; nothing has needed that yet.
+- `dropdown_control` is the shared tail for all three controls: a control
+  that is disabled *or* has no rows renders as the bare label rather than an
+  openable-but-empty dropdown. One function, so "disabled or empty means no
+  popover" cannot be decided three different ways.
+- `branch_indicator` reaches for `assets::GIT_BRANCH_ICON_PATH` directly — it
+  is the only place in `ui` that names an asset path, and it is why `assets`
+  and `ui` had to land on the same side of the lib/bin split.
+
 ## crates/harvester/src/ui/shell.rs
 
 Window chrome that is not the prompt, the transcript, or a modal: section
-headers, the chat pane's header, and the statusbar frame.
+headers, the chat pane's header, and the statusbar frame. The chrome rhythm
+is deliberately tight (`pt_2` section headers, `py_1p5` chat header): the
+chrome frames the content, it never competes with it for height.
 
-- `STATUSBAR_HEIGHT` (26px): the fixed statusbar band. Tall enough for one
+Wording convention, app-wide: user-visible text is sentence case
+("Loading models…", "No sessions yet", "Session exited…"). Lowercase is
+reserved for identifiers (tool names, branch names, model ids) and the
+gallery's knob/preset vocabulary, which mirrors code.
+
+- `STATUSBAR_HEIGHT` (24px): the fixed statusbar band. Tall enough for one
   line of `text_xs` with breathing room, short enough that it reads as a
   status strip rather than a second toolbar.
 - `collapsible_section` is the whole disclosure control — header, chevron and
@@ -920,12 +1458,14 @@ headers, the chat pane's header, and the statusbar frame.
   three pieces (the sidebar did it twice, identically). It takes `expanded`
   (not `collapsed`) so the parameter reads the same way as the glyph it
   selects, plus the caller's own click listener; the collapse *state* stays
-  with the screen that owns it, since `ui` holds no state.
-- `section_header` and `section_chevron` are private for that reason: they are
-  halves of `collapsible_section`, and a caller reaching for either one alone
-  would be building a disclosure control that cannot disclose. The chevron is
-  a text glyph (`▾`/`▸`) rather than an icon asset so it inherits the header's
-  own faint color and text size for free.
+  with the screen that owns it, since `ui` holds no state. The header text
+  brightens in two steps — `faint` at rest, `dim` on hover, full foreground
+  on press — so the disclosure answers pointer-down like every other control.
+- `section_header` is private for that reason: it is half of
+  `collapsible_section`, and a caller reaching for it alone would be building
+  a disclosure control that cannot disclose. The chevron is the shared
+  `disclosure_chevron` icon from `core.rs`, which inherits the header's faint
+  color from the ambient text style.
 
 ## crates/harvester/src/ui/sidebar.rs
 
@@ -956,11 +1496,65 @@ means belong to `workbench/sidebar.rs`.
 - `sidebar_empty_note` is the "no sessions yet" line. It is a plain note, not
   a row: an empty list has nothing to select, so it must not look clickable.
 
+## crates/harvester/src/ui/theme.rs
 
+Harvester's palette — "Graphite Dark", a cool near-monochrome (every surface
+is the same hue-240/5%-saturation gray at a different lightness) replacing
+`gpui-component`'s pure-neutral dark theme. Installed by
+`shell_bootstrap::install_widget_layer` right after `Theme::change(Dark)`.
+
+- It ships as a `ThemeConfig` applied via `Theme::apply_config`, *not* as
+  field-by-field mutation of `Theme::global_mut`, because `apply_config` is
+  what derives every slot we don't specify (button variants, tokens like
+  `list_hover`, table colors) from the ones we do. Mutating colors directly
+  would leave `ThemeTokens` stale. The config is also stored back into
+  `theme.dark_theme`, so any future `Theme::change(Dark)` re-applies graphite
+  instead of reverting to the library default — and the eventual light theme
+  slots in beside it as a second config.
+- The lightness consts are an elevation ladder, darkest = furthest back:
+  `CHROME` 7% (sidebar, title bar, status bar, control dock),
+  `CANVAS` 9% (content background), `SURFACE` 12% (popovers, tool-call
+  cards, story panels), `HOVER` 14% (row hover fill), `INPUT_WELL` 15%
+  (prompt box fill and input borders — the `input` slot serves both roles in
+  the library), `RAISED` 16% (chips, message bubbles, `muted`/`secondary`),
+  then `RAISED_HOVER` 19% / `RAISED_ACTIVE` 22% for interaction states.
+  Depth comes from this ladder plus hairline borders, not from decoration.
+- Borders: `HAIRLINE` 18% against content surfaces, `CHROME_HAIRLINE` 13%
+  where chrome meets chrome (sidebar/status-bar edges, window border) —
+  chrome is darker, so its separators must be too or they read as lines
+  instead of edges. `EDGE` 30% is the "visibly outlined" tier: the selected
+  list row's border and the text-selection fill (selection stays monochrome
+  on purpose; the default theme's blue selection was the one saturated
+  surface in an otherwise gray app).
+- Text: `TEXT_BRIGHT` 94% and `TEXT_DIM` 63%; the third (faint) tier remains
+  `core.rs`'s `IDLE_OPACITY` over `TEXT_DIM`. `PRIMARY` stays near-white
+  (93%, hover 97%, press 86%) — filled controls are light-on-graphite, and
+  status color keeps coming exclusively from `Tone`.
+- `CONTROL_RADIUS` 6 / `PANEL_RADIUS` 10: controls stay tight, large
+  surfaces (dialogs, notifications) round more — the density lives in
+  spacing, not in sharp corners.
+- `UI_FONT` "Inter" / `MONO_FONT` "Geist Mono": both set as theme slots
+  (`font_family`, `mono_font_family`) so `Root` styles the whole window and
+  gpui-component widgets agree with our own mono runs (`core.rs` reads the
+  slot back). gpui matches families by exact name; if a family is missing,
+  the platform text system substitutes, so a machine without these installed
+  degrades instead of failing.
+
+## crates/harvester/src/ui/tool_block.rs
 
 Reusable visual primitives (frame, typography, status treatment) for one
 transcript tool-call block; tool-specific labeling and body policy live in
 `transcript.rs` instead, keeping this module purely presentational.
+
+- `block` renders on the `popover` slot with a hairline border and
+  `shadow_sm`: in the graphite elevation ladder a tool card is a raised
+  surface over the canvas (it was previously the `sidebar` slot, which the
+  graphite ladder repurposed as the *darkest* tier — keeping it would have
+  sunk the cards below their page). The header chevron is
+  `core::disclosure_chevron`, tinted `faint` like every disclosure marker.
+- The header has both a hover fill (`list_hover`) and a press fill (`muted`):
+  press feedback lands on pointer-down, matching every other clickable
+  surface in the app.
 
 ## crates/harvester/src/ui/transcript.rs
 
@@ -991,6 +1585,16 @@ wrong block.
   (`OnceLock`) rather than repeatedly.
 - `render_message`: user text is rendered verbatim (never markdown); only
   Pi's own prose goes through the markdown renderer.
+- `message_frame` renders chat-app style with no author labels: the roles
+  are told apart by shape alone. User messages are a filled bubble (`muted`
+  bg, `px_3 py_2`, rounded) floated right (`justify_end`) and capped at
+  `USER_BUBBLE_MAX_WIDTH` (70% of the pane) so they read as "sent"; the
+  agent's prose flows flush left at full width with no padding of its own.
+  Every body sets `line_height(relative(MESSAGE_LINE_HEIGHT))` (1.7):
+  `TextViewStyle` has no line-height field, but gpui text style inherits, so
+  the wrapper is where transcript leading is set for both plain text and
+  markdown. With the "pi" label gone, `render_failure` carries its
+  `Tone::Failed` color on the text itself.
 - `render_failure`: a failed turn is Pi-authored but intentionally *not*
   rendered as markdown, because provider error strings must preserve literal
   `*` and `#` characters rather than have them interpreted as formatting.

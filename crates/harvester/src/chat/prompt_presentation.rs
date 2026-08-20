@@ -5,11 +5,11 @@ use crate::models::ModelChoice;
 use crate::session_state::{ModelSelection, ModelsState};
 use crate::workspaces::folder_name;
 
-pub(super) const DEFAULT_MODEL_ROW: &str = "default (pi chooses)";
+pub(super) const DEFAULT_MODEL_ROW: &str = "Default (pi chooses)";
 pub(super) const ADD_REPO_ROW: &str = "Add new…";
-pub(super) const NO_MACHINE_LABEL: &str = "no machines";
-pub(super) const CHOOSE_MACHINE_LABEL: &str = "choose machine";
-pub(super) const CHOOSE_REPO_LABEL: &str = "choose repository";
+pub(super) const NO_MACHINE_LABEL: &str = "No machines";
+pub(super) const CHOOSE_MACHINE_LABEL: &str = "Choose machine";
+pub(super) const CHOOSE_REPO_LABEL: &str = "Choose repository";
 
 pub(super) fn model_control_state(
     selection: &ModelSelection,
@@ -23,12 +23,12 @@ pub(super) fn model_control_state(
             (choice.name.clone().into(), choices_available)
         }
         ModelSelection::LaunchDefault => match models {
-            ModelsState::Loading => ("loading models…".into(), false),
-            ModelsState::Loaded(_) => ("default model".into(), true),
-            ModelsState::NotRequested | ModelsState::Failed(_) => ("default model".into(), false),
+            ModelsState::Loading => ("Loading models…".into(), false),
+            ModelsState::Loaded(_) => ("Default model".into(), true),
+            ModelsState::NotRequested | ModelsState::Failed(_) => ("Default model".into(), false),
         },
-        ModelSelection::LivePending => ("model".into(), choices_available),
-        ModelSelection::LiveUnavailable => ("model unavailable".into(), choices_available),
+        ModelSelection::LivePending => ("Model".into(), choices_available),
+        ModelSelection::LiveUnavailable => ("Model unavailable".into(), choices_available),
     }
 }
 
@@ -87,7 +87,7 @@ mod tests {
         let (label, enabled) =
             model_control_state(&ModelSelection::LaunchDefault, &ModelsState::Loading, &[]);
 
-        assert_eq!(label, "loading models…");
+        assert_eq!(label, "Loading models…");
         assert!(!enabled);
     }
 
@@ -100,7 +100,7 @@ mod tests {
             &choices,
         );
 
-        assert_eq!(label, "default model");
+        assert_eq!(label, "Default model");
         assert!(enabled);
     }
 
@@ -112,7 +112,7 @@ mod tests {
             &[],
         );
 
-        assert_eq!(label, "default model");
+        assert_eq!(label, "Default model");
         assert!(!enabled);
     }
 
@@ -150,8 +150,8 @@ mod tests {
             &choices,
         );
 
-        assert_eq!(pending_label, "model");
-        assert_eq!(unavailable_label, "model unavailable");
+        assert_eq!(pending_label, "Model");
+        assert_eq!(unavailable_label, "Model unavailable");
     }
 
     #[test]

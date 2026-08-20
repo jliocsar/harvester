@@ -316,7 +316,7 @@ Cutting to one harness and one platform deletes most of the earlier abstraction 
 15. Is `tool_execution_update` emitted for all built-in tools or only streaming ones (docs only exemplify `bash`)?
 16. `toolcall_start` per provider: are tool `id`/`name` populated at start or only at end? Read from `partial.content[contentIndex]`.
 17. Copying `~/.pi/agent/auth.json` between machines for OAuth creds: device-binding? refresh races across N VMs? NOT DOCUMENTED. (Moot if the LLM gateway works.)
-18. ~~Version pinning~~ **RESOLVED (smoke test): image ships pi 0.83.0 — exactly the version this research is pinned to.**
+18. ~~Version pinning~~ **RESOLVED (smoke test): image ships pi 0.83.0 — exactly the version this research is pinned to.** **STALE as of 2026-08-18: fresh exeuntu VMs ship pi 0.84.2; `exeuntu update pi --version 0.83.0` pins back cleanly (used for the fixture capture). See §Watch below.**
 
 ## Watch: pi protocol v2 (upstream, experimental)
 
@@ -325,6 +325,8 @@ Cutting to one harness and one platform deletes most of the earlier abstraction 
 Implications: this smells like a future pi server/daemon mode. If it ships, harvesterd may shrink to a bootstrapper and the Harvester envelope migrates to it — the client's pi-event rendering survives unchanged (we pass pi payloads through verbatim by design). Re-check on every pi release; do not adopt while experimental.
 
 ## Watch: pi main wire changes (unreleased, WILL land in the next release)
+
+**Update 2026-08-18 (fixture-capture session): this is no longer hypothetical — fresh exeuntu VMs now ship pi 0.84.2.** Any new VM runs the post-0.83 wire unless pinned back (`exeuntu update pi --version 0.83.0`, verified working). Before harvester adopts 0.84.x, verify against a live 0.84.2 stream whether `message_update` really lost its cumulative `partial` (below) and re-run the `--session-id`/stdin-close checks. Until then, pin every VM harvester touches to 0.83.0.
 
 Verified 2026-08-04 against the pi checkout at `main` (= the 0.83.0 release plus ~212 unreleased commits; `packages/coding-agent/package.json` still reads 0.83.0):
 

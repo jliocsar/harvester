@@ -1,14 +1,12 @@
 mod prompt_presentation;
 
 use gpui::{
-    div, prelude::*, px, AnyElement, App, Context, Entity, EventEmitter, Focusable, ScrollHandle,
-    SharedString, Subscription, Window,
+    div, prelude::*, px, App, Context, Entity, EventEmitter, Focusable, ScrollHandle, SharedString,
+    Subscription, Window,
 };
-use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::{Icon, IconName};
+use gpui_component::input::{InputEvent, InputState};
 use serde_json::Value;
 
-use crate::assets::GIT_BRANCH_ICON_PATH;
 use crate::models::ModelChoice;
 use crate::session_state::{self, ModelSelection, ModelsState, SessionPhase, SessionState};
 use crate::store::{FleetStore, StoreEvent};
@@ -119,7 +117,7 @@ impl Chat {
                 self.fail_pending_requests(detail.clone(), cx)
             }
             BridgeEvent::Disconnected if self.runs_on(machine) => {
-                self.fail_pending_requests("connection lost".to_string(), cx)
+                self.fail_pending_requests("Connection lost".to_string(), cx)
             }
             BridgeEvent::RequestFailed { .. } if self.runs_on(machine) => {
                 if self.state.fail_start() {
@@ -450,7 +448,7 @@ impl Chat {
 
     fn unstarted_subtitle(&self, cx: &Context<Self>) -> SharedString {
         if !self.state.target().is_resolved() {
-            return "pick a machine and a repository below".into();
+            return "Pick a machine and a repository below".into();
         }
 
         format!(
@@ -478,54 +476,65 @@ impl Chat {
     }
 
     fn render_bottom_row(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let row = div().flex_none().px_3().pb_3();
-        let notice = match (self.state.exited_notice(), self.state.phase()) {
-            (Some(notice), _) => Some(notice.to_string()),
-            (None, SessionPhase::Starting { .. }) => Some("starting session…".to_string()),
-            (None, _) => None,
-        };
-
-        if let Some(notice) = notice {
-            return row.child(ui::inline_note(Tone::Idle, notice, cx));
-        }
-
-        let input_focused = self.input.read(cx).focus_handle(cx).is_focused(window);
-
-        row.child(self.render_prompt_box(input_focused, cx))
-    }
-
-    fn render_prompt_box(&self, input_focused: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        let unstarted = matches!(self.state.phase(), SessionPhase::Unstarted);
-        let (model_label, model_enabled) = self.model_control_state();
-        let can_send = !unstarted || self.state.target().is_resolved();
-
-        ui::prompt_box(input_focused, cx)
-            .child(ui::prompt_box_input(
-                Input::new(&self.input).appearance(false).p_0(),
-            ))
-            .child(
-                ui::prompt_box_controls()
-                    .child(self.render_model_control(model_label, model_enabled, cx))
-                    .child(self.render_machine_control(unstarted, cx))
-                    .child(self.render_repo_control(unstarted, cx))
-                    .children(self.render_branch_indicator(cx))
-                    .child(div().flex_1())
-                    .child(ui::prompt_box_send("chat-send", can_send, cx).on_click(
-                        cx.listener(|chat, _, window, cx| chat.submit_prompt(window, cx)),
-                    )),
-            )
-    }
-
-    fn render_branch_indicator(&self, cx: &App) -> Option<impl IntoElement> {
-        let branch: SharedString = self.state.branch()?.to_string().into();
-
-        Some(ui::prompt_box_control(
-            "chat-branch",
-            Icon::default().path(GIT_BRANCH_ICON_PATH),
-            branch,
-            false,
+        let model_picks = self.model_picks();
+        let machine_candidates = self.machine_candidates(cx);
+        let repo_candidates = self.repo_candidates(cx);
+        let strip = self.prompt_strip(
+            &model_picks,
+            &machine_candidates,
+            &repo_candidates,
+            window,
             cx,
-        ))
+        );
+        let handlers = create_prompt_strip_handlers(
+            cx.entity(),
+            model_picks,
+            machine_candidates,
+            repo_candidates,
+        );
+
+        ui::prompt_strip(strip, handlers, &self.input, cx)
+    }
+
+    fn prompt_strip(
+        &self,
+        model_picks: &[Option<ModelChoice>],
+        machine_candidates: &[MachineCandidate],
+        repo_candidates: &[String],
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> ui::PromptStrip {
+        ui::PromptStrip {
+            notice: self.prompt_strip_notice(),
+            model: self.model_control(model_picks),
+            machine: self.machine_control(machine_candidates, cx),
+            repo: self.repo_control(repo_candidates),
+            branch: self.branch_label(),
+            can_send: self.can_send(),
+            focused: self.input.read(cx).focus_handle(cx).is_focused(window),
+        }
+    }
+
+    fn prompt_strip_notice(&self) -> Option<ui::PromptStripNotice> {
+        match (self.state.exited_notice(), self.state.phase()) {
+            (Some(notice), _) => Some(ui::PromptStripNotice::SessionExited(
+                notice.to_string().into(),
+            )),
+            (None, SessionPhase::Starting { .. }) => Some(ui::PromptStripNotice::SessionStarting),
+            (None, _) => None,
+        }
+    }
+
+    fn is_unstarted(&self) -> bool {
+        matches!(self.state.phase(), SessionPhase::Unstarted)
+    }
+
+    fn can_send(&self) -> bool {
+        !self.is_unstarted() || self.state.target().is_resolved()
+    }
+
+    fn branch_label(&self) -> Option<SharedString> {
+        Some(self.state.branch()?.to_string().into())
     }
 
     fn model_control_state(&self) -> (SharedString, bool) {
@@ -536,14 +545,9 @@ impl Chat {
         )
     }
 
-    fn render_model_control(
-        &self,
-        label: SharedString,
-        enabled: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let picks = self.model_picks();
-        let rows: Vec<ui::DropdownRow> = picks
+    fn model_control(&self, picks: &[Option<ModelChoice>]) -> ui::PromptStripControl {
+        let (label, enabled) = self.model_control_state();
+        let rows = picks
             .iter()
             .map(|pick| ui::DropdownRow {
                 label: model_row_label(pick.as_ref()),
@@ -551,35 +555,26 @@ impl Chat {
                 divider_above: false,
             })
             .collect();
-        let chat = cx.entity();
 
-        render_dropdown_control(
-            "chat-model",
-            "chat-model-dropdown",
-            Icon::new(IconName::Bot),
+        ui::PromptStripControl {
             label,
             enabled,
             rows,
-            move |index, _, cx| {
-                let Some(pick) = picks.get(index).cloned() else {
-                    return;
-                };
-
-                chat.update(cx, |chat, cx| chat.pick_model(pick, cx));
-            },
-            cx,
-        )
+        }
     }
 
-    fn render_machine_control(&self, unstarted: bool, cx: &mut Context<Self>) -> AnyElement {
-        let candidates = self.machine_candidates(cx);
+    fn machine_control(
+        &self,
+        candidates: &[MachineCandidate],
+        cx: &Context<Self>,
+    ) -> ui::PromptStripControl {
         let label = machine_control_label(
             &self.state.target().machine,
             &self.machine_label(cx),
-            &candidates,
+            candidates,
         );
-        let enabled = unstarted && !candidates.is_empty();
-        let rows: Vec<ui::DropdownRow> = candidates
+        let enabled = self.is_unstarted() && !candidates.is_empty();
+        let rows = candidates
             .iter()
             .map(|candidate| ui::DropdownRow {
                 label: candidate.label.clone().into(),
@@ -587,35 +582,18 @@ impl Chat {
                 divider_above: false,
             })
             .collect();
-        let keys: Vec<String> = candidates
-            .into_iter()
-            .map(|candidate| candidate.key)
-            .collect();
-        let chat = cx.entity();
 
-        render_dropdown_control(
-            "chat-machine",
-            "chat-machine-dropdown",
-            Icon::new(IconName::HardDrive),
+        ui::PromptStripControl {
             label,
             enabled,
             rows,
-            move |index, _, cx| {
-                let Some(machine) = keys.get(index).cloned() else {
-                    return;
-                };
-
-                chat.update(cx, |chat, cx| chat.pick_machine(machine, cx));
-            },
-            cx,
-        )
+        }
     }
 
-    fn render_repo_control(&self, unstarted: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn repo_control(&self, repos: &[String]) -> ui::PromptStripControl {
         let path = &self.state.target().workspace_path;
         let label = repo_control_label(path);
-        let enabled = unstarted && !self.state.target().machine.is_empty();
-        let repos = self.repo_candidates(cx);
+        let enabled = self.is_unstarted() && !self.state.target().machine.is_empty();
         let mut rows: Vec<ui::DropdownRow> = repos
             .iter()
             .map(|repo| ui::DropdownRow {
@@ -631,25 +609,11 @@ impl Chat {
             divider_above: !repos.is_empty(),
         });
 
-        let chat = cx.entity();
-
-        render_dropdown_control(
-            "chat-repo",
-            "chat-repo-dropdown",
-            Icon::new(IconName::Folder),
+        ui::PromptStripControl {
             label,
             enabled,
             rows,
-            move |index, _, cx| {
-                let picked = repos.get(index).cloned();
-
-                chat.update(cx, |chat, cx| match picked {
-                    Some(repo) => chat.select_repo(repo, cx),
-                    None => chat.add_repo(cx),
-                });
-            },
-            cx,
-        )
+        }
     }
 
     fn render_unstarted_body(&self, cx: &App) -> impl IntoElement {
@@ -668,23 +632,47 @@ impl Chat {
     }
 }
 
-fn render_dropdown_control(
-    control_id: &'static str,
-    dropdown_id: &'static str,
-    icon: Icon,
-    label: SharedString,
-    enabled: bool,
-    rows: Vec<ui::DropdownRow>,
-    on_pick: impl Fn(usize, &mut Window, &mut App) + 'static,
-    cx: &App,
-) -> AnyElement {
-    let control = ui::prompt_box_control(control_id, icon, label, enabled, cx);
+fn create_prompt_strip_handlers(
+    chat: Entity<Chat>,
+    model_picks: Vec<Option<ModelChoice>>,
+    machine_candidates: Vec<MachineCandidate>,
+    repo_candidates: Vec<String>,
+) -> ui::PromptStripHandlers {
+    let machine_keys: Vec<String> = machine_candidates
+        .into_iter()
+        .map(|candidate| candidate.key)
+        .collect();
+    let model_chat = chat.clone();
+    let machine_chat = chat.clone();
+    let repo_chat = chat.clone();
 
-    if !enabled || rows.is_empty() {
-        return control.into_any_element();
-    }
+    ui::PromptStripHandlers::new(
+        move |index, _, cx| {
+            let Some(pick) = model_picks.get(index).cloned() else {
+                return;
+            };
 
-    ui::prompt_box_dropdown(dropdown_id, control, rows, on_pick).into_any_element()
+            model_chat.update(cx, |chat, cx| chat.pick_model(pick, cx));
+        },
+        move |index, _, cx| {
+            let Some(machine) = machine_keys.get(index).cloned() else {
+                return;
+            };
+
+            machine_chat.update(cx, |chat, cx| chat.pick_machine(machine, cx));
+        },
+        move |index, _, cx| {
+            let picked = repo_candidates.get(index).cloned();
+
+            repo_chat.update(cx, |chat, cx| match picked {
+                Some(repo) => chat.select_repo(repo, cx),
+                None => chat.add_repo(cx),
+            });
+        },
+        move |window, cx| {
+            chat.update(cx, |chat, cx| chat.submit_prompt(window, cx));
+        },
+    )
 }
 
 impl Render for Chat {

@@ -1,4 +1,3 @@
-mod assets;
 mod catalog;
 mod chat;
 mod desktop_shell;
@@ -7,9 +6,10 @@ mod modal;
 mod models;
 mod session_state;
 mod store;
-mod ui;
 mod workbench;
 mod workspaces;
+
+pub use harvester::{assets, ui};
 
 const EMBEDDED_DAEMON: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/harvesterd"));
 const DEV_DAEMON_PATH: &str = "target/x86_64-unknown-linux-musl/release/harvesterd";
