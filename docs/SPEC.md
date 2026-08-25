@@ -50,10 +50,10 @@ A Rust + gpui desktop app that orchestrates **Pi** coding-agent sessions on remo
 ## Architecture
 
 ```
-┌──────────────┐   SSH (socket forward)   ┌────────────────┐   stdin/stdout   ┌──────────────┐
-│ gpui client  │ ───────────────────────► │  harvesterd    │ ───────────────► │ pi --mode rpc │  × N sessions
-│  (desktop)   │ ◄─────────────────────── │  (per machine) │ ◄─────────────── │  (per session)│
-└──────────────┘                          └────────────────┘                  └──────────────┘
+┌──────────────┐   SSH (socket forward)   ┌────────────────┐   stdin/stdout   ┌────────────────┐
+│ gpui client  │ ───────────────────────► │  harvesterd    │ ───────────────► │ pi --mode rpc  │ × N sessions
+│  (desktop)   │ ◄─────────────────────── │  (per machine) │ ◄─────────────── │  (per session) │
+└──────────────┘                          └────────────────┘                  └────────────────┘
        │                                          │                                  │
        │ one-shot exec                            │ spawns/reaps                     │ appends
        ▼                                          ▼                                  ▼

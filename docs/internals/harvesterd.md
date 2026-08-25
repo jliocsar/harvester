@@ -218,6 +218,24 @@ frames/decodes/routes/encodes (the controller-layer house rule).
   work rides its own task since even the ~1s pi startup (bounded by
   `LIST_MODELS_TIMEOUT`) must not block sibling requests on the same
   connection.
+- **`capture_pi_stderr` / `explain_pi_failure` / `pi_stderr_summary`**: pi's
+  stderr used to be `Stdio::null()`, so a pi that died on startup produced
+  only "pi exited before answering" and the reason was gone. It is piped now.
+  The drain runs as its own task and keeps reading *after* the
+  `PI_STDERR_CAPTURE_BYTES` cap is reached, appending nothing — stopping the
+  reads instead would fill the pipe and block pi, turning a crash report into
+  a hang. Both failure arms (clean EOF and a read error) route through
+  `explain_pi_failure`, which writes the whole capture to the daemon's own
+  stderr — `~/.harvester/log/harvesterd.log` when started by `bootstrap.rs` —
+  and appends a one-line summary to the error the client shows.
+  `pi_stderr_summary` prefers the first non-empty line *containing
+  whitespace*, falling back to the first non-empty line: a message has words,
+  whereas a bare token is a path or a source location. That rule is what turns
+  node's first line (`.../cachestorage.js:20`) into the line that actually
+  names the fault (`TypeError: webidl.util.markAsUncloneable is not a
+  function`) — the real failure when pi runs on a Node older than 22, which
+  is the case this was written for. A capture that summarizes to nothing
+  leaves the caller's own reason untouched.
 - **`attach`**: subscribes to the session's broadcast channel *before* joining
   the dialog room, never the reverse. A dialog arriving between the two steps
   is auto-cancelled (room still reads as empty) — one spurious "Escape" — but
@@ -265,6 +283,19 @@ Named constants and why their values are what they are:
 - `MODELS_REQUEST_ID` ("hv-models"): deliberately inside the `hv-` namespace
   the passthrough pump routes on, even though this throwaway pi has no pump —
   the reply filter matches it directly.
+- `PI_STDERR_CAPTURE_BYTES` (8 KiB) / `PI_STDERR_CHUNK_BYTES` (1 KiB): a
+  startup crash report is a few hundred bytes and a node stack trace is a
+  couple of KiB, so 8 KiB holds a whole one with room spare while bounding
+  what a chatty pi can make the daemon hold.
+- `PI_STDERR_SUMMARY_CHARS` (200): the summary rides in an error string the
+  client renders in a toast, so it is capped to a readable length; the log
+  keeps the untruncated text.
+- `PI_STDERR_DRAIN_TIMEOUT` (2s): the drain task ends when pi's stderr closes,
+  which a dead pi has already done, so this only bounds the pathological case
+  where the pipe is held open by something we no longer control. Expiry costs
+  the summary, never the error itself.
+- `PI_EXITED_EARLY`: the one wording for "pi exited before answering", shared
+  so the message the client matches on cannot drift between call sites.
 
 The test module documents that payload wire shapes are pinned in
 `harvester-proto`; what belongs to `ops.rs` is only the *routing* —
