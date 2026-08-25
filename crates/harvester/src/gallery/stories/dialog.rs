@@ -3,9 +3,9 @@ use gpui_component::input::Input;
 use gpui_component::v_flex;
 use gpui_component::ActiveTheme as _;
 use harvester::ui::dialog::{
-    action_button, button_row, cancel_button, option_row, options_height, title_or_named_condition,
-    ActionAccent, Confirmation, CONFIRMATION_DIALOG_WIDTH_IN_REMS, SELECT_DIALOG_WIDTH_IN_REMS,
-    TEXT_DIALOG_WIDTH_IN_REMS,
+    action_button, button_row, cancel_button, dismiss_only_row, option_row, options_height,
+    title_or_named_condition, ActionAccent, Confirmation, CONFIRMATION_DIALOG_WIDTH_IN_REMS,
+    SELECT_DIALOG_WIDTH_IN_REMS, TEXT_DIALOG_WIDTH_IN_REMS,
 };
 
 use super::{caption, panel, story_column};
@@ -22,7 +22,6 @@ pub const ACCENT_LABELS: &[&str] = &["primary", "danger"];
 const CANCEL_BUTTON_ID: &str = "story-dialog-cancel";
 const ACTION_BUTTON_ID: &str = "story-dialog-action";
 const SELECT_CANCEL_BUTTON_ID: &str = "story-dialog-select-cancel";
-const SELECT_COMMIT_BUTTON_ID: &str = "story-dialog-select-commit";
 const UNTITLED_CONFIRM_CONDITION: &str = "The agent needs a yes or no";
 const CONFIRMATION_CAPTION: &str = "Confirmation width — one decision, no form";
 const SELECT_CAPTION: &str = "Select width — a scannable option list, Enter commits";
@@ -98,10 +97,7 @@ fn confirmation_surface(confirmation: Confirmation, cx: &App) -> Div {
 }
 
 fn select_surface(cx: &App) -> Div {
-    let buttons = button_row(
-        cancel_button(SELECT_CANCEL_BUTTON_ID, "Cancel"),
-        action_button(SELECT_COMMIT_BUTTON_ID, "Choose", ActionAccent::Primary),
-    );
+    let buttons = dismiss_only_row(cancel_button(SELECT_CANCEL_BUTTON_ID, "Cancel"));
 
     panel(cx)
         .w(rems(SELECT_DIALOG_WIDTH_IN_REMS))

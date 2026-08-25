@@ -3,7 +3,6 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonGroup};
 use gpui_component::input::Input;
-use gpui_component::switch::Switch;
 use gpui_component::{ActiveTheme as _, Selectable as _};
 use harvester::ui::{
     chat_header, collapsible_section, inline_note, sidebar_row, statusbar_frame, KeyboardFocusRing,
@@ -23,6 +22,7 @@ const KNOB_GRID_ID: &str = "knob-grid";
 const STORY_SIDEBAR_LABEL: &str = "stories";
 const STAGE_LABEL: &str = "stage";
 const DOCK_TITLE: &str = "Controls";
+const BOOL_KNOB_LABELS: [&str; 2] = ["Off", "On"];
 const NO_KNOBS_NOTE: &str = "This story has no knobs";
 const NO_PRESETS_NOTE: &str = "This story has no presets";
 
@@ -274,7 +274,6 @@ fn render_knob(
     knobs: &KnobValues,
     cx: &mut Context<Gallery>,
 ) -> Stateful<Div> {
-    let control_carries_its_own_label = matches!(spec.kind, KnobKind::Bool);
     let control = match &spec.kind {
         KnobKind::Bool => render_bool_knob(spec.name, knobs.flag(spec.name), cx),
         KnobKind::Choice(labels) => {
@@ -282,7 +281,7 @@ fn render_knob(
         }
         KnobKind::Text => render_text_knob(gallery, spec.name),
     };
-    let knob_label = (!control_carries_its_own_label).then(|| caption(spec.name, cx));
+    let knob_label = caption(spec.name, cx);
 
     div()
         .id(SharedString::from(format!("knob-{}", spec.name)))
@@ -291,16 +290,26 @@ fn render_knob(
         .flex()
         .flex_col()
         .gap_1p5()
-        .children(knob_label)
+        .child(knob_label)
         .child(control)
 }
 
 fn render_bool_knob(name: &'static str, value: bool, cx: &mut Context<Gallery>) -> AnyElement {
-    Switch::new(SharedString::from(format!("knob-switch-{name}")))
-        .label(name)
-        .checked(value)
-        .on_click(cx.listener(move |gallery, checked: &bool, _, cx| {
-            gallery.set_knob(name, KnobValue::Bool(*checked), cx)
+    let segments = BOOL_KNOB_LABELS.iter().enumerate().map(|(index, label)| {
+        Button::new(index)
+            .label(*label)
+            .selected(index == usize::from(value))
+    });
+
+    ButtonGroup::new(SharedString::from(format!("knob-bool-{name}")))
+        .outline()
+        .children(segments)
+        .on_click(cx.listener(move |gallery, picked: &Vec<usize>, _, cx| {
+            let Some(index) = picked.first() else {
+                return;
+            };
+
+            gallery.set_knob(name, KnobValue::Bool(*index == usize::from(true)), cx);
         }))
         .into_any_element()
 }

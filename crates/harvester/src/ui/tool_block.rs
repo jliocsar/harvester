@@ -47,7 +47,6 @@ pub(super) fn header(
         .flex()
         .items_center()
         .gap_2()
-        .cursor_pointer()
         .hover(|style| style.bg(cx.theme().list_hover))
         .active(|style| style.bg(cx.theme().muted))
         .child(status(index, tone, status_label, cx))

@@ -93,8 +93,6 @@ impl Sidebar {
                 .label(NEW_SESSION_LABEL)
                 .ghost()
                 .small()
-                .w_full()
-                .justify_start()
                 .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarIntent::NewSession))),
         )
     }

@@ -7,7 +7,7 @@ use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::dialog::{CancelDialog, DialogAction, DialogClose, DialogFooter};
 use gpui_component::input::{Input, InputState};
 use gpui_component::list::{List, ListDelegate, ListItem, ListState};
-use gpui_component::{ActiveTheme as _, Disableable as _, IndexPath, WindowExt as _};
+use gpui_component::{ActiveTheme as _, IndexPath, WindowExt as _};
 
 pub const CONFIRMATION_DIALOG_WIDTH_IN_REMS: f32 = 30.;
 pub const SELECT_DIALOG_WIDTH_IN_REMS: f32 = 36.;
@@ -17,11 +17,9 @@ const SELECT_OPTION_ROW_HEIGHT_IN_REMS: f32 = 2.;
 const SELECT_VISIBLE_OPTION_ROWS: usize = 8;
 const EDITOR_ROWS: (usize, usize) = (6, 16);
 const CANCEL_LABEL: &str = "Cancel";
-const SELECT_COMMIT_LABEL: &str = "Choose";
 const TEXT_COMMIT_LABEL: &str = "Reply";
 const SELECT_OPTION_ROW_ID: &str = "dialog-option";
 const SELECT_CANCEL_BUTTON_ID: &str = "dialog-select-cancel";
-const SELECT_COMMIT_BUTTON_ID: &str = "dialog-select-commit";
 const CONFIRMATION_CANCEL_BUTTON_ID: &str = "dialog-confirmation-cancel";
 const CONFIRMATION_ACTION_BUTTON_ID: &str = "dialog-confirmation-action";
 const TEXT_CANCEL_BUTTON_ID: &str = "dialog-text-cancel";
@@ -75,12 +73,11 @@ pub fn action_button(
 }
 
 pub fn button_row(cancel: Button, action: Button) -> Div {
-    div()
-        .flex()
-        .justify_end()
-        .gap_2()
-        .child(cancel)
-        .child(action)
+    dismiss_only_row(cancel).child(action)
+}
+
+pub fn dismiss_only_row(cancel: Button) -> Div {
+    div().flex().justify_end().gap_2().child(cancel)
 }
 
 pub fn option_row(index: usize, option: impl Into<SharedString>, selected: bool) -> ListItem {
@@ -136,24 +133,16 @@ pub fn open_select<T: 'static>(
 
     window.open_dialog(cx, move |dialog, window, cx| {
         let cancelled = cancelled.clone();
-        let committed = options_list.clone();
-        let nothing_chosen = options_list.read(cx).selected_index().is_none();
 
         dialog
             .title(title.clone())
             .width(dialog_width(SELECT_DIALOG_WIDTH_IN_REMS, window))
             .close_button(false)
             .child(options_pane(&options_list, option_count, cx))
-            .footer(action_footer(
-                cancel_button(SELECT_CANCEL_BUTTON_ID, CANCEL_LABEL),
-                action_button(
-                    SELECT_COMMIT_BUTTON_ID,
-                    SELECT_COMMIT_LABEL,
-                    ActionAccent::Primary,
-                )
-                .disabled(nothing_chosen),
-            ))
-            .on_ok(move |_, window, cx| commit_chosen_option(&committed, window, cx))
+            .footer(dismiss_only_footer(cancel_button(
+                SELECT_CANCEL_BUTTON_ID,
+                CANCEL_LABEL,
+            )))
             .on_cancel(move |_, window, cx| cancelled(window, cx))
     });
 
@@ -295,19 +284,6 @@ impl ListDelegate for OptionListDelegate {
     }
 }
 
-fn commit_chosen_option(
-    options_list: &Entity<ListState<OptionListDelegate>>,
-    window: &mut Window,
-    cx: &mut App,
-) -> bool {
-    let Some(option) = options_list.read(cx).delegate().chosen_option() else {
-        return false;
-    };
-    let chosen = options_list.read(cx).delegate().chosen.clone();
-
-    chosen(option.to_string(), window, cx)
-}
-
 fn options_pane(
     options_list: &Entity<ListState<OptionListDelegate>>,
     option_count: usize,
@@ -328,4 +304,8 @@ fn action_footer(cancel: Button, action: Button) -> DialogFooter {
     DialogFooter::new()
         .child(DialogClose::new().child(cancel))
         .child(DialogAction::new().child(action))
+}
+
+fn dismiss_only_footer(cancel: Button) -> DialogFooter {
+    DialogFooter::new().child(DialogClose::new().child(cancel))
 }

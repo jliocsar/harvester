@@ -24,6 +24,9 @@ const SESSION_STARTING_NOTICE: &str = "Starting session…";
 const SEND_TOOLTIP: &str = "Send";
 const INPUT_KEY_CONTEXT: &str = "Input";
 
+const CONTROL_LABEL_MAX_CHARS: usize = 24;
+const CONTROL_LABEL_ELLIPSIS: char = '\u{2026}';
+
 const SEND_KEYSTROKE: Enter = Enter {
     secondary: false,
     shift: false,
@@ -85,11 +88,20 @@ pub fn prompt_box_control(
         .ghost()
         .small()
         .icon(icon)
-        .label(label)
+        .label(truncated_control_label(label))
         .dropdown_caret(true)
         .disabled(!enabled)
         .max_w_56()
-        .overflow_hidden()
+}
+
+fn truncated_control_label(label: SharedString) -> SharedString {
+    if label.chars().count() <= CONTROL_LABEL_MAX_CHARS {
+        return label;
+    }
+
+    let kept: String = label.chars().take(CONTROL_LABEL_MAX_CHARS - 1).collect();
+
+    format!("{}{CONTROL_LABEL_ELLIPSIS}", kept.trim_end()).into()
 }
 
 pub fn prompt_box_dropdown(
@@ -273,4 +285,48 @@ fn branch_indicator_body(branch: SharedString) -> Div {
         .gap_1()
         .child(Icon::default().path(GIT_BRANCH_ICON_PATH).size_3())
         .child(branch)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{truncated_control_label, CONTROL_LABEL_MAX_CHARS};
+
+    #[test]
+    fn a_label_that_fits_is_left_alone() {
+        assert_eq!(truncated_control_label("Sonnet".into()), "Sonnet");
+    }
+
+    #[test]
+    fn a_label_at_the_budget_is_still_left_alone() {
+        let exact: String = "x".repeat(CONTROL_LABEL_MAX_CHARS);
+
+        assert_eq!(truncated_control_label(exact.clone().into()), exact);
+    }
+
+    #[test]
+    fn a_longer_label_is_cut_to_the_budget_and_marked() {
+        let long: String = "x".repeat(CONTROL_LABEL_MAX_CHARS + 10);
+        let truncated = truncated_control_label(long.into());
+
+        assert_eq!(truncated.chars().count(), CONTROL_LABEL_MAX_CHARS);
+        assert!(truncated.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn the_cut_does_not_leave_a_space_before_the_ellipsis() {
+        let padded = format!("{} tail", "y".repeat(CONTROL_LABEL_MAX_CHARS - 2));
+
+        assert_eq!(
+            truncated_control_label(padded.into()),
+            format!("{}\u{2026}", "y".repeat(CONTROL_LABEL_MAX_CHARS - 2))
+        );
+    }
+
+    #[test]
+    fn a_multibyte_label_is_cut_on_character_boundaries() {
+        let wide: String = "\u{3042}".repeat(CONTROL_LABEL_MAX_CHARS + 5);
+        let truncated = truncated_control_label(wide.into());
+
+        assert_eq!(truncated.chars().count(), CONTROL_LABEL_MAX_CHARS);
+    }
 }

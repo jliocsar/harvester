@@ -334,7 +334,9 @@ pick).
 - `ADD_REPO_ROW` ("Add new…"): the repo picker's last row, for browsing to a
   repository Harvester has not been told about yet. It is also the *only*
   row an empty picker has, which is what makes a fresh client's first
-  session reachable.
+  session reachable. Its ellipsis is the conventional one — the row opens a
+  dialog rather than committing anything — unlike a progress ellipsis, which
+  the app spends far more carefully.
 - `NO_MACHINE_LABEL` / `CHOOSE_MACHINE_LABEL`: what the machine control says
   before anything is picked and when there is nothing to pick (fleet empty
   until a provider lists).
@@ -456,6 +458,16 @@ question deserves and what a click means to Pi.
   shown, title as the condition and message as its consequence. Rendering the
   degenerate cases literally is what produced dialogs that said the same
   sentence twice, or that had a generic heading over the only real sentence.
+  Note the limit of that rule: **the copy inside a Pi dialog is not ours.**
+  Only whitespace trimming and the drop-the-duplicate rule touch what Pi wrote;
+  everything else reaches the screen verbatim, phrasing and all. The literals
+  this client owns are the four untitled conditions and the two confirm button
+  labels, and nothing else.
+- The machine and session id are both available on the obligation at this point
+  and are deliberately kept out of the title. The dialog is modal over a
+  workbench that already shows which session is attached, and a title that
+  restates the surrounding window is spending the user's most valuable line on
+  context they can already see.
 - `open_question`: dismissal (Escape / close) answers "no" rather than
   cancelling outright, because Pi resolves a cancelled `confirm` to `false`
   anyway — so treating Escape as a refusal loses no information and removes
@@ -465,7 +477,11 @@ question deserves and what a click means to Pi.
   into the shared chrome — the forget-machine flow needs "Remove"/"Cancel" —
   but Pi's own vocabulary is no longer what they say: "Yes"/"No" only reads
   correctly under a question, and a Pi `confirm` title is very often a
-  statement.
+  statement. The wire settles the argument too: `DialogAnswer::dismissal_for` a
+  `confirm` is `Confirmed(false)`, so the decline button, Escape and an overlay
+  click all send exactly the same thing — calling that path "Cancel" makes the
+  button say what Escape does, where "No" implied two distinct commitments over
+  a protocol that has one commitment and one non-commitment.
 - `open_value_entry` owns the "no input, no dialog" guard itself rather than
   the caller unwrapping first. Both `Input` and `Editor` reach it, and putting
   the guard in the callee is what let those two become separate match arms
@@ -520,11 +536,14 @@ Two of these moved *out* of the gallery since: group and dock headers no longer
 re-apply `Role::Button`/`aria_expanded` because `ui::collapsible_section` sets
 them itself now (the gallery applying them a third time is what proved they
 belonged in the component), and the bespoke chips that carried
-`aria_selected` are gone entirely — a `Switch`, a `ButtonGroup` and a `Button`
+`aria_selected` are gone entirely — a `ButtonGroup` and a `Button`
 bring their own a11y. Story *content* is therefore no longer uniformly
 invisible: whatever a11y a gpui-component widget has upstream now shows up in
-a story that renders it. `tmp/gallery_walk.py` drives every story and a knob
-toggle over the MCP as the regression check.
+a story that renders it. `scripts/gallery_walk.py` drives every story and a knob
+toggle over the MCP as the regression check. Its selectors track the
+accessibility tree, so a component swapped for a different library widget
+breaks them: story rows are `ListItem`s reporting `sel`, knob controls are
+`ButtonGroup` `Button`s reporting `toggled=`.
 
 Feel: story switching and knob changes are the two things a user does dozens
 of times a minute, so both are **instant** — no animation anywhere in the
@@ -578,7 +597,15 @@ They are sentence case ("Core", "Prompt", "Flagship") rather than the lowercase
 they used to be: `section_header` stopped uppercasing its title, so a lowercase
 group name now renders lowercase, and a heading is user-visible text under the
 app-wide wording convention. Knob and preset names stay lowercase — those
-mirror code, not prose.
+mirror code, not prose. *Story* names are deliberately not prose either:
+`inline_note`, `sidebar_stacked_row` and `chat_header` are Rust identifiers,
+the exact symbol a reader is being sent to go and read, and sentence-casing
+them into English would break the one thing the catalog is for. Preset labels
+stay lowercase for a different reason — they name the scenario a command
+produces ("running session", "fast forward"), which is the register a gallery
+wants. The gallery's `aria_label`s ("stories", "stage") are likewise kept
+verbatim: they are accessibility-tree selectors that agent tooling keys on, not
+visible copy to be styled.
 
 - `STREAMING_TRANSCRIPT_STORY` is the replay story's name, and
   `story_index()` resolves it to an index once at start-up. The replay loop
@@ -648,11 +675,13 @@ stories a fixed viewport so their internal scroll behaves like the chat's.
   no chat behind it. The input is a real `Entity<InputState>` from the runtime,
   so typing, focus ring and auto-grow are the genuine article.
 - `transcript.rs` (flagships): the rendered story folds a fixture and renders
-  it through `TranscriptPresentation` with live tool-block expansion; the
+  it through `TranscriptPresentation` with live tool-block expansion, and its
+  caption says out loud that a tool header is a tab stop — the story is the one
+  place a reviewer can discover that without reading the code; the
   streaming story renders the replay transcript plus its control row (restart
   button, `applied / total` progress, and the paused/finished note). Play and
   speed are knobs; restart is a button because it is an action, not a state.
-- `dialog.rs` (foundation): `Confirmation` + `button_row` + the `select`
+- `dialog.rs`: `Confirmation` + `button_row` + the `select`
   option list + both input kinds, rendered **inline on the canvas**, never
   through `window.open_dialog`. See the recorded gap below. Each surface is
   built at its real modal width by reading `ui::dialog`'s own
@@ -660,7 +689,14 @@ stories a fixed viewport so their internal scroll behaves like the chat's.
   real `option_row`s — the whole point of the story is the width ladder, so a
   story that guessed the widths would be showing you the wrong thing. The
   untitled-confirmation knob path goes through `title_or_named_condition` with
-  the same "The agent needs a yes or no" condition `dialogs.rs` uses.
+  the same "The agent needs a yes or no" condition `dialogs.rs` uses. The
+  option list is painted as a plain column of `option_row`s rather than as a
+  live `List`, with one row forced selected so the selected style is reviewable:
+  a story render function runs on every frame and cannot own a list state
+  without putting one in `StoryRuntime`, and a list state rebuilt per frame
+  could never hold a selection to show. The rows are the dialog's own builder,
+  so what the story shows is honest; what it cannot show is scrolling and
+  keyboard traversal.
 
 ### crates/harvester/src/gallery/runtime.rs
 
@@ -773,7 +809,10 @@ inputs.
 
 - `GALLERY_WINDOW_WIDTH`/`HEIGHT` (1100×720) match the app's window rather
   than being sized to the catalog, so a component rendered in a story is laid
-  out at the width it will really get.
+  out at the width it will really get. They stay bare pixels while the rest of
+  the gallery moved onto the rem scale, because they are the OS window's
+  physical bounds rather than layout — the one place a pixel is the honest
+  unit.
 - Text knobs are backed by real `Entity<InputState>`s keyed by
   `(story_index, knob_name)` and created lazily in `sync_text_knob_inputs`
   during render (the first frame that shows the knob is the first frame that
@@ -814,6 +853,41 @@ separable. It is a sibling module of the crate root, which is why it can read
   the only measure left as a named const here: it caps the stage's content
   column so a component never stretches to a width no real pane would give it,
   and it is in rems so that cap scales with the type it is capping.
+- Each region is described by three constraints — a minimum, a comfortable
+  default, and a rule for surplus — rather than by one number back-solved from
+  a screenshot. The sidebar's minimum is the width at which the *task* still
+  works: below it the two transcript stories truncate to the same string and
+  picking a story stops being possible. Its default is comfortable for the
+  longest name in the catalog. Its surplus rule is `flex_grow_0`, meaning every
+  extra pixel goes to the stage — which is what "visibly subordinate to the
+  work area" means in layout terms — while `flex_shrink_1` makes it yield down
+  to its minimum before the stage gives up anything. `max_w_80` is inert at the
+  current default and exists to bound the region if it is ever given a basis of
+  its own. The stage yields nothing and absorbs surplus up to its measure,
+  after which the canvas centers and the extra becomes symmetric gutters. The
+  dock is `flex_none`: it never grows, and the knob grid scrolls inside
+  `max_h_56` instead — a bound deliberately set just under a quarter of the
+  default window height, because the controls must never outweigh the thing
+  being controlled. `min_w_0` on the right-hand column is a flexbox requirement
+  so descendants can ellipsize, not a design constraint.
+- `STAGE_MEASURE_IN_REMS` is chosen as **four times the sidebar's preferred
+  width**, not as a translation of the pixel constant it replaced: the work
+  area reading as four sidebars wide is the relationship the proportion is
+  actually about. It is written as `rems(...)` rather than a `max_w_*` helper
+  because gpui's box scale tops out well short of a canvas measure; it rides
+  the same zoom axis either way.
+- **No resizable split**, and this was considered rather than overlooked. The
+  library ships one. A draggable split earns its state when the two regions
+  hold content the user must trade off against each other; the story list is a
+  fixed, bounded catalog of known names, so there is no more or less of it to
+  want. A handle plus a resize entity in `Gallery` would add state and an
+  affordance that answers no question. Revisit if story names ever become
+  user-authored.
+- The text knob's `w_56` fits roughly thirty characters, which covers every
+  default knob string in the registry except the long dialog message (the
+  `Input` scrolls that one), and it is also what keeps three to four knobs on a
+  dock row at the default window width instead of collapsing the grid into a
+  column.
 - Every other former sizing const is now a rem step read straight off the
   library scale: the knob grid caps at `max_h_56` (it must not eat the stage
   when a story has eleven knobs — the prompt strip does — and scrolls past
@@ -829,14 +903,19 @@ separable. It is a sibling module of the crate root, which is why it can read
   `px_3 py_2p5` under the shared section header, so the dock's left edge and
   row spacing never jitter as stories swap knob sets in and out. `py_2p5` is
   the density step the rest of the chrome took; at `py_1p5` a dock row of
-  medium-tier controls had less air than the controls themselves.
+  medium-tier controls had less air than the controls themselves. Four sibling
+  regions used to carry four leading edges here; the stage canvas, the preset
+  row, the knob grid and both empty notes now all resolve from the one
+  function, and `chat_header` / `statusbar_frame` land on the same edge by
+  taking the same step directly. The stage canvas keeps a taller *vertical*
+  rhythm (`py_4`) on purpose — it is a canvas, not a row, and only the leading
+  edge is the shared decision.
 - **The gallery has no bespoke widgets left.** The chip — a hand-rolled
   `div` with its own `primary`/`secondary` fills, hover and press states, and
   `text_xs` — is gone, along with `BOOL_ON_SLOT`/`BOOL_OFF_SLOT`, the id slots
-  its on/off pair occupied. A bool knob is a `Switch` (which carries its own
-  label, so `render_knob` suppresses the caption above it — one label, not
-  two), a choice knob is a `ButtonGroup` of selectable `Button`s, a preset is
-  an `outline` `Button`, and a text knob is an `Input` with an `aria_label`.
+  its on/off pair occupied. A bool knob and a choice knob are both a
+  `ButtonGroup` of selectable `Button`s, a preset is an `outline` `Button`,
+  and a text knob is an `Input` with an `aria_label`.
   All of them sit at the library's medium default: no `.small()`, no
   `.compact()`. The old argument was that a dev tool should not grow the
   library — but the chip was never the library's to grow, it was three
@@ -844,11 +923,41 @@ separable. It is a sibling module of the crate root, which is why it can read
   that decided this: a catalog whose own controls are hand-rolled is not
   exercising the thing it catalogs. A `ButtonGroup` also gives a choice knob
   the segmented-control semantics a row of independent chips only imitated.
+  A bool knob was briefly a `Switch`, on the argument that a knob takes
+  effect immediately and that is what a switch means. It went back to a
+  two-segment `ButtonGroup` (`BOOL_KNOB_LABELS`, "Off"/"On") for one
+  disqualifying reason: `Switch` in this revision tracks no focus handle,
+  sets no tab stop and fires from `on_mouse_down` only, so it was the single
+  control in the dock unreachable by keyboard. Wrapping it in a focusable div
+  would have produced a tab stop that toggles nothing. A bool is a two-way
+  choice, so rendering it as one deletes the special case instead of adding a
+  workaround — `render_knob` no longer needs to know that one kind of control
+  carries its own label, and every knob in the dock now has the same shape:
+  caption above, focus-ringed control below. A choice knob is a `ButtonGroup`, which toggles
+  its children itself — the segments advertise their toggled state without the
+  gallery asking, and single-select mode guarantees exactly one is on. A preset
+  is an `outline` `Button` because a preset is a command, not a state. The one
+  thing lost in the trade is `aria_selected` on the segments, since `Button`
+  is not a stateful interactive element; the toggled state it does report is
+  the richer signal anyway, because it says `false` as well as `true`.
+- The story rows are the one hand-rolled surface left, and they take the app's
+  shared `keyboard_focus_ring` rather than a ring of their own. An earlier
+  version grew one out of a transparent resting border recolored on focus: it
+  worked, but it cost two pixels of row height and it double-drew against the
+  library list item's own inset active-highlight whenever a row was both
+  selected and focused. A spread box shadow has neither problem. One app, one
+  ring.
 - The statusbar reports the story count and any fixture failure, so a broken
   fixture is visible from every story, not only from the one that needs it. It
   no longer repeats the selected `group · name`: the stage header directly
   above it is a `chat_header` carrying exactly that, and the same two words in
-  two bands eight pixels apart is noise, not redundancy.
+  two bands eight pixels apart is noise, not redundancy. What survives passed a
+  test each line has to pass: name the object, name the scope, and say why it
+  is worth a permanent band. The story count is the only place the catalog's
+  size shows when every group is collapsed, and it is how you notice a story
+  you just added never registered; the fixture failure is the reason the stage
+  looks wrong, and it is scoped to every flagship story rather than to the one
+  that happens to need the file.
 
 ### Recorded gaps
 
@@ -1269,7 +1378,9 @@ everything else in `ui` should ask for a `Tone`/`Dot`, never a raw `Hsla`.
   session), `Failed` (failed and must be visible).
 - `Tone::color` resolves through the library's *semantic* status slots only —
   `info` / `warning` / `success` / `danger` plus `muted_foreground` — never a
-  raw palette entry. `Active` is `theme.info`: it was `theme.blue` (a palette
+  raw palette entry. That is an invariant, not a preference: a palette entry is
+  a hue, a role is a meaning, and only the meaning survives a theme swap.
+  `Active` is `theme.info`: it was `theme.blue` (a palette
   color, which broke the rule that a meaning resolves to a meaning) and before
   that `theme.primary`, which in the dark theme is near-white — right for a
   filled button, wrong for the word "you". `Idle` is `Muted` faded by
@@ -1277,6 +1388,16 @@ everything else in `ui` should ask for a `Tone`/`Dot`, never a raw `Hsla`.
   token for; the same opacity constant backs `faint()` for tertiary text
   (context lines, disabled controls, disclosure chevrons), while `dim()` is
   unfaded `muted_foreground` for secondary text/subtitles.
+- The text hierarchy is **exactly three tiers and the set is closed**:
+  `cx.theme().foreground` for body text, `dim()`/`Tone::Muted` for secondary
+  labels, `faint()`/`Tone::Idle` for the tertiary run. `FAINT_TEXT_OPACITY` is
+  the single number behind the third tier — it was inherited from the two call
+  sites that each carried their own copy of it, and it is the lowest step that
+  still clears comfortable legibility against the graphite canvas and surface
+  fills. `Tone::Idle` calls `faint()` rather than re-deriving the opacity, so
+  the tier has one definition and one accessor. Do not add a fourth tier:
+  something that needs to recede further than faint should leave the surface or
+  move behind a disclosure, not be dimmed again.
 - `Tone::label` is the tone's one user-facing word ("Neutral", "Idle",
   "Running", "Pending", "Live", "Failed"). It exists because a colored dot is
   invisible to a screen reader and ambiguous to anyone reading in a hurry, so
@@ -1287,19 +1408,40 @@ everything else in `ui` should ask for a `Tone`/`Dot`, never a raw `Hsla`.
   surfaces from calling the same state two different things — though note the
   tool block deliberately overrides it with its own vocabulary, since
   "Completed" is the right word for a settled call and "Neutral" is not.
+  Two of the six words are not the variant's own name, on purpose. `Active`
+  speaks as "Running" because that is the word the transcript and the session
+  list already use for work in progress — the enum keeps the tone's name, the
+  label speaks the product's. `Muted` speaks as "Neutral" so the tone with no
+  lifecycle meaning cannot be confused with "Idle", which has one. The words
+  are consts rather than inline literals, under the house rule that
+  user-visible strings are named once.
 - `Tone::dot` derives the *shape* from the meaning: `Idle` and `Pending` are
   `Hollow`, everything else `Solid`. An outline says "no verdict yet" —
   unprobed, or working with the outcome still unknown — without spending a
   color the theme doesn't have. Making this a function of the tone is what
   retired the last per-call-site shape choice; `status_dot_for_tone(tone, cx)`
   is now how every caller draws a dot, and nobody picks solid-versus-hollow by
-  hand. `STATUS_DOT_DIAMETER` (6px) is the dot itself.
+  hand. In one sentence: hollow means the dot is a placeholder for work that
+  has not begun; solid means it stands for something real — running or
+  finished, good or bad. That is why `Failed` is solid: a settled terminal
+  state must not read as "not started".
+- `STATUS_DOT_DIAMETER` (6px) is the dot itself, and it is one of the few
+  pixel numbers in `ui` that is deliberately **off** the rem axis. A 6px disc
+  is a raster boundary rather than product geometry: it is the smallest circle
+  that still antialiases into a circle, and the rem steps on either side land
+  it either visibly mushy or off the half-pixel grid on a 1× display. The dot
+  should stay the same physical size when `BASE_FONT_SIZE` moves; the lane it
+  sits in (`SIDEBAR_STATUS_LANE`, the tool block's `size_4` slot) is what
+  scales instead, which is also why the diameter can change without moving any
+  text.
 - `Dot` (`Solid(Tone)` / `Hollow(Tone)`) and the `Dot`-taking `status_dot`
   survive as the shape vocabulary `Tone::dot` answers in, and
   `machine_presentation` still carries a `Dot`. Note the consequence: the
   sidebar reads only `.tone()` off that `Dot` and re-derives the shape, so a
   shape `machine_presentation` picks that disagrees with `Tone::dot` is simply
-  not rendered.
+  not rendered. See "Recorded gaps (visual layer)" at the end of this document
+  for the call site where that is currently visible and for the deletion this
+  type is waiting on.
 - `disclosure_chevron` is the one expand/collapse marker for the whole app
   (section headers, tool blocks): `ChevronDown` when expanded, `ChevronRight`
   when collapsed, at `size_3p5` — the `text_sm` line, so it sits optically
@@ -1323,7 +1465,9 @@ about Pi, obligations, modal leases, or machines, and takes plain strings plus
 callbacks that return "did this answer stick?". The three modal owners
 (`dialogs.rs`, `workbench/forget_machine_flow.rs`, `workbench/picker.rs`) all
 build their chrome from here, so a dialog cannot look different depending on
-which flow raised it.
+which flow raised it. Every public item in the module has at least one caller
+outside it; nothing here is built speculatively for a dialog kind that does not
+exist yet.
 
 - The modal widths are three named rem measures, not one pixel constant:
   `CONFIRMATION_DIALOG_WIDTH_IN_REMS` (30), `SELECT_DIALOG_WIDTH_IN_REMS` (36),
@@ -1338,10 +1482,21 @@ which flow raised it.
   same chrome inline at the same widths — a story that guesses the width is
   not showing you the dialog. Being rems, they also grow with the base font
   size, which a pixel constant did not. `dialog_width` is the one place they
-  are resolved against `window.rem_size()`.
+  are resolved against `window.rem_size()`, and it runs inside the dialog
+  builder closure, which the library re-runs every render — so the widths track
+  a base-font change live instead of freezing at whatever the size was when the
+  dialog opened. What each rung is sized *for*: 30 rem is about a
+  sixty-character measure, which is one paragraph of consequence under a title
+  and no more (the forget-machine confirmation is the worst real case and fits);
+  36 rem is for option strings that are branch names, paths and command lines —
+  more room than a sentence needs, still narrow enough that the list scans as a
+  column; 44 rem is the widest because the text entry is the only dialog where
+  the user *authors* something rather than picking it.
 - `EDITOR_ROWS` (6, 16): visible row range for a multi-line input before it
   scrolls. A `set_editor_text`-style body is usually a commit message, so a
-  handful of lines is the right initial shape.
+  handful of lines is the right initial shape. It stays a bare pair of integers
+  rather than becoming a rem measure because it is a row *count* handed to
+  `auto_grow`, not geometry.
 - `title_or_named_condition(title, named_condition)`: the title shown when a
   caller has no title to give (Pi omits its own on some dialogs). It replaced a
   single `UNTITLED` const ("The agent is asking") because one generic fallback
@@ -1356,14 +1511,25 @@ which flow raised it.
   confirmation call sites deliberately share one pair of ids rather than
   threading per-flow ids through the builder. `select` and `text` carry their
   own pairs because they are different dialogs, not two callers of the same one.
-- Commit-button wording is per dialog kind, not a generic "OK": `Choose` for a
-  `select`, `Reply` for a text entry, `Confirm` for a question, and `Cancel`
-  everywhere for the refusal. The button should say what it is about to do, so
+- Commit-button wording is per dialog kind, not a generic "OK": `Reply` for a
+  text entry, `Confirm` for a question, and `Cancel` everywhere for the
+  refusal. A `select` has no commit button at all — see below. The button should say what it is about to do, so
   a user who reads nothing but the buttons still knows what they are answering.
+  `Reply` specifically replaced `Send`: `Send` is already the chat composer's
+  verb for handing a turn to the agent, and one product term should name one
+  object — answering a blocking question is not sending a turn. `cancel_button`
+  is the plain default `Button` variant everywhere, which is the library's own
+  convention for the leave-without-committing action; the select dialog used to
+  outline its cancel and was the odd one out.
 - `ActionAccent`: `Primary` for the ordinary affirmative, `Danger` for an
   action the user cannot undo from the dialog (forgetting a machine). The
   accent is a parameter rather than a per-call `.primary()`/`.danger()` so
   "which button is the scary one" is stated in the caller's own vocabulary.
+  `Danger` has exactly one caller and that is not an accident: a Pi `confirm`
+  payload carries only a title and a message, so destructiveness cannot be
+  *inferred* from it, and every Pi confirmation is therefore `Primary`. Do not
+  "fix" that by sniffing the message for scary words — the only flow that knows
+  it is about to do something irreversible is the flow that initiated it.
 - `Confirmation`: the entire text of a confirmation dialog (title, message,
   both labels, accent) as data, because the library's dialog builder closure
   is re-run every frame and a `Button` cannot be captured and reused across
@@ -1377,26 +1543,58 @@ which flow raised it.
 - `button_row` is the body-side counterpart of `action_footer`: same
   right-aligned cancel-then-action pattern, for a dialog that owns its own
   body layout.
-- `open_select` renders a `List` of option rows with a real
-  cancel/`Choose` footer. It used to render one full-width `outline` button per
+- `open_select` renders a `List` of option rows over a cancel-only footer.
+  It used to render one full-width `outline` button per
   option, with no OK button at all, on the reasoning that picking an option
   *is* confirming. Two things were wrong with that. A stack of buttons has no
   selection, so there is nothing to arrow through and nothing for Enter to
   mean — `on_ok` had to be hard-wired to `false` precisely because the dialog
   had no notion of a current choice — and a list of five branch names rendered
   as five buttons reads as five actions rather than one question. A `ListState`
-  gives selection, keyboard navigation and Enter-to-confirm for free, and the
-  `Choose` button is then honest: it is disabled until something is selected,
-  and `on_ok` commits whatever the list has selected. Both paths (the list's own
-  `confirm`, and the footer button) funnel through `commit_chosen_option`, and
-  the dialog is popped only when the caller reports the answer stuck.
+  gives selection, keyboard navigation and Enter-to-confirm for free. It also
+  ends the commit button: `List` commits on a *single click* — `on_click` sets
+  the index and calls `on_action_confirm` in the same handler — and Enter does
+  the same for the keyboard. Nobody can ever observe a selected-but-uncommitted
+  row, so a footer `Choose` button was unreachable by mouse and redundant by
+  keyboard. It was deleted along with `commit_chosen_option`, and the select
+  dialog's footer is `dismiss_only_footer`: a way out and nothing else, because
+  the list itself is the action. This is the one dialog whose footer is not a
+  cancel/commit pair, and the gallery's select story matches it. Beyond
+  selection and Enter, the list brings a selected-row style, `up`/`down`
+  traversal, `escape` to deselect, list-item roles carrying position-in-set,
+  and a virtualized scroller for Pi's unbounded option counts — all things the
+  button stack would have had to grow one at a time.
+- **Nothing is selected when a select dialog opens, deliberately.** A default
+  selection would let a stray Enter send option one to a pi process that is
+  blocked waiting for an answer, which is the worst failure this dialog has.
+  With no selection the commit path is a no-op that leaves the dialog open, and
+  that is enforced in the commit logic rather than by a disabled button, since
+  the dialog's action wrapper dispatches whether or not the button inside it is
+  disabled.
+- Escape has to reach Pi through a focused `List`, and it does so by
+  propagation rather than by luck: the list's own cancel handler propagates
+  before doing anything, and gpui walks every binding that matches a keystroke
+  while propagation is alive — so `escape` first clears the list's selection
+  and then resolves to the dialog's cancel, which answers Pi and closes.
+  **Upgrade watch:** if a future `gpui-component` bump makes that handler stop
+  propagating, the select dialog silently swallows Escape and leaves a Pi
+  dialog unanswered, which is the one thing CLAUDE.md forbids. Re-check it on
+  every library bump.
 - `option_row` and `options_height` are `pub` for the gallery: the story
   renders the same rows at the same height inline on the canvas, and would
   otherwise be a lookalike. `options_height` clamps to
   `SELECT_VISIBLE_OPTION_ROWS` (8) rows of `SELECT_OPTION_ROW_HEIGHT_IN_REMS`
   (2) each — a short list gets exactly its own height (no dead space under
   three options) and a long one scrolls inside a fixed box instead of growing
-  the modal past the window.
+  the modal past the window. The height is *definite* rather than a `max_h`
+  with inferred sizing because a virtual list needs a resolved height to
+  compute its visible range and the dialog body is auto-height; measuring under
+  indeterminate available space is the fragile path. The 2 rem row is the
+  library list item's own padding plus one line at the theme's line height, so
+  if that padding changes upstream the rows clip slightly and the list starts
+  scrolling a little early — cosmetic drift, not a correctness bug. Eight
+  visible rows keeps even the tallest select at 16 rem of list, which sits
+  inside a normal window above the footer.
 - `OptionListDelegate` holds the options, the selected `IndexPath` and the
   caller's `chosen` callback together, because the library's confirm path and
   the footer button both need all three and neither owns the dialog. Note the
@@ -1414,6 +1612,19 @@ which flow raised it.
   and the box this whole dialog exists to have filled in should not require an
   extra click before it accepts a keystroke. The typed value is read at
   submit time and handed to the caller as a `String`.
+- Focus and dismissal, stated once for all three dialogs. Returning focus to
+  whatever opened the modal is the library's job — `open_dialog` records the
+  previously focused handle and `close_dialog` restores it — so nothing here
+  duplicates it. What each dialog does on *open* differs by what it has to
+  offer: a text entry focuses its input, a select focuses its list so
+  `up`/`down` and Enter work without a pointer, and a confirmation leaves focus
+  on the frame handle the library created. That last one is deliberate: there
+  is no field to put a caret in, the frame sits inside the dialog's focus trap
+  so Tab reaches cancel and then the commit, and Enter/Escape resolve on the
+  dialog's own key context — focusing the primary button instead would only
+  give Enter a second path to the same call. In all three, Escape ends at the
+  dialog's cancel callback, which answers Pi. There is no dismissal path that
+  closes a Pi dialog without answering it.
 
 ## crates/harvester/src/ui/mod.rs
 
@@ -1485,7 +1696,14 @@ from happening again.
   centers its text (`text_center`) for the same reason, since a wrapped hint
   ragged against an invisible left edge reads as a stray label. It is a
   `v_flex` with `gap_4` and `p_8` rather than a bare centered div so a caller
-  may `.child(...)` an action underneath the sentence.
+  may `.child(...)` an action underneath the sentence. Both steps are chosen as
+  relationships rather than as pixel counts: `gap_4` is the "separate groups
+  inside one section" step (the sentence and the action are two things, not
+  one), and `p_8` is the major-region step an empty state wants — the pane has
+  nothing else in it, and crowding its one sentence against the edges is how an
+  empty state reads as broken rather than as waiting. The signature did not
+  change when the action slot was added, so every existing caller keeps
+  rendering exactly what it rendered before.
 - `empty_pane_action` is that action: a small primary `Button`, one per empty
   state. An empty pane that states a problem without offering the one way out
   of it is a dead end, and the alternative — every empty pane hand-rolling its
@@ -1521,15 +1739,35 @@ control wears, what its rows say, and what a pick *means*.
   `.small()` and not `.xsmall()` specifically so they match the send button's
   height: a strip whose pickers sit a few pixels shorter than the button
   beside them reads as three loose controls rather than one row.
+- The `max_w_56` cap is not cosmetic: `Button` lays its label out in a
+  `flex_none` child with no ellipsis lane of its own, so without a cap an
+  unusually long model name pushes the send button out of the box — a clipped
+  label is a cosmetic defect, an unreachable send button is a functional one.
+  The label is therefore cut before it is handed over:
+  `truncated_control_label` keeps `CONTROL_LABEL_MAX_CHARS` (24) *characters*
+  (never bytes, so a multibyte name is never split mid-codepoint), trims the
+  trailing space so the ellipsis does not float, and appends one. All three
+  real label sources (a folder name, a fleet machine label, a model name) are
+  short in practice, so the budget should rarely bite; the unit tests pin the
+  boundary, the trim and the multibyte case.
 - `prompt_box` rounds through `theme.radius_lg` and takes the full theme
   `ring` on focus, plain `border` at rest. The old half-opacity resting border
   plus `shadow_md` are gone: with the graphite ladder the input well already
   reads as raised against the canvas, and a shadow under a control that also
-  fades its own border was two devices doing one job.
+  fades its own border was two devices doing one job. The half-opacity border
+  was also a pseudo-role invented at the call site: the resting state is the
+  plain `border` role now, for the same reason `faint()` became one named
+  accessor instead of an inline `0.6` in two files.
 - `prompt_box_controls()`: `pl_2` + `pr_3`, `gap_2`. The asymmetry is
   deliberate — the button's own internal padding supplies the rest of the left
   inset, while the send button carries none, so `pr_3` is what lands it on the
-  same margin as the input above.
+  same margin as the input above. The rule the left inset is solved against is
+  optical: the controls row is inset one step less than the input row so that
+  the first picker's *content* starts on the same x as the input's first
+  character, which means the row's own padding plus the library's padding for
+  the button size in use has to add up to the input's `px_3`. It is a
+  deliberate off-scale correction, documented here because that is the price of
+  making one.
 - `DropdownRow` is the one shape a picker's rows are described in, and it is
   now purely a description: `label`, `selected` (the choice in effect — the
   menu draws its own check mark) and `divider_above` (a separator meaning what
@@ -1547,12 +1785,34 @@ control wears, what its rows say, and what a pick *means*.
   `on_action` handlers (see its section). This is also what deleted
   `PromptStripHandlers`: three of its four callbacks became actions, and one
   callback (`send`) does not justify a struct.
+  Mechanically, `PopupMenu` focuses `action_context` and *then* dispatches, and
+  gpui walks the dispatch tree upward from whatever is focused — which buys two
+  things at once: the action provably passes through the chat pane, and focus
+  is back in the prompt input when the menu closes, which the hand-rolled
+  popover never managed. `action_context` is an `Option` because the gallery's
+  standalone dropdown story has no input to restore focus to; with `None` the
+  action still dispatches from the menu's own handle (a deferred descendant of
+  whatever rendered the trigger), it simply restores nothing.
+  The three actions are declared `no_json`: they are never addressed by name
+  from a keymap and never deserialized, so they have no business carrying a
+  `Deserialize`/`JsonSchema` derive to satisfy a code path that would only ever
+  error.
+- `send` stayed a plain closure rather than becoming a fourth action. It is a
+  direct control — click, send — it carries no index, and routing a click
+  through `dispatch_action` would be indirection bought for nothing.
 - `prompt_box_dropdown` anchors `BottomLeft` and opens upward deliberately —
   the prompt box sits at the bottom of the pane, so a downward-opening list
   would run past the window edge and snap back over its own trigger. The menu
   is `scrollable(true)` so a long model list scrolls inside the window instead
   of overflowing it; the library owns the popover's padding, width, check-mark
-  gutter and dismissal, all of which this module used to specify by hand.
+  gutter and dismissal, all of which this module used to specify by hand. No
+  max height is set: `PopupMenu` defaults to half the window height, which is a
+  better rule than the pixel literal it replaced because it scales with the
+  window rather than with nothing. (Submenus are unsupported while `scrollable`
+  is on — the pickers have none.) The trigger also *looks* open now for free:
+  the library selects a popover's trigger for as long as the menu is up, and a
+  real `Button` renders that selected state, which is precisely what the
+  deleted `PlainTrigger` newtype existed to no-op away.
 - `prompt_box_control`'s icon is given neither an explicit size nor color:
   `Icon` falls back to the ambient text style, so the glyph and its label
   always match without a second set of tokens. `dropdown_caret(true)` is the
@@ -1561,14 +1821,26 @@ control wears, what its rows say, and what a pick *means*.
 - `prompt_box_send` carries a `tooltip_with_action` naming the `Enter`
   keystroke in the `Input` key context (`SEND_KEYSTROKE` / `INPUT_KEY_CONTEXT`)
   — the send button and Enter are the same action, and the tooltip is where
-  that is said once. Its `enabled` flag remains a look, not a guard: a chat
+  that is said once. The keystroke is not an invented advertisement: the
+  library binds `enter` to that exact action inside the `Input` key context,
+  and the prompt's `submit_on_enter` is what turns it into a submit, so the
+  tooltip names a binding that genuinely exists. `.rounded_full()` is chained
+  through `Styled` rather than expressed as a huge radius, because `Button`
+  refines the caller's own style over its per-corner rounding, so the chained
+  call wins outright. Its `enabled` flag remains a look, not a guard: a chat
   with no machine or repository selected refuses the prompt inside its own
   state machine; the disabled rendering is just how the strip communicates
   that *before* the user starts typing.
 - `branch_indicator` is a `Tag::secondary().small()`, not a disabled picker.
   It never opens anything, and rendering it as a dead dropdown trigger made it
   look like a control the user had failed to earn. A tag reads as a label
-  about the session, which is all it ever was. It is still the only place in
+  about the session, which is all it ever was. `Tag` is this library's chip —
+  `gpui_component::Badge` is a notification overlay dot, not the same thing —
+  and the `secondary` variant is chosen because a branch name carries no
+  success, warning or danger meaning; a strip with a row of colored badges in
+  it is a hierarchy decision nobody made. There is exactly one badge on the
+  strip and it stays quiet. Its icon/label `gap_1` is the "parts of one
+  control" step, not the "separate controls" one. It is still the only place in
   `ui` that names an asset path (`assets::GIT_BRANCH_ICON_PATH`, at `size_3`),
   and still the reason `assets` and `ui` had to land on the same side of the
   lib/bin split.
@@ -1599,7 +1871,12 @@ when models failed to load" a question with one answer instead of three.
   makes the bottom row a single render path, so a caller cannot draw a notice
   and a prompt box at the same time or drift on the tone. `SESSION_STARTING_NOTICE`
   ("Starting session…") is a const here for the same reason: the wording is
-  presentation, and the state machine has no business owning it.
+  presentation, and the state machine has no business owning it. Its ellipsis
+  is doing real work and stays until something replaces it: the honest control
+  for ongoing work is an indeterminate progress indicator, but `inline_note`
+  has no leading slot to put one in, and dropping the dots without adding a
+  spinner would delete the "still happening" reading and leave a flat
+  statement.
 - `prompt_strip(strip, send, input, cx)` takes exactly one callback. `send` is
   `Fn(&mut Window, &mut App)`: the click event carries nothing a caller needs,
   and dropping it keeps `gpui::ClickEvent` out of the surface. The three picks
@@ -1641,7 +1918,13 @@ Wording convention, app-wide: user-visible text is sentence case
 "Sessions", "Controls"). Section headers used to `to_uppercase()` their title
 and set `SEMIBOLD`; both are gone. Small-caps at 12.25px is the least legible
 thing the app could render, and the weight was doing the job the `faint`/`dim`/
-foreground brightness ladder already does. Lowercase is now reserved for
+foreground brightness ladder already does. The decisive argument was
+mechanical, not aesthetic: caps are only legible as a compact shape when they
+come with measured tracking, and this gpui revision exposes no letter-spacing
+API at all, so shipping caps would have been shipping half of the recipe at the
+smallest size the app draws. Level is carried by size and brightness instead.
+Restoring caps later is a change to the caller's literals — `ui/shell.rs`
+uppercases nothing and would not need to change. Lowercase is now reserved for
 identifiers (tool names, branch names, model ids) and the gallery's knob and
 preset vocabulary, which mirrors code — the gallery's *group* names are
 sentence case like every other heading.
@@ -1654,7 +1937,24 @@ sentence case like every other heading.
   shadow rather than a border because a border changes an element's layout box
   and would shift a row by a pixel the moment it gained focus; a shadow draws
   outside the box and moves nothing. One trait, so the sidebar, the section
-  headers and the gallery cannot each invent their own ring.
+  headers and the gallery cannot each invent their own ring. `FOCUS_RING_SPREAD`
+  and `FOCUS_RING_OFFSET` are the two `px()` literals in this module that are
+  meant to stay pixels: a focus ring is a physical hairline, in the same class
+  as a 1px border, and it must stay one crisp ring at any rem size. 1.5px is
+  also what gpui-component uses for its own ring, so ours differs from the
+  library's in exactly one respect — the library draws the ring color at 0.2
+  alpha and we draw it at full strength, because a keyboard focus ring is the
+  one thing on screen that must not be subtle.
+- Keyboard activation is nowhere written by hand, and that is a gpui fact worth
+  knowing before anyone adds a key handler: `tab_index` sets both `focusable`
+  and `tab_stop`, gpui creates the `FocusHandle` in element state for a
+  focusable element that has no tracked one (so no view has to hold a handle
+  and no `&Window` has to be threaded into a row builder), and gpui synthesizes
+  a keyboard `ClickEvent` from Enter/Space on a focused element that has click
+  listeners — so an existing `on_click` is already the keyboard behavior. Tab
+  order resolves by `(path, insertion index)`, meaning equal indices fall back
+  to paint order; that is why every tab stop in the app uses index 0 and still
+  walks in visual order.
 - The statusbar band is `h_8` (2rem, 28px) — one line of `text_sm` with real
   breathing room, still short enough to read as a status strip rather than a
   second toolbar. There is no `STATUSBAR_HEIGHT` const any more: the rem step
@@ -1688,7 +1988,18 @@ sentence case like every other heading.
   so its shape is something the user actually sees, and at `pb_1` there was
   under 4px between the text and the ring's lower edge.
 - `chat_header` is `py_3` for the same reason the statusbar grew, and its
-  subtitle is `text_sm`.
+  subtitle is `text_sm`. The subtitle slot has a rule: it names the next action
+  or the target, never a restatement of the title. The chat pane pairs "New
+  session" with "Pick a machine and a repository below", or a live session's
+  title with `<folder> on <machine>`; the gallery pairs a story name with its
+  group, which is the story's location. A subtitle that only echoed its title
+  would be the header charging twice for one line of information.
+- Pointer conventions, app-wide: `cursor_pointer()` is not how this app says
+  "clickable". Nothing in the chrome navigates to an external resource, so
+  nothing takes the pointing hand — hover fills, press fills and the focus ring
+  carry affordance instead. The library agrees by default: `Button` sets
+  `cursor_default()` and only opts into a pointer for its link and text
+  variants.
 
 ## crates/harvester/src/ui/sidebar.rs
 
@@ -1710,6 +2021,17 @@ means belong to `workbench/sidebar.rs`.
   aligns to so a note and a row title share one left edge. `section_header`
   in `ui/shell.rs` reads the same two constants, and `workbench/sidebar.rs`
   reads `SIDEBAR_ROW_GUTTER` for the New-session button.
+  The point of all of that is a single alignment spine. Four siblings describe
+  the same level of the sidebar — the New-session button, the section headers,
+  the rows and the empty note — and each used to invent its own leading edge
+  from its own literal. They now all resolve from this one pair, so changing
+  the gutter moves every one of them together instead of starting a hunt.
+  `SIDEBAR_CONTENT_INSET` is *computed* (`rems(GUTTER.0 + PADDING.0)`) rather
+  than typed a second time; `Rems` is a tuple struct and `rems` is a `const fn`,
+  so the sum costs nothing at runtime and cannot drift. `ui/shell.rs` reaching
+  into `ui/sidebar.rs` for geometry is the intended direction: the sidebar owns
+  the inset, and `collapsible_section` is a sidebar-shaped header that the
+  gallery's dock happens to reuse.
 - Row padding is `py_2` (was `py_1`), matching the standard-tier step the rest
   of the chrome took: a session row carries two lines of `text_sm` and at
   `py_1` the stacked rows ran together into one grey block.
@@ -1719,15 +2041,28 @@ means belong to `workbench/sidebar.rs`.
   time the dot diameter or the dot/title gap changed (it was "6px + gap_2").
   Declaring the lane instead of deriving it means the two can never disagree,
   and it is why the detail line hangs under the *title* rather than under the
-  dot.
+  dot. The dot sits at the lane's leading edge and the row carries no outer
+  gap of its own, so the dot's diameter is free to change without moving a
+  single character of text.
 - `sidebar_row` is a `ListItem` base, not a `div`: the library owns the
   hover/selected/disabled treatments, and machine rows rely on `disabled`
   gating the row while still rendering a live suffix button (see
   `render_missing_machine_row`). It sets a `tab_index` so rows are reachable
   by keyboard; a caller that must *not* be a tab stop (the machine rows, which
-  are not clickable) opts out with `tab_stop(false)`, and a caller that is
-  opts into the ring with `keyboard_focus_ring`. It no longer restates a text
-  size — the ambient body size is correct now that nothing overrides it.
+  are not clickable) opts out with `tab_stop(false)` — still focusable
+  programmatically, just skipped by Tab, because a row with no click handler is
+  a dead end to land on — and a caller that is opts into the ring with
+  `keyboard_focus_ring`. The ring cannot live inside `sidebar_row` itself: it
+  needs `cx` for the theme's ring color and this builder takes only an id, so
+  the split is deliberate — the row owns reachability, the call site owns the
+  ring. It no longer restates a text
+  size — the ambient body size is correct now that nothing overrides it. The
+  size was *removed* rather than read from the theme for the same reason the
+  ring stayed outside: both roots that can host a row (the workbench root and
+  the gallery's chrome root) set the theme's font size themselves, so the row
+  renders at exactly the size it used to declare with one fewer place to drift.
+  A row mounted under some third root wants the size restored at that root,
+  never back on the row.
 - `sidebar_stacked_row` takes a **`Tone`, not a `Dot`**: the shape is derived
   by `Tone::dot` (see `ui/core.rs`), so no caller picks solid-versus-hollow any
   more. It is one shape for both lists: status lane + title on the first line,
@@ -1741,6 +2076,9 @@ means belong to `workbench/sidebar.rs`.
   to *say* something: it carries `Tone::label` as both its `aria_label` and its
   tooltip. A color alone is not a status for a screen reader, and it is not one
   for a sighted user who has not memorized six shades either.
+  `STATUS_LANE_ELEMENT_ID` is the bare string `"status"` for every row, which is
+  correct rather than lazy: gpui element ids are paths, and every row already
+  carries a unique id, so a leaf only has to be unique among its siblings.
 - `sidebar_empty_note` is the "no sessions yet" line. It is a plain note, not
   a row: an empty list has nothing to select, so it must not look clickable.
 
@@ -1786,6 +2124,12 @@ is the same hue-240/5%-saturation gray at a different lightness) replacing
   prompt box, a tool card, the dialog option list, a user bubble) round
   through those slots rather than through gpui's fixed `rounded_md`/
   `rounded_lg` steps, so the theme stays the one place either radius is set.
+  That is not only about ownership: gpui's rounding helpers are rem steps, so
+  they would *grow with the font size*, and a corner that opens up when you
+  zoom the type is wrong — a radius is a property of the frame, not of the text
+  inside it. The two values stay bare numbers here because the config's radius
+  fields are plain integers; they are theme definitions, and the rule they
+  carry is on the consumer side.
 - `BASE_FONT_SIZE` (14) is set as **both** `font_size` and `mono_font_size`.
   This is the single most load-bearing number in the visual layer, because in
   gpui the base font size *is* the rem unit: every `px_3`, `gap_2`, `h_8`,
@@ -1797,6 +2141,26 @@ is the same hue-240/5%-saturation gray at a different lightness) replacing
   tier: `text_sm` is 12.25px at rem 14 and `text_xs` would be 10.5px, under
   the ~12px typography floor, which is why `text_xs` appears nowhere in
   `crates/harvester`.
+- The mechanism behind that is `gpui_component::Root::render` calling
+  `window.set_rem_size(cx.theme().font_size)`: this one theme slot *is* the
+  window's rem unit, for the library's own controls as much as for ours. The
+  config used to leave it unset — the library's default is 16 — while the app
+  root painted its text at 13, so type and geometry ran on two scales and the
+  geometry was around a fifth too airy for the text it framed. Owning the slot
+  is what turned the `px()` literals scattered through `ui` from
+  convert-by-hand into delete-and-read-the-scale.
+- `mono_font_size` is set explicitly even though the library ships a mono
+  default of its own that would often agree. The whole point of the axis is
+  that *one* const drives it, and an unset field would silently desync the
+  transcript's mono runs the next time either upstream's default or
+  `BASE_FONT_SIZE` moves; the cost of stating it is one line. Watch item: a
+  mono family reads optically larger than Inter at the same nominal size, so if
+  the transcript ever feels heavy the fix is a separate `MONO_FONT_SIZE` const
+  one step down — not dropping the field and going back to inheriting a number
+  nobody here chose.
+- Hex literals are confined to this file. No other module in `ui` contains a
+  color literal of any kind; `core.rs` in particular returns theme roles
+  exclusively, which is what makes SPEC C11 checkable by reading one file.
 - `UI_FONT` "Inter" / `MONO_FONT` "Geist Mono": both set as theme slots
   (`font_family`, `mono_font_family`) so `Root` styles the whole window and
   gpui-component widgets agree with our own mono runs (`core.rs` reads the
@@ -1824,7 +2188,13 @@ transcript tool-call block; tool-specific labeling and body policy live in
   `aria_label` the caller supplies (see `tool_label` / `tool_accessible_name`
   in `transcript.rs`). It takes its `index` rather than an `ElementId` and
   builds `(HEADER_ELEMENT_ID, index)` itself, so the id scheme lives in one
-  place with the status slot's matching `(STATUS_ELEMENT_ID, index)`.
+  place with the status slot's matching `(STATUS_ELEMENT_ID, index)` — the row
+  needs a stateful id for focus and click, the indicator needs its own for the
+  tooltip, and letting the caller invent either one invites a collision.
+  `HEADER_TAB_INDEX` (0) makes every tool header an ordinary tab stop in
+  document order, and that single call is the whole keyboard story: the
+  existing `on_click` toggle answers Enter and Space with no key handling
+  written here (see `ui/shell.rs` for the gpui mechanics).
 - Focus on the header is a transparent 1px border that turns `theme.ring`,
   not the shared `keyboard_focus_ring` shadow. The card clips its children
   (`overflow_hidden`), so a shadow drawn outside the header's box would be cut
@@ -1833,25 +2203,54 @@ transcript tool-call block; tool-specific labeling and body policy live in
 - The header has both a hover fill (`list_hover`) and a press fill (`muted`):
   press feedback lands on pointer-down, matching every other clickable
   surface in the app.
-- `status` is the dot in a fixed `size_4` slot with `Tone::label` as its
-  tooltip — same rule as the sidebar's status lane: a color is not a status
-  unless something says what it means. The fixed slot is what keeps every
-  header's label starting on the same x.
+- `status` is the dot in a fixed `size_4` slot carrying the caller's status
+  word as its tooltip — same rule as the sidebar's status lane: a color is not
+  a status unless something says what it means. The word is *not* `Tone::label`
+  here; it is `transcript::tool_status_label`, because the tones speak the
+  machine- and session-liveness vocabulary and a finished tool call is
+  "Completed", not "Neutral". The slot is `size_4` rather than hugging the 6px
+  dot for two reasons: a 6px tooltip target is not something a pointer can
+  reliably hit, and a fixed-width indicator gives a stack of repeated rows one
+  stable icon column, which is what keeps every header's label starting on the
+  same x.
 - `stats` is one faint run (`+3 −1`), not a green `+` beside a red `−`. Diff
   counts are metadata about an edit, not a verdict on it, and spending the
   success/danger colors on them made a routine edit look like a test result —
   the two colors that mean "it worked" and "it failed" have to stay scarce.
+  Semantic color is legitimate where it *is* the data, which in this module is
+  the diff lines in the body and nowhere else. `stats` also gave up its own
+  smaller size, which is what lets the `items_baseline` label row line up
+  exactly instead of nearly.
+- The card's emphasis budget is three text tiers and no more: full foreground
+  for the subject (the file name or the command), `dim` for the verb and the
+  output body, `faint` for the stats, the context line, the chevron and the
+  truncation notice. Together with `tool_tone` mapping a settled call to
+  `Tone::Muted`, that leaves a finished tool block with exactly one focal point
+  and, in the header, exactly one colored element — the dot. Color in the
+  transcript means "running" or "broken" and nothing else.
+- Header and body deliberately sit at the same `text_sm` size. They are two
+  halves of one secondary-tier card, told apart by a hairline and a font
+  change, not by size; the body used to be smaller than its own header, which
+  inverted the label/content relationship. One step below the message prose is
+  the right place for the whole card: prose is the content, tool rows are the
+  scannable log of how it was produced, and under the old two-scale mismatch
+  the log rendered *larger* than the work it described.
 - `body` is `text_sm` on the mono family with an explicit
   `line_height(relative(CODE_LINE_HEIGHT))` (1.45). Code needs tighter leading
-  than the 1.7 prose uses, and `TextViewStyle` has no line-height field, so the
+  than the 1.7 prose uses — it is the *ratio* between the two that carries the
+  meaning (code reads as one block, prose wants air), not either number on its
+  own — and `TextViewStyle` has no line-height field, so the
   wrapper is where it is set — the same technique `transcript.rs` uses for
   messages. `code_lines` is a bare unpadded column so a run of diff or written
   lines stacks with no gap between them; the `gap_1` on `body` separates the
   *sections* of a body (context line, content, output), not the lines inside a
-  section.
+  section. Equal gaps claim equal relationships, and consecutive lines of one
+  file are not siblings with space between them — their leading is what should
+  separate them, which is exactly what `CODE_LINE_HEIGHT` is for.
 - `truncation_notice` says "Output truncated" as a sentence, not "… output
   truncated": it is chrome stating a fact about the block, and the leading
-  ellipsis made it read like part of the output it is describing.
+  ellipsis made it read like part of the output it is describing. No final
+  period either — a short state is a label, not a sentence to be closed.
 
 ## crates/harvester/src/ui/transcript.rs
 
@@ -1870,10 +2269,18 @@ wrong block.
   events as they stream in is lifecycle/adaptation policy, while the
   scrollable message surface itself is presentation policy — the split keeps
   those concerns in their respective owners.
-- The message column is `gap_4` / `p_4` (up from `gap_3` / `p_3`). The
-  transcript is the one surface the user reads continuously, so it takes the
-  standard tier ahead of everything else; at rem 14 the compact spacing let a
-  tool card and the paragraph under it touch.
+- The message column is `gap_4` / `py_4` / `px_3`. The transcript is the one
+  surface the user reads continuously, so it takes the standard tier
+  vertically ahead of everything else; at rem 14 the compact spacing let a
+  tool card and the paragraph under it touch. Horizontally it stays at `px_3`
+  because that is the chat column's shared leading edge — `ui::chat_header`
+  above it and `ui::prompt_strip` below it are both `px_3`, and three siblings
+  in one pane with three different left edges is the kind of drift nobody sees
+  individually and everybody feels. Vertical rhythm is the transcript's own
+  business; the leading edge is not. The transcript owns this padding
+  outright: neither the chat pane that hosts it nor the gallery's
+  `transcript_panel` (explicitly `p_0`) adds any of its own, so there is one
+  place to change it and no chance of doubling it.
 - `tool_tone`: `ToolStatus::Running` maps to `Tone::Active` rather than
   `Tone::Pending` — a running tool is the live thing the user is watching on
   screen right now, not a "just working, outcome unknown" state. `Ok` maps to
@@ -1896,17 +2303,25 @@ wrong block.
   Completed"). Status is included because the dot that carries it is invisible
   to a screen reader, and it comes last because the action is what identifies
   the row — a list of blocks all beginning "Completed" would be unnavigable.
-  Both shapes are pinned by tests.
+  Both shapes are pinned by tests, and the reason they are worth a test is that
+  this string is the selector surface agents drive the gallery through over the
+  a11y tree — it is an interface, not a nicety.
 - `tool_status_label` is the tool block's own status vocabulary
   ("Running"/"Completed"/"Failed") rather than `Tone::label`'s: the tones are
   named for what they *mean* across the app, and a settled tool call is
-  "Completed", not "Neutral".
+  "Completed", not "Neutral". The same string feeds both the status dot's
+  tooltip and the header's accessible name, so what the block shows on hover
+  and what it says out loud cannot drift apart. The *shape* channel still comes
+  from the tone, through `Tone::dot`.
 - `output_text` centralizes the empty-output case: "Running…" while the call is
   in flight, "No output" once it has settled. It was `"(no output)"` —
   parenthesised asides are how a UI mumbles, and a tool that genuinely printed
   nothing is a fact worth stating plainly. Pinned by a test.
-- `render_tool_body` is now a router over three named builders rather than a
-  chain of early returns: `render_tool_content` decides whether this block has
+- `render_tool_body` is now a router over named builders (`render_tool_content`
+  over `render_diff` / `render_written_content` / `render_written_line`, and
+  `output_text`) rather than a chain of early returns; the behavior is
+  unchanged, but every branch has a name and the early-return shape is stated
+  once instead of being inferred: `render_tool_content` decides whether this block has
   *content* (a diff, or a `write`'s written lines rendered as added lines —
   neither offered for a failed call, because that is where the error message
   has to win), and only when it has none does the body fall through to the
@@ -1935,7 +2350,10 @@ wrong block.
   `Tone::Failed` color on the text itself.
 - `render_failure`: a failed turn is Pi-authored but intentionally *not*
   rendered as markdown, because provider error strings must preserve literal
-  `*` and `#` characters rather than have them interpreted as formatting.
+  `*` and `#` characters rather than have them interpreted as formatting. It
+  paints a whole paragraph in `Tone::Failed`, which is a great deal of color by
+  this module's own standards — kept deliberately, because a failed turn is
+  precisely where the emphasis budget should be spent and it is rare.
 - `render_streaming`: shows the in-flight turn's partial markdown (suffixed
   with a `▍` cursor), or a bare "…" activity placeholder before the first
   partial chunk arrives, or nothing if the transcript isn't busy.
@@ -2270,6 +2688,18 @@ repository is picked inside the chat that is about to use it, and
 `workspaces.json` is that picker's backing store rather than being surfaced
 as a sidebar citizen with its own list.
 
+The New session button is a plain `ghost` `small` `Button`, sized to its own
+content rather than stretched to the sidebar. It used to ask for `w_full()`
+and `justify_start()`, and rendered neither: gpui-component's `Button` builds
+its label as an inner `h_flex().size_full().items_center().justify_center()`
+added as a child *after* `refine_style` applies the caller's style, so the
+button's own justify never reaches the label — a full-width button rendered a
+centered label while the code claimed a left-aligned one. Between honouring
+the claim and honouring the pixels, the claim won, because a left edge shared
+with the rows below it is the point. The cost is the full-width hit target; if
+that turns out to matter, the honest way back is a `ui::sidebar_row` carrying
+`Role::Button`, not a style the library will keep ignoring.
+
 Row chrome is not here: `ui::sidebar_row`, `ui::sidebar_stacked_row` and
 `ui::sidebar_empty_note` own how a row *looks* (see `ui/sidebar.rs`), and
 `ui::collapsible_section` owns the two section headers, so this module is
@@ -2409,3 +2839,66 @@ Skipped directories: `target` (build output) and `bin` (spike binaries —
 throwaway code is exempt from house rules). The scan roots at the parent of
 `CARGO_MANIFEST_DIR`, i.e. `crates/`, so every workspace crate is covered from
 this one test regardless of which crate hosts it.
+
+## Recorded gaps (visual layer)
+
+Known and accepted limitations that cut across modules; the gallery keeps its
+own list under its section above. Each of these is a decision to *not* fix
+something yet, with the reason it was not worth fixing blind.
+
+- **The send button has no accessible name.** `Button` sets `aria_label` from
+  its own label and from nothing else, and the send button is icon-only.
+  Nothing can be done about it from this side: `aria_label` lives on
+  `StatefulInteractiveElement`, which `Button` does not implement, and gpui's
+  interactivity aria field is crate-private. Wrapping the button in a labelled
+  `div` is theatre rather than a fix — a div with no role is filtered out of
+  the accessibility tree, and a wrapper *with* a role is not the focusable
+  node, so an assistive-technology user still lands on an unnamed button. The
+  real fix is upstream.
+- **`Dot` is legacy and one call site proves it.** `Tone::dot` derives the
+  shape now, and `status_dot_for_tone` is the surface every caller should use;
+  once `workbench/machine_presentation.rs` stops carrying a `Dot` of its own,
+  `Dot`, `Dot::tone` and the `Dot`-taking `status_dot` should be deleted and
+  `Tone::dot` folded into `status_dot_for_tone`. Until then, treat a
+  hand-built `Dot::Solid(..)`/`Dot::Hollow(..)` as legacy. The live
+  consequence: a reachable-but-idle machine is built as `Dot::Solid(Tone::Idle)`
+  and renders **hollow**, because the sidebar reads only the tone back off it.
+  The fix is to re-pick the *tone* — a settled state wants `Tone::Muted`,
+  genuinely-unknown keeps `Tone::Idle` — never to hand-build a shape; the unit
+  tests in that file assert on `Dot` variants and move with it.
+- **Two optical insets drifted when the controls stepped up a size.** Both the
+  prompt strip's controls row and the sidebar's New-session button were solved
+  against the library's *extra-small* button padding and the sidebar's older
+  row padding respectively. Both controls are `small` now and the row padding
+  grew, so in each case the control's leading content sits a quarter-rem
+  inboard of the text it is supposed to align with. The rule in both places is
+  still "the row's own inset plus the library's padding equals the neighbour's
+  inset"; what is missing is re-solving it, which is one step in each file and
+  wants an eye on the rendered result rather than arithmetic alone.
+- **`KeyboardFocusRing` has no inset variant.** A control inside a clipping
+  container cannot use it, because an overflow-hidden parent masks a shadow
+  drawn outside the child's box. The tool block header therefore hand-rolls the
+  equivalent as a permanently-reserved transparent border recolored on
+  `focus_visible`. One trait with an inset mode would let it share the app's
+  one ring instead.
+- **A long transcript is a long tab sequence.** Every tool header is a tab
+  stop, which is what "every action is reachable by keyboard" demands and what
+  chat UIs generally do, but the better end state is the transcript as a list
+  with arrow-key traversal behind a single tab stop. That needs an owner for
+  keyboard navigation across the whole shell, not a change inside one module.
+- **Two ellipses are standing in for an indeterminate progress indicator**: the
+  prompt strip's "Starting session…" and the streaming turn's bare "…"
+  placeholder. Decorative dots are the weaker answer, but this revision of
+  `gpui-component` ships no indeterminate indicator, and `inline_note` has no
+  leading slot to put one in. Whoever adds the slot should retire both dots in
+  the same change.
+- **The select dialog is not searchable.** With a hundred options from a Pi
+  extension, filtering would help; the library's list state has the mechanism.
+  It is not done because a search input takes focus and changes what Enter
+  means inside a dialog whose whole contract is that Enter answers Pi — which
+  is a change to verify against a real Pi dialog, not to reason about.
+- **The dialog geometry has never been seen driven by a real Pi.** The option
+  row height, the three width rungs, and a virtual list inside an auto-height
+  dialog body were all chosen by construction. They want one look at a genuine
+  `select` from a real extension on a throwaway VM before they are treated as
+  settled.

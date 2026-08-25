@@ -59,7 +59,8 @@ impl TranscriptPresentation {
                     .flex()
                     .flex_col()
                     .gap_4()
-                    .p_4()
+                    .px_3()
+                    .py_4()
                     .children(transcript.items().iter().enumerate().map(|(index, item)| {
                         self.render_item(index, item, toggle_tool_block.clone(), cx)
                     }))
