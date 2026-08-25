@@ -4,13 +4,13 @@ use crate::stories::TONE_LABELS;
 use crate::stories::{core, dialog, note, prompt, prompt_strip, shell, sidebar, transcript};
 use crate::story::{KnobSpec, KnobValue, Preset, Story};
 
-pub const CORE_GROUP: &str = "core";
-pub const NOTE_GROUP: &str = "note";
-pub const SHELL_GROUP: &str = "shell";
-pub const SIDEBAR_GROUP: &str = "sidebar";
-pub const PROMPT_GROUP: &str = "prompt";
-pub const FLAGSHIP_GROUP: &str = "flagship";
-pub const DIALOG_GROUP: &str = "dialog";
+pub const CORE_GROUP: &str = "Core";
+pub const NOTE_GROUP: &str = "Note";
+pub const SHELL_GROUP: &str = "Shell";
+pub const SIDEBAR_GROUP: &str = "Sidebar";
+pub const PROMPT_GROUP: &str = "Prompt";
+pub const FLAGSHIP_GROUP: &str = "Flagship";
+pub const DIALOG_GROUP: &str = "Dialog";
 
 pub const STREAMING_TRANSCRIPT_STORY: &str = "Transcript — streaming";
 
@@ -30,24 +30,19 @@ pub fn build_stories() -> Vec<Story> {
         Story::new(
             CORE_GROUP,
             "Dot",
-            vec![
-                KnobSpec::choice(core::TONE_KNOB, TONE_LABELS, LIVE_TONE_INDEX),
-                KnobSpec::flag(core::SOLID_KNOB, true),
-            ],
+            vec![KnobSpec::choice(
+                core::TONE_KNOB,
+                TONE_LABELS,
+                LIVE_TONE_INDEX,
+            )],
             vec![
                 Preset::new(
                     "running session",
-                    vec![
-                        (core::TONE_KNOB, KnobValue::Choice(LIVE_TONE_INDEX)),
-                        (core::SOLID_KNOB, KnobValue::Bool(true)),
-                    ],
+                    vec![(core::TONE_KNOB, KnobValue::Choice(LIVE_TONE_INDEX))],
                 ),
                 Preset::new(
                     "unreachable machine",
-                    vec![
-                        (core::TONE_KNOB, KnobValue::Choice(FAILED_TONE_INDEX)),
-                        (core::SOLID_KNOB, KnobValue::Bool(false)),
-                    ],
+                    vec![(core::TONE_KNOB, KnobValue::Choice(FAILED_TONE_INDEX))],
                 ),
             ],
             core::dot,
@@ -159,7 +154,6 @@ pub fn build_stories() -> Vec<Story> {
             "sidebar_stacked_row",
             vec![
                 KnobSpec::choice(sidebar::TONE_KNOB, TONE_LABELS, LIVE_TONE_INDEX),
-                KnobSpec::flag(sidebar::SOLID_KNOB, true),
                 KnobSpec::text(sidebar::TITLE_KNOB, "fix the dialog room"),
                 KnobSpec::text(sidebar::DETAIL_KNOB, "harvester · exe-vm-7fa2"),
                 KnobSpec::text(sidebar::NOTE_KNOB, "opening…"),
@@ -170,7 +164,6 @@ pub fn build_stories() -> Vec<Story> {
                     "running session",
                     vec![
                         (sidebar::TONE_KNOB, KnobValue::Choice(LIVE_TONE_INDEX)),
-                        (sidebar::SOLID_KNOB, KnobValue::Bool(true)),
                         (sidebar::NOTE_KNOB, KnobValue::Text(String::new())),
                         (sidebar::SELECTED_KNOB, KnobValue::Bool(true)),
                     ],
@@ -179,7 +172,6 @@ pub fn build_stories() -> Vec<Story> {
                     "opening session",
                     vec![
                         (sidebar::TONE_KNOB, KnobValue::Choice(1)),
-                        (sidebar::SOLID_KNOB, KnobValue::Bool(false)),
                         (sidebar::NOTE_KNOB, KnobValue::Text("opening…".into())),
                         (sidebar::SELECTED_KNOB, KnobValue::Bool(false)),
                     ],

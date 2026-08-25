@@ -1,8 +1,11 @@
-use gpui::{div, prelude::*, px, AnyElement, App, Div, FontWeight, Window};
+use gpui::{div, prelude::*, rems, AnyElement, App, Div, FontWeight, Window};
 use gpui_component::input::Input;
+use gpui_component::v_flex;
 use gpui_component::ActiveTheme as _;
 use harvester::ui::dialog::{
-    action_button, button_row, cancel_button, title_or_fallback, ActionAccent, Confirmation,
+    action_button, button_row, cancel_button, option_row, options_height, title_or_named_condition,
+    ActionAccent, Confirmation, CONFIRMATION_DIALOG_WIDTH_IN_REMS, SELECT_DIALOG_WIDTH_IN_REMS,
+    TEXT_DIALOG_WIDTH_IN_REMS,
 };
 
 use super::{caption, panel, story_column};
@@ -18,11 +21,23 @@ pub const ACCENT_LABELS: &[&str] = &["primary", "danger"];
 
 const CANCEL_BUTTON_ID: &str = "story-dialog-cancel";
 const ACTION_BUTTON_ID: &str = "story-dialog-action";
-const DIALOG_SURFACE_WIDTH: f32 = 520.;
-const SINGLE_LINE_CAPTION: &str = "Single-line input (pi text dialog)";
-const MULTI_LINE_CAPTION: &str = "Multi-line input (pi editor dialog)";
+const SELECT_CANCEL_BUTTON_ID: &str = "story-dialog-select-cancel";
+const SELECT_COMMIT_BUTTON_ID: &str = "story-dialog-select-commit";
+const UNTITLED_CONFIRM_CONDITION: &str = "The agent needs a yes or no";
+const CONFIRMATION_CAPTION: &str = "Confirmation width — one decision, no form";
+const SELECT_CAPTION: &str = "Select width — a scannable option list, Enter commits";
+const TEXT_CAPTION: &str = "Text width — single-line input (pi text dialog)";
+const MULTI_LINE_CAPTION: &str = "Text width — multi-line input (pi editor dialog)";
 const FOUNDATION_CAPTION: &str =
     "Chrome only — rendered inline, never through window.open_dialog; the redesign happens here";
+const SELECTED_OPTION_INDEX: usize = 1;
+const STORY_OPTIONS: &[&str] = &[
+    "main",
+    "backend-hardening",
+    "design-pass",
+    "release/0.4",
+    "spike/pi-0.84",
+];
 
 pub fn chrome(scene: &StoryScene, _window: &mut Window, cx: &mut App) -> AnyElement {
     let confirmation = confirmation(scene);
@@ -31,11 +46,14 @@ pub fn chrome(scene: &StoryScene, _window: &mut Window, cx: &mut App) -> AnyElem
     let multi_line = runtime.dialog_multi_line_input.clone();
 
     story_column()
+        .child(caption(CONFIRMATION_CAPTION, cx))
         .child(confirmation_surface(confirmation, cx))
+        .child(caption(SELECT_CAPTION, cx))
+        .child(select_surface(cx))
         .child(
             panel(cx)
-                .w(px(DIALOG_SURFACE_WIDTH))
-                .child(caption(SINGLE_LINE_CAPTION, cx))
+                .w(rems(TEXT_DIALOG_WIDTH_IN_REMS))
+                .child(caption(TEXT_CAPTION, cx))
                 .child(Input::new(&single_line))
                 .child(caption(MULTI_LINE_CAPTION, cx))
                 .child(Input::new(&multi_line)),
@@ -46,7 +64,7 @@ pub fn chrome(scene: &StoryScene, _window: &mut Window, cx: &mut App) -> AnyElem
 
 fn confirmation(scene: &StoryScene) -> Confirmation {
     Confirmation {
-        title: title_or_fallback(scene.knobs.text(TITLE_KNOB)),
+        title: title_or_named_condition(scene.knobs.text(TITLE_KNOB), UNTITLED_CONFIRM_CONDITION),
         message: scene.knobs.text(MESSAGE_KNOB).to_string().into(),
         cancel_label: scene.knobs.text(CANCEL_LABEL_KNOB).to_string().into(),
         action_label: scene.knobs.text(ACTION_LABEL_KNOB).to_string().into(),
@@ -72,13 +90,42 @@ fn confirmation_surface(confirmation: Confirmation, cx: &App) -> Div {
     );
 
     panel(cx)
-        .w(px(DIALOG_SURFACE_WIDTH))
+        .w(rems(CONFIRMATION_DIALOG_WIDTH_IN_REMS))
         .bg(cx.theme().popover)
-        .child(
-            div()
-                .font_weight(FontWeight::MEDIUM)
-                .child(confirmation.title),
-        )
+        .child(title_line(confirmation.title))
         .child(div().child(confirmation.message))
         .child(buttons)
+}
+
+fn select_surface(cx: &App) -> Div {
+    let buttons = button_row(
+        cancel_button(SELECT_CANCEL_BUTTON_ID, "Cancel"),
+        action_button(SELECT_COMMIT_BUTTON_ID, "Choose", ActionAccent::Primary),
+    );
+
+    panel(cx)
+        .w(rems(SELECT_DIALOG_WIDTH_IN_REMS))
+        .bg(cx.theme().popover)
+        .child(title_line("Which branch should I work on?"))
+        .child(option_rows(cx))
+        .child(buttons)
+}
+
+fn option_rows(cx: &App) -> Div {
+    let rows = STORY_OPTIONS
+        .iter()
+        .enumerate()
+        .map(|(index, option)| option_row(index, *option, index == SELECTED_OPTION_INDEX));
+
+    v_flex()
+        .h(options_height(STORY_OPTIONS.len()))
+        .overflow_hidden()
+        .border_1()
+        .border_color(cx.theme().border)
+        .rounded(cx.theme().radius)
+        .children(rows)
+}
+
+fn title_line(title: impl Into<gpui::SharedString>) -> Div {
+    div().font_weight(FontWeight::MEDIUM).child(title.into())
 }

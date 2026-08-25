@@ -1,7 +1,6 @@
 use gpui::{prelude::*, AnyElement, App, Window};
 use harvester::ui::{
-    prompt_strip, DropdownRow, PromptStrip, PromptStripControl, PromptStripHandlers,
-    PromptStripNotice,
+    prompt_strip, DropdownRow, PromptStrip, PromptStripControl, PromptStripNotice,
 };
 
 use super::{caption, panel, story_column};
@@ -40,14 +39,13 @@ const STRIP_CAPTION: &str = "The input is a real InputState — type in it";
 pub fn strip(scene: &StoryScene, _window: &mut Window, cx: &mut App) -> AnyElement {
     let input = scene.runtime.read(cx).prompt_input.clone();
     let props = strip_props(scene.knobs);
-    let handlers = PromptStripHandlers::new(|_, _, _| {}, |_, _, _| {}, |_, _, _| {}, |_, _| {});
 
     story_column()
         .w(gpui::px(STRIP_WIDTH))
         .child(
             panel(cx)
                 .p_0()
-                .child(prompt_strip(props, handlers, &input, cx)),
+                .child(prompt_strip(props, |_, _| {}, &input, cx)),
         )
         .child(caption(STRIP_CAPTION, cx))
         .into_any_element()

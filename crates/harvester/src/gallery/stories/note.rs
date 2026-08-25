@@ -1,13 +1,15 @@
-use gpui::{prelude::*, px, AnyElement, App, Window};
-use harvester::ui::{empty_pane_hint, inline_note};
+use gpui::{prelude::*, AnyElement, App, Window};
+use harvester::ui::{empty_pane_action, empty_pane_hint, inline_note};
 
-use super::{panel, story_column, tone_at};
+use super::{caption, panel, story_column, tone_at};
 use crate::story::StoryScene;
 
 pub const TONE_KNOB: &str = "tone";
 pub const TEXT_KNOB: &str = "text";
 
-const HINT_PANEL_HEIGHT: f32 = 160.;
+const HINT_ACTION_ID: &str = "story-empty-pane-action";
+const HINT_ACTION_LABEL: &str = "New session";
+const HINT_ACTION_CAPTION: &str = "The trailing slot carries the one action the empty state names";
 
 pub fn inline(scene: &StoryScene, _window: &mut Window, cx: &mut App) -> AnyElement {
     let tone = tone_at(scene.knobs.choice(TONE_KNOB));
@@ -22,8 +24,13 @@ pub fn empty_pane(scene: &StoryScene, _window: &mut Window, cx: &mut App) -> Any
     let tone = tone_at(scene.knobs.choice(TONE_KNOB));
     let text = scene.knobs.text(TEXT_KNOB).to_string();
 
-    panel(cx)
-        .h(px(HINT_PANEL_HEIGHT))
-        .child(empty_pane_hint(tone, text, cx))
+    story_column()
+        .child(
+            panel(cx).h_48().child(
+                empty_pane_hint(tone, text, cx)
+                    .child(empty_pane_action(HINT_ACTION_ID, HINT_ACTION_LABEL)),
+            ),
+        )
+        .child(caption(HINT_ACTION_CAPTION, cx))
         .into_any_element()
 }

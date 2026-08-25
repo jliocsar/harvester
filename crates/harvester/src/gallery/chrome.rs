@@ -1,30 +1,28 @@
 use gpui::{
-    div, prelude::*, px, AnyElement, App, Context, Div, ElementId, Role, SharedString, Stateful,
-    Window,
+    div, prelude::*, rems, AnyElement, Context, Div, Role, SharedString, Stateful, Styled, Window,
 };
+use gpui_component::button::{Button, ButtonGroup};
 use gpui_component::input::Input;
-use gpui_component::ActiveTheme as _;
+use gpui_component::switch::Switch;
+use gpui_component::{ActiveTheme as _, Selectable as _};
 use harvester::ui::{
-    chat_header, collapsible_section, inline_note, sidebar_row, statusbar_frame, Tone,
-    BASE_TEXT_SIZE,
+    chat_header, collapsible_section, inline_note, sidebar_row, statusbar_frame, KeyboardFocusRing,
+    Tone,
 };
 
 use crate::stories::caption;
 use crate::story::{KnobKind, KnobSpec, KnobValue, KnobValues, StoryScene};
 use crate::Gallery;
 
-const STORY_SIDEBAR_WIDTH: f32 = 240.;
-const STAGE_MAX_WIDTH: f32 = 900.;
-const DOCK_KNOBS_MAX_HEIGHT: f32 = 200.;
-const TEXT_KNOB_WIDTH: f32 = 220.;
-const BOOL_ON_SLOT: usize = 0;
-const BOOL_OFF_SLOT: usize = 1;
+const STAGE_MEASURE_IN_REMS: f32 = 64.;
 
 const STORY_SIDEBAR_ID: &str = "story-sidebar";
 const STAGE_CANVAS_ID: &str = "stage-canvas";
 const DOCK_HEADER_ID: &str = "control-dock-header";
 const KNOB_GRID_ID: &str = "knob-grid";
-const DOCK_TITLE: &str = "controls";
+const STORY_SIDEBAR_LABEL: &str = "stories";
+const STAGE_LABEL: &str = "stage";
+const DOCK_TITLE: &str = "Controls";
 const NO_KNOBS_NOTE: &str = "This story has no knobs";
 const NO_PRESETS_NOTE: &str = "This story has no presets";
 
@@ -44,18 +42,26 @@ pub fn render_gallery(
         .flex()
         .bg(cx.theme().background)
         .text_color(cx.theme().foreground)
-        .text_size(px(BASE_TEXT_SIZE))
+        .text_size(cx.theme().font_size)
         .child(story_sidebar)
         .child(
             div()
                 .flex_1()
-                .min_w(px(0.))
+                .min_w_0()
                 .flex()
                 .flex_col()
                 .child(stage)
                 .child(dock)
                 .child(statusbar),
         )
+}
+
+fn with_content_inset<E: Styled>(element: E) -> E {
+    element.px_3()
+}
+
+fn with_dock_row_inset<E: Styled>(element: E) -> E {
+    with_content_inset(element).py_2p5()
 }
 
 fn render_story_sidebar(gallery: &Gallery, cx: &mut Context<Gallery>) -> Stateful<Div> {
@@ -69,10 +75,13 @@ fn render_story_sidebar(gallery: &Gallery, cx: &mut Context<Gallery>) -> Statefu
     div()
         .id(STORY_SIDEBAR_ID)
         .role(Role::List)
-        .aria_label("stories")
-        .w(px(STORY_SIDEBAR_WIDTH))
+        .aria_label(STORY_SIDEBAR_LABEL)
+        .w_64()
+        .min_w_56()
+        .max_w_80()
+        .flex_grow_0()
+        .flex_shrink_1()
         .h_full()
-        .flex_none()
         .overflow_y_scroll()
         .bg(cx.theme().sidebar)
         .border_r_1()
@@ -95,10 +104,7 @@ fn render_story_group(
         expanded,
         cx.listener(move |gallery, _, _, cx| gallery.toggle_group(group, cx)),
         cx,
-    )
-    .role(Role::Button)
-    .aria_label(group)
-    .aria_expanded(expanded);
+    );
     let rows: Vec<_> = gallery
         .stories()
         .iter()
@@ -127,6 +133,7 @@ fn render_story_row(
         .aria_label(name)
         .aria_selected(selected)
         .selected(selected)
+        .keyboard_focus_ring(cx)
         .child(div().overflow_hidden().text_ellipsis().child(name))
         .on_click(cx.listener(move |gallery, _, _, cx| gallery.select_story(story_index, cx)))
 }
@@ -147,30 +154,31 @@ fn render_stage(
 
     div()
         .flex_1()
-        .min_h(px(0.))
+        .min_h_0()
         .flex()
         .flex_col()
         .child(header)
+        .child(render_stage_canvas(body))
+}
+
+fn render_stage_canvas(body: AnyElement) -> Stateful<Div> {
+    with_content_inset(div().id(STAGE_CANVAS_ID))
+        .role(Role::Group)
+        .aria_label(STAGE_LABEL)
+        .py_4()
+        .flex_1()
+        .min_h_0()
+        .overflow_y_scroll()
+        .flex()
+        .justify_center()
         .child(
             div()
-                .id(STAGE_CANVAS_ID)
-                .role(Role::Group)
-                .aria_label("stage")
-                .flex_1()
-                .min_h(px(0.))
-                .overflow_y_scroll()
-                .p_6()
+                .w_full()
+                .max_w(rems(STAGE_MEASURE_IN_REMS))
                 .flex()
+                .flex_col()
                 .justify_center()
-                .child(
-                    div()
-                        .w_full()
-                        .max_w(px(STAGE_MAX_WIDTH))
-                        .flex()
-                        .flex_col()
-                        .justify_center()
-                        .child(body),
-                ),
+                .child(body),
         )
 }
 
@@ -182,11 +190,8 @@ fn render_control_dock(gallery: &Gallery, knobs: &KnobValues, cx: &mut Context<G
         expanded,
         cx.listener(|gallery, _, _, cx| gallery.toggle_dock(cx)),
         cx,
-    )
-    .role(Role::Button)
-    .aria_label(DOCK_TITLE)
-    .aria_expanded(expanded);
-    let presets = render_preset_chips(gallery, cx);
+    );
+    let presets = render_preset_buttons(gallery, cx);
     let knob_grid = render_knob_grid(gallery, knobs, cx);
 
     div()
@@ -200,24 +205,38 @@ fn render_control_dock(gallery: &Gallery, knobs: &KnobValues, cx: &mut Context<G
         .when(expanded, |dock| dock.child(presets).child(knob_grid))
 }
 
-fn render_preset_chips(gallery: &Gallery, cx: &mut Context<Gallery>) -> Div {
+fn render_preset_buttons(gallery: &Gallery, cx: &mut Context<Gallery>) -> Div {
     let presets = &gallery.stories()[gallery.selected_story()].presets;
 
     if presets.is_empty() {
-        return div().px_3().py_1p5().child(caption(NO_PRESETS_NOTE, cx));
+        return with_dock_row_inset(div()).child(caption(NO_PRESETS_NOTE, cx));
     }
 
-    div()
-        .px_3()
-        .py_1p5()
+    with_dock_row_inset(div())
         .flex()
         .flex_wrap()
         .gap_2()
-        .children(presets.iter().enumerate().map(|(index, preset)| {
-            chip(("preset", index), preset.name, false, cx).on_click(
-                cx.listener(move |gallery, _, window, cx| gallery.apply_preset(index, window, cx)),
-            )
-        }))
+        .children(
+            presets
+                .iter()
+                .enumerate()
+                .map(|(index, preset)| render_preset_button(index, preset.name, cx)),
+        )
+}
+
+fn render_preset_button(
+    preset_index: usize,
+    name: &'static str,
+    cx: &mut Context<Gallery>,
+) -> Button {
+    Button::new(("preset", preset_index))
+        .outline()
+        .label(name)
+        .on_click(
+            cx.listener(move |gallery, _, window, cx| {
+                gallery.apply_preset(preset_index, window, cx)
+            }),
+        )
 }
 
 fn render_knob_grid(
@@ -228,9 +247,7 @@ fn render_knob_grid(
     let specs = &gallery.stories()[gallery.selected_story()].knobs;
 
     if specs.is_empty() {
-        return div()
-            .px_3()
-            .py_1p5()
+        return with_dock_row_inset(div())
             .child(caption(NO_KNOBS_NOTE, cx))
             .into_any_element();
     }
@@ -240,14 +257,12 @@ fn render_knob_grid(
         .map(|spec| render_knob(gallery, spec, knobs, cx))
         .collect();
 
-    div()
-        .id(KNOB_GRID_ID)
-        .max_h(px(DOCK_KNOBS_MAX_HEIGHT))
+    with_dock_row_inset(div().id(KNOB_GRID_ID))
+        .max_h_56()
         .overflow_y_scroll()
-        .px_3()
-        .py_1p5()
         .flex()
         .flex_wrap()
+        .items_center()
         .gap_3()
         .children(controls)
         .into_any_element()
@@ -259,6 +274,7 @@ fn render_knob(
     knobs: &KnobValues,
     cx: &mut Context<Gallery>,
 ) -> Stateful<Div> {
+    let control_carries_its_own_label = matches!(spec.kind, KnobKind::Bool);
     let control = match &spec.kind {
         KnobKind::Bool => render_bool_knob(spec.name, knobs.flag(spec.name), cx),
         KnobKind::Choice(labels) => {
@@ -266,6 +282,7 @@ fn render_knob(
         }
         KnobKind::Text => render_text_knob(gallery, spec.name),
     };
+    let knob_label = (!control_carries_its_own_label).then(|| caption(spec.name, cx));
 
     div()
         .id(SharedString::from(format!("knob-{}", spec.name)))
@@ -273,20 +290,19 @@ fn render_knob(
         .aria_label(spec.name)
         .flex()
         .flex_col()
-        .gap_1()
-        .child(caption(spec.name, cx))
+        .gap_1p5()
+        .children(knob_label)
         .child(control)
 }
 
-fn render_bool_knob(name: &'static str, value: bool, cx: &mut Context<Gallery>) -> Div {
-    let on = chip((SharedString::from(name), BOOL_ON_SLOT), "on", value, cx).on_click(
-        cx.listener(move |gallery, _, _, cx| gallery.set_knob(name, KnobValue::Bool(true), cx)),
-    );
-    let off = chip((SharedString::from(name), BOOL_OFF_SLOT), "off", !value, cx).on_click(
-        cx.listener(move |gallery, _, _, cx| gallery.set_knob(name, KnobValue::Bool(false), cx)),
-    );
-
-    div().flex().gap_1().child(on).child(off)
+fn render_bool_knob(name: &'static str, value: bool, cx: &mut Context<Gallery>) -> AnyElement {
+    Switch::new(SharedString::from(format!("knob-switch-{name}")))
+        .label(name)
+        .checked(value)
+        .on_click(cx.listener(move |gallery, checked: &bool, _, cx| {
+            gallery.set_knob(name, KnobValue::Bool(*checked), cx)
+        }))
+        .into_any_element()
 }
 
 fn render_choice_knob(
@@ -294,86 +310,43 @@ fn render_choice_knob(
     labels: &[SharedString],
     selected: usize,
     cx: &mut Context<Gallery>,
-) -> Div {
-    let chips: Vec<_> = labels
-        .iter()
-        .enumerate()
-        .map(|(index, label)| {
-            chip(
-                (SharedString::from(name), index),
-                label.clone(),
-                index == selected,
-                cx,
-            )
-            .on_click(cx.listener(move |gallery, _, _, cx| {
-                gallery.set_knob(name, KnobValue::Choice(index), cx)
-            }))
-        })
-        .collect();
+) -> AnyElement {
+    let segments = labels.iter().enumerate().map(|(index, label)| {
+        Button::new(index)
+            .label(label.clone())
+            .selected(index == selected)
+    });
 
-    div().flex().flex_wrap().gap_1().children(chips)
+    ButtonGroup::new(SharedString::from(format!("knob-choice-{name}")))
+        .outline()
+        .children(segments)
+        .on_click(cx.listener(move |gallery, picked: &Vec<usize>, _, cx| {
+            let Some(index) = picked.first() else {
+                return;
+            };
+
+            gallery.set_knob(name, KnobValue::Choice(*index), cx);
+        }))
+        .into_any_element()
 }
 
-fn render_text_knob(gallery: &Gallery, name: &'static str) -> Div {
+fn render_text_knob(gallery: &Gallery, name: &'static str) -> AnyElement {
     let Some(input) = gallery.text_knob_input(name) else {
-        return div();
+        return div().into_any_element();
     };
 
-    div().w(px(TEXT_KNOB_WIDTH)).child(Input::new(input))
-}
-
-fn chip(
-    id: impl Into<ElementId>,
-    label: impl Into<SharedString>,
-    active: bool,
-    cx: &App,
-) -> Stateful<Div> {
-    let label = label.into();
-
-    let base = div()
-        .id(id)
-        .role(Role::Button)
-        .aria_label(label.clone())
-        .aria_selected(active)
-        .px_2()
-        .py_0p5()
-        .rounded_md()
-        .border_1()
-        .text_xs()
-        .cursor_pointer()
-        .child(label);
-
-    if active {
-        return base
-            .bg(cx.theme().primary)
-            .border_color(cx.theme().primary)
-            .text_color(cx.theme().primary_foreground)
-            .active(|style| style.bg(cx.theme().primary_active));
-    }
-
-    base.bg(cx.theme().secondary)
-        .border_color(cx.theme().border)
-        .text_color(cx.theme().muted_foreground)
-        .hover(|style| {
-            style
-                .bg(cx.theme().secondary_hover)
-                .text_color(cx.theme().foreground)
-        })
-        .active(|style| style.bg(cx.theme().secondary_active))
+    div()
+        .w_56()
+        .child(Input::new(input).aria_label(name))
+        .into_any_element()
 }
 
 fn render_statusbar(gallery: &Gallery, cx: &mut Context<Gallery>) -> Div {
     let story_count = gallery.stories().len();
-    let story = &gallery.stories()[gallery.selected_story()];
     let fixture_failure = gallery.runtime().read(cx).fixture_failure();
 
     statusbar_frame(cx)
         .child(div().child(format!("{story_count} stories")))
-        .child(inline_note(
-            Tone::Muted,
-            format!("{} · {}", story.group, story.name),
-            cx,
-        ))
         .child(div().flex_1())
         .children(
             fixture_failure.map(|failure| inline_note(Tone::Failed, failure, cx).overflow_hidden()),

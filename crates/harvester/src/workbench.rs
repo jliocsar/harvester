@@ -544,7 +544,7 @@ impl Render for Workbench {
             .flex_col()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .text_size(px(ui::BASE_TEXT_SIZE))
+            .text_size(cx.theme().font_size)
             .child(
                 div()
                     .flex_1()

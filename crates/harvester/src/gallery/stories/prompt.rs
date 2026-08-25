@@ -2,7 +2,7 @@ use gpui::{div, prelude::*, AnyElement, App, Window};
 use gpui_component::{Icon, IconName};
 use harvester::ui::{
     prompt_box, prompt_box_control, prompt_box_controls, prompt_box_dropdown, prompt_box_send,
-    DropdownRow,
+    DropdownRow, PickModel,
 };
 
 use super::{caption, panel, story_column, story_row};
@@ -14,7 +14,6 @@ pub const ENABLED_KNOB: &str = "enabled";
 const CONTROL_STORY_ID: &str = "story-prompt-control";
 const SEND_STORY_ID: &str = "story-prompt-send";
 const DROPDOWN_TRIGGER_ID: &str = "story-prompt-dropdown-trigger";
-const DROPDOWN_STORY_ID: &str = "story-prompt-dropdown";
 const DROPDOWN_ROW_LABELS: &[&str] = &[
     "claude-sonnet-4-6",
     "claude-opus-4-1",
@@ -22,7 +21,7 @@ const DROPDOWN_ROW_LABELS: &[&str] = &[
     "Add a model…",
 ];
 const DROPDOWN_DIVIDER_INDEX: usize = 3;
-const DROPDOWN_CAPTION: &str = "The popover is live — pick a row and the trigger label follows";
+const DROPDOWN_CAPTION: &str = "A real PopupMenu — arrow keys, Enter, Escape all work";
 const SEND_CAPTION: &str = "Send is the only control that carries the primary accent";
 
 pub fn control(scene: &StoryScene, _window: &mut Window, cx: &mut App) -> AnyElement {
@@ -35,7 +34,6 @@ pub fn control(scene: &StoryScene, _window: &mut Window, cx: &mut App) -> AnyEle
             Icon::new(IconName::Bot),
             label.into(),
             enabled,
-            cx,
         ))
         .into_any_element()
 }
@@ -44,7 +42,7 @@ pub fn send(scene: &StoryScene, _window: &mut Window, cx: &mut App) -> AnyElemen
     let enabled = scene.knobs.flag(ENABLED_KNOB);
 
     story_column()
-        .child(panel(cx).child(story_row().child(prompt_box_send(SEND_STORY_ID, enabled, cx))))
+        .child(panel(cx).child(story_row().child(prompt_box_send(SEND_STORY_ID, enabled))))
         .child(caption(SEND_CAPTION, cx))
         .into_any_element()
 }
@@ -61,22 +59,23 @@ pub fn dropdown(scene: &StoryScene, _window: &mut Window, cx: &mut App) -> AnyEl
         Icon::new(IconName::Bot),
         label.into(),
         true,
-        cx,
     );
     let dropdown = prompt_box_dropdown(
-        DROPDOWN_STORY_ID,
         trigger,
         dropdown_rows(selected),
-        move |index, _, cx| {
+        |index| Box::new(PickModel { index }),
+        None,
+    );
+
+    story_column()
+        .on_action(move |action: &PickModel, _, cx| {
+            let index = action.index;
+
             runtime.update(cx, |runtime, cx| {
                 runtime.dropdown_selection = index;
                 cx.notify();
             });
-        },
-        cx,
-    );
-
-    story_column()
+        })
         .child(
             panel(cx).child(
                 prompt_box(false, cx)

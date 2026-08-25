@@ -9,7 +9,7 @@ pub mod transcript;
 
 use gpui::{div, prelude::*, px, App, Div, SharedString};
 use gpui_component::ActiveTheme as _;
-use harvester::ui::{inline_note, Dot, Tone};
+use harvester::ui::{inline_note, Tone};
 
 pub const TONE_LABELS: &[&str] = &["muted", "idle", "active", "pending", "live", "failed"];
 
@@ -25,16 +25,6 @@ pub fn tone_at(index: usize) -> Tone {
         5 => Tone::Failed,
         _ => Tone::Muted,
     }
-}
-
-pub fn dot_at(tone_index: usize, solid: bool) -> Dot {
-    let tone = tone_at(tone_index);
-
-    if solid {
-        return Dot::Solid(tone);
-    }
-
-    Dot::Hollow(tone)
 }
 
 pub fn story_column() -> Div {

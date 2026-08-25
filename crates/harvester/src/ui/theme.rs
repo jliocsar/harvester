@@ -28,6 +28,8 @@ const PRIMARY_TEXT: &str = "#18181b";
 const UI_FONT: &str = "Inter";
 const MONO_FONT: &str = "Geist Mono";
 
+const BASE_FONT_SIZE: f32 = 14.;
+
 const CONTROL_RADIUS: usize = 6;
 const PANEL_RADIUS: usize = 10;
 
@@ -45,7 +47,9 @@ fn graphite_theme_config() -> ThemeConfig {
         mode: ThemeMode::Dark,
         radius: Some(CONTROL_RADIUS),
         radius_lg: Some(PANEL_RADIUS),
+        font_size: Some(BASE_FONT_SIZE),
         font_family: Some(UI_FONT.into()),
+        mono_font_size: Some(BASE_FONT_SIZE),
         mono_font_family: Some(MONO_FONT.into()),
         colors: graphite_theme_colors(),
         ..ThemeConfig::default()

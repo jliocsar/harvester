@@ -1,9 +1,9 @@
 use gpui::{div, prelude::*, AnyElement, App, Window};
 use harvester::ui::{
-    chat_header, collapsible_section, sidebar_empty_note, status_dot, statusbar_frame,
+    chat_header, collapsible_section, sidebar_empty_note, status_dot_for_tone, statusbar_frame,
 };
 
-use super::{caption, dot_at, panel, story_column};
+use super::{caption, panel, story_column, tone_at};
 use crate::story::StoryScene;
 
 pub const TITLE_KNOB: &str = "title";
@@ -12,9 +12,10 @@ pub const SECTION_TITLE_KNOB: &str = "section";
 pub const STATUS_TEXT_KNOB: &str = "status";
 pub const STATUS_TONE_KNOB: &str = "tone";
 
-pub const SECTION_TITLES: &[&str] = &["machines", "sessions", "stories"];
+pub const SECTION_TITLES: &[&str] = &["Machines", "Sessions", "Stories"];
 
 const SECTION_HEADER_ID: &str = "story-collapsible-section";
+const DEFAULT_SECTION_TITLE: &str = "Machines";
 const SECTION_BODY_NOTE: &str = "The section body is collapsed by the header above";
 const STATUSBAR_TRAILING_NOTE: &str = "harvesterd · connected";
 
@@ -34,7 +35,7 @@ pub fn section(scene: &StoryScene, _window: &mut Window, cx: &mut App) -> AnyEle
     let title = SECTION_TITLES
         .get(scene.knobs.choice(SECTION_TITLE_KNOB))
         .copied()
-        .unwrap_or("machines");
+        .unwrap_or(DEFAULT_SECTION_TITLE);
     let header = collapsible_section(
         SECTION_HEADER_ID,
         title,
@@ -64,7 +65,7 @@ pub fn statusbar(scene: &StoryScene, _window: &mut Window, cx: &mut App) -> AnyE
         .child(
             panel(cx).p_0().child(
                 statusbar_frame(cx)
-                    .child(status_dot(dot_at(tone_index, true), cx))
+                    .child(status_dot_for_tone(tone_at(tone_index), cx))
                     .child(div().child(text))
                     .child(div().flex_1())
                     .child(caption(STATUSBAR_TRAILING_NOTE, cx)),

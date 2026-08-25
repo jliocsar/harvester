@@ -1,4 +1,4 @@
-use gpui::{div, prelude::*, px, Context, Entity, EventEmitter, SharedString};
+use gpui::{div, prelude::*, Context, Entity, EventEmitter, Role, SharedString};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::list::ListItem;
 use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _};
@@ -8,13 +8,17 @@ use harvester_proto::SessionStatus;
 use super::machine_presentation::present_machine;
 use crate::assets::TRASH_ICON_PATH;
 use crate::store::{FleetStore, MachineSession};
-use crate::ui::{self, Tone};
+use crate::ui::{self, KeyboardFocusRing as _, Tone};
 use crate::workspaces::folder_name;
 
-const SIDEBAR_WIDTH: f32 = 240.;
 const SID_PREVIEW_CHARS: usize = 8;
 const MISSING_MACHINE_DETAIL: &str = "no longer listed";
 const FORGET_MACHINE_TOOLTIP: &str = "Forget this machine";
+const MACHINES_SECTION_TITLE: &str = "Machines";
+const SESSIONS_SECTION_TITLE: &str = "Sessions";
+const NO_SESSIONS_NOTE: &str = "No sessions yet";
+const NEW_SESSION_LABEL: &str = "New session";
+const OPENING_SESSION_NOTE: &str = "opening…";
 
 #[derive(Clone)]
 pub(super) enum SidebarIntent {
@@ -68,7 +72,7 @@ impl Sidebar {
         div()
             .id("sessions")
             .flex_1()
-            .min_h(px(0.))
+            .min_h_0()
             .overflow_y_scroll()
             .flex()
             .flex_col()
@@ -78,15 +82,15 @@ impl Sidebar {
                     .map(|(index, row)| self.render_session_row(index, row, cx)),
             )
             .when(empty, |list| {
-                list.child(ui::sidebar_empty_note("No sessions yet", cx))
+                list.child(ui::sidebar_empty_note(NO_SESSIONS_NOTE, cx))
             })
     }
 
     fn render_new_session_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div().px_2().pt_2().child(
+        div().px(ui::SIDEBAR_ROW_GUTTER).pt_2().child(
             Button::new("new-session")
                 .icon(IconName::Plus)
-                .label("New session")
+                .label(NEW_SESSION_LABEL)
                 .ghost()
                 .small()
                 .w_full()
@@ -155,11 +159,16 @@ impl Sidebar {
         key: &str,
         cx: &Context<Self>,
     ) -> ListItem {
-        let dot = present_machine(self.store.read(cx).state(key), key).dot;
+        let tone = present_machine(self.store.read(cx).state(key), key)
+            .dot
+            .tone();
 
         ui::sidebar_row(id)
+            .role(Role::ListItem)
+            .aria_label(label.clone())
             .disabled(true)
-            .child(ui::sidebar_stacked_row(dot, label, detail, None, cx))
+            .tab_stop(false)
+            .child(ui::sidebar_stacked_row(tone, label, detail, None, cx))
     }
 
     fn render_missing_machine_row(
@@ -185,7 +194,7 @@ impl Sidebar {
             Button::new(("forget-machine", index))
                 .icon(Icon::default().path(TRASH_ICON_PATH))
                 .ghost()
-                .xsmall()
+                .small()
                 .tooltip(FORGET_MACHINE_TOOLTIP)
                 .on_click(move |_, _, cx| {
                     let machine = machine.clone();
@@ -229,16 +238,21 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let sid = row.sid;
+        let title = row.title.clone();
         let body = ui::sidebar_stacked_row(
-            ui::Dot::Solid(row.tone),
+            row.tone,
             row.title,
             Some(row.subtitle),
-            row.opening.then(|| "opening…".into()),
+            row.opening.then(|| OPENING_SESSION_NOTE.into()),
             cx,
         );
 
         ui::sidebar_row(("session", index))
+            .role(Role::ListItem)
+            .aria_label(title)
+            .aria_selected(row.selected)
             .selected(row.selected)
+            .keyboard_focus_ring(cx)
             .child(body)
             .on_click(cx.listener(move |_, _, _, cx| {
                 cx.emit(SidebarIntent::OpenSession { sid: sid.clone() })
@@ -249,7 +263,7 @@ impl Sidebar {
 impl Render for Sidebar {
     fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .w(px(SIDEBAR_WIDTH))
+            .w_64()
             .h_full()
             .flex_none()
             .flex()
@@ -260,7 +274,7 @@ impl Render for Sidebar {
             .child(self.render_new_session_button(cx))
             .child(ui::collapsible_section(
                 "machines-header",
-                "machines",
+                MACHINES_SECTION_TITLE,
                 !self.machines_collapsed,
                 cx.listener(|sidebar, _, _, cx| {
                     sidebar.machines_collapsed = !sidebar.machines_collapsed;
@@ -273,7 +287,7 @@ impl Render for Sidebar {
             })
             .child(ui::collapsible_section(
                 "sessions-header",
-                "sessions",
+                SESSIONS_SECTION_TITLE,
                 !self.sessions_collapsed,
                 cx.listener(|sidebar, _, _, cx| {
                     sidebar.sessions_collapsed = !sidebar.sessions_collapsed;

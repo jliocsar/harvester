@@ -14,7 +14,8 @@ pub const SPEED_KNOB: &str = "speed";
 const RESTART_BUTTON_ID: &str = "story-replay-restart";
 const REPLAY_DONE_NOTE: &str = "Replay finished — press restart";
 const REPLAY_PAUSED_NOTE: &str = "Paused — flip the playing knob to resume";
-const RENDERED_CAPTION: &str = "Tool blocks expand and collapse on click";
+const RENDERED_CAPTION: &str =
+    "Tool block headers are tab stops — click, Enter, or Space toggles one";
 
 pub fn rendered(scene: &StoryScene, _window: &mut Window, cx: &mut App) -> AnyElement {
     let source_index = scene.knobs.choice(SOURCE_KNOB);

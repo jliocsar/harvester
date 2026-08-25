@@ -486,14 +486,53 @@ impl Chat {
             window,
             cx,
         );
-        let handlers = create_prompt_strip_handlers(
-            cx.entity(),
-            model_picks,
-            machine_candidates,
-            repo_candidates,
-        );
+        let chat = cx.entity();
+        let send = move |window: &mut Window, cx: &mut App| {
+            chat.update(cx, |chat, cx| chat.submit_prompt(window, cx));
+        };
 
-        ui::prompt_strip(strip, handlers, &self.input, cx)
+        ui::prompt_strip(strip, send, &self.input, cx)
+    }
+
+    fn handle_pick_model(
+        &mut self,
+        action: &ui::PickModel,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pick) = self.model_picks().get(action.index).cloned() else {
+            return;
+        };
+
+        self.pick_model(pick, cx);
+    }
+
+    fn handle_pick_machine(
+        &mut self,
+        action: &ui::PickMachine,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(candidate) = self.machine_candidates(cx).get(action.index).cloned() else {
+            return;
+        };
+
+        self.pick_machine(candidate.key, cx);
+    }
+
+    fn handle_pick_repo(
+        &mut self,
+        action: &ui::PickRepo,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repo) = self.repo_candidates(cx).get(action.index).cloned() else {
+            self.add_repo(cx);
+
+            return;
+        };
+
+        self.select_repo(repo, cx);
     }
 
     fn prompt_strip(
@@ -632,49 +671,6 @@ impl Chat {
     }
 }
 
-fn create_prompt_strip_handlers(
-    chat: Entity<Chat>,
-    model_picks: Vec<Option<ModelChoice>>,
-    machine_candidates: Vec<MachineCandidate>,
-    repo_candidates: Vec<String>,
-) -> ui::PromptStripHandlers {
-    let machine_keys: Vec<String> = machine_candidates
-        .into_iter()
-        .map(|candidate| candidate.key)
-        .collect();
-    let model_chat = chat.clone();
-    let machine_chat = chat.clone();
-    let repo_chat = chat.clone();
-
-    ui::PromptStripHandlers::new(
-        move |index, _, cx| {
-            let Some(pick) = model_picks.get(index).cloned() else {
-                return;
-            };
-
-            model_chat.update(cx, |chat, cx| chat.pick_model(pick, cx));
-        },
-        move |index, _, cx| {
-            let Some(machine) = machine_keys.get(index).cloned() else {
-                return;
-            };
-
-            machine_chat.update(cx, |chat, cx| chat.pick_machine(machine, cx));
-        },
-        move |index, _, cx| {
-            let picked = repo_candidates.get(index).cloned();
-
-            repo_chat.update(cx, |chat, cx| match picked {
-                Some(repo) => chat.select_repo(repo, cx),
-                None => chat.add_repo(cx),
-            });
-        },
-        move |window, cx| {
-            chat.update(cx, |chat, cx| chat.submit_prompt(window, cx));
-        },
-    )
-}
-
 impl Render for Chat {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let accepts_input = self.state.exited_notice().is_none()
@@ -685,7 +681,13 @@ impl Render for Chat {
             self.focus_input = false;
         }
 
-        let pane = div().size_full().flex().flex_col();
+        let pane = div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .on_action(cx.listener(Self::handle_pick_model))
+            .on_action(cx.listener(Self::handle_pick_machine))
+            .on_action(cx.listener(Self::handle_pick_repo));
         let pane = match self.state.phase() {
             SessionPhase::Unstarted | SessionPhase::Starting { .. } => pane
                 .child(ui::chat_header(
