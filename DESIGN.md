@@ -612,13 +612,12 @@ worth fixing blind. A contract that hides its own exceptions is worthless.
   trait with an inset mode would let it share the app's one ring.
 - **Light mode is blocked** by the memoized dark `TextViewStyle` in
   `ui/transcript.rs` (see §3). The fix and the theme toggle land together.
-- **`Dot` is legacy and one call site proves it.** `Tone::dot` derives the shape
-  and `status_dot_for_tone` is the surface every caller should use, but
-  `workbench/machine_presentation.rs` still carries a hand-built `Dot`. The
-  sidebar reads only the tone back off it, so a reachable-but-idle machine built
-  as `Dot::Solid(Tone::Idle)` renders **hollow**. The fix is to re-pick the
-  *tone* — a settled state wants `Tone::Muted`, genuinely-unknown keeps
-  `Tone::Idle` — never to hand-build a shape.
+- **`Dot::tone` and the `Dot`-taking `status_dot` are exported with no callers.**
+  Nothing hand-builds a `Dot` any longer, so the type is only ever produced by
+  `Tone::dot` and consumed by `status_dot`. Folding `Tone::dot` into
+  `status_dot_for_tone` would let both disappear and make `Dot` private to
+  `ui/core.rs`. Worth doing before the public export reads as an invitation to
+  build one by hand again.
 - **Two ellipses stand in for an indeterminate progress indicator**: the prompt
   strip's "Starting session…" and the streaming turn's bare "…". Decorative dots
   are the weaker answer, but this revision of gpui-component ships no

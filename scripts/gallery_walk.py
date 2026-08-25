@@ -28,6 +28,7 @@ SERVER_BINARY = os.path.join(GPUI_MCP_ROOT, "target/debug/gpui-mcp")
 ATTACH_ATTEMPTS = 60
 ATTACH_DELAY_SECONDS = 1.0
 DOCK_TITLE = "Controls"
+CLICK_SETTLE_SECONDS = 0.6
 
 
 def parse_lines(snapshot_text):
@@ -102,6 +103,7 @@ def main():
             between snapshot and click; each retry re-resolves both."""
             last = ""
             for _ in range(attempts):
+                time.sleep(CLICK_SETTLE_SECONDS)
                 fresh, is_error = client.call_tool("snapshot")
                 if is_error:
                     last = fresh
@@ -122,9 +124,6 @@ def main():
                 if not is_error:
                     return clicked, ""
                 last = clicked
-                if "scrolled out of view" in clicked:
-                    collapse_first_expanded_group(fresh)
-                    continue
                 if "stale_handle" not in clicked:
                     break
             return None, last
@@ -138,69 +137,113 @@ def main():
                     return token.split("=", 1)[1] == "true"
             return None
 
-        def collapse_first_expanded_group(snapshot_text):
-            """What an agent does after the out-of-view refusal: make room by
-            collapsing an expanded story group above the target."""
+        def group_headers(snapshot_text):
+            """(key, label, expanded) per story group header, never the dock."""
+            headers = []
             for key, role, label, states in parse_lines(snapshot_text):
-                if role == "Button" and "exp" in states.split() and label.casefold() != DOCK_TITLE.casefold():
-                    client.call_tool(
-                        "click",
-                        {"key": key, "frame": header_frame(snapshot_text)},
-                    )
-                    return
+                if role != "Button" or label.casefold() == DOCK_TITLE.casefold():
+                    continue
+                tokens = states.split()
+                if "exp" in tokens:
+                    headers.append((key, label, True))
+                elif "col" in tokens:
+                    headers.append((key, label, False))
+            return headers
 
-        story_names = [label for _, label, _ in find_story_rows(snapshot)]
-        check("sidebar lists stories", len(story_names) >= 10, f"{len(story_names)} stories")
-
-        knob_story = None
-        for name in story_names:
-            clicked, failure = click_by_label("ListItem", name)
-            if clicked is None:
-                check(f"select {name!r}", False, failure[:80])
-                continue
-            now_selected = [label for _, label, sel in find_story_rows(clicked) if sel]
-            check(f"select {name!r}", now_selected == [name], f"selected={now_selected}")
-            has_chips = any(
-                role == "Button" and toggle_state(states) is not None
-                for _, role, _, states in parse_lines(clicked)
-            )
-            if knob_story is None and has_chips:
-                knob_story = name
-
-        def expand_collapsed_groups():
-            """Undo any collapses the out-of-view recovery made, so every
-            story row is findable again. One group per pass because every
-            click reassigns keys."""
-            for _ in range(10):
+        def set_group(label, expanded):
+            """Drive one group to a known state. Keys are per-dump, so this
+            re-resolves on every attempt rather than caching one."""
+            for _ in range(4):
+                time.sleep(CLICK_SETTLE_SECONDS)
                 fresh, is_error = client.call_tool("snapshot")
                 if is_error:
-                    return
-                collapsed = next(
-                    (key for key, role, label, states in parse_lines(fresh)
-                     if role == "Button" and "col" in states.split()
-                     and label.casefold() != DOCK_TITLE.casefold()),
+                    return False
+                match = next(
+                    ((key, is_open) for key, name, is_open in group_headers(fresh)
+                     if name == label),
                     None,
                 )
-                if collapsed is None:
-                    return
-                client.call_tool(
-                    "click", {"key": collapsed, "frame": header_frame(fresh)}
+                if match is None:
+                    return False
+                key, is_open = match
+                if is_open == expanded:
+                    return True
+                _, is_error = client.call_tool(
+                    "click", {"key": key, "frame": header_frame(fresh)}
                 )
+                if is_error:
+                    return False
+            return False
 
-        check(
-            "a story exposes a toggleable knob",
-            knob_story is not None,
-            "no story reported a control with a toggled= state",
-        )
-
-        if knob_story is not None:
-            expand_collapsed_groups()
-            reselected, failure = click_by_label("ListItem", knob_story)
-            chips = [] if reselected is None else [
+        def knob_chips(snapshot_text):
+            """Toggleable controls in the control dock only. The stage renders
+            buttons of its own, and a story that happens to draw a toggled
+            control is not a knob."""
+            lines = parse_lines(snapshot_text)
+            dock_at = next(
+                (index for index, (_, role, label, _) in enumerate(lines)
+                 if role == "Button" and label.casefold() == DOCK_TITLE.casefold()),
+                None,
+            )
+            if dock_at is None:
+                return []
+            return [
                 (label, toggle_state(states))
-                for _, role, label, states in parse_lines(reselected)
+                for _, role, label, states in lines[dock_at + 1:]
                 if role == "Button" and toggle_state(states) is not None
             ]
+
+        groups = [label for _, label, _ in group_headers(snapshot)]
+        check("sidebar lists story groups", len(groups) >= 5, f"{len(groups)} groups")
+
+        for label in groups:
+            set_group(label, False)
+
+        story_count = 0
+        knob_story = None
+
+        for group in groups:
+            if not set_group(group, True):
+                check(f"expand group {group!r}", False, "the header did not respond")
+                continue
+
+            fresh, is_error = client.call_tool("snapshot")
+            if is_error:
+                check(f"list stories in {group!r}", False, fresh[:80])
+                continue
+
+            for name in [label for _, label, _ in find_story_rows(fresh)]:
+                story_count += 1
+                clicked, failure = click_by_label("ListItem", name)
+                if clicked is None:
+                    check(f"select {name!r}", False, failure[:80])
+                    continue
+                now_selected = [
+                    label for _, label, sel in find_story_rows(clicked) if sel
+                ]
+                check(
+                    f"select {name!r}",
+                    now_selected == [name],
+                    f"selected={now_selected}",
+                )
+                if knob_story is None and knob_chips(clicked):
+                    knob_story = (group, name)
+
+            set_group(group, False)
+
+        check("walk reached every story", story_count >= 10, f"{story_count} stories")
+
+        if knob_story is None:
+            check(
+                "a story exposes a toggleable knob",
+                False,
+                "no dock control reported a toggled= state",
+            )
+        else:
+            group, name = knob_story
+            set_group(group, True)
+            reselected, failure = click_by_label("ListItem", name)
+            chips = [] if reselected is None else knob_chips(reselected)
             target_label = next(
                 (label for label, on in chips if not on),
                 chips[0][0] if chips else None,
@@ -208,19 +251,17 @@ def main():
 
             if target_label is None:
                 check(
-                    f"toggle a knob on story {knob_story!r}",
+                    f"toggle a knob on story {name!r}",
                     False,
-                    "the story exposed no untoggled chip to click",
+                    "the dock exposed no untoggled chip to click",
                 )
             else:
                 clicked, failure = click_by_label("Button", target_label)
                 flipped = [] if clicked is None else [
-                    toggle_state(states)
-                    for _, role, label, states in parse_lines(clicked)
-                    if role == "Button" and label == target_label
+                    on for label, on in knob_chips(clicked) if label == target_label
                 ]
                 check(
-                    f"toggle knob {target_label!r} on story {knob_story!r}",
+                    f"toggle knob {target_label!r} on story {name!r}",
                     True in flipped,
                     failure[:80] if clicked is None else f"chip states now {flipped}",
                 )

@@ -157,9 +157,7 @@ impl Sidebar {
         key: &str,
         cx: &Context<Self>,
     ) -> ListItem {
-        let tone = present_machine(self.store.read(cx).state(key), key)
-            .dot
-            .tone();
+        let tone = present_machine(self.store.read(cx).state(key), key).tone;
 
         ui::sidebar_row(id)
             .role(Role::ListItem)

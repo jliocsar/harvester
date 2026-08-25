@@ -36,7 +36,7 @@ impl Tone {
         }
     }
 
-    pub fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
             Tone::Muted => MUTED_LABEL,
             Tone::Idle => IDLE_LABEL,
@@ -63,7 +63,7 @@ pub(super) fn faint(cx: &App) -> Hsla {
     cx.theme().muted_foreground.opacity(FAINT_TEXT_OPACITY)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dot {
     Solid(Tone),
     Hollow(Tone),

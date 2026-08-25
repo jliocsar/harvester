@@ -545,6 +545,20 @@ accessibility tree, so a component swapped for a different library widget
 breaks them: story rows are `ListItem`s reporting `sel`, knob controls are
 `ButtonGroup` `Button`s reporting `toggled=`.
 
+Two things about the walk are worth knowing before changing it. It expands
+exactly one story group at a time and collapses the rest, because seventeen
+stories plus seven headers do not fit in a 720px window and the MCP has no
+scroll tool — its seven tools are `launch`, `attach`, `snapshot`, `detail`,
+`click`, `input`, `status`, and the refusal for an off-screen node tells you
+to bring it into view yourself. Walking group by group keeps every row on
+screen by construction, so it does not care how tall a row gets. And every
+click waits out `CLICK_SETTLE_SECONDS` first: two synthetic clicks in quick
+succession arrive as a single multi-click and the second is silently
+swallowed, which reads as "the click succeeded but nothing moved" and is very
+hard to tell from a broken component. The knob search is scoped to nodes
+after the dock header for the same class of reason — a story that happens to
+render a toggled `Button` on the stage is not a knob.
+
 Feel: story switching and knob changes are the two things a user does dozens
 of times a minute, so both are **instant** — no animation anywhere in the
 gallery chrome. The only motion in the binary is the streaming replay, which
@@ -622,8 +636,14 @@ visible copy to be styled.
 
 One module per `ui` module plus the three flagships, each exporting its knob
 *names* as consts so `registry.rs` and the render function cannot disagree
-about a string. `stories/mod.rs` holds what every story shares: `TONE_LABELS`
-and `tone_at` (the choice-index → `Tone` mapping used by six stories), plus
+about a string. `stories/mod.rs` holds what every story shares: `TONES`
+(the tone order the whole gallery indexes into), `TONE_LABELS` derived from it
+through `Tone::label`, and `tone_at` (the choice-index → `Tone` mapping used by
+six stories). `TONE_LABELS` used to be its own lowercase list, which made it a
+second tone vocabulary that had already drifted — it said "muted" and "active"
+where the app says "Neutral" and "Running", so the catalog was labelling tones
+with words no screen uses. `Tone::label` is a `const fn` so the derived list
+stays a `const` and the two can never disagree again. Also here are
 the layout primitives `story_column`, `story_row`, `caption`
 (an `inline_note`, so captions obey `Tone`), `panel` and `transcript_panel`.
 `panel` sits on the `popover` slot with `rounded_lg` and `shadow_sm` — the
@@ -1434,14 +1454,10 @@ everything else in `ui` should ask for a `Tone`/`Dot`, never a raw `Hsla`.
   sits in (`SIDEBAR_STATUS_LANE`, the tool block's `size_4` slot) is what
   scales instead, which is also why the diameter can change without moving any
   text.
-- `Dot` (`Solid(Tone)` / `Hollow(Tone)`) and the `Dot`-taking `status_dot`
-  survive as the shape vocabulary `Tone::dot` answers in, and
-  `machine_presentation` still carries a `Dot`. Note the consequence: the
-  sidebar reads only `.tone()` off that `Dot` and re-derives the shape, so a
-  shape `machine_presentation` picks that disagrees with `Tone::dot` is simply
-  not rendered. See "Recorded gaps (visual layer)" at the end of this document
-  for the call site where that is currently visible and for the deletion this
-  type is waiting on.
+- `Dot` (`Solid(Tone)` / `Hollow(Tone)`) is the shape vocabulary `Tone::dot`
+  answers in, and nothing hand-builds one any more: every caller names a tone
+  and lets the shape follow. `Dot` is therefore an output type, not an input
+  one, which is what keeps the shape rule in a single place.
 - `disclosure_chevron` is the one expand/collapse marker for the whole app
   (section headers, tool blocks): `ChevronDown` when expanded, `ChevronRight`
   when collapsed, at `size_3p5` — the `text_sm` line, so it sits optically
@@ -2513,15 +2529,19 @@ different surfaces: the sidebar, the empty content pane, and the statusbar.
 
 `MachinePresentation`: the strings differ per surface because they are
 different *sentences* about the same state, not because the state means
-something different in each place. Choosing the tone (`dot`) exactly once in
+something different in each place. Choosing the `tone` exactly once in
 `present_machine` is what prevents a failed state from rendering red in one
 surface and gray in another — tone and message are decided together instead
 of being independently derived per call site.
 
-Only the *tone* half of that `Dot` still reaches a screen. The sidebar calls
-`.tone()` and lets `ui::Tone::dot` derive solid-versus-hollow (see
-`ui/core.rs`), so the shape written down here is no longer rendered anywhere;
-`Dot` survives as the type the presentation happens to be expressed in.
+The field is a `Tone`, never a `Dot`. It used to be a hand-built `Dot`, and
+every consumer threw the shape away and re-derived it from the tone, so the
+shape recorded here was not what got drawn: a `Reachable` machine written as
+`Dot::Solid(Tone::Idle)` rendered *hollow*, which is the treatment reserved
+for a machine nobody has probed. Naming only the tone makes that class of
+disagreement unrepresentable. `Reachable` is `Tone::Muted` for exactly this
+reason — it is a settled verdict and must read as solid — while `Unknown`
+keeps `Tone::Idle` and stays hollow. A unit test pins the two apart.
 
 `pane_message` / `statusbar_link` are both `None` for probe-only states
 (`Unreachable`, `Reachable`, `Unknown`) — nothing about a daemon connection
@@ -2746,14 +2766,9 @@ rather than in `ui/sidebar.rs`:
   happens when you click one — and a focus stop that leads nowhere is worse
   than no focus stop at all. They still carry `Role::ListItem` and an
   `aria_label`, because being unclickable does not make them unreadable.
-- Machine rows pass `present_machine(...).dot.tone()` to
-  `ui::sidebar_stacked_row`, which takes a `Tone` and derives the dot's shape
-  itself (`Tone::dot`). The consequence is worth knowing: the shape
-  `machine_presentation` chose is discarded, so a `Connecting` machine now
-  renders hollow (from `Tone::Pending`) where `machine_presentation` had asked
-  for solid. That is the intended direction — shape follows meaning — but it
-  means `MachinePresentation.dot`'s shape half is no longer what the sidebar
-  draws.
+- Machine rows pass `present_machine(...).tone` to `ui::sidebar_stacked_row`,
+  which derives the dot's shape itself (`Tone::dot`). Shape follows meaning,
+  and there is only one place that decides it.
 - The New-session button aligns to `ui::SIDEBAR_ROW_GUTTER` rather than a local
   `px_2`, so it sits in the same lane as the rows and the section headers
   below it, and the forget-machine button moved from `.xsmall()` to `.small()`
@@ -2855,17 +2870,12 @@ something yet, with the reason it was not worth fixing blind.
   the accessibility tree, and a wrapper *with* a role is not the focusable
   node, so an assistive-technology user still lands on an unnamed button. The
   real fix is upstream.
-- **`Dot` is legacy and one call site proves it.** `Tone::dot` derives the
-  shape now, and `status_dot_for_tone` is the surface every caller should use;
-  once `workbench/machine_presentation.rs` stops carrying a `Dot` of its own,
-  `Dot`, `Dot::tone` and the `Dot`-taking `status_dot` should be deleted and
-  `Tone::dot` folded into `status_dot_for_tone`. Until then, treat a
-  hand-built `Dot::Solid(..)`/`Dot::Hollow(..)` as legacy. The live
-  consequence: a reachable-but-idle machine is built as `Dot::Solid(Tone::Idle)`
-  and renders **hollow**, because the sidebar reads only the tone back off it.
-  The fix is to re-pick the *tone* — a settled state wants `Tone::Muted`,
-  genuinely-unknown keeps `Tone::Idle` — never to hand-build a shape; the unit
-  tests in that file assert on `Dot` variants and move with it.
+- **`Dot::tone` and the `Dot`-taking `status_dot` have no callers.** Nothing
+  hand-builds a `Dot` any more, so `Dot` is only ever produced by `Tone::dot`
+  and consumed by `status_dot`. The tidy-up is to fold `Tone::dot` into
+  `status_dot_for_tone` and delete both, leaving `Dot` as a private detail of
+  `ui/core.rs`. Small, and it wants doing before someone reads the public
+  export as an invitation to build one by hand again.
 - **Two optical insets drifted when the controls stepped up a size.** Both the
   prompt strip's controls row and the sidebar's New-session button were solved
   against the library's *extra-small* button padding and the sidebar's older

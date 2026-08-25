@@ -11,19 +11,31 @@ use gpui::{div, prelude::*, px, App, Div, SharedString};
 use gpui_component::ActiveTheme as _;
 use harvester::ui::{inline_note, Tone};
 
-pub const TONE_LABELS: &[&str] = &["muted", "idle", "active", "pending", "live", "failed"];
+pub const TONES: [Tone; 6] = [
+    Tone::Muted,
+    Tone::Idle,
+    Tone::Active,
+    Tone::Pending,
+    Tone::Live,
+    Tone::Failed,
+];
+
+pub const TONE_LABELS: &[&str] = &[
+    Tone::Muted.label(),
+    Tone::Idle.label(),
+    Tone::Active.label(),
+    Tone::Pending.label(),
+    Tone::Live.label(),
+    Tone::Failed.label(),
+];
 
 const PANEL_MIN_WIDTH: f32 = 320.;
 const TRANSCRIPT_PANEL_HEIGHT: f32 = 420.;
 
 pub fn tone_at(index: usize) -> Tone {
-    match index {
-        1 => Tone::Idle,
-        2 => Tone::Active,
-        3 => Tone::Pending,
-        4 => Tone::Live,
-        5 => Tone::Failed,
-        _ => Tone::Muted,
+    match TONES.get(index) {
+        Some(tone) => *tone,
+        None => Tone::Muted,
     }
 }
 

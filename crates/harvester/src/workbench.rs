@@ -499,7 +499,7 @@ impl Workbench {
         let display = present_machine(self.store.read(cx).state(machine), machine);
 
         match display.pane_message {
-            Some(message) => (message, display.dot.tone()),
+            Some(message) => (message, display.tone),
             None => (NO_CHAT_HINT.to_string(), Tone::Idle),
         }
     }
@@ -532,7 +532,7 @@ impl Workbench {
         let machine = store.argv_machine()?;
         let display = present_machine(store.state(machine), machine);
 
-        Some((display.statusbar_link?, display.dot.tone()))
+        Some((display.statusbar_link?, display.tone))
     }
 }
 
