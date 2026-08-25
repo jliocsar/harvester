@@ -4,17 +4,21 @@ Rust + gpui orchestrator for Pi coding-agent sessions on remote VMs. Read
 `docs/SPEC.md` first; it is the umbrella spec and points at the normative
 contract docs. Do not re-research what the docs already answer.
 
-## Source-of-truth docs (in `docs/`, this order)
+## Source-of-truth docs (this order)
 
-1. `SPEC.md` — umbrella: architecture, citizens, flows, non-goals, open questions.
-2. `DAEMON.md` — client ↔ harvesterd contract (envelope, launch line, dialog policy).
-3. `PROVIDERS.md` — machine provider contract (one-shot JSON-stdio executables).
-4. `HARNESS_RESEARCH.md` — verified Pi/exe.dev facts; every claim sourced or marked UNVERIFIED.
-5. `internals/<crate>.md` — per-crate implementation notes: invariants, rationale,
+1. `docs/SPEC.md` — umbrella: architecture, citizens, flows, non-goals, open questions.
+2. `docs/DAEMON.md` — client ↔ harvesterd contract (envelope, launch line, dialog policy).
+3. `docs/PROVIDERS.md` — machine provider contract (one-shot JSON-stdio executables).
+4. `docs/HARNESS_RESEARCH.md` — verified Pi/exe.dev facts; every claim sourced or marked UNVERIFIED.
+5. `DESIGN.md` (repo root) — the design system as shipped: the rem axis, type
+   scale, colour roles, density tiers, component-choice and accessibility rules.
+   Normative for anything that renders. Read it before adding UI.
+6. `docs/internals/<crate>.md` — per-crate implementation notes: invariants, rationale,
    gotchas, const meanings. This is where code comments would go — see below.
 
 When a decision changes, update the doc in the same change. `SPEC.md` defers to
-the contract docs on conflicts.
+the contract docs on conflicts; `DESIGN.md` is the authority on visual and
+interaction decisions, and defers to the code when they disagree.
 
 ## No comments in code — ever
 
