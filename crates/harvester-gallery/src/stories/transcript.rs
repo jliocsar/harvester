@@ -3,21 +3,82 @@ use gpui_component::button::Button;
 use gpui_component::Sizable as _;
 use harvester::ui::{empty_pane_hint, Tone};
 
-use super::{caption, story_column, story_row, transcript_panel};
+use super::{caption, story_column, story_row, transcript_panel, FLAGSHIP_GROUP};
+use crate::fixtures::TRANSCRIPT_SOURCE_LABELS;
 use crate::runtime::{StoryRuntime, REPLAY_SPEED_LABELS};
-use crate::story::StoryScene;
+use crate::story::{KnobSpec, KnobValue, Preset, Story, StoryScene};
 
-pub const SOURCE_KNOB: &str = "source";
 pub const PLAYING_KNOB: &str = "playing";
 pub const SPEED_KNOB: &str = "speed";
+pub const STREAMING_TRANSCRIPT_STORY: &str = "Transcript — streaming";
 
+const SOURCE_KNOB: &str = "source";
+
+const RENDERED_TRANSCRIPT_STORY: &str = "Transcript — rendered";
+const FIRST_TRANSCRIPT_SOURCE_INDEX: usize = 0;
+const DEFAULT_SPEED_INDEX: usize = 1;
+const FAST_FORWARD_SPEED_INDEX: usize = 2;
 const RESTART_BUTTON_ID: &str = "story-replay-restart";
 const REPLAY_DONE_NOTE: &str = "Replay finished — press restart";
 const REPLAY_PAUSED_NOTE: &str = "Paused — flip the playing knob to resume";
 const RENDERED_CAPTION: &str =
     "Tool block headers are tab stops — click, Enter, or Space toggles one";
 
-pub fn rendered(scene: &StoryScene, _window: &mut Window, cx: &mut App) -> AnyElement {
+pub fn stories() -> Vec<Story> {
+    vec![
+        Story::new(
+            FLAGSHIP_GROUP,
+            RENDERED_TRANSCRIPT_STORY,
+            vec![KnobSpec::choice(
+                SOURCE_KNOB,
+                TRANSCRIPT_SOURCE_LABELS,
+                FIRST_TRANSCRIPT_SOURCE_INDEX,
+            )],
+            source_presets(),
+            rendered,
+        ),
+        Story::new(
+            FLAGSHIP_GROUP,
+            STREAMING_TRANSCRIPT_STORY,
+            vec![
+                KnobSpec::flag(PLAYING_KNOB, true),
+                KnobSpec::choice(SPEED_KNOB, REPLAY_SPEED_LABELS, DEFAULT_SPEED_INDEX),
+            ],
+            replay_presets(),
+            streaming,
+        ),
+    ]
+}
+
+fn source_presets() -> Vec<Preset> {
+    TRANSCRIPT_SOURCE_LABELS
+        .iter()
+        .enumerate()
+        .map(|(index, label)| Preset::new(label, vec![(SOURCE_KNOB, KnobValue::Choice(index))]))
+        .collect()
+}
+
+fn replay_presets() -> Vec<Preset> {
+    vec![
+        Preset::new(
+            "play",
+            vec![
+                (PLAYING_KNOB, KnobValue::Bool(true)),
+                (SPEED_KNOB, KnobValue::Choice(DEFAULT_SPEED_INDEX)),
+            ],
+        ),
+        Preset::new("pause", vec![(PLAYING_KNOB, KnobValue::Bool(false))]),
+        Preset::new(
+            "fast forward",
+            vec![
+                (PLAYING_KNOB, KnobValue::Bool(true)),
+                (SPEED_KNOB, KnobValue::Choice(FAST_FORWARD_SPEED_INDEX)),
+            ],
+        ),
+    ]
+}
+
+fn rendered(scene: &StoryScene, _window: &mut Window, cx: &mut App) -> AnyElement {
     let source_index = scene.knobs.choice(SOURCE_KNOB);
     let toggling_runtime = scene.runtime.clone();
 
@@ -51,7 +112,7 @@ pub fn rendered(scene: &StoryScene, _window: &mut Window, cx: &mut App) -> AnyEl
         .into_any_element()
 }
 
-pub fn streaming(scene: &StoryScene, _window: &mut Window, cx: &mut App) -> AnyElement {
+fn streaming(scene: &StoryScene, _window: &mut Window, cx: &mut App) -> AnyElement {
     let playing = scene.knobs.flag(PLAYING_KNOB);
     let speed = REPLAY_SPEED_LABELS
         .get(scene.knobs.choice(SPEED_KNOB))

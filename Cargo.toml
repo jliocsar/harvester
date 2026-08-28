@@ -7,6 +7,11 @@ members = [
     "crates/harvester-cli",
     "crates/harvester",
 ]
+# The gallery is a crate of its own with its own workspace and lockfile: it
+# path-depends on a sibling gpui-mcp checkout that no clean clone has, and a
+# workspace member's path deps are resolved unconditionally. See
+# crates/harvester-gallery/Cargo.toml.
+exclude = ["crates/harvester-gallery"]
 
 [workspace.package]
 version = "0.1.0"
@@ -31,8 +36,12 @@ tokio = { version = "1", features = [
 [profile.dev]
 debug = "line-tables-only"
 
-# harvesterd ships as a static musl binary; keep it small.
-[profile.release]
+# harvesterd ships as a static musl binary uploaded over SSH; keep it small.
+# Daemon-only on purpose: the gpui client is a desktop binary that wants frame
+# time and unwinding, so these settings never reach `--release`. See
+# docs/internals/harvesterd.md.
+[profile.daemon-release]
+inherits = "release"
 opt-level = "z"
 lto = true
 strip = true

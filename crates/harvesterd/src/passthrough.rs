@@ -10,6 +10,8 @@ use crate::sid::Sid;
 
 const SESSION_SWAPPING_COMMANDS: &[&str] = &["new_session", "switch_session", "fork", "clone"];
 
+const SESSION_EXITED_BEFORE_RESPONDING: &str = "session exited before responding";
+
 pub fn pi_passthrough(
     daemon: &Daemon,
     id: Option<Value>,
@@ -61,8 +63,7 @@ pub fn pi_passthrough(
     answer_later(out_tx, async move {
         let response = match response_rx.await {
             Ok(response) => response,
-            Err(_closed) => json!({"type": "response", "success": false,
-                                   "error": "session exited before responding"}),
+            Err(_closed) => pi_failure_payload(SESSION_EXITED_BEFORE_RESPONDING),
         };
 
         Outgoing::PiResponse {
@@ -116,8 +117,12 @@ fn error_response(id: Option<Value>, sid: String, error: String) -> Outgoing {
     Outgoing::PiResponse {
         id,
         sid,
-        response: json!({"type": "response", "success": false, "error": error}),
+        response: pi_failure_payload(error),
     }
+}
+
+fn pi_failure_payload(error: impl Into<String>) -> Value {
+    json!({"type": "response", "success": false, "error": error.into()})
 }
 
 #[cfg(test)]
@@ -196,6 +201,28 @@ mod tests {
         assert!(
             message.contains("one pi process = one session file"),
             "{message}"
+        );
+    }
+
+    #[test]
+    fn every_failure_wears_the_shape_of_a_pi_response() {
+        for payload in [
+            pi_failure_payload(SESSION_EXITED_BEFORE_RESPONDING),
+            pi_failure_payload(session_swap_refusal_message("fork")),
+        ] {
+            assert_eq!(payload["type"], "response");
+            assert_eq!(payload["success"], json!(false));
+            assert!(payload["error"].is_string());
+        }
+    }
+
+    #[test]
+    fn a_daemon_invented_failure_carries_no_pi_command_name() {
+        let payload = pi_failure_payload(SESSION_EXITED_BEFORE_RESPONDING);
+
+        assert!(
+            payload.get("command").is_none(),
+            "pi echoes the command it answered; the daemon has no command to echo"
         );
     }
 

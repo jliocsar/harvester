@@ -357,7 +357,20 @@ Pick the component by its **semantic role**, not by its shape:
   dense control surface, `danger` only for an action the user cannot undo from
   the dialog. `danger` has exactly one caller — forgetting a machine — and that
   is not an accident: destructiveness cannot be inferred from a pi payload, so
-  every pi confirmation is `primary`.
+  every pi confirmation is `primary`. `outline` has one caller too: the prompt
+  strip's Stop button, a command sharing a row with three `ghost` pickers and
+  the `primary` send. It is deliberately not `danger` — stopping a session
+  ends pi, but the session file survives and the sidebar resumes it, so the
+  hue that means "no way back" would be lying.
+- **A control that can only act sometimes is either disabled or absent, and
+  which one is a statement about the control.** Send is disabled when it
+  cannot fire: it is the prompt box's permanent commitment and keeps its
+  place in the row. Stop is *absent* unless the session has a turn running,
+  because there is no such thing as an interrupt for work that is not
+  happening, and a permanently greyed Stop would advertise an action the
+  session never offers. Both live at the right end of the strip, Stop
+  immediately left of send, so the turn's arrival and departure move nothing
+  else in the row.
 
 What stays in `ui/` is only what the library does not know: which icon a control
 wears, what its rows say, and what a pick *means*. `ui/` is Harvester's visual
@@ -533,9 +546,10 @@ path, rather than showing an empty stage.
 
 ## 10. The component gallery
 
-`cargo run -p harvester --bin gallery` renders Harvester's `ui` components in
-isolation, Storybook-style. It is the enforcement mechanism for everything above,
-and it does three jobs:
+`cd crates/harvester-gallery && cargo run` renders Harvester's `ui` components
+in isolation, Storybook-style (it is a crate of its own, outside the
+workspace — see README §Build). It is the enforcement mechanism for everything
+above, and it does three jobs:
 
 1. **It makes every state renderable.** A component that can only be seen by
    driving a real session to the right state does not get reviewed. The prompt
@@ -569,9 +583,15 @@ reporting `sel`, knob controls are `ButtonGroup` `Button`s reporting `toggled=`
 That is the intended behaviour: a component swap is exactly the kind of change
 that should require a second look.
 
-Adding a component to `ui/` means adding a story for it. Anything a story
-renders must be exported from `ui/mod.rs`, which makes that flat re-export
-surface the catalog as well as the app's import path.
+Adding a component to `ui/` means adding a story for it — or, when the
+component is only ever drawn as part of a composite, making sure the
+composite's story covers it. The prompt box's control, send button and
+dropdown are catalogued through the prompt strip rather than through three
+stories of their own, because no screen assembles them by hand and a catalog
+of parts no screen uses is a second place for the truth to live. Anything a
+story renders must be exported from `ui/mod.rs`, which makes that flat
+re-export surface the catalog as well as the app's import path — and nothing
+a story stops rendering should stay exported.
 
 ---
 
@@ -631,7 +651,8 @@ worth fixing blind. A contract that hides its own exceptions is worthless.
 - **The dialog stories are chrome only.** They render the confirmation body, the
   button row, the option list and both inputs inline on the canvas; they never
   call `window.open_dialog`. Modal behaviour — focus, escape, the Root dialog
-  stack — belongs to `modal.rs` and is not what a component catalog is for.
+  stack — belongs to `workbench/modal.rs` and is not what a component catalog
+  is for.
 - **The dialog geometry has never been seen driven by a real Pi.** The option
   row height, the three width rungs, and a virtual list inside an auto-height
   dialog body were all chosen by construction. They want one look at a genuine

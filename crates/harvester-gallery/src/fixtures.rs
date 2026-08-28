@@ -6,7 +6,7 @@ use harvester_client_core::transcript::Transcript;
 use harvester_proto::{CR, LF};
 use serde_json::Value;
 
-pub const FIXTURES_DIR_NAME: &str = "fixtures";
+pub const APP_CRATE_FIXTURES_DIR: &str = "../harvester/fixtures";
 pub const STREAMING_FIXTURE_NAME: &str = "streaming.jsonl";
 pub const TOOLS_FIXTURE_NAME: &str = "tools.jsonl";
 pub const MIXED_FIXTURE_NAME: &str = "mixed.jsonl";
@@ -97,7 +97,7 @@ pub fn load_fixture(name: &str) -> FixtureEvents {
 
 pub fn fixture_path(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(FIXTURES_DIR_NAME)
+        .join(APP_CRATE_FIXTURES_DIR)
         .join(name)
 }
 

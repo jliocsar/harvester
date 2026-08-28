@@ -50,16 +50,8 @@ pub struct DialogKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnqueueResult {
-    Visible,
-    Queued,
-    Duplicate,
-    Ignored,
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct Retirement {
-    pub retired: Vec<DialogObligation>,
-    pub front_removed: bool,
+    Accepted,
+    Rejected,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -75,25 +67,26 @@ pub struct DialogObligations {
 }
 
 impl DialogObligations {
-    pub fn enter_room(&mut self, room: DialogRoom) -> Retirement {
+    pub fn enter_room(&mut self, room: DialogRoom) -> Vec<DialogObligation> {
         if self.rooms_by_machine.get(&room.machine) == Some(&room) {
-            return Retirement::default();
+            return Vec::new();
         }
 
         self.rooms_by_machine
             .insert(room.machine.clone(), room.clone());
-        self.retire(|obligation| obligation.machine != room.machine || obligation.room() == room)
+
+        self.retire_machine(&room.machine)
     }
 
-    pub fn leave_machine(&mut self, machine: &str) -> Retirement {
+    pub fn leave_machine(&mut self, machine: &str) -> Vec<DialogObligation> {
         if self.rooms_by_machine.remove(machine).is_none() {
-            return Retirement::default();
+            return Vec::new();
         }
 
-        self.retire(|obligation| obligation.machine != machine)
+        self.retire_machine(machine)
     }
 
-    pub fn retire_room(&mut self, machine: &str, sid: &str) -> Retirement {
+    pub fn retire_room(&mut self, machine: &str, sid: &str) -> Vec<DialogObligation> {
         let room = DialogRoom::new(machine.to_string(), sid.to_string());
 
         if self.rooms_by_machine.get(machine) == Some(&room) {
@@ -105,7 +98,7 @@ impl DialogObligations {
 
     pub fn enqueue(&mut self, obligation: DialogObligation) -> EnqueueResult {
         if self.rooms_by_machine.get(&obligation.machine) != Some(&obligation.room()) {
-            return EnqueueResult::Ignored;
+            return EnqueueResult::Rejected;
         }
 
         if self
@@ -113,33 +106,16 @@ impl DialogObligations {
             .iter()
             .any(|pending| pending.key() == obligation.key())
         {
-            return EnqueueResult::Duplicate;
+            return EnqueueResult::Rejected;
         }
 
-        let visible = self.pending.is_empty();
         self.pending.push_back(obligation);
 
-        if visible {
-            EnqueueResult::Visible
-        } else {
-            EnqueueResult::Queued
-        }
-    }
-
-    pub fn room(&self, machine: &str) -> Option<&DialogRoom> {
-        self.rooms_by_machine.get(machine)
+        EnqueueResult::Accepted
     }
 
     pub fn front(&self) -> Option<&DialogObligation> {
         self.pending.front()
-    }
-
-    pub fn len(&self) -> usize {
-        self.pending.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.pending.is_empty()
     }
 
     pub fn answer_front(
@@ -156,26 +132,32 @@ impl DialogObligations {
             .map(|obligation| AnsweredDialog { obligation, answer })
     }
 
-    fn retire(&mut self, keep: impl Fn(&DialogObligation) -> bool) -> Retirement {
-        let old_front = self.pending.front().map(DialogObligation::key);
-        let mut retired = Vec::new();
-        let mut retained = VecDeque::new();
+    fn retire_machine(&mut self, machine: &str) -> Vec<DialogObligation> {
+        self.retire(|obligation| obligation.machine != machine)
+    }
 
-        while let Some(obligation) = self.pending.pop_front() {
-            if keep(&obligation) {
-                retained.push_back(obligation);
-            } else {
-                retired.push(obligation);
-            }
-        }
+    fn retire(&mut self, keep: impl Fn(&DialogObligation) -> bool) -> Vec<DialogObligation> {
+        let (retained, retired): (Vec<DialogObligation>, Vec<DialogObligation>) =
+            self.pending.drain(..).partition(keep);
 
-        let new_front = retained.front().map(DialogObligation::key);
-        self.pending = retained;
+        self.pending = VecDeque::from(retained);
 
-        Retirement {
-            front_removed: old_front != new_front,
-            retired,
-        }
+        retired
+    }
+
+    #[cfg(test)]
+    fn room(&self, machine: &str) -> Option<&DialogRoom> {
+        self.rooms_by_machine.get(machine)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
     }
 }
 
@@ -218,13 +200,13 @@ mod tests {
         let mut obligations = DialogObligations::default();
         assert_eq!(
             obligations.enqueue(question("vm", "sid-1", "d-1")),
-            EnqueueResult::Ignored
+            EnqueueResult::Rejected
         );
 
         obligations.enter_room(room("vm", "sid-1"));
         assert_eq!(
             obligations.enqueue(question("vm", "sid-1", "d-1")),
-            EnqueueResult::Visible
+            EnqueueResult::Accepted
         );
     }
 
@@ -236,7 +218,7 @@ mod tests {
 
         assert_eq!(
             obligations.enqueue(question("vm", "sid-1", "d-1")),
-            EnqueueResult::Duplicate
+            EnqueueResult::Rejected
         );
         assert_eq!(obligations.len(), 1);
     }
@@ -248,7 +230,7 @@ mod tests {
         obligations.enqueue(question("vm", "sid-1", "d-1"));
         assert_eq!(
             obligations.enqueue(question("vm", "sid-1", "d-2")),
-            EnqueueResult::Queued
+            EnqueueResult::Accepted
         );
 
         let first_key = obligations.front().expect("first obligation").key();
@@ -277,9 +259,9 @@ mod tests {
         obligations.enqueue(question("vm", "sid-1", "d-1"));
         obligations.enqueue(question("vm", "sid-1", "d-2"));
 
-        let retirement = obligations.retire_room("vm", "sid-1");
-        assert!(retirement.front_removed);
-        assert_eq!(retirement.retired.len(), 2);
+        let retired = obligations.retire_room("vm", "sid-1");
+
+        assert_eq!(retired.len(), 2);
         assert!(obligations.front().is_none());
         assert!(obligations.room("vm").is_none());
     }
@@ -290,17 +272,17 @@ mod tests {
         obligations.enter_room(room("vm", "old"));
         obligations.enqueue(question("vm", "old", "d-1"));
 
-        let retirement = obligations.enter_room(room("vm", "new"));
-        assert!(retirement.front_removed);
-        assert_eq!(retirement.retired[0].sid, "old");
+        let retired = obligations.enter_room(room("vm", "new"));
+
+        assert_eq!(retired[0].sid, "old");
         assert_eq!(obligations.room("vm"), Some(&room("vm", "new")));
         assert_eq!(
             obligations.enqueue(question("vm", "old", "late")),
-            EnqueueResult::Ignored
+            EnqueueResult::Rejected
         );
         assert_eq!(
             obligations.enqueue(question("vm", "new", "d-2")),
-            EnqueueResult::Visible
+            EnqueueResult::Accepted
         );
     }
 
@@ -310,7 +292,7 @@ mod tests {
         obligations.enter_room(room("vm", "sid-1"));
         obligations.enqueue(question("vm", "sid-1", "d-1"));
 
-        assert_eq!(obligations.leave_machine("other").retired.len(), 0);
+        assert!(obligations.leave_machine("other").is_empty());
         assert_eq!(
             obligations.front().map(|dialog| dialog.request.id.as_str()),
             Some("d-1")
@@ -323,8 +305,9 @@ mod tests {
         obligations.enter_room(room("vm", "sid-1"));
         obligations.enqueue(question("vm", "sid-1", "d-1"));
 
-        let retirement = obligations.leave_machine("vm");
-        assert_eq!(retirement.retired.len(), 1);
+        let retired = obligations.leave_machine("vm");
+
+        assert_eq!(retired.len(), 1);
         assert!(obligations.room("vm").is_none());
         assert!(obligations.front().is_none());
     }
@@ -337,19 +320,18 @@ mod tests {
 
         assert_eq!(
             obligations.enqueue(question("machine-a", "sid-a", "dialog-a")),
-            EnqueueResult::Visible
+            EnqueueResult::Accepted
         );
         assert_eq!(
             obligations.enqueue(question("machine-b", "sid-b", "dialog-b")),
-            EnqueueResult::Queued
+            EnqueueResult::Accepted
         );
         assert_eq!(obligations.len(), 2);
 
-        let retirement = obligations.enter_room(room("machine-b", "sid-b-2"));
+        let retired = obligations.enter_room(room("machine-b", "sid-b-2"));
 
-        assert!(!retirement.front_removed);
-        assert_eq!(retirement.retired.len(), 1);
-        assert_eq!(retirement.retired[0].request.id, "dialog-b");
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].request.id, "dialog-b");
         assert_eq!(
             obligations.front().map(|dialog| dialog.request.id.as_str()),
             Some("dialog-a")
@@ -368,18 +350,16 @@ mod tests {
         obligations.enqueue(question("machine-a", "shared-sid", "dialog-a"));
         obligations.enqueue(question("machine-b", "shared-sid", "dialog-b"));
 
-        let retirement = obligations.retire_room("machine-b", "shared-sid");
+        let retired = obligations.retire_room("machine-b", "shared-sid");
 
-        assert!(!retirement.front_removed);
-        assert_eq!(retirement.retired.len(), 1);
-        assert_eq!(retirement.retired[0].machine, "machine-b");
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].machine, "machine-b");
         assert!(obligations.room("machine-a").is_some());
         assert!(obligations.room("machine-b").is_none());
 
-        let retirement = obligations.leave_machine("machine-a");
+        let retired = obligations.leave_machine("machine-a");
 
-        assert!(retirement.front_removed);
-        assert_eq!(retirement.retired.len(), 1);
+        assert_eq!(retired.len(), 1);
         assert!(obligations.is_empty());
     }
 
@@ -392,7 +372,7 @@ mod tests {
 
         assert_eq!(
             obligations.enqueue(question("machine-b", "sid-b", "dialog")),
-            EnqueueResult::Queued
+            EnqueueResult::Accepted
         );
         assert_eq!(obligations.len(), 2);
     }
@@ -415,6 +395,22 @@ mod tests {
         assert_eq!(
             obligations.front().map(|dialog| dialog.request.id.as_str()),
             Some("second")
+        );
+    }
+
+    #[test]
+    fn a_stale_session_exit_cannot_close_the_room_that_replaced_it() {
+        let mut obligations = DialogObligations::default();
+        obligations.enter_room(room("vm", "old"));
+        obligations.enter_room(room("vm", "new"));
+
+        let retired = obligations.retire_room("vm", "old");
+
+        assert!(retired.is_empty());
+        assert_eq!(obligations.room("vm"), Some(&room("vm", "new")));
+        assert_eq!(
+            obligations.enqueue(question("vm", "new", "d-1")),
+            EnqueueResult::Accepted
         );
     }
 

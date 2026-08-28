@@ -159,12 +159,9 @@ with `json!` on one side and hand-dug with `.get()` on the other.
   *this generation* of the session object. A session that exited and
   respawned is a new generation, so the attach is real (not a no-op) even for
   a sid the client believes it already holds.
-- `DetachData` — deliberately empty; the acknowledgement itself is the whole
-  payload. Modelled as a type rather than a bare `{}` so the operation has
-  somewhere to grow later, and no call site hand-builds an object.
-- `StopData.stopping` — always true, and means "shutdown initiated", never
-  "done": `SessionExit` is the authoritative completion signal and may arrive
-  before or after this response (docs/DAEMON.md §stop).
+- The `detach` and `stop` payloads have no proto type: they are write-only
+  shapes nobody decodes, built with `json!` at their ops.rs sites and pinned
+  by docs/DAEMON.md (see docs/internals/harvesterd.md for the reasoning).
 - `SessionInfo.file` — the session file on the machine, absent while pi has
   not written one yet. Pi creates the file lazily on the first entry, so a
   session that was spawned but never prompted is genuinely fileless; a client

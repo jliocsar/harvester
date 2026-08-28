@@ -3,14 +3,14 @@ use crate::provider::MachineKey;
 pub const LOCAL_MACHINE: &str = "local";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MachineRef {
+pub(crate) enum MachineRef {
     Local,
     Provider(MachineKey),
     AdHoc(String),
 }
 
 impl MachineRef {
-    pub fn parse(stored: &str) -> MachineRef {
+    pub(crate) fn parse(stored: &str) -> MachineRef {
         if stored == LOCAL_MACHINE {
             return MachineRef::Local;
         }

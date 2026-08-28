@@ -1,23 +1,19 @@
-mod forget_machine_flow;
 mod machine_presentation;
+mod modal;
 mod picker;
-mod repo_flow;
 mod sidebar;
 
 use gpui::{div, prelude::*, px, Context, Entity, Subscription, Window};
 use gpui_component::notification::NotificationType;
 use gpui_component::{ActiveTheme as _, Root, WindowExt as _};
-use harvester_client_core::bridge::{Command, Event as BridgeEvent};
+use harvester_client_core::bridge::Event as BridgeEvent;
 use serde_json::Value;
 
-use forget_machine_flow::{ForgetMachineFlow, MachineForgotten};
 use machine_presentation::present_machine;
-use repo_flow::{AddRepoFlow, RepoAdded};
+use modal::{MachineForgotten, ModalCoordinator, RepoAdded};
 use sidebar::{Sidebar, SidebarIntent};
 
-use crate::chat::{Chat, ChatFlowRequest, ChatRequest, ChatTarget};
-use crate::dialogs::DialogCoordinator;
-use crate::modal::ModalCoordinator;
+use crate::chat::{Chat, ChatFlowRequest, ChatTarget};
 use crate::store::{FleetStore, StoreEvent};
 use crate::ui::{self, Tone};
 
@@ -26,11 +22,9 @@ const NO_CHAT_HINT: &str = "start a new session to begin";
 pub struct Workbench {
     store: Entity<FleetStore>,
     sidebar: Entity<Sidebar>,
-    add_repo_flow: Entity<AddRepoFlow>,
-    forget_machine_flow: Entity<ForgetMachineFlow>,
-    _dialogs: Entity<DialogCoordinator>,
+    modal: Entity<ModalCoordinator>,
     chat: Option<Entity<Chat>>,
-    chat_subscriptions: Option<[Subscription; 2]>,
+    chat_subscription: Option<Subscription>,
     _subscriptions: [Subscription; 5],
 }
 
@@ -43,26 +37,21 @@ impl Workbench {
     ) -> Self {
         let store = cx.new(|cx| FleetStore::new(argv_machine, daemon_binary, cx));
         let sidebar = cx.new(|cx| Sidebar::new(store.clone(), cx));
-        let modals = cx.new(|_| ModalCoordinator::default());
-        let add_repo_flow = cx.new(|_| AddRepoFlow::new(store.clone(), modals.clone()));
-        let forget_machine_flow = cx.new(|_| ForgetMachineFlow::new(store.clone(), modals.clone()));
-        let dialogs = cx.new(|cx| DialogCoordinator::new(store.clone(), modals, window, cx));
+        let modal = cx.new(|cx| ModalCoordinator::new(store.clone(), window, cx));
         let subscriptions = [
             cx.observe(&store, |_, _, cx| cx.notify()),
             cx.subscribe_in(&store, window, Self::handle_store_event),
             cx.subscribe_in(&sidebar, window, Self::handle_sidebar_intent),
-            cx.subscribe_in(&add_repo_flow, window, Self::handle_repo_added),
-            cx.subscribe_in(&forget_machine_flow, window, Self::handle_machine_forgotten),
+            cx.subscribe_in(&modal, window, Self::handle_repo_added),
+            cx.subscribe_in(&modal, window, Self::handle_machine_forgotten),
         ];
 
         Self {
             store,
             sidebar,
-            add_repo_flow,
-            forget_machine_flow,
-            _dialogs: dialogs,
+            modal,
             chat: None,
-            chat_subscriptions: None,
+            chat_subscription: None,
             _subscriptions: subscriptions,
         }
     }
@@ -78,48 +67,15 @@ impl Workbench {
             StoreEvent::Bridge {
                 machine,
                 event: BridgeEvent::Attached { sid, entries },
-            } => self.defer_attached(machine.clone(), sid.clone(), entries.clone(), window, cx),
+            } => self.handle_attached(machine, sid, entries, window, cx),
             StoreEvent::Failed(detail) => self.report(detail.clone(), window, cx),
             StoreEvent::Bridge { .. } | StoreEvent::Machines(_) => {}
         }
     }
 
-    fn defer_attached(
-        &self,
-        machine: String,
-        sid: String,
-        entries: Vec<Value>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let workbench = cx.entity();
-
-        window.defer(cx, move |window, cx| {
-            workbench.update(cx, |workbench, cx| {
-                workbench.handle_attached(&machine, &sid, &entries, window, cx)
-            });
-        });
-    }
-
     fn handle_sidebar_intent(
         &mut self,
         _sidebar: &Entity<Sidebar>,
-        intent: &SidebarIntent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let intent = intent.clone();
-        let workbench = cx.entity();
-
-        window.defer(cx, move |window, cx| {
-            workbench.update(cx, |workbench, cx| {
-                workbench.dispatch_sidebar_intent(&intent, window, cx)
-            });
-        });
-    }
-
-    fn dispatch_sidebar_intent(
-        &mut self,
         intent: &SidebarIntent,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -139,13 +95,14 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.forget_machine_flow
-            .update(cx, |flow, cx| flow.open(machine, window, cx));
+        self.modal.update(cx, |modal, cx| {
+            modal.open_forget_machine(machine, window, cx)
+        });
     }
 
     fn handle_machine_forgotten(
         &mut self,
-        _flow: &Entity<ForgetMachineFlow>,
+        _modal: &Entity<ModalCoordinator>,
         forgotten: &MachineForgotten,
         _window: &mut Window,
         cx: &mut Context<Self>,
@@ -160,14 +117,13 @@ impl Workbench {
         }
 
         self.chat = None;
-        self.chat_subscriptions = None;
-        self.select_current_session(None, cx);
+        self.chat_subscription = None;
         cx.notify();
     }
 
     fn handle_repo_added(
         &mut self,
-        _flow: &Entity<AddRepoFlow>,
+        _modal: &Entity<ModalCoordinator>,
         added: &RepoAdded,
         _window: &mut Window,
         cx: &mut Context<Self>,
@@ -202,7 +158,6 @@ impl Workbench {
                 chat.promote_to_live(sid.to_string(), entries, cx);
                 chat.request_prompt_controls(cx);
             });
-            self.select_current_session(Some(sid.to_string()), cx);
 
             return;
         }
@@ -218,23 +173,13 @@ impl Workbench {
     }
 
     fn install_chat(&mut self, chat: Entity<Chat>, window: &mut Window, cx: &mut Context<Self>) {
-        let subscriptions = [
-            cx.subscribe_in(&chat, window, Self::handle_chat_request),
-            cx.subscribe_in(&chat, window, Self::handle_chat_flow_request),
-        ];
-        let selected_sid = chat.read(cx).sid().map(str::to_string);
+        let subscription = cx.subscribe_in(&chat, window, Self::handle_chat_flow_request);
 
         chat.update(cx, |chat, cx| chat.request_prompt_controls(cx));
 
         self.chat = Some(chat);
-        self.chat_subscriptions = Some(subscriptions);
-        self.select_current_session(selected_sid, cx);
+        self.chat_subscription = Some(subscription);
         cx.notify();
-    }
-
-    fn select_current_session(&self, sid: Option<String>, cx: &mut Context<Self>) {
-        self.sidebar
-            .update(cx, |sidebar, cx| sidebar.select_session(sid, cx));
     }
 
     fn workspace_path_of(&self, sid: &str, cx: &Context<Self>) -> String {
@@ -243,139 +188,6 @@ impl Workbench {
             .session_cwd(sid)
             .unwrap_or_default()
             .to_string()
-    }
-
-    fn handle_chat_request(
-        &mut self,
-        chat: &Entity<Chat>,
-        request: &ChatRequest,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let machine = chat.read(cx).machine().to_string();
-
-        if !self.machine_ready_for(request, &machine, cx) {
-            let detail = format!(
-                "{}: not connected — nothing was sent",
-                self.store.read(cx).label(&machine)
-            );
-
-            chat.update(cx, |chat, cx| {
-                chat.fail_pending_requests(detail.clone(), cx)
-            });
-            self.report(detail, window, cx);
-
-            return;
-        }
-
-        match request {
-            ChatRequest::ListModels { cwd, token } => self.send_command(
-                &machine,
-                Command::ListModels {
-                    cwd: cwd.clone(),
-                    token: *token,
-                },
-                cx,
-            ),
-            ChatRequest::Start { .. } => self.start_session(&machine, request, cx),
-            ChatRequest::Prompt { sid, text } => self.send_command(
-                &machine,
-                Command::Prompt {
-                    sid: sid.clone(),
-                    text: text.clone(),
-                },
-                cx,
-            ),
-            ChatRequest::SetModel {
-                sid,
-                provider,
-                model_id,
-                token,
-            } => self.send_command(
-                &machine,
-                Command::SetModel {
-                    sid: sid.clone(),
-                    provider: provider.clone(),
-                    model_id: model_id.clone(),
-                    token: *token,
-                },
-                cx,
-            ),
-            ChatRequest::ModelControls { sid, models, state } => {
-                self.request_model_controls(&machine, sid, *models, *state, cx)
-            }
-        }
-    }
-
-    fn start_session(&mut self, machine: &str, request: &ChatRequest, cx: &mut Context<Self>) {
-        let ChatRequest::Start {
-            sid,
-            cwd,
-            provider,
-            model,
-            name,
-            first_prompt,
-        } = request
-        else {
-            return;
-        };
-
-        self.store.update(cx, |store, cx| {
-            store.begin_start(machine.to_string(), sid.clone(), cx)
-        });
-        self.send_command(
-            machine,
-            Command::StartSession {
-                sid: sid.clone(),
-                cwd: cwd.clone(),
-                provider: provider.clone(),
-                model: model.clone(),
-                name: name.clone(),
-                first_prompt: first_prompt.clone(),
-            },
-            cx,
-        );
-    }
-
-    fn request_model_controls(
-        &self,
-        machine: &str,
-        sid: &str,
-        models: harvester_client_core::RequestToken,
-        state: harvester_client_core::RequestToken,
-        cx: &Context<Self>,
-    ) {
-        self.send_command(
-            machine,
-            Command::ListSessionModels {
-                sid: sid.to_string(),
-                token: models,
-            },
-            cx,
-        );
-        self.send_command(
-            machine,
-            Command::GetSessionState {
-                sid: sid.to_string(),
-                token: state,
-            },
-            cx,
-        );
-    }
-
-    fn machine_ready_for(
-        &mut self,
-        request: &ChatRequest,
-        machine: &str,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if request.is_pre_session() {
-            return self
-                .store
-                .update(cx, |store, cx| store.ensure_connection(machine, cx));
-        }
-
-        self.store.read(cx).is_live(machine)
     }
 
     fn open_session(&mut self, sid: &str, cx: &mut Context<Self>) {
@@ -413,8 +225,7 @@ impl Workbench {
         }
 
         self.chat = None;
-        self.chat_subscriptions = None;
-        self.select_current_session(None, cx);
+        self.chat_subscription = None;
     }
 
     fn take_starting_chat(&mut self, sid: &str, cx: &mut Context<Self>) -> Option<Entity<Chat>> {
@@ -456,6 +267,8 @@ impl Workbench {
         let store = self.store.clone();
         let chat = cx.new(|cx| Chat::unstarted(target, store, window, cx));
 
+        self.store
+            .update(cx, |store, cx| store.clear_selected_session(cx));
         self.install_chat(chat, window, cx);
     }
 
@@ -472,12 +285,8 @@ impl Workbench {
     }
 
     fn open_add_repo(&mut self, machine: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.add_repo_flow
-            .update(cx, |flow, cx| flow.open(machine, window, cx));
-    }
-
-    fn send_command(&self, machine: &str, command: Command, cx: &Context<Self>) {
-        self.store.read(cx).send(machine, command);
+        self.modal
+            .update(cx, |modal, cx| modal.open_add_repo(machine, window, cx));
     }
 
     fn render_content(&self, cx: &Context<Self>) -> impl IntoElement {

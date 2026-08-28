@@ -96,10 +96,7 @@ pub enum HarvesterCmd {
     Ping {
         version: u32,
     },
-    ListSessions {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        cwd: Option<String>,
-    },
+    ListSessions,
     CreateSession {
         sid: String,
         cwd: String,
@@ -204,14 +201,6 @@ pub struct CreateSessionData {
 pub struct AttachData {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub already: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DetachData {}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StopData {
-    pub stopping: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -396,7 +385,7 @@ mod tests {
     async fn request_harvester_matches_the_documented_envelope() {
         let request = Request::Harvester {
             id: Some(json!(1)),
-            cmd: HarvesterCmd::ListSessions { cwd: None },
+            cmd: HarvesterCmd::ListSessions,
         };
 
         let (parsed, _) = round_trip(&request).await;
@@ -499,12 +488,7 @@ mod tests {
                 HarvesterCmd::Ping { version: 1 },
                 json!({"type": "ping", "version": 1}),
             ),
-            (
-                HarvesterCmd::ListSessions {
-                    cwd: Some("/work/repo".to_string()),
-                },
-                json!({"type": "list_sessions", "cwd": "/work/repo"}),
-            ),
+            (HarvesterCmd::ListSessions, json!({"type": "list_sessions"})),
             (
                 HarvesterCmd::CreateSession {
                     sid: "01H".to_string(),
@@ -546,6 +530,15 @@ mod tests {
 
             assert_eq!(parsed, expected);
         }
+    }
+
+    #[tokio::test]
+    async fn list_sessions_ignores_a_stale_cwd_from_an_older_client() {
+        let decoded: HarvesterCmd =
+            serde_json::from_value(json!({"type": "list_sessions", "cwd": "/work/repo"}))
+                .expect("a field the daemon no longer knows must not fail the whole request");
+
+        assert!(matches!(decoded, HarvesterCmd::ListSessions));
     }
 
     #[tokio::test]
@@ -721,14 +714,6 @@ mod tests {
             (
                 serde_json::to_value(AttachData { already: true }).expect("serializes"),
                 json!({"already": true}),
-            ),
-            (
-                serde_json::to_value(DetachData {}).expect("serializes"),
-                json!({}),
-            ),
-            (
-                serde_json::to_value(StopData { stopping: true }).expect("serializes"),
-                json!({"stopping": true}),
             ),
         ];
 

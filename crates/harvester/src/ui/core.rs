@@ -23,6 +23,15 @@ pub enum Tone {
 }
 
 impl Tone {
+    pub const ALL: &'static [Tone] = &[
+        Tone::Muted,
+        Tone::Idle,
+        Tone::Active,
+        Tone::Pending,
+        Tone::Live,
+        Tone::Failed,
+    ];
+
     pub fn color(self, cx: &App) -> Hsla {
         let theme = cx.theme();
 

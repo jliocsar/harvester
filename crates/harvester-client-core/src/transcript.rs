@@ -4,6 +4,8 @@ use serde_json::Value;
 
 const TOOL_OUTPUT_MAX_BYTES: usize = 64 * 1024;
 
+const UNNAMED_TOOL_NAME: &str = "tool";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     User,
@@ -35,6 +37,18 @@ pub struct ToolBlock {
 }
 
 impl ToolBlock {
+    pub fn running(tool_call_id: String, tool_name: String, args: Value) -> Self {
+        ToolBlock {
+            tool_call_id,
+            tool_name,
+            args,
+            output: String::new(),
+            output_truncated: false,
+            diff: None,
+            status: ToolStatus::Running,
+        }
+    }
+
     pub fn arg(&self, key: &str) -> Option<&str> {
         self.args.get(key)?.as_str()
     }
@@ -120,6 +134,11 @@ impl Transcript {
         self.streaming = None;
     }
 
+    pub fn fail_turn(&mut self, detail: String) {
+        self.end_turn();
+        self.items.push(Item::Failure(detail));
+    }
+
     pub fn apply(&mut self, event: &Value) -> bool {
         let Some(event_type) = event.get("type").and_then(Value::as_str) else {
             return false;
@@ -182,19 +201,11 @@ impl Transcript {
             return;
         };
 
-        self.items.push(Item::Tool(ToolBlock {
-            tool_call_id: tool_call_id.to_string(),
-            tool_name: event
-                .get("toolName")
-                .and_then(Value::as_str)
-                .unwrap_or("tool")
-                .to_string(),
-            args: event.get("args").cloned().unwrap_or(Value::Null),
-            output: String::new(),
-            output_truncated: false,
-            diff: None,
-            status: ToolStatus::Running,
-        }));
+        self.items.push(Item::Tool(ToolBlock::running(
+            tool_call_id.to_string(),
+            tool_name_or_fallback(event.get("toolName")),
+            event.get("args").cloned().unwrap_or(Value::Null),
+        )));
     }
 
     fn apply_tool_update(&mut self, event: &Value) {
@@ -210,26 +221,14 @@ impl Transcript {
     }
 
     fn apply_tool_end(&mut self, event: &Value) {
-        let is_error = event
-            .get("isError")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let is_error = is_error_flag(event);
         let result = event.get("result");
 
         let Some(block) = self.tool_block_for(event) else {
             return;
         };
 
-        block.status = if is_error {
-            ToolStatus::Error
-        } else {
-            ToolStatus::Ok
-        };
-
-        if let Some(result) = result {
-            (block.output, block.output_truncated) = capped_content_text(result);
-            block.diff = extract_diff(result);
-        }
+        finish_tool_block(block, is_error, result);
     }
 
     fn tool_block_for(&mut self, event: &Value) -> Option<&mut ToolBlock> {
@@ -319,19 +318,11 @@ fn tool_block_from_history(
     tool_results: &HashMap<&str, &Value>,
 ) -> Option<ToolBlock> {
     let tool_call_id = block.get("id").and_then(Value::as_str)?;
-    let mut tool_block = ToolBlock {
-        tool_call_id: tool_call_id.to_string(),
-        tool_name: block
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or("tool")
-            .to_string(),
-        args: block.get("arguments").cloned().unwrap_or(Value::Null),
-        output: String::new(),
-        output_truncated: false,
-        diff: None,
-        status: ToolStatus::Running,
-    };
+    let mut tool_block = ToolBlock::running(
+        tool_call_id.to_string(),
+        tool_name_or_fallback(block.get("name")),
+        block.get("arguments").cloned().unwrap_or(Value::Null),
+    );
 
     if let Some(result) = tool_results.get(tool_call_id) {
         fill_tool_block_from_result(&mut tool_block, result);
@@ -341,18 +332,35 @@ fn tool_block_from_history(
 }
 
 fn fill_tool_block_from_result(tool_block: &mut ToolBlock, result: &Value) {
-    let is_error = result
-        .get("isError")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    finish_tool_block(tool_block, is_error_flag(result), Some(result));
+}
 
+fn finish_tool_block(tool_block: &mut ToolBlock, is_error: bool, result: Option<&Value>) {
     tool_block.status = if is_error {
         ToolStatus::Error
     } else {
         ToolStatus::Ok
     };
+
+    let Some(result) = result else {
+        return;
+    };
+
     (tool_block.output, tool_block.output_truncated) = capped_content_text(result);
     tool_block.diff = extract_diff(result);
+}
+
+fn is_error_flag(container: &Value) -> bool {
+    container
+        .get("isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn tool_name_or_fallback(name: Option<&Value>) -> String {
+    name.and_then(Value::as_str)
+        .unwrap_or(UNNAMED_TOOL_NAME)
+        .to_string()
 }
 
 fn capped_content_text(container: &Value) -> (String, bool) {

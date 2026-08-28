@@ -20,7 +20,6 @@ const NO_SESSIONS_NOTE: &str = "No sessions yet";
 const NEW_SESSION_LABEL: &str = "New session";
 const OPENING_SESSION_NOTE: &str = "opening…";
 
-#[derive(Clone)]
 pub(super) enum SidebarIntent {
     NewSession,
     OpenSession { sid: String },
@@ -29,7 +28,6 @@ pub(super) enum SidebarIntent {
 
 pub(super) struct Sidebar {
     store: Entity<FleetStore>,
-    selected_sid: Option<String>,
     machines_collapsed: bool,
     sessions_collapsed: bool,
     _store: gpui::Subscription,
@@ -43,20 +41,10 @@ impl Sidebar {
 
         Self {
             store,
-            selected_sid: None,
             machines_collapsed: false,
             sessions_collapsed: false,
             _store: store_subscription,
         }
-    }
-
-    pub(super) fn select_session(&mut self, sid: Option<String>, cx: &mut Context<Self>) {
-        if self.selected_sid == sid {
-            return;
-        }
-
-        self.selected_sid = sid;
-        cx.notify();
     }
 
     fn render_session_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -221,7 +209,7 @@ impl Sidebar {
                 SessionStatus::Running => Tone::Live,
                 SessionStatus::Exited => Tone::Idle,
             },
-            selected: self.selected_sid.as_deref() == Some(info.sid.as_str()),
+            selected: store.is_selected_session(&info.sid),
             opening: store.opening_sid() == Some(info.sid.as_str()),
             sid: info.sid.clone(),
         }

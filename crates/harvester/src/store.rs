@@ -1,5 +1,5 @@
 use crate::catalog::Catalog;
-use crate::session_state::ChatTarget;
+use crate::session_state::{ChatTarget, PI_SET_MODEL};
 use crate::workspaces::Workspace;
 use gpui::{Context, EventEmitter};
 use harvester_client_core::bridge::{Command, Event as BridgeEvent};
@@ -106,7 +106,7 @@ impl FleetStore {
 
     fn apply_bridge_event(&mut self, machine: &str, event: &BridgeEvent, cx: &mut Context<Self>) {
         match event {
-            BridgeEvent::Connected { .. } => cx.notify(),
+            BridgeEvent::Connected => cx.notify(),
             BridgeEvent::ConnectFailed { .. } | BridgeEvent::Disconnected => {
                 self.catalog.abandon_open_on(machine);
                 cx.notify();
@@ -124,19 +124,19 @@ impl FleetStore {
                 self.catalog.session_exited(sid);
                 cx.notify();
             }
-            BridgeEvent::ModelSet {
+            BridgeEvent::PiAnswered {
+                method,
                 result: Err(detail),
                 ..
-            } => self.fail(format!("set_model: {detail}"), cx),
+            } if method == PI_SET_MODEL => self.fail(format!("{PI_SET_MODEL}: {detail}"), cx),
             BridgeEvent::Sessions(_)
             | BridgeEvent::AttachmentLeft { .. }
             | BridgeEvent::HistoryReplaced { .. }
             | BridgeEvent::HistoryExtended { .. }
             | BridgeEvent::Pi { .. }
+            | BridgeEvent::PromptFailed { .. }
             | BridgeEvent::ModelsListed { .. }
-            | BridgeEvent::SessionModelsListed { .. }
-            | BridgeEvent::SessionState { .. }
-            | BridgeEvent::ModelSet { .. } => {}
+            | BridgeEvent::PiAnswered { .. } => {}
         }
     }
 
@@ -187,6 +187,44 @@ impl FleetStore {
 
     pub fn send(&self, machine: &str, command: Command) {
         self.fleet.send(machine, command);
+    }
+
+    pub fn send_gated(&mut self, machine: &str, command: Command, cx: &mut Context<Self>) -> bool {
+        if let Some(detail) = self.gate_failure(machine, &command) {
+            self.fail(detail, cx);
+
+            return false;
+        }
+
+        self.raise_open_guard_for(machine, &command, cx);
+        self.send(machine, command);
+
+        true
+    }
+
+    fn gate_failure(&mut self, machine: &str, command: &Command) -> Option<String> {
+        let label = self.label(machine);
+
+        if is_pre_session_command(command) {
+            return match self.fleet.ensure_connection(machine) {
+                Ok(()) => None,
+                Err(error) => Some(format!("{label}: {error} — nothing was sent")),
+            };
+        }
+
+        if self.is_live(machine) {
+            return None;
+        }
+
+        Some(format!("{label}: not connected — nothing was sent"))
+    }
+
+    fn raise_open_guard_for(&mut self, machine: &str, command: &Command, cx: &mut Context<Self>) {
+        let Command::StartSession { sid, .. } = command else {
+            return;
+        };
+
+        self.begin_start(machine.to_string(), sid.clone(), cx);
     }
 
     pub fn send_host_command(
@@ -363,4 +401,20 @@ impl FleetStore {
     pub fn opening_sid(&self) -> Option<&str> {
         self.catalog.opening_sid()
     }
+
+    pub fn is_selected_session(&self, sid: &str) -> bool {
+        self.catalog.is_selected_session(sid)
+    }
+
+    pub fn clear_selected_session(&mut self, cx: &mut Context<Self>) {
+        self.catalog.clear_selected_session();
+        cx.notify();
+    }
+}
+
+fn is_pre_session_command(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::ListModels { .. } | Command::StartSession { .. }
+    )
 }

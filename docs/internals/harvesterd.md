@@ -4,6 +4,32 @@ This codebase carries no code comments (see AGENTS.md). Everything a comment
 would have said about `harvesterd` lives here instead, one section per module.
 Update the relevant section in the same change that touches the code.
 
+## The `daemon-release` cargo profile
+
+harvesterd ships as a static musl binary that the client uploads over SSH on
+every fingerprint mismatch, so size is the metric that matters for it:
+`opt-level = "z"`, full LTO, `strip`, and `panic = "abort"` (a daemon that
+panics has nothing to unwind for — the session state is on disk, and the
+client re-bootstraps).
+
+Those settings live in `[profile.daemon-release]` (root `Cargo.toml`,
+`inherits = "release"`) and **not** in `[profile.release]`, because cargo
+profiles are workspace-wide: as release overrides they also applied to the
+gpui desktop client, where every one of them is wrong — `panic = "abort"`
+kills the window on any UI panic instead of unwinding, and `opt-level = "z"`
+plus full LTO trades frame time for bytes nobody ships. `[profile.release]`
+is therefore stock, and the daemon build line is
+
+```sh
+cargo build --profile daemon-release --target x86_64-unknown-linux-musl -p harvesterd
+```
+
+which lands the binary in `target/x86_64-unknown-linux-musl/daemon-release/`.
+That directory name is load-bearing in three places — `crates/harvester/build.rs`
+(what it embeds), `crates/harvester/src/main.rs` (`DEV_DAEMON_PATH`, the dev
+fallback) and `harvester-cli`'s `--daemon` default — so a profile rename is a
+four-file change, not a one-line one.
+
 ## crates/harvesterd/src/daemon.rs
 
 Shared daemon state: the pid table, and nothing else. Per docs/DAEMON.md,
@@ -85,7 +111,7 @@ async-runtime thread never waits on disk.
 - `read_session_file` streams the file **line by line** rather than slurping
   it whole: session files are full conversation logs that can run to many MB,
   and only the header line and the last `session_info` entry actually matter.
-  A cwd-filter miss then costs exactly one line read.
+  A file whose header does not parse then costs exactly one line read.
 - Read as **bytes** (`read_until(LF, …)`, matching pi's LF-only framing rule —
   see CLAUDE.md), never via `read_line`/text APIs: `read_line` would
   UTF-8-validate every byte of the *entire* log just to find two lines of
@@ -106,9 +132,15 @@ async-runtime thread never waits on disk.
   *explicit clear*, not as a blank/missing title. A later nameless
   `session_info` entry therefore clears an earlier name — "last entry wins"
   includes losing the name, by design.
-- `append_fileless_running`: for a session with no file yet, cwd filtering
-  uses the cwd the pid table recorded (there being no header line to read one
-  from).
+- `append_fileless_running`: a session with no file yet has no header line, so
+  everything reported about it (`cwd`, `mtime_ms`) comes from what the pid
+  table recorded at spawn.
+- The scan takes **no cwd filter**. `list_sessions` used to accept an optional
+  `cwd` and thread it through all three functions here; no client ever sent
+  one (the gpui client renders every machine's sessions in one sidebar and
+  needs the whole list), so it was a filter that only ever matched everything.
+  Filtering belongs to the caller that knows which workspaces it is showing —
+  the daemon's job is the scan (docs/DAEMON.md §list_sessions).
 
 ## crates/harvesterd/src/main.rs
 
@@ -164,6 +196,67 @@ is docs/DAEMON.md (protocol v1). Stateless by design.
   we read the *right file* and get a real answer — the test binary is itself
   readable via `/proc/self/exe`.
 
+## crates/harvesterd/src/models.rs
+
+Implements `list_models`: the throwaway-pi query behind the unstarted chat's
+model picker, plus the stderr forensics that make a pi which dies on startup
+diagnosable. Split out of `ops.rs` so the dispatch layer stays a list of
+one-command handlers; `ops::spawn_list_models` is the only caller.
+
+- **`list_models` / `query_available_models`**: the models pi would
+  offer in a given `cwd` are fetched fresh on every call (DAEMON.md requires
+  this to be deterministic and untouching of any session — no caching). A
+  throwaway `PI_OFFLINE=1 pi --mode rpc --no-session` process asks
+  `get_available_models` and pi's `data` is returned verbatim. Stdin must stay
+  open until the response line is read, because pi treats EOF as shutdown and
+  will die before answering otherwise (verified live on pi 0.83.0). The child
+  is `kill_on_drop`, so on every exit path it's either already exiting (stdin
+  already dropped) or gets SIGKILLed — no pi ever outlives the function. This
+  work rides its own task since even the ~1s pi startup (bounded by
+  `LIST_MODELS_TIMEOUT`) must not block sibling requests on the same
+  connection.
+- **`capture_pi_stderr` / `explain_pi_failure` / `pi_stderr_summary`**: pi's
+  stderr used to be `Stdio::null()`, so a pi that died on startup produced
+  only "pi exited before answering" and the reason was gone. It is piped now.
+  The drain runs as its own task and keeps reading *after* the
+  `PI_STDERR_CAPTURE_BYTES` cap is reached, appending nothing — stopping the
+  reads instead would fill the pipe and block pi, turning a crash report into
+  a hang. Both failure arms (clean EOF and a read error) route through
+  `explain_pi_failure`, which writes the whole capture to the daemon's own
+  stderr — `~/.harvester/log/harvesterd.log` when started by `bootstrap.rs` —
+  and appends a one-line summary to the error the client shows.
+  `pi_stderr_summary` prefers the first non-empty line *containing
+  whitespace*, falling back to the first non-empty line: a message has words,
+  whereas a bare token is a path or a source location. That rule is what turns
+  node's first line (`.../cachestorage.js:20`) into the line that actually
+  names the fault (`TypeError: webidl.util.markAsUncloneable is not a
+  function`) — the real failure when pi runs on a Node older than 22, which
+  is the case this was written for. A capture that summarizes to nothing
+  leaves the caller's own reason untouched.
+
+Named constants and why their values are what they are:
+- `LIST_MODELS_TIMEOUT` (15s): ceiling on the whole throwaway `list_models`
+  run (spawn → answer → exit; measured ~1s on exe.dev). Same role as
+  `STOP_KILL_BACKSTOP` — only a wedged pi hits it, and `kill_on_drop` SIGKILLs
+  on expiry, which is safe here because a `--no-session` pi has nothing
+  durable to truncate.
+- `MODELS_REQUEST_ID` ("hv-models"): deliberately inside the `hv-` namespace
+  the passthrough pump routes on, even though this throwaway pi has no pump —
+  the reply filter matches it directly.
+- `PI_STDERR_CAPTURE_BYTES` (8 KiB) / `PI_STDERR_CHUNK_BYTES` (1 KiB): a
+  startup crash report is a few hundred bytes and a node stack trace is a
+  couple of KiB, so 8 KiB holds a whole one with room spare while bounding
+  what a chatty pi can make the daemon hold.
+- `PI_STDERR_SUMMARY_CHARS` (200): the summary rides in an error string the
+  client renders in a toast, so it is capped to a readable length; the log
+  keeps the untruncated text.
+- `PI_STDERR_DRAIN_TIMEOUT` (2s): the drain task ends when pi's stderr closes,
+  which a dead pi has already done, so this only bounds the pathological case
+  where the pipe is held open by something we no longer control. Expiry costs
+  the summary, never the error itself.
+- `PI_EXITED_EARLY`: the one wording for "pi exited before answering", shared
+  so the message the client matches on cannot drift between call sites.
+
 ## crates/harvesterd/src/ops.rs
 
 `ops.rs` holds one named function per harvester command; `server.rs` only
@@ -206,36 +299,20 @@ frames/decodes/routes/encodes (the controller-layer house rule).
 - **`spawn_list_sessions`** runs the disk scan on the blocking pool: session
   files can be large, and a synchronous read on the daemon's single runtime
   thread would stall every pump and connection meanwhile.
-- **`spawn_list_models` / `query_available_models`**: the models pi would
-  offer in a given `cwd` are fetched fresh on every call (DAEMON.md requires
-  this to be deterministic and untouching of any session — no caching). A
-  throwaway `PI_OFFLINE=1 pi --mode rpc --no-session` process asks
-  `get_available_models` and pi's `data` is returned verbatim. Stdin must stay
-  open until the response line is read, because pi treats EOF as shutdown and
-  will die before answering otherwise (verified live on pi 0.83.0). The child
-  is `kill_on_drop`, so on every exit path it's either already exiting (stdin
-  already dropped) or gets SIGKILLed — no pi ever outlives the function. This
-  work rides its own task since even the ~1s pi startup (bounded by
-  `LIST_MODELS_TIMEOUT`) must not block sibling requests on the same
-  connection.
-- **`capture_pi_stderr` / `explain_pi_failure` / `pi_stderr_summary`**: pi's
-  stderr used to be `Stdio::null()`, so a pi that died on startup produced
-  only "pi exited before answering" and the reason was gone. It is piped now.
-  The drain runs as its own task and keeps reading *after* the
-  `PI_STDERR_CAPTURE_BYTES` cap is reached, appending nothing — stopping the
-  reads instead would fill the pipe and block pi, turning a crash report into
-  a hang. Both failure arms (clean EOF and a read error) route through
-  `explain_pi_failure`, which writes the whole capture to the daemon's own
-  stderr — `~/.harvester/log/harvesterd.log` when started by `bootstrap.rs` —
-  and appends a one-line summary to the error the client shows.
-  `pi_stderr_summary` prefers the first non-empty line *containing
-  whitespace*, falling back to the first non-empty line: a message has words,
-  whereas a bare token is a path or a source location. That rule is what turns
-  node's first line (`.../cachestorage.js:20`) into the line that actually
-  names the fault (`TypeError: webidl.util.markAsUncloneable is not a
-  function`) — the real failure when pi runs on a Node older than 22, which
-  is the case this was written for. A capture that summarizes to nothing
-  leaves the caller's own reason untouched.
+- **`spawn_list_models`** is the whole of `list_models` that belongs to the
+  dispatch layer: hand the `cwd` to `models::list_models` on its own task and
+  let it answer later. The throwaway-pi machinery and its constants live in
+  `models.rs` (below) — same split as `list_sessions`, whose scan lives in
+  `fslist.rs`.
+- **`detach` / `stop` payloads** are built with `json!` rather than through a
+  typed struct: `{}`, `{"stopping": true}` and `{"stopping": false}` are
+  write-only shapes nobody decodes, and a `DetachData {}`/`StopData` pair in
+  `harvester-proto` was two types whose entire content was the literal they
+  produced. The shapes stay pinned by docs/DAEMON.md, by
+  `detach_answers_the_documented_empty_payload` and by
+  `stopping_a_session_that_is_no_longer_running_succeeds`.
+  The `already` flags on `attach`/`create_session` keep their typed payloads —
+  those are a documented contract the client reads.
 - **`attach`**: subscribes to the session's broadcast channel *before* joining
   the dialog room, never the reverse. A dialog arriving between the two steps
   is auto-cancelled (room still reads as empty) — one spurious "Escape" — but
@@ -252,7 +329,15 @@ frames/decodes/routes/encodes (the controller-layer house rule).
   seen event, then streaming continues from the oldest retained event.
 - **`stop`** is non-blocking: it starts a polite escalation ladder and returns
   immediately. `session_exit` is the authoritative "it's done" signal; this
-  response only means "shutdown initiated". The escalation:
+  response only means "shutdown initiated". A sid the pid table doesn't know
+  takes the `already_stopped` arm — success with `{"stopping": false}`, not
+  `no_such_session` — because the requested end state already holds and the
+  caller is a UI whose picture of "still running" is always one event behind
+  this process: the client's Stop button lives beside a busy indicator that a
+  `session_exit` in flight has not yet cleared, and turning that race into an
+  error banner would blame the user for the daemon's own timing. `attach`
+  still errors on an unknown sid — that one *is* a lookup, and a client
+  attaching to nothing has no stream to read. The escalation:
   1. *Rung 1* — write an `abort` command so pi records the in-flight turn
      cleanly in the session file instead of dying mid-stream. Failure here is
      fine, since a dead/deaf pi is exactly what the later rungs handle.
@@ -270,32 +355,25 @@ frames/decodes/routes/encodes (the controller-layer house rule).
   behavior (rungs 1–2 only touch the queue, never the pipe, so neither can
   block on their own).
 
+  Rung 1 registers a response waiter for the injected `abort` and drops the
+  receiver on the spot (`drop(session.register_response_waiter(…))`). That
+  looks pointless and is not: the pump swallows every `hv-`-prefixed response
+  as a passthrough answer instead of forwarding it as an event, so pi's answer
+  to *our* abort has to land somewhere. With no waiter registered it lands in
+  `resolve_response`'s miss branch, which logs "dropped response for hv-N" to
+  the daemon's stderr on every single stop — a false alarm in the one log a
+  wedged session is diagnosed from. Registering gives the answer a home;
+  dropping the receiver says nobody is waiting for it, because `stop` already
+  answered `{"stopping": true}` and `session_exit` is the authoritative
+  completion signal. A `oneshot::Sender` whose receiver is gone fails its
+  `send` harmlessly, and the map entry is cleared either by that delivery or
+  by `fail_pending_responses` when the session exits.
+
 Named constants and why their values are what they are:
 - `STOP_KILL_BACKSTOP` (30s): not a correctness knob — EOF triggers pi's
   immediate shutdown path (verified in rpc-mode.js; it never waits for an
   in-flight turn). This only fires for a genuinely wedged process (a hung
   extension `session_shutdown` handler, a stuck runtime).
-- `LIST_MODELS_TIMEOUT` (15s): ceiling on the whole throwaway `list_models`
-  run (spawn → answer → exit; measured ~1s on exe.dev). Same role as
-  `STOP_KILL_BACKSTOP` — only a wedged pi hits it, and `kill_on_drop` SIGKILLs
-  on expiry, which is safe here because a `--no-session` pi has nothing
-  durable to truncate.
-- `MODELS_REQUEST_ID` ("hv-models"): deliberately inside the `hv-` namespace
-  the passthrough pump routes on, even though this throwaway pi has no pump —
-  the reply filter matches it directly.
-- `PI_STDERR_CAPTURE_BYTES` (8 KiB) / `PI_STDERR_CHUNK_BYTES` (1 KiB): a
-  startup crash report is a few hundred bytes and a node stack trace is a
-  couple of KiB, so 8 KiB holds a whole one with room spare while bounding
-  what a chatty pi can make the daemon hold.
-- `PI_STDERR_SUMMARY_CHARS` (200): the summary rides in an error string the
-  client renders in a toast, so it is capped to a readable length; the log
-  keeps the untruncated text.
-- `PI_STDERR_DRAIN_TIMEOUT` (2s): the drain task ends when pi's stderr closes,
-  which a dead pi has already done, so this only bounds the pathological case
-  where the pipe is held open by something we no longer control. Expiry costs
-  the summary, never the error itself.
-- `PI_EXITED_EARLY`: the one wording for "pi exited before answering", shared
-  so the message the client matches on cannot drift between call sites.
 
 The test module documents that payload wire shapes are pinned in
 `harvester-proto`; what belongs to `ops.rs` is only the *routing* —
@@ -358,6 +436,19 @@ Implements verbatim pi RPC passthrough (docs/DAEMON.md §The `pi` passthrough).
 - `session_swap_refusal_message` names the invariant explicitly in the error
   text rather than just saying no, so the client author reading the error
   understands it's a hard rule, not a bug to work around.
+- `pi_failure_payload` is the one place a *daemon-invented* pi answer is
+  built. Every failure the daemon has to answer on pi's behalf — a rejected
+  sid, an unknown session, a refused session-swap, a failed stdin write, a
+  session that exited before responding — must be shaped like a pi response
+  (`{"type": "response", "success": false, "error": …}`), because the client
+  speaks Pi and does not know these came from us. It was written out twice
+  before, once inside the `answer_later` future and once in `error_response`;
+  one builder means the two cannot drift. There is no `command` field: pi
+  echoes the command it answered, and the daemon has no command to echo on
+  the paths where nothing reached pi.
+- `SESSION_EXITED_BEFORE_RESPONDING`: the wording a client sees when the pump
+  drops its waiter map on exit, named because it is the only pi "answer" the
+  daemon authors for a command it did successfully write.
 
 ## crates/harvesterd/src/paths.rs
 
@@ -407,6 +498,19 @@ logic itself lives in `ops.rs` (harvester-native commands) and
   differs per caller (`HarvesterResponse` vs `PiResponse`).
 - `decode_line` returning `None` means "nothing to dispatch" — either a blank
   line, or a parse error that has already been reported to the client inline.
+- `RequestIdProbe` / `request_id_from_raw_line`: a line that fails to decode as
+  a `Request` still has to be answered *with its `id`*. `serde_json` gives us no
+  id from a failed decode (the whole value is discarded), so the raw bytes are
+  re-parsed a second time through a struct that has exactly one optional field.
+  This is the version-skew path — an unknown `cmd.type` from a newer client, a
+  field an older daemon does not know — and the client's response router drops
+  id-less responses while its pending waiters have no timeout, so answering
+  `id: None` would hang that request forever rather than fail it. The probe
+  keeps the id as a `Value`, not a `u64`: the daemon echoes what it was sent
+  and never re-types it (only the *envelope* is typed). Yielding `None` for a
+  line that is not JSON, is not a JSON object, or carries `"id": null` is
+  correct — there is no id to correlate, and the error still reaches the
+  client's stderr note. Documented in docs/DAEMON.md §Envelope.
 
 ## crates/harvesterd/src/session.rs
 
@@ -635,6 +739,3 @@ of those roles honest — the type itself is the proof validation happened.
   caller that must echo the *rejected* sid back in an error still owns it.
 - `Borrow<str>` lets a `HashMap<Sid, _>` (e.g. `AttachedMap`) be looked up by
   `&str` without allocating a new `Sid`.
-</content>
-
-## crates/harvesterd/src/{daemon,main,passthrough,fslist,server,paths}.rs

@@ -28,7 +28,6 @@ pub enum BootstrapOutcome {
 
 pub struct Connected {
     pub connection: DaemonConnection,
-    pub daemon_version: String,
     pub outcome: BootstrapOutcome,
 }
 
@@ -91,7 +90,6 @@ fn connected_if_protocol_matches(
 
     Ok(Connected {
         connection,
-        daemon_version: ping.version.to_string(),
         outcome,
     })
 }

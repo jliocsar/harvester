@@ -12,10 +12,7 @@ use crate::sid::Sid;
 
 const SESSION_INFO_MARKER: &[u8] = br#""session_info""#;
 
-pub fn list_sessions(
-    cwd_filter: Option<&str>,
-    running: &HashMap<Sid, RunningSession>,
-) -> Vec<SessionInfo> {
+pub fn list_sessions(running: &HashMap<Sid, RunningSession>) -> Vec<SessionInfo> {
     let mut sessions = Vec::new();
     let mut line_buffer = Vec::new();
 
@@ -37,15 +34,13 @@ pub fn list_sessions(
 
             let mtime_ms = entry_mtime_ms(&file);
 
-            if let Some(info) =
-                read_session_file(&path, mtime_ms, cwd_filter, running, &mut line_buffer)
-            {
+            if let Some(info) = read_session_file(&path, mtime_ms, running, &mut line_buffer) {
                 sessions.push(info);
             }
         }
     }
 
-    append_fileless_running(&mut sessions, cwd_filter, running);
+    append_fileless_running(&mut sessions, running);
 
     sessions.sort_by_key(|session| std::cmp::Reverse(session.mtime_ms));
 
@@ -54,14 +49,12 @@ pub fn list_sessions(
 
 fn append_fileless_running(
     sessions: &mut Vec<SessionInfo>,
-    cwd_filter: Option<&str>,
     running: &HashMap<Sid, RunningSession>,
 ) {
     for (sid, session) in running {
         let on_disk = sessions.iter().any(|found| found.sid == sid.as_str());
-        let wanted = cwd_filter.is_none_or(|cwd| cwd == session.cwd);
 
-        if on_disk || !wanted {
+        if on_disk {
             continue;
         }
 
@@ -89,7 +82,6 @@ fn entry_mtime_ms(entry: &std::fs::DirEntry) -> u64 {
 fn read_session_file(
     path: &Path,
     mtime_ms: u64,
-    cwd_filter: Option<&str>,
     running: &HashMap<Sid, RunningSession>,
     line_buffer: &mut Vec<u8>,
 ) -> Option<SessionInfo> {
@@ -106,12 +98,6 @@ fn read_session_file(
 
     let sid = header.get("id")?.as_str()?.to_owned();
     let cwd = header.get("cwd")?.as_str()?.to_owned();
-
-    if let Some(filter) = cwd_filter {
-        if cwd != filter {
-            return None;
-        }
-    }
 
     let name = scan_for_last_name(&mut reader, path, line_buffer);
 
@@ -211,7 +197,6 @@ mod tests {
     fn read_fixture_bytes(
         dir: &tempfile::TempDir,
         contents: &[u8],
-        cwd_filter: Option<&str>,
         running: &HashMap<Sid, RunningSession>,
     ) -> Option<SessionInfo> {
         let path = dir.path().join("fixture.jsonl");
@@ -219,22 +204,15 @@ mod tests {
 
         std::fs::write(&path, contents).expect("fixture file must be writable");
 
-        read_session_file(
-            &path,
-            FIXTURE_MTIME_MS,
-            cwd_filter,
-            running,
-            &mut line_buffer,
-        )
+        read_session_file(&path, FIXTURE_MTIME_MS, running, &mut line_buffer)
     }
 
     fn read_fixture(
         dir: &tempfile::TempDir,
         contents: &str,
-        cwd_filter: Option<&str>,
         running: &HashMap<Sid, RunningSession>,
     ) -> Option<SessionInfo> {
-        read_fixture_bytes(dir, contents.as_bytes(), cwd_filter, running)
+        read_fixture_bytes(dir, contents.as_bytes(), running)
     }
 
     fn nothing_running() -> HashMap<Sid, RunningSession> {
@@ -268,7 +246,7 @@ mod tests {
         ]);
 
         let info =
-            read_fixture(&dir, &contents, None, &nothing_running()).expect("valid file must parse");
+            read_fixture(&dir, &contents, &nothing_running()).expect("valid file must parse");
 
         assert_eq!(info.sid, FIXTURE_SID);
         assert_eq!(info.cwd, FIXTURE_CWD);
@@ -292,7 +270,7 @@ mod tests {
         ]);
 
         let info =
-            read_fixture(&dir, &contents, None, &nothing_running()).expect("valid file must parse");
+            read_fixture(&dir, &contents, &nothing_running()).expect("valid file must parse");
 
         assert_eq!(info.name.as_deref(), Some("third name"));
     }
@@ -306,7 +284,7 @@ mod tests {
         ]);
 
         let info =
-            read_fixture(&dir, &contents, None, &nothing_running()).expect("valid file must parse");
+            read_fixture(&dir, &contents, &nothing_running()).expect("valid file must parse");
 
         assert!(info.name.is_none());
     }
@@ -320,7 +298,7 @@ mod tests {
         ]);
 
         let info =
-            read_fixture(&dir, &contents, None, &nothing_running()).expect("valid file must parse");
+            read_fixture(&dir, &contents, &nothing_running()).expect("valid file must parse");
 
         assert!(info.name.is_none());
     }
@@ -335,36 +313,9 @@ mod tests {
         ]);
 
         let info =
-            read_fixture(&dir, &contents, None, &nothing_running()).expect("valid file must parse");
+            read_fixture(&dir, &contents, &nothing_running()).expect("valid file must parse");
 
         assert!(info.name.is_none());
-    }
-
-    #[test]
-    fn cwd_filter_match_yields_the_session() {
-        let dir = temp_dir();
-        let contents = jsonl(&[
-            session_header(FIXTURE_SID, FIXTURE_CWD),
-            session_info_entry("in scope"),
-        ]);
-
-        let info = read_fixture(&dir, &contents, Some(FIXTURE_CWD), &nothing_running())
-            .expect("matching cwd must parse");
-
-        assert_eq!(info.cwd, FIXTURE_CWD);
-    }
-
-    #[test]
-    fn cwd_filter_miss_yields_nothing() {
-        let dir = temp_dir();
-        let contents = jsonl(&[
-            session_header(FIXTURE_SID, FIXTURE_CWD),
-            session_info_entry("out of scope"),
-        ]);
-
-        assert!(
-            read_fixture(&dir, &contents, Some("/some/other/dir"), &nothing_running()).is_none()
-        );
     }
 
     #[test]
@@ -375,7 +326,7 @@ mod tests {
             session_info_entry("ignored"),
         ]);
 
-        assert!(read_fixture(&dir, &contents, None, &nothing_running()).is_none());
+        assert!(read_fixture(&dir, &contents, &nothing_running()).is_none());
     }
 
     #[test]
@@ -383,7 +334,7 @@ mod tests {
         let dir = temp_dir();
         let contents = jsonl(&[json!({ "type": "session", "version": 3, "cwd": FIXTURE_CWD })]);
 
-        assert!(read_fixture(&dir, &contents, None, &nothing_running()).is_none());
+        assert!(read_fixture(&dir, &contents, &nothing_running()).is_none());
     }
 
     #[test]
@@ -391,7 +342,7 @@ mod tests {
         let dir = temp_dir();
         let contents = jsonl(&[json!({ "type": "session", "version": 3, "id": FIXTURE_SID })]);
 
-        assert!(read_fixture(&dir, &contents, None, &nothing_running()).is_none());
+        assert!(read_fixture(&dir, &contents, &nothing_running()).is_none());
     }
 
     #[test]
@@ -399,23 +350,21 @@ mod tests {
         let dir = temp_dir();
         let contents = jsonl(&[json!({ "version": 3, "id": FIXTURE_SID, "cwd": FIXTURE_CWD })]);
 
-        assert!(read_fixture(&dir, &contents, None, &nothing_running()).is_none());
+        assert!(read_fixture(&dir, &contents, &nothing_running()).is_none());
     }
 
     #[test]
     fn unparseable_header_yields_nothing() {
         let dir = temp_dir();
 
-        assert!(
-            read_fixture(&dir, "this is not json at all\n", None, &nothing_running()).is_none()
-        );
+        assert!(read_fixture(&dir, "this is not json at all\n", &nothing_running()).is_none());
     }
 
     #[test]
     fn empty_file_yields_nothing() {
         let dir = temp_dir();
 
-        assert!(read_fixture(&dir, "", None, &nothing_running()).is_none());
+        assert!(read_fixture(&dir, "", &nothing_running()).is_none());
     }
 
     #[test]
@@ -424,7 +373,7 @@ mod tests {
         let contents = jsonl(&[session_header(FIXTURE_SID, FIXTURE_CWD)]);
         let running = running(FIXTURE_SID, FIXTURE_CWD, 1);
 
-        let info = read_fixture(&dir, &contents, None, &running).expect("valid file must parse");
+        let info = read_fixture(&dir, &contents, &running).expect("valid file must parse");
 
         assert_eq!(info.status, SessionStatus::Running);
     }
@@ -435,7 +384,7 @@ mod tests {
         let contents = jsonl(&[session_header(FIXTURE_SID, FIXTURE_CWD)]);
         let running = running("some-other-sid", FIXTURE_CWD, 1);
 
-        let info = read_fixture(&dir, &contents, None, &running).expect("valid file must parse");
+        let info = read_fixture(&dir, &contents, &running).expect("valid file must parse");
 
         assert_eq!(info.status, SessionStatus::Exited);
     }
@@ -453,7 +402,7 @@ mod tests {
         contents.push_str(&jsonl(&[session_info_entry("after garbage")]));
 
         let info =
-            read_fixture(&dir, &contents, None, &nothing_running()).expect("valid file must parse");
+            read_fixture(&dir, &contents, &nothing_running()).expect("valid file must parse");
 
         assert_eq!(info.name.as_deref(), Some("after garbage"));
     }
@@ -473,7 +422,7 @@ mod tests {
         ]);
 
         let info =
-            read_fixture(&dir, &contents, None, &nothing_running()).expect("valid file must parse");
+            read_fixture(&dir, &contents, &nothing_running()).expect("valid file must parse");
 
         assert_eq!(info.name.as_deref(), Some("real name"));
     }
@@ -490,7 +439,7 @@ mod tests {
         contents.extend_from_slice(&[0xFF, 0xFE, b'\n']);
         contents.extend_from_slice(jsonl(&[session_info_entry("after bad bytes")]).as_bytes());
 
-        let info = read_fixture_bytes(&dir, &contents, None, &nothing_running())
+        let info = read_fixture_bytes(&dir, &contents, &nothing_running())
             .expect("valid header must still parse");
 
         assert_eq!(info.name.as_deref(), Some("after bad bytes"));
@@ -506,7 +455,7 @@ mod tests {
         ]);
 
         let info =
-            read_fixture(&dir, &contents, None, &nothing_running()).expect("valid file must parse");
+            read_fixture(&dir, &contents, &nothing_running()).expect("valid file must parse");
 
         assert!(info.name.is_none());
     }
@@ -521,7 +470,7 @@ mod tests {
         ]);
 
         let info =
-            read_fixture(&dir, &contents, None, &nothing_running()).expect("valid file must parse");
+            read_fixture(&dir, &contents, &nothing_running()).expect("valid file must parse");
 
         assert!(info.name.is_none());
     }
@@ -535,7 +484,7 @@ mod tests {
         ]);
 
         let info =
-            read_fixture(&dir, &contents, None, &nothing_running()).expect("valid file must parse");
+            read_fixture(&dir, &contents, &nothing_running()).expect("valid file must parse");
 
         assert_eq!(info.name.as_deref(), Some("padded name"));
     }
@@ -551,7 +500,7 @@ mod tests {
         );
 
         let info =
-            read_fixture(&dir, &contents, None, &nothing_running()).expect("valid file must parse");
+            read_fixture(&dir, &contents, &nothing_running()).expect("valid file must parse");
 
         assert_eq!(info.name.as_deref(), Some("unterminated"));
     }
@@ -561,7 +510,7 @@ mod tests {
         let running = running(FIXTURE_SID, FIXTURE_CWD, 4_242);
         let mut sessions = Vec::new();
 
-        append_fileless_running(&mut sessions, None, &running);
+        append_fileless_running(&mut sessions, &running);
 
         let listed = sessions.first().expect("the live pi must be listed");
 
@@ -590,23 +539,9 @@ mod tests {
             status: SessionStatus::Running,
         }];
 
-        append_fileless_running(&mut sessions, None, &running);
+        append_fileless_running(&mut sessions, &running);
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].name.as_deref(), Some("from disk"));
-    }
-
-    #[test]
-    fn a_fileless_session_honours_the_cwd_filter() {
-        let running = running(FIXTURE_SID, FIXTURE_CWD, 1);
-        let mut sessions = Vec::new();
-
-        append_fileless_running(&mut sessions, Some("/somewhere/else"), &running);
-
-        assert!(sessions.is_empty());
-
-        append_fileless_running(&mut sessions, Some(FIXTURE_CWD), &running);
-
-        assert_eq!(sessions.len(), 1);
     }
 }

@@ -19,9 +19,15 @@ const MODEL_CONTROL_ID: &str = "chat-model";
 const MACHINE_CONTROL_ID: &str = "chat-machine";
 const REPO_CONTROL_ID: &str = "chat-repo";
 const SEND_CONTROL_ID: &str = "chat-send";
+const STOP_CONTROL_ID: &str = "chat-stop";
+
+pub const DEFAULT_MODEL_ROW: &str = "Default (pi chooses)";
+pub const ADD_REPO_ROW: &str = "Add new…";
 
 const SESSION_STARTING_NOTICE: &str = "Starting session…";
 const SEND_TOOLTIP: &str = "Send";
+const STOP_LABEL: &str = "Stop";
+const STOP_TOOLTIP: &str = "Stop pi — the session can be resumed from the sidebar";
 const INPUT_KEY_CONTEXT: &str = "Input";
 
 const CONTROL_LABEL_MAX_CHARS: usize = 24;
@@ -50,7 +56,7 @@ pub struct PickRepo {
     pub index: usize,
 }
 
-pub fn prompt_box(focused: bool, cx: &App) -> Div {
+fn prompt_box(focused: bool, cx: &App) -> Div {
     let theme = cx.theme();
     let border = if focused { theme.ring } else { theme.border };
 
@@ -63,11 +69,11 @@ pub fn prompt_box(focused: bool, cx: &App) -> Div {
         .flex_col()
 }
 
-pub fn prompt_box_input(input: impl IntoElement) -> Div {
+fn prompt_box_input(input: impl IntoElement) -> Div {
     div().px_3().pt_3().pb_2().child(input)
 }
 
-pub fn prompt_box_controls() -> Div {
+fn prompt_box_controls() -> Div {
     div().pl_2().pr_3().pb_2().flex().items_center().gap_2()
 }
 
@@ -78,7 +84,7 @@ pub struct DropdownRow {
     pub divider_above: bool,
 }
 
-pub fn prompt_box_control(
+fn prompt_box_control(
     id: impl Into<ElementId>,
     icon: Icon,
     label: SharedString,
@@ -104,7 +110,7 @@ fn truncated_control_label(label: SharedString) -> SharedString {
     format!("{}{CONTROL_LABEL_ELLIPSIS}", kept.trim_end()).into()
 }
 
-pub fn prompt_box_dropdown(
+fn prompt_box_dropdown(
     trigger: Button,
     rows: Vec<DropdownRow>,
     action_for_index: impl Fn(usize) -> Box<dyn Action> + 'static,
@@ -146,7 +152,16 @@ fn create_dropdown_menu(
     menu
 }
 
-pub fn prompt_box_send(id: impl Into<ElementId>, enabled: bool) -> Button {
+fn prompt_box_stop(id: impl Into<ElementId>) -> Button {
+    Button::new(id)
+        .outline()
+        .small()
+        .icon(Icon::new(IconName::CircleX))
+        .label(STOP_LABEL)
+        .tooltip(STOP_TOOLTIP)
+}
+
+fn prompt_box_send(id: impl Into<ElementId>, enabled: bool) -> Button {
     Button::new(id)
         .primary()
         .small()
@@ -183,12 +198,14 @@ pub struct PromptStrip {
     pub repo: PromptStripControl,
     pub branch: Option<SharedString>,
     pub can_send: bool,
+    pub can_stop: bool,
     pub focused: bool,
 }
 
 pub fn prompt_strip(
     strip: PromptStrip,
     send: impl Fn(&mut Window, &mut App) + 'static,
+    stop: impl Fn(&mut Window, &mut App) + 'static,
     input: &Entity<InputState>,
     cx: &App,
 ) -> Div {
@@ -198,12 +215,13 @@ pub fn prompt_strip(
         return row.child(inline_note(Tone::Idle, notice.text(), cx));
     }
 
-    row.child(prompt_strip_box(strip, send, input, cx))
+    row.child(prompt_strip_box(strip, send, stop, input, cx))
 }
 
 fn prompt_strip_box(
     strip: PromptStrip,
     send: impl Fn(&mut Window, &mut App) + 'static,
+    stop: impl Fn(&mut Window, &mut App) + 'static,
     input: &Entity<InputState>,
     cx: &App,
 ) -> Div {
@@ -231,6 +249,9 @@ fn prompt_strip_box(
     );
     let send_button = prompt_box_send(SEND_CONTROL_ID, strip.can_send)
         .on_click(move |_, window, cx| send(window, cx));
+    let stop_button = strip
+        .can_stop
+        .then(|| prompt_box_stop(STOP_CONTROL_ID).on_click(move |_, window, cx| stop(window, cx)));
 
     prompt_box(strip.focused, cx)
         .child(prompt_box_input(Input::new(input).appearance(false).p_0()))
@@ -241,6 +262,7 @@ fn prompt_strip_box(
                 .child(repo)
                 .children(branch_indicator(strip.branch))
                 .child(div().flex_1())
+                .children(stop_button)
                 .child(send_button),
         )
 }

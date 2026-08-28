@@ -1,5 +1,8 @@
-# The desktop client. gpui lives here and only here — same quarantine logic
-# as clap-in-harvester-cli: the library crates stay UI-framework-free.
+# The desktop client. gpui lives here and only here among the workspace members
+# — same quarantine logic as clap-in-harvester-cli: the library crates stay
+# UI-framework-free. The lib target carries `ui`, `assets` and
+# `shell_bootstrap`, which is exactly what the out-of-workspace
+# crates/harvester-gallery consumes.
 [package]
 name = "harvester"
 version.workspace = true
@@ -33,12 +36,6 @@ gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "
 ] }
 # Lucide SVGs behind `IconName`. Without an AssetSource every icon renders blank.
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "f96f1576" }
-# Lets gpui-mcp (the MCP server) attach to the gallery and drive it: dump the
-# a11y tree, inject keys. Inert unless launched with `GPUI_MCP=1` on a debug
-# build, and only the gallery calls `install` — the client binary never does.
-# Its gpui dep is the same bare zed-git source as ours, pinned by lockfile to
-# the same commit; a mismatched build is caught by the bridge handshake.
-gpui-mcp-bridge = { path = "../../../gpui-mcp/crates/gpui-mcp-bridge" }
 harvester-client-core = { path = "../harvester-client-core" }
 harvester-proto = { path = "../harvester-proto" }
 serde = { workspace = true }
@@ -47,10 +44,3 @@ tokio = { workspace = true }
 # Uuidv7 sids minted client-side for ghost-chat starts (time-sortable — the
 # sidebar's newest-first order keys on the sid). Client crate only.
 uuid = { version = "1", features = ["v7"] }
-
-[[bin]]
-# The component gallery: a dev-only story catalog. It lives in `src/gallery/`
-# rather than `src/bin/` so the `no_comments` lint (which skips `bin/`) covers
-# it — the gallery is real code, not a throwaway spike.
-name = "gallery"
-path = "src/gallery/main.rs"

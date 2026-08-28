@@ -8,17 +8,28 @@ use harvester::ui::dialog::{
     SELECT_DIALOG_WIDTH_IN_REMS, TEXT_DIALOG_WIDTH_IN_REMS,
 };
 
-use super::{caption, panel, story_column};
-use crate::story::StoryScene;
+use super::{caption, panel, story_column, DIALOG_GROUP};
+use crate::story::{KnobSpec, KnobValue, Preset, Story, StoryScene};
 
-pub const ACCENT_KNOB: &str = "accent";
-pub const TITLE_KNOB: &str = "title";
-pub const MESSAGE_KNOB: &str = "message";
-pub const CANCEL_LABEL_KNOB: &str = "cancel label";
-pub const ACTION_LABEL_KNOB: &str = "action label";
+const ACCENT_KNOB: &str = "accent";
+const TITLE_KNOB: &str = "title";
+const MESSAGE_KNOB: &str = "message";
+const CANCEL_LABEL_KNOB: &str = "cancel label";
+const ACTION_LABEL_KNOB: &str = "action label";
 
-pub const ACCENT_LABELS: &[&str] = &["primary", "danger"];
-
+const DIALOG_CHROME_STORY: &str = "Dialog chrome";
+const ACCENT_LABELS: &[&str] = &["primary", "danger"];
+const PRIMARY_ACCENT_INDEX: usize = 0;
+const DANGER_ACCENT_INDEX: usize = 1;
+const CONFIRM_TITLE: &str = "Start a session on exe-vm-7fa2?";
+const CONFIRM_MESSAGE: &str = "pi will run in ~/harvester on the branch backend-hardening.";
+const CONFIRM_ACTION_LABEL: &str = "Start";
+const CANCEL_LABEL: &str = "Cancel";
+const DESTRUCTIVE_TITLE: &str = "Forget exe-vm-0c19?";
+const DESTRUCTIVE_MESSAGE: &str =
+    "The machine is no longer listed by its provider. Sessions on its disk are untouched.";
+const DESTRUCTIVE_ACTION_LABEL: &str = "Forget";
+const SELECT_TITLE: &str = "Which branch should I work on?";
 const CANCEL_BUTTON_ID: &str = "story-dialog-cancel";
 const ACTION_BUTTON_ID: &str = "story-dialog-action";
 const SELECT_CANCEL_BUTTON_ID: &str = "story-dialog-select-cancel";
@@ -38,7 +49,60 @@ const STORY_OPTIONS: &[&str] = &[
     "spike/pi-0.84",
 ];
 
-pub fn chrome(scene: &StoryScene, _window: &mut Window, cx: &mut App) -> AnyElement {
+pub fn stories() -> Vec<Story> {
+    vec![Story::new(
+        DIALOG_GROUP,
+        DIALOG_CHROME_STORY,
+        knobs(),
+        presets(),
+        chrome,
+    )]
+}
+
+fn knobs() -> Vec<KnobSpec> {
+    vec![
+        KnobSpec::choice(ACCENT_KNOB, ACCENT_LABELS, PRIMARY_ACCENT_INDEX),
+        KnobSpec::text(TITLE_KNOB, CONFIRM_TITLE),
+        KnobSpec::text(MESSAGE_KNOB, CONFIRM_MESSAGE),
+        KnobSpec::text(CANCEL_LABEL_KNOB, CANCEL_LABEL),
+        KnobSpec::text(ACTION_LABEL_KNOB, CONFIRM_ACTION_LABEL),
+    ]
+}
+
+fn presets() -> Vec<Preset> {
+    vec![
+        Preset::new(
+            "confirm",
+            vec![
+                (ACCENT_KNOB, KnobValue::Choice(PRIMARY_ACCENT_INDEX)),
+                (TITLE_KNOB, KnobValue::Text(CONFIRM_TITLE.into())),
+                (MESSAGE_KNOB, KnobValue::Text(CONFIRM_MESSAGE.into())),
+                (
+                    ACTION_LABEL_KNOB,
+                    KnobValue::Text(CONFIRM_ACTION_LABEL.into()),
+                ),
+            ],
+        ),
+        Preset::new(
+            "destructive",
+            vec![
+                (ACCENT_KNOB, KnobValue::Choice(DANGER_ACCENT_INDEX)),
+                (TITLE_KNOB, KnobValue::Text(DESTRUCTIVE_TITLE.into())),
+                (MESSAGE_KNOB, KnobValue::Text(DESTRUCTIVE_MESSAGE.into())),
+                (
+                    ACTION_LABEL_KNOB,
+                    KnobValue::Text(DESTRUCTIVE_ACTION_LABEL.into()),
+                ),
+            ],
+        ),
+        Preset::new(
+            "untitled",
+            vec![(TITLE_KNOB, KnobValue::Text(String::new()))],
+        ),
+    ]
+}
+
+fn chrome(scene: &StoryScene, _window: &mut Window, cx: &mut App) -> AnyElement {
     let confirmation = confirmation(scene);
     let runtime = scene.runtime.read(cx);
     let single_line = runtime.dialog_single_line_input.clone();
@@ -73,7 +137,7 @@ fn confirmation(scene: &StoryScene) -> Confirmation {
 
 fn accent(index: usize) -> ActionAccent {
     match index {
-        1 => ActionAccent::Danger,
+        DANGER_ACCENT_INDEX => ActionAccent::Danger,
         _ => ActionAccent::Primary,
     }
 }
@@ -97,12 +161,12 @@ fn confirmation_surface(confirmation: Confirmation, cx: &App) -> Div {
 }
 
 fn select_surface(cx: &App) -> Div {
-    let buttons = dismiss_only_row(cancel_button(SELECT_CANCEL_BUTTON_ID, "Cancel"));
+    let buttons = dismiss_only_row(cancel_button(SELECT_CANCEL_BUTTON_ID, CANCEL_LABEL));
 
     panel(cx)
         .w(rems(SELECT_DIALOG_WIDTH_IN_REMS))
         .bg(cx.theme().popover)
-        .child(title_line("Which branch should I work on?"))
+        .child(title_line(SELECT_TITLE))
         .child(option_rows(cx))
         .child(buttons)
 }

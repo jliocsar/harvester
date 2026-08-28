@@ -15,6 +15,12 @@ disk.
   `cargo check --workspace` still succeeds on a fresh clone that hasn't yet
   cross-built the musl daemon. Dev builds fall back to reading the target
   directory at runtime instead (see `daemon_binary` in `main.rs`).
+- The artifact it looks for is
+  `target/x86_64-unknown-linux-musl/daemon-release/harvesterd` — the daemon
+  has its own cargo profile (`--profile daemon-release`), so the path is
+  *not* `.../release/`. Why the profile exists is in
+  docs/internals/harvesterd.md; the same path is spelled again in
+  `main.rs`'s `DEV_DAEMON_PATH`.
 
 ## crates/harvester/src/assets.rs
 
@@ -59,8 +65,16 @@ session-file contents.
 
 Session status transitions (`set_session_status`) silently ignore an unknown
 sid — the next authoritative listing will introduce it, so there is nothing
-to correct here. `session_attached` marks a row running and clears that
-machine's opening guard. `session_exited` marks a row exited but
+to correct here. `session_attached` marks a row running, clears that
+machine's opening guard, and makes that sid the selected one: attaching is
+exactly the moment the shell builds or promotes the chat for it, so the
+sidebar highlight is derived from this rather than pushed in behind it.
+`clear_selected_session` is the one thing attachment cannot express — a chat
+with no session behind it yet — and `is_selected_session` is the only reader
+(the sidebar, per row). A sid that never got a row (a session still
+`Starting`) is selected internally and highlights nothing, because there is no
+row to highlight; `forget_selection_without_a_session` drops a selection whose
+row disappeared, so a re-listed machine cannot resurrect an old highlight. `session_exited` marks a row exited but
 deliberately does *not* touch the opening guard on its own — an exit
 reported by some other machine must not clear an open in flight elsewhere,
 because opening is scoped to its own machine.
@@ -68,6 +82,9 @@ because opening is scoped to its own machine.
 `add_workspace` is atomic with respect to the on-disk file: it writes
 `workspaces.json` before updating the in-memory list, and a duplicate
 workspace is a silent no-op that skips the write entirely.
+
+`forget_machine` also drops the selection when the selected session was one
+of the rows it removed; a selection on another machine survives untouched.
 
 `forget_machine` cascade and its ordering invariant: the file write happens
 *first*, and any failure aborts the whole removal — so what the sidebar
@@ -138,17 +155,24 @@ whole partial message — replace, never append. `agent_settled` (not
 ### Constants
 
 The prompt strip's label constants live with the policy that reads them, in
-`chat/prompt_presentation.rs` (see its own section below). `chat.rs` itself
-holds no constants: everything left in this file needs a `Window`, an
-`Entity` or the store, and none of that has a tunable number in it.
+`chat/prompt_presentation.rs` (see its own section below). `chat.rs` holds
+exactly one: `UNSENT_REQUEST_DETAIL` (`"Not connected"`), the reason this
+pane records against its own controls when the store's send gate refuses a
+command. It is deliberately shorter than the notification the gate raises —
+the toast names the machine and the diagnosis, while this string is composed
+into in-pane sentences like "{detail} — pi will use its default model", and
+restating the whole toast there would read as a wall.
 
 ### `ChatFlowRequest`
 
-What a chat needs the composition shell to run on its behalf. Separate from
-`ChatRequest` (bridge traffic the shell only routes): this one needs Root's
-modal stack, which a pane inside the shell does not own and must not
-arbitrate for itself (SPEC C11). Currently just `AddRepo { machine }`:
-browse `machine` for a repository to store and then select.
+What a chat needs the composition shell to run on its behalf — now the *only*
+thing a chat emits. Bridge traffic used to be an event too (`ChatRequest`,
+routed by the workbench into `FleetStore::send`); it goes straight to
+`store.send_gated` from the pane that wants it, because the workbench added
+nothing to that trip but a liveness check the store was better placed to make
+(see `FleetStore::send_gated`). What is left here is what a pane genuinely
+cannot do: `AddRepo { machine }` needs Root's modal stack, which a pane
+inside the shell does not own and must not arbitrate for itself (SPEC C11).
 
 ### `Chat` struct fields
 
@@ -203,10 +227,16 @@ scoping tiers:
   throwaway `list_models` an unstarted chat asked for (that request has no
   sid to be found by).
 - Sid-scoped (`HistoryReplaced`, `HistoryExtended`, `Pi`, `SessionExit`,
-  `SessionModelsListed`, `SessionState`, `ModelSet`): sids are UUIDs, unique
-  across machines, so no machine check is needed to route these. A failed
-  `set_model` is the store's to report; this pane only moves its label when
-  pi *confirms* one (`ModelSet`).
+  `PromptFailed`, `PiAnswered`): sids are UUIDs, unique across machines, so
+  no machine check is needed to route these. `PiAnswered` is every
+  session-scoped pi answer arriving through one arm; `handle_pi_answered`
+  hands it straight to `SessionState::accept_pi_answer`, which dispatches on
+  the echoed pi `method` and then lets the addressed control's token decide
+  whether the answer is still wanted. A failed `set_model` is *also* the
+  store's to report (statusbar) — that is a deliberate duplicate consumer,
+  not a leak, because a chat that has been dropped would otherwise take the
+  only signal with it; this pane only moves its label when pi *confirms* a
+  switch.
 
 `runs_on(machine)` — scoping by machine keeps one machine's failure from
 cancelling a start still in flight on another; without it, a retry mints a
@@ -254,7 +284,7 @@ actually read.
 
 `pick_model`: unstarted, the pick is local (becomes a launch-line argument);
 live, it costs a `set_model` the session must confirm, so the label does not
-move until `handle_model_set` says pi agreed.
+move until `accept_model_set` says pi agreed.
 
 `pick_machine`: retargeting survives the typed prompt; only the destination
 changes. Picking the current machine changes nothing (no refetch). The stale
@@ -275,8 +305,8 @@ repo, or nothing if it has none.
   card's own border is the boundary.
 - `Chat` builds no prompt-strip chrome of its own. `render_bottom_row`
   assembles a `ui::PromptStrip` value (labels, enabled flags, rows, branch,
-  `can_send`, `focused`, notice) plus one `send` closure, and hands both to
-  `ui::prompt_strip`. Everything visual — the ids, the icons, the "disabled or
+  `can_send`, `can_stop`, `focused`, notice) plus a `send` and a `stop`
+  closure, and hands them to `ui::prompt_strip`. Everything visual — the ids, the icons, the "disabled or
   empty means no popover" rule, the notice's tone — lives in `ui/prompt.rs`;
   see that section for the contract. `chat.rs` keeps only what needs the store,
   the state machine or an `Entity`.
@@ -300,6 +330,20 @@ repo, or nothing if it has none.
   `handle_pick_repo`'s missing index is not an error: the repo picker's last
   row is "Add new…", which is *past* the end of `repo_candidates`, so a `None`
   lookup is exactly how that row is recognized.
+- **Stop is the strip's second direct control.** `can_stop` comes straight
+  from `SessionState::can_stop`, so the button is on screen exactly while the
+  chat's session has a turn in flight — the same condition that puts the busy
+  indicator in the transcript. `stop_session` re-asks the state machine for
+  the command (`stop_command`) instead of trusting the flag the last frame
+  rendered: a `session_exit` can land between paint and click, and the state
+  machine is the only thing that knows. Sending goes through the same
+  `Chat::send` as everything else, so the store's liveness gate and its
+  "nothing was sent" reporting apply unchanged. A stop that races an exit the
+  client has not seen yet is not an error either — harvesterd answers a
+  no-longer-running sid with `{"stopping": false}` (docs/DAEMON.md §stop) —
+  which is why the button needs no disabled-while-stopping state: it stays
+  live until the turn it interrupts is gone, and pressing it twice costs one
+  wasted round trip and nothing else.
 - `model_control` / `machine_control` / `repo_control` still build rows for
   a control that is disabled (a live session's machine and repository). That
   is a Vec of labels per repaint, deliberately traded for one code path; if a
@@ -328,11 +372,14 @@ store, so the policy is unit-testable without gpui machinery, and `chat.rs`
 is left with adaptation only (read the state, build the rows, wire the
 pick).
 
-- `DEFAULT_MODEL_ROW` ("default (pi chooses)"): the unstarted chat's
+- `DEFAULT_MODEL_ROW` ("Default (pi chooses)"): the unstarted chat's
   "no model chosen" row. pi launches with its own default, and saying so is
-  more honest than naming a model Harvester did not actually pick.
-- `ADD_REPO_ROW` ("Add new…"): the repo picker's last row, for browsing to a
-  repository Harvester has not been told about yet. It is also the *only*
+  more honest than naming a model Harvester did not actually pick. The const
+  itself now lives in `ui/prompt.rs` (the gallery renders the same row); the
+  wording decision is still this module's.
+- `ADD_REPO_ROW` ("Add new…", also in `ui/prompt.rs` now): the repo picker's
+  last row, for browsing to a repository Harvester has not been told about
+  yet. It is also the *only*
   row an empty picker has, which is what makes a fresh client's first
   session reachable. Its ellipsis is the conventional one — the row opens a
   dialog rather than committing anything — unlike a progress ellipsis, which
@@ -384,11 +431,11 @@ This module is the app-only half that stayed on the bin side, because
 
 ## crates/harvester/src/dialogs.rs
 
-The extension-dialog modal *policy*: pi asks, the user answers, pi unblocks.
-This is the client-side implementation of docs/DAEMON.md §Dialogs. Not one
-widget is built here — the chrome (footers, buttons, widths, input boxes)
-lives in `ui/dialog.rs`, and this file only decides which chrome a given Pi
-question deserves and what a click means to Pi.
+Which chrome a given Pi question deserves, and what a click on it means to
+Pi. This is the client-side half of docs/DAEMON.md §Dialogs that is *about
+the question*; the obligation lifecycle (queue, display, answer, retirement)
+belongs to `workbench/modal.rs`, and not one widget is built here either —
+footers, buttons, widths and input boxes live in `ui/dialog.rs`.
 
 - Protocol fact: an extension calling `select`/`confirm`/`input`/`editor`
   suspends the whole agent until a response comes back. harvesterd only
@@ -398,55 +445,39 @@ question deserves and what a click means to Pi.
   obligation by cancelling every question sight-unseen (SPEC C5); this module
   is what replaced that behavior.
 - Ownership split: `DialogRequest` (from `harvester_client_core`) owns Pi's
-  wire shape — what the question *is*. This file owns the client
-  obligation/modal lifecycle and how a user click becomes a `DialogAnswer`.
-- `DialogCoordinator` is the GPUI adapter over the window-free
-  `DialogObligations` state machine, which decides ordering, duplicate
-  replay, answers, and retirement on its own. The coordinator's job is
-  narrower: subscribe to the one store, own the text inputs, place the front
-  modal, and send exactly one answer back through the same machine route.
-- `handle_modal_available`: the repo picker releases its modal lease from an
-  `on_cancel` callback *before* Root performs its own automatic pop. The
-  handler must `window.defer` past both the callback and that pop, or it can
-  race Root's own dialog-stack bookkeeping.
-- `advance`: shows the global FIFO front only *after* acquiring the modal
-  lease for Pi (see `modal.rs`). While `AddRepo` owns the lease, Pi's
-  obligations remain queued and no `Root` call happens at all — this is how
-  the two flows never fight over the same dialog stack.
-- `answer_front`: the dialog key is checked twice — once here, once inside
-  the window-free `DialogObligations::answer_front` — specifically so a
-  duplicate or delayed answer callback from an already-replaced modal can
-  never consume its successor's answer.
-- After answering, `gpui-component` pops the dialog stack itself following the
-  answer callback, and `select`'s button handler performs an equivalent
-  guarded pop. Advancement to the next obligation is deferred
-  (`defer_advance`) so the next dialog owner never renders underneath the
-  modal that's still being closed.
-- `apply_retirement`: only the flow that currently owns Root's dialog stack
-  may pop it. Concretely: retiring a *queued* Pi obligation while the repo
-  picker owns the modal must leave that unrelated workspace modal completely
-  untouched.
-- `create_input`: `editor` is Pi's multi-line question kind, `input` its
-  single-line one, so the two kinds pick different `ui::dialog` input
-  builders. Which *kind* wants which box is Pi policy and stays here; how
-  either box is configured is chrome and lives in `ui/dialog.rs`.
-- `AnswerCallback` / `open`: the `answered` callback is wrapped in `Rc`
-  because every exit path out of the dialog needs a reference to it, and the
-  library's dialog builder closure is an `Fn` that gets re-run every frame, so
-  nothing passed into it can be a consumed `FnOnce`. The alias exists so the
-  three per-kind wrappers below can all take the same shared callback.
-- `open_option_list` / `open_question` / `open_value_entry`: the whole Pi-facing
-  half of dialog chrome — each takes the shared answer callback and hands
+  wire shape — what the question *is*. This file owns the translation from
+  that question to modal chrome, and from a click back to a `DialogAnswer`.
+- `open_pi_dialog` is the single entry point: one `DialogObligation` in, one
+  Root dialog out, with the caller's `answered` callback wired to every exit
+  the chrome offers. It is generic over the owning view so this module never
+  names the modal coordinator; the coordinator is the only caller.
+- `AnswerCallback` / `open_pi_dialog`: the `answered` callback is wrapped in
+  `Rc` because every exit path out of the dialog needs a reference to it, and
+  the library's dialog builder closure is an `Fn` that gets re-run every
+  frame, so nothing passed into it can be a consumed `FnOnce`. The alias
+  exists so the per-kind wrappers below can all take the same shared callback.
+- `open_option_list` / `open_question` / `open_single_line_entry` /
+  `open_multi_line_entry` / `open_value_entry`: the whole Pi-facing half of
+  dialog chrome — each takes the shared answer callback and hands
   `ui::dialog` two plain callbacks, translating a click into the right
   `DialogAnswer`. `ui::dialog` therefore never sees a `DialogAnswer`,
   a `DialogKind`, or anything else from `harvester-client-core`.
-- Titles: `open` no longer computes one fallback title for every kind. Each
-  arm names its own condition — `UNTITLED_SELECT_CONDITION` ("Choose an
-  option"), `UNTITLED_INPUT_CONDITION` ("Enter a value"),
+- The text box is built *here*, at display time, by the arm that needs it:
+  `editor` is Pi's multi-line question kind and `input` its single-line one,
+  so `open_multi_line_entry` and `open_single_line_entry` pick different
+  `ui::dialog` input builders and hand the entity straight to
+  `open_value_entry`. Which *kind* wants which box is Pi policy and stays
+  here; how either box is configured is chrome and lives in `ui/dialog.rs`.
+  There is no input map and no "input missing" guard: an obligation that is
+  not on screen has no input entity in existence, and the one that is on
+  screen cannot be displayed twice (see `workbench/modal.rs`).
+- Titles: `open_pi_dialog` does not compute one fallback title for every
+  kind. Each arm names its own condition — `UNTITLED_SELECT_CONDITION`
+  ("Choose an option"), `UNTITLED_INPUT_CONDITION` ("Enter a value"),
   `UNTITLED_EDITOR_CONDITION` ("Write a response"),
   `UNTITLED_CONFIRM_CONDITION` ("The agent needs a yes or no") — and hands it
   to `ui::dialog::title_or_named_condition`. This is why `Input` and `Editor`
-  stopped sharing a match arm: they take the same *chrome* but they are not
+  do not share a match arm: they take the same *chrome* but they are not
   the same *question*, and the shared arm was hiding that. Which words go with
   which `DialogKind` is Pi policy and stays here.
 - `condition_and_consequence` is the one piece of Pi-copy reasoning in this
@@ -471,324 +502,31 @@ question deserves and what a click means to Pi.
 - `open_question`: dismissal (Escape / close) answers "no" rather than
   cancelling outright, because Pi resolves a cancelled `confirm` to `false`
   anyway — so treating Escape as a refusal loses no information and removes
-  one more way for the agent to hang waiting for an answer. Its labels are now
+  one more way for the agent to hang waiting for an answer. Its labels are
   `CONFIRM_ACTION_LABEL` ("Confirm") / `CONFIRM_CANCEL_LABEL` ("Cancel"), not
   "Yes"/"No". They still pass through `Confirmation` rather than being baked
-  into the shared chrome — the forget-machine flow needs "Remove"/"Cancel" —
-  but Pi's own vocabulary is no longer what they say: "Yes"/"No" only reads
-  correctly under a question, and a Pi `confirm` title is very often a
-  statement. The wire settles the argument too: `DialogAnswer::dismissal_for` a
-  `confirm` is `Confirmed(false)`, so the decline button, Escape and an overlay
-  click all send exactly the same thing — calling that path "Cancel" makes the
-  button say what Escape does, where "No" implied two distinct commitments over
-  a protocol that has one commitment and one non-commitment.
-- `open_value_entry` owns the "no input, no dialog" guard itself rather than
-  the caller unwrapping first. Both `Input` and `Editor` reach it, and putting
-  the guard in the callee is what let those two become separate match arms
-  without duplicating the check.
+  into the shared chrome — the forget-machine confirmation needs
+  "Remove"/"Cancel" — but Pi's own vocabulary is no longer what they say:
+  "Yes"/"No" only reads correctly under a question, and a Pi `confirm` title
+  is very often a statement. The wire settles the argument too:
+  `DialogAnswer::dismissal_for` a `confirm` is `Confirmed(false)`, so the
+  decline button, Escape and an overlay click all send exactly the same
+  thing — calling that path "Cancel" makes the button say what Escape does,
+  where "No" implied two distinct commitments over a protocol that has one
+  commitment and one non-commitment.
 - `open_option_list`: the option's *text itself* is the answer; Pi has no
   notion of an index here, so the chosen label round-trips straight back as a
   `DialogAnswer::Value`.
 
-## crates/harvester/src/gallery/ — the component gallery
+## crates/harvester/fixtures/ (provenance)
 
-A dev-only second binary (`cargo run -p harvester --bin gallery`) that renders
-Harvester's `ui` components in isolation, Storybook-style. Declared as an
-explicit `[[bin]]` at `src/gallery/`, deliberately **not** under `src/bin/`:
-the `no_comments` test skips any directory named `bin` (throwaway spikes such
-as `bin/uispike.rs` were always exempt from house rules), and the gallery is
-real, maintained code that must obey them. Putting it one directory over is
-the whole trick.
-
-Module map:
-
-| module | role |
-|---|---|
-| `main.rs` | bootstrap, the `Gallery` root view, all mutable gallery state, replay scheduling |
-| `chrome.rs` | the gallery's own screen: story sidebar, stage, control dock, statusbar |
-| `story.rs` | the story/knob/preset model (pure data, no rendering) |
-| `registry.rs` | the one hand-written list of stories |
-| `stories/` | one module per `ui` submodule, each holding that group's render functions |
-| `runtime.rs` | the live state stories share with the gallery (inputs, transcripts, replay) |
-| `fixtures.rs` | runtime loading of `fixtures/*.jsonl` and folding them into `Transcript`s |
-
-### The gpui-mcp bridge
-
-`main.rs` calls `gpui_mcp_bridge::install(cx)` inside the `run_desktop_shell`
-closure. This lets the gpui-mcp MCP server attach to a running gallery and
-drive it — dump the accessibility tree, click via AT-SPI, inject keys — which
-is how agents UI-test the gallery. Deliberately gallery-only: the client
-binary never calls `install`, so shipping builds carry no bridge socket. The
-bridge itself is inert unless the process is a debug build launched with
-`GPUI_MCP=1`, so plain `cargo run --bin gallery` is unaffected. The bridge's
-gpui dependency uses the same bare zed-git source as ours and both lockfiles
-pin the same commit; a host on a mismatched gpui build is caught at attach
-time by the bridge's `hello` handshake, not at runtime by silent weirdness.
-
-`chrome.rs` carries the a11y adoption that makes the gallery agent-navigable:
-a node reaches the accessibility tree only when it has **both** `.id()` and a
-`.role()` (gpui rule; verified — without roles the whole gallery projected as
-one Window node). The sidebar is `Role::List`, story rows `Role::ListItem`
-with `aria_label(name)` + `aria_selected`, each knob a labelled `Role::Group`,
-the stage a labelled `Role::Group`. gpui-component's `ListItem` implements
-`StatefulInteractiveElement`, so the aria builders chain straight through it.
-Two of these moved *out* of the gallery since: group and dock headers no longer
-re-apply `Role::Button`/`aria_expanded` because `ui::collapsible_section` sets
-them itself now (the gallery applying them a third time is what proved they
-belonged in the component), and the bespoke chips that carried
-`aria_selected` are gone entirely — a `ButtonGroup` and a `Button`
-bring their own a11y. Story *content* is therefore no longer uniformly
-invisible: whatever a11y a gpui-component widget has upstream now shows up in
-a story that renders it. `scripts/gallery_walk.py` drives every story and a knob
-toggle over the MCP as the regression check. Its selectors track the
-accessibility tree, so a component swapped for a different library widget
-breaks them: story rows are `ListItem`s reporting `sel`, knob controls are
-`ButtonGroup` `Button`s reporting `toggled=`.
-
-Two things about the walk are worth knowing before changing it. It expands
-exactly one story group at a time and collapses the rest, because seventeen
-stories plus seven headers do not fit in a 720px window and the MCP has no
-scroll tool — its seven tools are `launch`, `attach`, `snapshot`, `detail`,
-`click`, `input`, `status`, and the refusal for an off-screen node tells you
-to bring it into view yourself. Walking group by group keeps every row on
-screen by construction, so it does not care how tall a row gets. And every
-click waits out `CLICK_SETTLE_SECONDS` first: two synthetic clicks in quick
-succession arrive as a single multi-click and the second is silently
-swallowed, which reads as "the click succeeded but nothing moved" and is very
-hard to tell from a broken component. The knob search is scoped to nodes
-after the dock header for the same class of reason — a story that happens to
-render a toggled `Button` on the stage is not a knob.
-
-Feel: story switching and knob changes are the two things a user does dozens
-of times a minute, so both are **instant** — no animation anywhere in the
-gallery chrome. The only motion in the binary is the streaming replay, which
-is the subject of a story rather than a transition. Dark theme only (see the
-recorded gap below), `cx.theme().font_size` at the root (the same slot the app
-root reads — the gallery must never set its own text size, or a component
-would be catalogued at a scale no real pane gives it), every color from `Tone`
-or a theme slot, and the chrome itself is built from `ui::` components
-(`sidebar_row`, `collapsible_section`, `chat_header`, `statusbar_frame`,
-`inline_note`, `KeyboardFocusRing`) — the gallery dogfoods the library it
-catalogs.
-
-### crates/harvester/src/gallery/story.rs
-
-The model, deliberately data-only so the registry reads as a table:
-
-- `KnobValue` is the value union (`Bool` / `Choice(usize)` / `Text(String)`)
-  and `KnobKind` is the *shape* (`Choice` carries its labels). They are
-  separate types because a spec needs the labels once while a value is copied
-  per story per frame; folding the labels into the value would clone them on
-  every knob read.
-- `KnobValues` is an association list, not a `HashMap`: knob counts are
-  single-digit, order is the declaration order the dock renders in, and the
-  lookups (`flag`, `choice`, `text`, `optional_text`) all degrade to a default
-  instead of panicking, so a story that reads a knob it never declared renders
-  rather than crashes.
-- `Preset` is *a set of knob values with a name* — nothing more. That is what
-  makes presets and knobs commute: clicking a preset button writes into the
-  same `KnobValues` a knob control writes into, so a preset can always be
-  adjusted afterwards. Presets set every knob they care about explicitly rather than
-  diffing against a base, so preset order never matters.
-- `Story` is name + group + knobs + presets + a plain `fn` pointer. A `fn`
-  (not a boxed closure) is what keeps the registry a static list: a story
-  cannot capture state, which is exactly the property that forces shared live
-  state into `StoryRuntime` where the gallery can observe it.
-- `StoryScene` is what the render `fn` receives: the resolved knob values plus
-  the `Entity<StoryRuntime>`. This is the one deviation from the phase plan's
-  sketched signature (`&KnobValues` alone): live stories (collapse, tool-block
-  expansion, dropdown selection, replay, the real `InputState`) need state
-  that survives across frames and can notify the view, and in gpui that means
-  an entity handle, not a value.
-
-### crates/harvester/src/gallery/registry.rs
-
-`build_stories()` is the whole catalog: one `vec![]` of `Story::new(...)`, no
-macros (a macro would hide exactly the thing a reviewer wants to read). Group
-names are consts (`CORE_GROUP` … `DIALOG_GROUP`) because they are also the
-sidebar's section titles and `collapsible_section` demands `&'static str`.
-They are sentence case ("Core", "Prompt", "Flagship") rather than the lowercase
-they used to be: `section_header` stopped uppercasing its title, so a lowercase
-group name now renders lowercase, and a heading is user-visible text under the
-app-wide wording convention. Knob and preset names stay lowercase — those
-mirror code, not prose. *Story* names are deliberately not prose either:
-`inline_note`, `sidebar_stacked_row` and `chat_header` are Rust identifiers,
-the exact symbol a reader is being sent to go and read, and sentence-casing
-them into English would break the one thing the catalog is for. Preset labels
-stay lowercase for a different reason — they name the scenario a command
-produces ("running session", "fast forward"), which is the register a gallery
-wants. The gallery's `aria_label`s ("stories", "stage") are likewise kept
-verbatim: they are accessibility-tree selectors that agent tooling keys on, not
-visible copy to be styled.
-
-- `STREAMING_TRANSCRIPT_STORY` is the replay story's name, and
-  `story_index()` resolves it to an index once at start-up. The replay loop
-  keys on that index instead of a name comparison per tick, and if the story
-  is ever renamed the lookup returns `None` and the replay simply never runs —
-  no panic, no silent tick on the wrong story.
-- `group_names()` derives the sidebar's group order from the story order, so
-  adding a story to a new group needs no second edit.
-- `LIVE_TONE_INDEX` / `FAILED_TONE_INDEX` name the two `TONE_LABELS` positions
-  the presets reach for; `DEFAULT_SPEED_INDEX` is the `1x` slot of
-  `REPLAY_SPEED_LABELS`.
-
-### crates/harvester/src/gallery/stories/
-
-One module per `ui` module plus the three flagships, each exporting its knob
-*names* as consts so `registry.rs` and the render function cannot disagree
-about a string. `stories/mod.rs` holds what every story shares: `TONES`
-(the tone order the whole gallery indexes into), `TONE_LABELS` derived from it
-through `Tone::label`, and `tone_at` (the choice-index → `Tone` mapping used by
-six stories). `TONE_LABELS` used to be its own lowercase list, which made it a
-second tone vocabulary that had already drifted — it said "muted" and "active"
-where the app says "Neutral" and "Running", so the catalog was labelling tones
-with words no screen uses. `Tone::label` is a `const fn` so the derived list
-stays a `const` and the two can never disagree again. Also here are
-the layout primitives `story_column`, `story_row`, `caption`
-(an `inline_note`, so captions obey `Tone`), `panel` and `transcript_panel`.
-`panel` sits on the `popover` slot with `rounded_lg` and `shadow_sm` — the
-raised-surface tier of the graphite ladder — so a story's framing matches
-how real raised components (tool cards, popovers) sit on the canvas.
-`PANEL_MIN_WIDTH` (320) keeps a one-line component from collapsing to its
-text width on the stage; `TRANSCRIPT_PANEL_HEIGHT` (420) gives the transcript
-stories a fixed viewport so their internal scroll behaves like the chat's.
-`dot_at` is gone with the per-call-site shape choice it existed to serve.
-
-- `core.rs`: the tone swatch grid (all six tones × the derived dot × the
-  tone's own `label()` × colored text, `w_20` lanes aligning both label
-  columns) and the single-dot story. Neither story picks a dot shape any more:
-  the swatch shows the one dot `Tone::dot` derives, and the dot story *reports*
-  the derived shape (`derived_dot_label`) instead of letting a knob set it —
-  a catalog whose controls can produce a combination the app cannot render is
-  lying about the component.
-- `note.rs`: `inline_note` and `empty_pane_hint`; the hint gets an `h_48` box
-  because it is a `size_full` component and would otherwise have no height to
-  fill on the stage, and it is rendered *with* an `empty_pane_action` child so
-  the story shows the trailing action slot rather than only the sentence.
-- `shell.rs`: `chat_header`, `collapsible_section` (live — the expanded flag
-  lives in `StoryRuntime`, so the story demonstrates the real click), and
-  `statusbar_frame`. Section titles come from a *choice* knob rather than a
-  text knob because the component's signature is `&'static str`.
-- `sidebar.rs`: the three sidebar builders inside a `w_64` frame tinted with
-  the sidebar theme slots (the app's own sidebar width — the gallery should not
-  invent a second sidebar metric), because a row's selected state is only
-  legible against the surface it really sits on. Both row stories chain
-  `keyboard_focus_ring` so the story can be Tab'd into, and `row` mirrors the
-  app's `tab_stop(!disabled)` rule. The stacked-row story carries a caption
-  saying the dot shape is derived from the tone rather than chosen per row,
-  because that is the question the retired `solid` knob used to answer.
-- `prompt.rs`: `prompt_box_control`, `prompt_box_send` and a live
-  `prompt_box_dropdown`. The dropdown is the component's real `PopupMenu` —
-  arrow keys, Enter and Escape all work — and since picks now travel as
-  actions, the story listens with `on_action(|action: &PickModel, …|)` on its
-  own column and writes `action.index` into
-  `StoryRuntime::dropdown_selection`. It passes `None` for the action context,
-  which is the correct shape for a story: there is no prompt input to scope
-  dispatch to, so the action rises to the listener the story just installed.
-- `prompt_strip.rs` (flagship): builds the whole `PromptStrip` value struct
-  from knobs, with the six presets from the plan (`ready`, `loading models`,
-  `models failed`, `no machines`, `starting session`, `exited`). The dropdown
-  rows are static label lists and `send` is a no-op closure: the story exists
-  to show every *state* of the strip, and a working picker would need a store.
-  It installs no `on_action` listener either, so a pick opens and dismisses the
-  real menu and changes nothing — which is the honest rendering of a strip with
-  no chat behind it. The input is a real `Entity<InputState>` from the runtime,
-  so typing, focus ring and auto-grow are the genuine article.
-- `transcript.rs` (flagships): the rendered story folds a fixture and renders
-  it through `TranscriptPresentation` with live tool-block expansion, and its
-  caption says out loud that a tool header is a tab stop — the story is the one
-  place a reviewer can discover that without reading the code; the
-  streaming story renders the replay transcript plus its control row (restart
-  button, `applied / total` progress, and the paused/finished note). Play and
-  speed are knobs; restart is a button because it is an action, not a state.
-- `dialog.rs`: `Confirmation` + `button_row` + the `select`
-  option list + both input kinds, rendered **inline on the canvas**, never
-  through `window.open_dialog`. See the recorded gap below. Each surface is
-  built at its real modal width by reading `ui::dialog`'s own
-  `*_DIALOG_WIDTH_IN_REMS` consts, and the option list at `options_height` with
-  real `option_row`s — the whole point of the story is the width ladder, so a
-  story that guessed the widths would be showing you the wrong thing. The
-  untitled-confirmation knob path goes through `title_or_named_condition` with
-  the same "The agent needs a yes or no" condition `dialogs.rs` uses. The
-  option list is painted as a plain column of `option_row`s rather than as a
-  live `List`, with one row forced selected so the selected style is reviewable:
-  a story render function runs on every frame and cannot own a list state
-  without putting one in `StoryRuntime`, and a list state rebuilt per frame
-  could never hold a selection to show. The rows are the dialog's own builder,
-  so what the story shows is honest; what it cannot show is scrolling and
-  keyboard traversal.
-
-### crates/harvester/src/gallery/runtime.rs
-
-`StoryRuntime` is the single entity holding everything a story needs to
-survive a frame: the collapsible section's flag, the dropdown's selection, the
-prompt strip's `InputState`, the dialog story's two inputs, the rendered
-transcript, and the replay. The gallery `cx.observe`s it once, so any story
-that calls `runtime.update(…, cx.notify())` re-renders the whole gallery —
-that one subscription is why story render functions can stay plain `fn`s.
-
-- `RenderedTranscript` caches the folded fixture keyed by `source_index`;
-  `ensure_rendered_source` rebuilds only when the source knob actually
-  changes, so switching *any other* knob doesn't re-parse a fixture, and it
-  resets the expansion set with it (a tool-call id from another fixture would
-  otherwise leave a random block open).
-- `ReplayTranscript` owns its own copy of the streaming events, its cursor and
-  its transcript. `restart()` rebuilds the transcript from scratch instead of
-  rewinding, because `Transcript` has no undo — replay from event zero is the
-  only faithful reset.
-- Replay timing consts: `REPLAY_FRAME_INTERVAL_MS` (260) is the wall-clock gap
-  between two fixture events at 1×; it is a *display* cadence, not the
-  capture's real timing (pi's provider batches partials, so the fixture's own
-  spacing is bursty). `REPLAY_SPEED_MULTIPLIERS` (0.5/1/4) divide it and
-  `REPLAY_SPEED_LABELS` are the same three values as knob labels — the two
-  arrays are index-parallel by construction. `REPLAY_IDLE_POLL_INTERVAL_MS`
-  (200) is how often a *paused* or unselected replay re-checks whether it
-  should start again; a paused loop must keep breathing because the knob it
-  waits on lives in the gallery, not in the task.
-- `PROMPT_INPUT_ROWS` (1–8) and the dialog placeholders mirror the app's own
-  values so the story is the real component, not a lookalike.
-
-### crates/harvester/src/gallery/fixtures.rs
-
-Fixtures are loaded **at runtime**, from
-`env!("CARGO_MANIFEST_DIR")/fixtures/*.jsonl`, not `include_str!`'d. The
-gallery is a dev tool that only ever runs from this repo, and runtime loading
-means capturing a new fixture is visible on the next `cargo run` without a
-rebuild — and, more importantly, a missing or malformed file degrades instead
-of failing the build for everyone.
-
-- Every failure path produces a `String` naming the offending path (and line
-  number for a parse failure) that the story renders through
-  `ui::empty_pane_hint(Tone::Failed, …)`, and the statusbar carries the first
-  failure of any fixture at all times. Nothing panics: the whole point of a
-  catalog is that the other 16 stories still work when one fixture is gone.
-- Parsing follows the house LF-only framing rule (`harvester_proto::{LF, CR}`,
-  split on `LF`, strip one trailing `CR`), the same as everything else that
-  reads pi JSONL.
-- **The user-prompt rule**: `Transcript::apply` deliberately ignores
-  `message_end` events whose `message.role` is `"user"` — in the app, user
-  text enters a transcript only through `push_user_prompt`, because the app
-  already knows what the user typed. A replayer has no such knowledge, so
-  `apply_event` intercepts exactly that event shape and calls
-  `push_user_prompt` with the concatenated text parts. Without it the mixed
-  fixture renders assistant turns and tool blocks with no prompts above them.
-  This is the one place the gallery is allowed to interpret a pi payload, and
-  it interprets it into the same call the app makes.
-- `TranscriptSource` maps the four preset/knob choices onto fixtures:
-  `markdown-heavy answer` → `streaming.jsonl`, `tool run` → `tools.jsonl`,
-  `mixed session` → `mixed.jsonl`, and `failed tool` → `tools.jsonl` filtered
-  to the tool-call ids whose `tool_execution_end` carried `isError: true`.
-  The filter exists so the error path gets a story of its own without a
-  second capture: it keeps every event that names a failing call and drops
-  the rest, which is enough for the block to render exactly as it does in a
-  full session.
-
-### crates/harvester/fixtures/ (provenance)
-
-Three checked-in pi session captures drive the transcript stories and
-`tests/fixtures.rs`. Each file is LF-only JSONL, one **raw pi event object**
-per line — the inner event exactly as `Transcript::apply` consumes it, never
-the harvesterd envelope.
+Three checked-in pi session captures drive `tests/fixtures.rs` and the
+gallery's transcript stories (which read them across the crate boundary — see
+`docs/internals/harvester-gallery.md`). They live here, with the workspace
+member, because the test that folds them is the transcript layer's contract
+check and a clean clone must be able to run it. Each file is LF-only JSONL,
+one **raw pi event object** per line — the inner event exactly as
+`Transcript::apply` consumes it, never the harvesterd envelope.
 
 - `streaming.jsonl` — one markdown-heavy answer (headings, bullets, numbered
   list, python fence, table, blockquote) with its 18 incremental
@@ -820,188 +558,19 @@ they are responses, not session events. `tool_execution_update` appears only
 twice per multi-turn capture (pi emits it only for long-running tool output),
 so the running-with-partial-output render path is thinly covered.
 
-### crates/harvester/src/gallery/main.rs
-
-`Gallery` owns all mutable gallery state: the story list, one `KnobValues` per
-story (so switching stories never loses your knob edits), the collapsed group
-list, the selected story, the dock flag, the runtime entity, and the text-knob
-inputs.
-
-- `GALLERY_WINDOW_WIDTH`/`HEIGHT` (1100×720) match the app's window rather
-  than being sized to the catalog, so a component rendered in a story is laid
-  out at the width it will really get. They stay bare pixels while the rest of
-  the gallery moved onto the rem scale, because they are the OS window's
-  physical bounds rather than layout — the one place a pixel is the honest
-  unit.
-- Text knobs are backed by real `Entity<InputState>`s keyed by
-  `(story_index, knob_name)` and created lazily in `sync_text_knob_inputs`
-  during render (the first frame that shows the knob is the first frame that
-  has a `Window`). Each gets a `cx.observe` subscription, which is what makes
-  typing in a knob update the story on the same keystroke.
-  `selected_knob_values` then reads the *input* rather than the stored value
-  for text knobs — the input is the source of truth while it exists, so there
-  is no mirror to keep in sync. Applying a preset writes both, since that is
-  the one direction the input cannot learn about by itself.
-- Replay scheduling: `schedule_replay` spawns one `cx.spawn` loop for the
-  gallery's lifetime. Each iteration reads the delay *before* sleeping
-  (`replay_tick_delay`), so flipping the speed knob takes effect on the next
-  tick rather than at the end of a long sleep, then advances exactly one
-  event. The loop returns when the entity is gone (`update` returns `Err`),
-  which is the task's only exit — there is no cancel flag to keep in sync.
-  `replay_is_playing` gates on three things: the replay story is the selected
-  one, its `playing` knob is on, and the replay has not finished. Gating on
-  selection is what keeps a background replay from silently running to
-  completion while you are reading another story.
-- The knob-name const `PLAYING_KNOB`/`SPEED_KNOB` import is the only place the
-  gallery shell knows anything about a specific story; it is the price of
-  driving a story's animation from the shell's async task.
-
-### crates/harvester/src/gallery/chrome.rs
-
-The gallery's own screen, kept out of `main.rs` so state and layout stay
-separable. It is a sibling module of the crate root, which is why it can read
-`Gallery`'s private fields through accessors without those fields becoming
-`pub`.
-
-- Layout: the story sidebar spans the full window height; stage, dock, and
-  statusbar stack in a column to its right, so the dock and statusbar read as
-  controls *for the canvas*, not window-level chrome. The sidebar is `w_64`
-  with `min_w_56`/`max_w_80` and is allowed to shrink (`flex_shrink_1`) — the
-  `w_64` matches the app's sidebar exactly, because the gallery should not
-  invent a second sidebar metric, and the bounds are what keep a narrow window
-  squeezing the sidebar rather than the stage. `STAGE_MEASURE_IN_REMS` (64) is
-  the only measure left as a named const here: it caps the stage's content
-  column so a component never stretches to a width no real pane would give it,
-  and it is in rems so that cap scales with the type it is capping.
-- Each region is described by three constraints — a minimum, a comfortable
-  default, and a rule for surplus — rather than by one number back-solved from
-  a screenshot. The sidebar's minimum is the width at which the *task* still
-  works: below it the two transcript stories truncate to the same string and
-  picking a story stops being possible. Its default is comfortable for the
-  longest name in the catalog. Its surplus rule is `flex_grow_0`, meaning every
-  extra pixel goes to the stage — which is what "visibly subordinate to the
-  work area" means in layout terms — while `flex_shrink_1` makes it yield down
-  to its minimum before the stage gives up anything. `max_w_80` is inert at the
-  current default and exists to bound the region if it is ever given a basis of
-  its own. The stage yields nothing and absorbs surplus up to its measure,
-  after which the canvas centers and the extra becomes symmetric gutters. The
-  dock is `flex_none`: it never grows, and the knob grid scrolls inside
-  `max_h_56` instead — a bound deliberately set just under a quarter of the
-  default window height, because the controls must never outweigh the thing
-  being controlled. `min_w_0` on the right-hand column is a flexbox requirement
-  so descendants can ellipsize, not a design constraint.
-- `STAGE_MEASURE_IN_REMS` is chosen as **four times the sidebar's preferred
-  width**, not as a translation of the pixel constant it replaced: the work
-  area reading as four sidebars wide is the relationship the proportion is
-  actually about. It is written as `rems(...)` rather than a `max_w_*` helper
-  because gpui's box scale tops out well short of a canvas measure; it rides
-  the same zoom axis either way.
-- **No resizable split**, and this was considered rather than overlooked. The
-  library ships one. A draggable split earns its state when the two regions
-  hold content the user must trade off against each other; the story list is a
-  fixed, bounded catalog of known names, so there is no more or less of it to
-  want. A handle plus a resize entity in `Gallery` would add state and an
-  affordance that answers no question. Revisit if story names ever become
-  user-authored.
-- The text knob's `w_56` fits roughly thirty characters, which covers every
-  default knob string in the registry except the long dialog message (the
-  `Input` scrolls that one), and it is also what keeps three to four knobs on a
-  dock row at the default window width instead of collapsing the grid into a
-  column.
-- Every other former sizing const is now a rem step read straight off the
-  library scale: the knob grid caps at `max_h_56` (it must not eat the stage
-  when a story has eleven knobs — the prompt strip does — and scrolls past
-  that), a text knob is `w_56`. `STORY_SIDEBAR_WIDTH`, `STAGE_MAX_WIDTH`,
-  `DOCK_KNOBS_MAX_HEIGHT` and `TEXT_KNOB_WIDTH` are all gone. Naming a pixel
-  number that a rem step already names is a second source of truth for a
-  measurement, and the gallery had four of them.
-- `with_content_inset` / `with_dock_row_inset` are generic over `Styled` rather
-  than being consts, because the thing being shared is a *decision* (this is a
-  content edge / this is a dock row) applied to differently-typed elements —
-  a `Div`, a `Stateful<Div>`. Dock rows share one vertical rhythm through the
-  latter: presets, the no-presets/no-knobs captions, and the knob grid are all
-  `px_3 py_2p5` under the shared section header, so the dock's left edge and
-  row spacing never jitter as stories swap knob sets in and out. `py_2p5` is
-  the density step the rest of the chrome took; at `py_1p5` a dock row of
-  medium-tier controls had less air than the controls themselves. Four sibling
-  regions used to carry four leading edges here; the stage canvas, the preset
-  row, the knob grid and both empty notes now all resolve from the one
-  function, and `chat_header` / `statusbar_frame` land on the same edge by
-  taking the same step directly. The stage canvas keeps a taller *vertical*
-  rhythm (`py_4`) on purpose — it is a canvas, not a row, and only the leading
-  edge is the shared decision.
-- **The gallery has no bespoke widgets left.** The chip — a hand-rolled
-  `div` with its own `primary`/`secondary` fills, hover and press states, and
-  `text_xs` — is gone, along with `BOOL_ON_SLOT`/`BOOL_OFF_SLOT`, the id slots
-  its on/off pair occupied. A bool knob and a choice knob are both a
-  `ButtonGroup` of selectable `Button`s, a preset is an `outline` `Button`,
-  and a text knob is an `Input` with an `aria_label`.
-  All of them sit at the library's medium default: no `.small()`, no
-  `.compact()`. The old argument was that a dev tool should not grow the
-  library — but the chip was never the library's to grow, it was three
-  gpui-component widgets reimplemented worse, and it is the *dogfooding* rule
-  that decided this: a catalog whose own controls are hand-rolled is not
-  exercising the thing it catalogs. A `ButtonGroup` also gives a choice knob
-  the segmented-control semantics a row of independent chips only imitated.
-  A bool knob was briefly a `Switch`, on the argument that a knob takes
-  effect immediately and that is what a switch means. It went back to a
-  two-segment `ButtonGroup` (`BOOL_KNOB_LABELS`, "Off"/"On") for one
-  disqualifying reason: `Switch` in this revision tracks no focus handle,
-  sets no tab stop and fires from `on_mouse_down` only, so it was the single
-  control in the dock unreachable by keyboard. Wrapping it in a focusable div
-  would have produced a tab stop that toggles nothing. A bool is a two-way
-  choice, so rendering it as one deletes the special case instead of adding a
-  workaround — `render_knob` no longer needs to know that one kind of control
-  carries its own label, and every knob in the dock now has the same shape:
-  caption above, focus-ringed control below. A choice knob is a `ButtonGroup`, which toggles
-  its children itself — the segments advertise their toggled state without the
-  gallery asking, and single-select mode guarantees exactly one is on. A preset
-  is an `outline` `Button` because a preset is a command, not a state. The one
-  thing lost in the trade is `aria_selected` on the segments, since `Button`
-  is not a stateful interactive element; the toggled state it does report is
-  the richer signal anyway, because it says `false` as well as `true`.
-- The story rows are the one hand-rolled surface left, and they take the app's
-  shared `keyboard_focus_ring` rather than a ring of their own. An earlier
-  version grew one out of a transparent resting border recolored on focus: it
-  worked, but it cost two pixels of row height and it double-drew against the
-  library list item's own inset active-highlight whenever a row was both
-  selected and focused. A spread box shadow has neither problem. One app, one
-  ring.
-- The statusbar reports the story count and any fixture failure, so a broken
-  fixture is visible from every story, not only from the one that needs it. It
-  no longer repeats the selected `group · name`: the stage header directly
-  above it is a `chat_header` carrying exactly that, and the same two words in
-  two bands eight pixels apart is noise, not redundancy. What survives passed a
-  test each line has to pass: name the object, name the scope, and say why it
-  is worth a permanent band. The story count is the only place the catalog's
-  size shows when every group is collapsed, and it is how you notice a story
-  you just added never registered; the fixture failure is the reason the stage
-  looks wrong, and it is scoped to every flagship story rather than to the one
-  that happens to need the file.
-
-### Recorded gaps
-
-- **Dialog stories are chrome only.** `dialog chrome` renders the
-  confirmation body, the button row and both inputs inline on the canvas; it
-  never calls `window.open_dialog`. That is deliberate (plan Q10a): the dialog
-  visual redesign is a follow-up, and it will be done *inside* the gallery,
-  against these stories. Modal behavior (focus, escape, the Root dialog stack)
-  is `modal.rs`'s business and is not what a component catalog is for.
-- **Light mode is blocked.** `ui/transcript.rs` memoizes its `TextViewStyle`
-  in a `OnceLock` with `is_dark: true` and a dark highlight theme, so a theme
-  toggle would leave the transcript rendering dark inside a light window. The
-  gallery is therefore dark-only for now (`shell_bootstrap` sets `Dark`), and
-  the fix and the gallery's theme toggle land together, later — a toggle that
-  half-works is worse than none in a tool whose job is to tell you what a
-  component looks like.
-
 ## crates/harvester/src/lib.rs
 
-The lib target exists for exactly one reason: two binaries (`harvester` and
-`gallery`) share a component layer and a window bootstrap, and Cargo has no
-way to share modules between binaries other than a lib.
+The lib target exists for exactly one reason: the `harvester` binary and the
+out-of-workspace `harvester-gallery` crate share a component layer and a
+window bootstrap. It began as a two-binaries-one-package split (the gallery
+was a `[[bin]]` here); the gallery has since moved to
+`crates/harvester-gallery` with its own workspace, which changed the
+*consumer* of this lib from a sibling bin to a path dependency and changed
+nothing else. The rule stands and is now enforced by the crate boundary
+rather than by convention: what the lib exports is exactly what both the app
+and the catalog need, no more.
 
-What lives lib-side is only what both binaries need:
+What lives lib-side:
 
 - `ui` — the whole visual layer. It was already dependency-free with respect
   to the rest of the crate (no `crate::` path in it pointed outside `ui`
@@ -1009,14 +578,16 @@ What lives lib-side is only what both binaries need:
   `assets::GIT_BRANCH_ICON_PATH` for the prompt strip's branch indicator),
   so moving it cost no rewiring.
 - `assets` — `HarvesterAssets` is the one `AssetSource` gpui accepts per
-  application, and both binaries install it.
+  application, and both binaries install it (the gallery through
+  `shell_bootstrap`).
 - `shell_bootstrap` — the shared application/window start-up.
 
 Everything else stays declared on the bin side (`main.rs`): `chat`,
 `workbench`, `dialogs`, `store`, `catalog`, `session_state`, `models`,
-`modal`, `workspaces`, `desktop_shell`. Those are the *application*, not a
-component library; the gallery must not be able to reach them, and keeping
-them bin-side is what enforces that.
+`workspaces`, `desktop_shell`. Those are the *application*, not a component
+library; the gallery must not be able to reach them, and keeping them bin-side
+is what enforces that — a bin's modules are unreachable from a dependent
+crate, so the boundary is compiler-checked, not documented.
 
 `main.rs` re-exports the two lib modules at the bin crate root
 (`pub use harvester::{assets, ui};`) so every existing `crate::ui::…` /
@@ -1028,7 +599,9 @@ lib boundary is a packaging fact, not a layering statement.
 
 `build.rs` is unaffected by the split: it writes `harvesterd` into `OUT_DIR`
 once per *package*, and only `main.rs` reads it (`include_bytes!`). The lib
-and the gallery bin never touch it.
+never touches it, and neither does the gallery — which does pay for it, since
+depending on this package runs its build script (and prints its
+no-musl-daemon warning) in the gallery's build too.
 
 ## crates/harvester/src/main.rs
 
@@ -1044,38 +617,14 @@ Harvester's desktop-client entry point (see docs/SPEC.md).
   It's empty (zero bytes) in dev builds made without the musl artifact having
   been built first — `daemon_binary()` then falls back to reading
   `DEV_DAEMON_PATH` off disk (relative to the repo-root cwd of
-  `cargo run -p harvester`) instead of failing outright.
+  `cargo run -p harvester`) instead of failing outright. `DEV_DAEMON_PATH`
+  names the `daemon-release` profile's output directory, and the error it
+  prints quotes the matching `--profile daemon-release` build line, so a user
+  who hits the fallback can copy the command that fixes it.
 - `pub use harvester::{assets, ui};` is the bin crate root adopting the two
   lib modules under the paths the app already uses (`crate::ui`,
   `crate::assets`). See the `lib.rs` section for why the split exists and why
   this re-export is the intended shape rather than a migration step.
-
-## crates/harvester/src/modal.rs
-
-Harvester's narrow arbitration layer over `gpui-component`'s single global
-Root dialog stack.
-
-- Protocol fact/constraint: Root stores every dialog in one vector, and
-  `close_dialog` always pops the *top* of that stack. Because of that,
-  Harvester permits exactly one of its modal flows to own the stack at a
-  time — Pi's FIFO dialog obligations, the repo picker (`AddRepo`), or the
-  forget-machine confirmation (`ForgetMachine`). Anything else risks one
-  flow's `close_dialog` popping a different flow's modal.
-- `ModalLease` is generation-tagged specifically so a delayed callback from a
-  flow that has already released its lease is harmless: it can never be
-  mistaken for owning the (possibly reacquired) lease.
-- `ModalAvailable` is emitted only *after* a valid lease releases the stack
-  for another flow to use.
-- `ModalArbiter` is deliberately window-free and knows nothing about dialog
-  bodies, queues, or callbacks — those responsibilities stay entirely with
-  the individual flows (e.g. `DialogCoordinator`); the arbiter only tracks
-  who currently owns Root.
-- `ModalCoordinator::release`: Pi is the only flow that ever *waits* for the
-  lease — every other flow (repo picker, forget-machine) starts from a user
-  click, which Root's own focus trap prevents while Pi owns a dialog. So a
-  `ModalAvailable` event is only emitted when a non-Pi owner releases;
-  avoiding emitting it for a Pi release also avoids synchronously
-  re-entering the very `DialogCoordinator` that triggered the release.
 
 ## crates/harvester/src/models.rs
 
@@ -1148,12 +697,25 @@ What the model label means in each lifecycle state:
 - `Live(ModelChoice)` — pi confirmed the model currently in effect.
 - `LiveUnavailable` — pi answered the current-model request with an error.
 
-### `ChatIntent`
+### Commands
 
-Intents emitted by the state machine; routing to a machine bridge remains
-the GPUI/workbench concern, so this type carries no sender or window.
-`is_pre_session()` marks `ListModels`/`Start` as intents that may queue
-while the bridge is bootstrapping.
+`SessionState` returns `harvester_client_core::bridge::Command` values
+directly — it used to return a `ChatIntent` whose variants re-declared the
+bridge's commands field for field, which the workbench then translated back
+verbatim. Three vocabularies for one thing is three places to add a field to,
+and the
+translation layer's only original contribution (a liveness gate) now lives on
+the store as `send_gated`. The state machine still carries no sender and no
+window: it *returns* commands, it never sends them.
+
+Where a command is session-scoped pi passthrough it is a
+`Command::PiRequest` carrying a verbatim pi payload built here — hence the
+`PI_GET_AVAILABLE_MODELS` / `PI_GET_STATE` / `PI_SET_MODEL` constants. They
+are named because they are spoken twice: once to build the request and once
+to recognize the answer's echoed `method` in `accept_pi_answer`.
+`PI_SET_MODEL` is `pub` for one out-of-pane reader, `store.rs`, which reports
+a failed model switch in the statusbar whether or not the asking chat is
+still open.
 
 ### `SessionState` fields
 
@@ -1188,12 +750,40 @@ else.
 - `fail_start`: a start command failed; other request failures must not
   rewind a live chat or a different in-flight start (distinguished by phase
   check).
+- `fail_prompt`: a prompt that never reached pi — refused by the daemon, or
+  refused by the store's send gate before it left the client. The transcript
+  already shows the prompt and a busy indicator (`submit_prompt` pushes both
+  before anything is sent, because `agent_start` is milliseconds away in the
+  normal case), so the turn has to be ended *here* or the pane spins forever.
+  Live-only: an unstarted or starting chat has no turn to end, and its own
+  failure path is `fail_pending`.
 - `pick_model`: unstarted picks are local launch settings (no round trip);
-  live picks are intents whose label changes only on pi's answer
-  (`accept_model_set`).
+  live picks are commands whose label changes only on pi's answer
+  (`accept_model_set`). A live pick stashes the selection it displaces *in
+  the pending slot itself* — the token and the thing to put back if the
+  answer is a refusal are one fact, and `Pending<T>`'s context slot already
+  exists to carry exactly that.
 - `accept_model_set`: a successful or failed `set_model` answer consumes its
-  correlation token; failures leave the previously confirmed model
-  untouched (no optimistic-then-rollback flicker).
+  correlation token. A refusal (and a success pi answered with an
+  unreadable model object) restores the selection the pick displaced, so the
+  control keeps naming the model the session is actually running. Leaving the
+  slot alone was not equivalent: a live chat starts in `LivePending`, whose
+  label is the bare placeholder "Model", and a refusal used to strand it
+  there indefinitely while pi ran a perfectly good model.
+- `accept_pi_answer`: routes one `Event::PiAnswered` to the control that
+  asked, by the pi `method` the bridge echoed. Method picks the control;
+  the token decides whether that control still wants the answer. An unknown
+  method changes nothing — no pane in this app sends a pi command it has no
+  answer handler for, so the arm is a floor, not a feature.
+- `can_stop` / `stop_command`: the affordance and the command it sends read
+  the same predicate — live phase, no exit notice, and a busy transcript — so
+  the button cannot be on screen for a state the command would refuse. Busy
+  is the gate rather than "is there a session": `Command::Stop` ends the pi
+  process (docs/DAEMON.md §stop), and offering that beside an idle prompt box
+  would be a foot-gun disguised as a cancel. `stop_command` mints the command
+  and never sends it, like every other method here; the sid it names is the
+  one the pane is rendering, taken from the phase rather than from a
+  caller-supplied string.
 - `submit_prompt`: empty prompts, starting chats, and exited sessions
   produce no intent — the phase machine is the single gate for "can this
   chat accept a prompt right now."
@@ -1225,7 +815,8 @@ caller builds.
   free of any generic view parameter and keeps app-only types
   (`Workbench`) invisible to the lib. The bootstrap wraps whatever comes
   back in `Root` itself, so no caller can forget to — `Root` is what makes
-  modals, notifications and the dialog stack work at all (see `modal.rs`).
+  modals, notifications and the dialog stack work at all (see
+  `workbench/modal.rs`).
 - `actions!(harvester, [Quit])` lives here now. The action's namespace stays
   `harvester` for both binaries: an action namespace is a keymap identity,
   and the gallery is the same application wearing a different root view.
@@ -1315,14 +906,22 @@ tables take their share) and is then re-emitted verbatim via
   state only: the daemon's list may predate a resume the client just did,
   but disk on the VM stays authoritative regardless.
 - `SessionExit` marks the row exited.
-- `ModelSet` with an `Err` becomes a failure notification; the session keeps
-  whatever model it had, and the answer still flows on to the chat, whose
-  own token guard is responsible for dropping it.
+- `PiAnswered` whose `method` is `set_model` and whose `result` is an `Err`
+  becomes a failure notification; the session keeps whatever model it had,
+  and the answer still flows on to the chat, whose own token guard is
+  responsible for dropping it. This arm is deliberately chat-independent:
+  picking a model in session A and then opening session B drops A's chat, and
+  a chat-owned notification would be the only signal for the failure — gone
+  with the pane that asked. Matching on the echoed pi `method` is what lets
+  the store recognize the one answer it cares about without re-typing the
+  command the bridge carries verbatim.
 - All other bridge events (`Sessions` — already handled earlier,
   `AttachmentLeft`, `HistoryReplaced`, `HistoryExtended`, `Pi`,
-  `ModelsListed`, `SessionModelsListed`, `SessionState`, and the `Ok` arm of
-  `ModelSet`) are view-owned lifecycle/chat answers with no table stake, so
-  their subscribers receive them unchanged.
+  `PromptFailed`, `ModelsListed`, and every other `PiAnswered`) are
+  view-owned lifecycle/chat answers with no table stake, so their subscribers
+  receive them unchanged. `PromptFailed` in particular is the chat's alone —
+  it lands as a failure item in the very transcript that shows the prompt,
+  which is a better account than a toast detached from it.
 
 `handle_machines_event` is a pure router: the fleet already took the machine
 table and probe verdicts, so `Listed`/`Probed` only need a repaint (a listing
@@ -1342,6 +941,30 @@ user gets for a machine that will not come up.
 `is_live` matters because a prompt sent down a dead link fails silently into
 stderr, which looks to the user exactly like a prompt pi itself ignored — so
 callers must check liveness before sending.
+
+`send_gated` is that check, made unskippable: it gates, notifies on refusal,
+and returns whether the command left. `send` (ungated) survives for the
+store's own traffic, which has already established a connection on the way in
+(`open_session`). The gate has two rules, chosen by `is_pre_session_command`:
+- `ListModels` and `StartSession` are *pre-session* — they are what a chat
+  does before any session exists, so they may bring the machine up
+  (`ensure_connection`) rather than requiring it to be up already. They queue
+  on the bridge's command channel while it bootstraps.
+- Everything else names a running session, so it needs a live link now.
+
+Exactly one notification comes out of a refusal, and it carries the fleet's
+own diagnosis for a machine that will not connect — the pre-session path
+therefore calls `fleet.ensure_connection` directly instead of the store's
+`ensure_connection`, whose job is to notify on its own behalf. Two toasts for
+one refusal (the connect error, then "nothing was sent") was the shape
+before, and the second one is the sentence that actually tells the user their
+action did not happen.
+
+`raise_open_guard_for` is why `begin_start` is no longer a caller's
+responsibility: raising the sidebar's open guard is the store's bookkeeping
+for a `StartSession` it just sent, and doing it before the gate — as the
+workbench once did in two separate steps — leaves the guard raised for a
+command that never left.
 
 `forget_machine`: `workspaces.json` is the only place a machine is
 persisted, so removing its entries *is* removing the machine.
@@ -1375,6 +998,12 @@ ordered and de-duplicated, and Pi's next listing remains authoritative.
 `new_session_target` derives where a New session opens from the catalog's
 rule, evaluated against the machines the fleet can *actually* reach right
 now — this is computed per open and never stored.
+
+`is_selected_session` / `clear_selected_session` are the sidebar's window
+onto the catalog's current-session bookkeeping. The store publishes them
+because the sidebar is not allowed to see the chat, and the highlight is
+therefore read from the one place both the sidebar and the attachment path
+already meet.
 
 ## crates/harvester/src/ui/core.rs
 
@@ -1418,6 +1047,17 @@ everything else in `ui` should ask for a `Tone`/`Dot`, never a raw `Hsla`.
   the tier has one definition and one accessor. Do not add a fourth tier:
   something that needs to recede further than faint should leave the surface or
   move behind a disclosure, not be dimmed again.
+- `Tone::ALL` is the variant order, written down once. It exists for the
+  gallery, which needs the tones as an indexable list twice over: a choice
+  knob's labels (`tone_labels()` maps `ALL` through `Tone::label`) and the
+  knob index → tone mapping (`tone_at`) with its inverse (`tone_index`, so a
+  preset reads `tone_index(Tone::Live)` rather than a bare `4`). The catalog
+  used to keep its own copy of the order *and* a parallel label list; both
+  were this enum restated, and the label list had already drifted from the
+  app's words. A const slice on the type they describe cannot. It is the one
+  `ui` export whose only consumer is the catalog and not a screen, on the same
+  reasoning as the dot builders: a catalog has to be able to enumerate what a
+  screen only ever picks one of.
 - `Tone::label` is the tone's one user-facing word ("Neutral", "Idle",
   "Running", "Pending", "Live", "Failed"). It exists because a colored dot is
   invisible to a screen reader and ambiguous to anyone reading in a hurry, so
@@ -1477,9 +1117,9 @@ everything else in `ui` should ask for a `Tone`/`Dot`, never a raw `Hsla`.
 Every piece of modal chrome Harvester draws: dialog geometry, titles, the
 cancel/primary button pattern, the two dialog input boxes, and the three
 `open_*` builders that assemble them. Deliberately dumb — it knows nothing
-about Pi, obligations, modal leases, or machines, and takes plain strings plus
-callbacks that return "did this answer stick?". The three modal owners
-(`dialogs.rs`, `workbench/forget_machine_flow.rs`, `workbench/picker.rs`) all
+about Pi, obligations, the active modal, or machines, and takes plain strings
+plus callbacks that return "did this answer stick?". The three callers
+(`dialogs.rs`, `workbench/modal.rs`, `workbench/picker.rs`) all
 build their chrome from here, so a dialog cannot look different depending on
 which flow raised it. Every public item in the module has at least one caller
 outside it; nothing here is built speculatively for a dialog kind that does not
@@ -1523,7 +1163,8 @@ exist yet.
   whitespace-only title counts as absent (the title is trimmed first), which is
   what stops a stray space from defeating the fallback.
 - Button-id consts: element ids are identity within one rendered tree, and
-  Harvester renders at most one modal at a time (see `modal.rs`), so the two
+  Harvester renders at most one modal at a time (see `workbench/modal.rs`),
+  so the two
   confirmation call sites deliberately share one pair of ids rather than
   threading per-flow ids through the builder. `select` and `text` carry their
   own pairs because they are different dialogs, not two callers of the same one.
@@ -1653,12 +1294,17 @@ reusable non-color metrics only, never raw colors of its own (SPEC C11). The
 re-exports exist to keep a stable `ui::…` import path for screen-level callers
 while the implementation stays split across cohesive modules (`core`,
 `dialog`, `note`, `prompt`, `shell`, `sidebar`, `tool_block`, `transcript`)
-rather than one broad file. Only names a *screen* calls are re-exported: a builder
-used solely by other `ui` modules (`section_header`) is reached through
-`super::core` / kept private to its module instead, so the flat `ui::`
-surface stays a list of what the screens actually draw with. The dot builders
-are the exception the gallery bought: no screen calls `status_dot` or
-`status_dot_for_tone` directly (screens reach a dot through
+rather than one broad file. Only names a *screen* calls are re-exported: a
+builder used solely by other `ui` modules (`section_header`) or by its own
+module (`prompt_box_input`, assembled into `prompt_strip` and never drawn
+alone) is reached through `super::core` / kept private to its module instead,
+so the flat `ui::` surface stays a list of what the screens actually draw
+with. Two of the re-exports are strings rather than builders — `ADD_REPO_ROW`
+and `DEFAULT_MODEL_ROW`, the two dropdown rows that are *chrome* rather than
+data (see `ui/prompt.rs`) — and they are exported for the same reason a
+builder is: both the chat screen and the gallery render them, and a copy in
+either place is drift waiting to happen. The dot builders are the exception the gallery bought: no screen calls
+`status_dot` or `status_dot_for_tone` directly (screens reach a dot through
 `sidebar_stacked_row` or a tool block), but a component catalog has to be able
 to render one on its own, and the gallery is a screen in every sense that
 matters here. `empty_pane_action` is exported on the same footing — it is the
@@ -1679,9 +1325,14 @@ flat: its names are generic on purpose (`open_text`, `button_row`,
 `ui::dialog::open_text`.
 
 `ui` lives on the lib side of the crate (see the `lib.rs` section) so the
-`harvester` and `gallery` binaries share one copy. That makes this flat
-re-export surface the gallery's catalog as well as the app's import path:
-anything a story renders must be exported here. `prompt_strip` and its value
+`harvester` binary and the out-of-workspace `harvester-gallery` crate share
+one copy. That makes this flat re-export surface the gallery's catalog as well
+as the app's import path: anything a story renders must be exported here — and
+nothing else should be, which is why deleting the three narrow prompt stories
+also un-exported `prompt_box`, `prompt_box_control`, `prompt_box_controls`,
+`prompt_box_dropdown` and `prompt_box_send`. They are assembled into
+`prompt_strip` and no longer drawn alone by anyone, so they went back to being
+private to `prompt.rs` alongside `prompt_box_input`. `prompt_strip` and its value
 types (`PromptStrip`, `PromptStripControl`, `PromptStripNotice`) are the first
 composite — not a primitive but a whole assembled strip — and the rule that
 only names a *screen* calls get re-exported still holds, since the chat screen
@@ -1774,6 +1425,23 @@ control wears, what its rows say, and what a pick *means*.
   was also a pseudo-role invented at the call site: the resting state is the
   plain `border` role now, for the same reason `faint()` became one named
   accessor instead of an inline `0.6` in two files.
+- `ADD_REPO_ROW` ("Add new…") and `DEFAULT_MODEL_ROW` ("Default (pi chooses)")
+  live here, not in `chat/prompt_presentation.rs` where they were written,
+  because two renderers draw them: the chat screen and the gallery's prompt
+  strip story. They are the only dropdown rows that are chrome rather than
+  data — every other row is a model, a machine or a repository the app was
+  told about — and while the gallery kept its own copies the catalog drifted
+  inside the very pass that shipped it (it offered "Add a folder…" and an
+  "Add a model…" row the app has never had). A shared const makes the drift
+  unrepresentable. The wording rules that earned them are recorded under
+  `chat/prompt_presentation.rs`.
+- `prompt_box_input(input)` is the input well's padding (`px_3`, `pt_3`,
+  `pb_2`) and nothing else. It is private to this module: `prompt_strip_box`
+  is its only caller and no screen or story draws a bare input well, so it
+  fails the `ui/mod.rs` re-export rule (only names a *screen* calls are
+  published). It stays a named builder rather than an inline `div()` because
+  the controls row's inset is solved *against* this one — the two numbers are
+  a pair, and the next reader has to be able to see both.
 - `prompt_box_controls()`: `pl_2` + `pr_3`, `gap_2`. The asymmetry is
   deliberate — the button's own internal padding supplies the rest of the left
   inset, while the send button carries none, so `pr_3` is what lands it on the
@@ -1874,10 +1542,19 @@ when models failed to load" a question with one answer instead of three.
   dropdown controls. `enabled` is the caller's gating decision (see
   `chat.rs`); `rows` are already built (`DropdownRow`), never a closure.
 - `PromptStrip` fields: `notice`, `model`, `machine`, `repo`, `branch`
-  (`None` when there is nothing to report), `can_send`, `focused`. Nothing
-  here is an `Entity`, a `Window` or a callback — the one live handle
-  `prompt_strip` takes is the `&Entity<InputState>` for the text box, which
-  gpui owns and cannot be reduced to a value.
+  (`None` when there is nothing to report), `can_send`, `can_stop`,
+  `focused`. Nothing here is an `Entity`, a `Window` or a callback — the one
+  live handle `prompt_strip` takes is the `&Entity<InputState>` for the text
+  box, which gpui owns and cannot be reduced to a value.
+- `can_stop` is a *presence* flag, not an enabled flag: false renders no stop
+  button at all, where `can_send` renders a disabled one. The difference is
+  what each control means when it cannot act. Send is the strip's permanent
+  commitment and has to keep its place in the row whether or not it is
+  available; stop only exists while there is a turn to interrupt, and a
+  permanently greyed Stop next to an idle prompt box would advertise an
+  action the session cannot offer. It also keeps the row from growing a hole:
+  the button appears at the right of the strip, immediately left of send, and
+  leaves with the turn.
 - `PromptStripNotice` is the short-circuit: `SessionStarting` (the session is
   being created, there is nothing to type into yet) and
   `SessionExited(detail)` (pi is gone; the detail is the state machine's own
@@ -1893,13 +1570,27 @@ when models failed to load" a question with one answer instead of three.
   has no leading slot to put one in, and dropping the dots without adding a
   spinner would delete the "still happening" reading and leave a flat
   statement.
-- `prompt_strip(strip, send, input, cx)` takes exactly one callback. `send` is
+- `prompt_strip(strip, send, stop, input, cx)` takes two callbacks, both
   `Fn(&mut Window, &mut App)`: the click event carries nothing a caller needs,
-  and dropping it keeps `gpui::ClickEvent` out of the surface. The three picks
-  are actions instead (above), which is why there is no handler struct any
-  more — a strip is a value plus one closure plus one live `InputState`.
+  and dropping it keeps `gpui::ClickEvent` out of the surface. They are the
+  strip's two *direct* controls — a command with no index, per DESIGN.md
+  §Interaction — while the three picks are gpui actions carrying a row index
+  (above). `stop` is passed even when `can_stop` is false; an `Option` of a
+  closure would buy a generic parameter's worth of noise to skip building a
+  button the strip already knows it will not render.
+- `prompt_box_stop` is `outline` where the pickers are `ghost` and send is
+  `primary`: DESIGN.md reserves `outline` for a command in a dense control
+  surface, which is exactly what an interrupt beside three pickers is, and
+  reserves `danger` for what cannot be undone — stopping a session is not
+  that, since the session file survives and the sidebar resumes it. It is the
+  one strip control that carries both an icon and a label (`STOP_LABEL`):
+  the label is what gives it an accessible name, which the icon-only send
+  button still lacks (DESIGN.md §Known gaps), and "Stop" is short enough that
+  the row is not disturbed by it. `STOP_TOOLTIP` says where the session goes,
+  because "Stop" alone reads like "cancel this turn" and the command ends
+  pi.
 - Element-id consts (`MODEL_CONTROL_ID` = `"chat-model"`, and the
-  machine/repo/send counterparts) kept their original `chat-*` names from when
+  machine/repo/send/stop counterparts) kept their original `chat-*` names from when
   this render code lived in `chat.rs`: element ids are identity within one
   rendered tree, so the names cost nothing, and keeping them byte-identical is
   what made the extraction verifiable as a pure refactor. The per-dropdown ids
@@ -2412,39 +2103,58 @@ own `div`: `statusbar_frame` already sets that band's text size, and
 Field-level invariants on `Workbench`:
 - `store: Entity<FleetStore>` is the single observable store; the shell reads
   it for the empty pane/statusbar and for root-window chat orchestration.
-- `_dialogs: Entity<DialogCoordinator>` is retained only for its store
-  subscription and modal lifecycle — the Root overlay itself is still placed
-  by `Workbench::render`.
+- `modal: Entity<ModalCoordinator>` is the whole modal layer: the Pi
+  obligation FIFO, the folder picker and the forget-machine confirmation
+  behind one `ActiveModal` (see `workbench/modal.rs`). The shell holds it for
+  its store subscription, to lend Root out on a chat's or a sidebar's request,
+  and to hear the two outcomes it must react to. The Root overlay itself is
+  still placed by `Workbench::render`.
 - `chat: Option<Entity<Chat>>` is the current conversation, whether or not a
   session exists behind it yet (an "unstarted" chat has no sid).
-- `chat_subscriptions: Option<[Subscription; 2]>` — bridge requests and flow
-  requests from the current chat. They die with the chat entity, so an
-  abandoned unstarted pane cannot route through this shell after being
-  dropped.
+- `chat_subscription: Option<Subscription>` — the current chat's flow
+  requests (its bridge traffic no longer comes through here; see
+  `FleetStore::send_gated`). It dies with the chat entity, so an abandoned
+  unstarted pane cannot route through this shell after being dropped.
 - `_subscriptions: [Subscription; 5]` covers store repaint/event, the
-  sidebar-intent subscription, and the two flow subscriptions (repo added,
-  machine forgotten).
+  sidebar-intent subscription, and the two modal outcomes (repo added,
+  machine forgotten) — both emitted by the same entity, subscribed
+  separately because they are answered by unrelated handlers.
 
 Event-handling ordering rules (load-bearing, not incidental):
 - `handle_store_event` is the only bridge event the shell owns; it builds or
   promotes a chat and therefore needs a `Window`. Dialog events are consumed
-  by `DialogCoordinator`; chat answers are consumed by `Chat` itself.
-- `StoreEvent` subscribers run *while* `FleetStore` is emitting. An
-  `Attached` event may need to update the store's opening catalog, so
-  `defer_attached` uses `window.defer` to finish that source update before
-  constructing or promoting the chat — reentering the store mid-update is not
-  safe.
-- Sidebar events are similarly emitted while the sidebar entity is leased.
-  Some intents (e.g. selecting a session) immediately change the sidebar's
-  own selected-session highlight, so `handle_sidebar_intent` also defers
-  dispatch until after that lease ends, rather than re-entering the child
-  entity synchronously.
+  by `ModalCoordinator`; chat answers are consumed by `Chat` itself.
+- `StoreEvent` subscribers do **not** run while `FleetStore` is leased.
+  `cx.emit` queues an effect that gpui dispatches from `flush_effects` after
+  the emitting `update` has returned, so during a subscriber callback only the
+  subscriber itself is leased and it may freely update its emitter.
+  `handle_attached` therefore constructs or promotes the chat synchronously,
+  straight from the match arm; the `defer_attached` hop that carried owned
+  machine/sid/entries into `window.defer` is deleted, because the re-lease
+  *inside* that deferred closure was the only thing in it that could have
+  panicked. The property the hop was credited with is not lost: gpui's
+  `SubscriberSet::retain` takes the emitter's subscriber list before
+  dispatching and merges back whatever was added during it, so a chat that
+  subscribes to the store while the store is mid-dispatch still cannot observe
+  the event that created it, and is ready for every later one.
+- Sidebar intents dispatch synchronously for the same reason:
+  `handle_sidebar_intent` *is* the subscriber and the match, and its arms may
+  freely update the store or the emitting `Sidebar` from inside that
+  callback, which gpui allows.
+- Ordering shift this created, recorded because it is real and was checked
+  rather than assumed: `ModalCoordinator` subscribes to the store before
+  `Workbench` does, so it still runs first on an `Attached` event, but its
+  retirement work now queues `defer_advance` *behind* `handle_attached`
+  instead of ahead of it. The two paths share no state — the coordinator
+  touches the obligation FIFO and Root's dialog stack, while `handle_attached`
+  touches the store catalog and the chat — so which runs first is not
+  observable.
 - `handle_attached`: the chat that minted a given sid is already on screen
   with the first prompt rendered by the time `Attached` arrives, so the
   handler promotes that existing chat in place (`promote_to_live`) rather
   than rebuilding it from scratch — this preserves scroll position and any
   local input state.
-- `install_chat` subscribes to both of a chat's seams *before* asking it to
+- `install_chat` subscribes to the chat's flow seam *before* asking it to
   report its prompt-strip state: an entity cannot emit to a subscriber that
   does not exist yet, so subscribe-then-notify ordering matters.
 
@@ -2452,13 +2162,24 @@ Machine-forgotten handling: once a machine is gone from the client's own
 configuration, a chat still pointed at it has no bridge to send to and no
 sidebar row to return to. Dropping the `Chat` entity is the entire teardown —
 its subscriptions and pending requests die with it, exactly like discarding
-an abandoned unstarted chat.
+an abandoned unstarted chat. The sidebar highlight needs no separate
+teardown: selection lives in the catalog and is dropped there with the rows
+that carried it.
+
+Session selection is not mirrored here. The shell used to push the current
+chat's sid into the sidebar at four points; the sidebar now reads it from the
+store, which learns it where it already learns everything else — a session is
+selected when this client attaches to it, and `open_new_session_chat` clears
+it because a chat with no session behind it selects no row. That is the one
+push left, and it names what it does.
 
 Repo-added handling: a repository the folder picker validated and stored is
 routed back only to the chat that asked for it (matched by machine), which
 then selects it — that's the entire purpose of the add-repository detour.
 
-`open_new_session_chat`: New session is always available. The chat opens on
+`open_new_session_chat`: New session is always available. It clears the
+store's selected session first — an unstarted chat has no sid, so no row is
+current while the user is composing it. The chat opens on
 defaults the store derives (see docs/SPEC.md "Start session" under Flows),
 and the user re-picks machine/model in the prompt strip if the defaults were
 wrong. An already-open *unstarted* chat is left alone on a repeat click —
@@ -2466,61 +2187,21 @@ reopening it would only discard what the user already typed.
 
 `handle_chat_flow_request`: the chat's repo picker asks the shell for a
 folder walk because it needs Root's dialog stack, which only this shell can
-lend out.
+lend out (through `modal`).
 
-`handle_chat_request`: chat intents route against whichever bridge is live
-right now. The chat entity owns its own request state and rejects stale
-answers on its own; the shell's only job is supplying the window-level route
-and a user-visible refusal message when the target machine isn't ready.
+There is no `handle_chat_request` any more. A chat's bridge traffic used to
+be emitted as `ChatRequest`, re-typed here into the identical
+`bridge::Command`, gated for liveness and handed to `store.send`; the refusal
+then had to be pushed *back* into the chat as `fail_pending_requests`. All of
+it collapsed into `store.send_gated`, which the chat calls itself: the store
+already owns liveness, already owns the notification path, and the chat
+already owns the request state that a refusal has to unwind. What the shell
+kept is what genuinely needs the window — building and promoting chats, and
+lending out Root's dialog stack.
 
 Render: Root owns the dialog/notification overlay stacks but does not render
 them itself — placing `Root::render_dialog_layer` / `render_notification_layer`
 remains this top-level shell's responsibility.
-
-## crates/harvester/src/workbench/forget_machine_flow.rs
-
-Forget-machine orchestration (`ForgetMachineFlow`): confirm, then let one file
-write cascade. Only a machine its provider no longer lists ever reaches this
-flow — the sidebar puts the trash icon on no other row kind — so there is
-nothing to disconnect and nothing on the remote machine to delete. The
-removal is entirely about what Harvester's local client still *claims* to
-know (docs/SPEC.md §Flows "Forget machine").
-
-Shape mirrors `AddRepoFlow`: one generation-tagged confirmation
-(`ConfirmationId`) and one Root modal lease. Ending a run releases the lease,
-so a delayed dialog callback cannot forget a second machine or free a
-different flow's modal out from under it.
-
-`NOTHING_IS_DELETED` — the reassurance shown on every removal confirmation. A
-missing machine is unreachable by definition, so this string is a statement
-of fact about what forgetting does, not a promise being made to the user.
-
-`ForgetMachineState::machine_of`: returns the machine a still-current
-confirmation names, if and only if it is still the current one — this is the
-guard that rejects stale confirmations.
-
-`ForgetMachineFlow::open`: same "second ask while one is open is ignored"
-rule as `AddRepoFlow::open` — Root holds one dialog, and the lease is spent.
-
-`open_removal_confirmation`: builds nothing itself — it fills in
-`ui::dialog::Confirmation` (danger accent, "Remove"/"Cancel") and hands
-`ui::dialog::open_confirmation` two entity callbacks. Both callbacks carry the
-generation-tagged `ConfirmationId`, which is what keeps a delayed click
-harmless, and the flow shares the app-wide dialog width for free by not
-having a width of its own.
-
-`forget`: the store owns the entire cascade behind one `workspaces.json`
-write — tracking removal, the ghost sidebar row disappearing, and the
-machine's sessions vanishing all fall out of that single write. This flow's
-only remaining job after calling `store.forget_machine` is to end its own run
-and tell the shell whose chat (if any) is now homeless. A failed write
-reports itself (via the store's own failure event) and forgets nothing, but
-the confirmation dialog still closes regardless — leaving it open would only
-offer the user the same failing button again.
-
-`removal_message`: the session count quoted is *sidebar rows*, which is all
-that a missing machine's sessions can still be to this client — their actual
-transcripts live on a disk this client will never be able to reach again.
 
 ## crates/harvester/src/workbench/machine_presentation.rs
 
@@ -2548,18 +2229,148 @@ keeps `Tone::Idle` and stays hollow. A unit test pins the two apart.
 can honestly be reported for a machine that has only been probed, not
 connected to.
 
+`Connected`'s `statusbar_link` is the machine name alone. It used to read
+`<machine> · harvesterd <daemon_version>`, where `daemon_version` was the
+protocol version the client had *just asserted* equals its own — so the
+number was always "1" and said nothing a connected machine doesn't already
+say. The payload is gone from `MachineState` entirely (see
+harvester-client-core.md §fleet.rs); if a build identity is ever worth
+showing here, `ping.build` is the real one and it is bootstrap's to publish.
+
 `MachineState::Missing` handling: a "missing" listing is only authoritative
 after its provider has actually spoken (i.e. this isn't inferred from mere
 silence). The fleet/store layer owns that precedence decision; this
 presentation function only names the verdict once the store has already
 committed to it.
 
+## crates/harvester/src/workbench/modal.rs
+
+The single owner of `gpui-component`'s one global Root dialog stack. Root
+stores every dialog in one vector and `close_dialog` always pops its *top*,
+so Harvester models "what is on the modal layer" as one `Option<ActiveModal>`
+inside one entity, rather than arbitrating independent owners. Two modal
+flows at once is not rejected at runtime — it is unrepresentable.
+
+`ActiveModal` is the whole rule:
+- `PiQuestion { key }` — the `DialogKey` of the obligation currently on
+  screen. This is also the old `displayed` field: what is shown and who owns
+  Root are the same fact, so they are one field.
+- `AddRepo { machine, picker, _picker_events }` — the folder walk
+  (docs/SPEC.md §Flows "Add repository"). The machine is *not* chosen here:
+  a repository is picked inside the chat that is about to run in it, and that
+  chat already has a machine. Holding the picker entity here is what replaced
+  the old generation-tagged `FlowId`: the subscription that could deliver a
+  picker event is the one stored beside it, and it dies when the variant is
+  replaced, so a late event from a previous walk has nobody to reach.
+- `ForgetMachine { machine }` — the removal confirmation (docs/SPEC.md
+  §Flows "Forget machine"). Only a machine its provider no longer lists ever
+  reaches this flow (the sidebar puts the trash icon on no other row kind),
+  so there is nothing to disconnect and nothing on the remote machine to
+  delete; the removal is entirely about what this client still *claims* to
+  know. Holding the machine here replaced the old `ConfirmationId`.
+
+Why the generation counters are gone at all: `Root::close_dialog` pops
+synchronously and never fires a dialog's callbacks, so a "late callback from
+a dialog that is already closed" cannot happen — a closed dialog does not
+speak. Every stale-callback guard those counters existed for was therefore
+guarding an unreachable state, and the surviving guard is the cheap one: a
+callback only does its work when `active` still names its own flow.
+
+The Pi half (client-side implementation of docs/DAEMON.md §Dialogs):
+- The obligation FIFO itself is `DialogObligations` from
+  `harvester-client-core` — window-free, and it decides ordering, duplicate
+  replay, answers and retirement on its own. This module is its GPUI adapter:
+  subscribe to the one store, place the front obligation on Root, and send
+  exactly one answer back through the same machine route.
+- `enqueue` → `advance` unconditionally when the obligation was accepted.
+  `advance` is idempotent (it returns immediately when something is already
+  on screen, or when the FIFO is empty), which is why "this one is visible"
+  and "this one is queued" is not a distinction the enqueue result has to
+  make.
+- `advance` builds the input entity at display time, through
+  `dialogs::open_pi_dialog`. Queued obligations own nothing: there is no map
+  of pre-created inputs to garbage-collect, because typed text can only exist
+  in the obligation that is on screen and a displayed obligation is never
+  displayed twice.
+- `answer_front`: the dialog key is checked twice — once here against
+  `ActiveModal::PiQuestion`, once inside the window-free
+  `DialogObligations::answer_front` — specifically so a duplicate or delayed
+  answer callback from an already-replaced modal can never consume its
+  successor's answer.
+- `apply_retirement` acts only when the *displayed* obligation was retired;
+  retiring queued obligations is pure bookkeeping and must leave the screen
+  alone. Its order is load-bearing: clear `active` first, then pop Root, then
+  queue the advance — popping while `active` still names the retired question
+  would let a synchronous advance push onto a stack that is about to be
+  popped.
+
+`defer_advance` is the one `window.defer` left in the client, and every
+release path goes through it. `answer_front` and the two dismissal callbacks
+run *inside* `gpui-component`'s own dialog callback, and the library pops the
+top of the stack **after** that callback returns (`if on_ok(…) {
+window.close_dialog(cx) }` in the library's `Dialog`; `select`'s button
+handler performs an equivalent guarded pop). The pop is a stack pop, not a
+keyed removal, so a *synchronous* advance would push dialog B and the library
+would immediately pop B — leaving the answered dialog on screen with `active`
+already cleared, which is a wedged coordinator: it believes nothing is shown
+while a dead modal owns the screen, and no later advance can repair it.
+`window.defer` queues onto the same FIFO effect queue as `cx.emit`, so the
+advance lands after the pop instead of underneath it. The paths that pop Root
+themselves (`apply_retirement`, `handle_workspace_picked`) use the same
+helper so there is one rule rather than two, and because deferring costs
+nothing there. This is also exactly what the deleted `ModalAvailable` event
+did — a queued hop from "the modal is free" to "show the Pi front" — with
+the entity round trip removed, since one owner can simply call itself.
+
+Add-repository specifics:
+- `open_add_repo` creates the picker, subscribes to it, takes the modal, then
+  opens the dialog and only then tells the picker to `start`. The send cannot
+  live inside `cx.new` (the picker needs its own entity to exist before it can
+  route an answer), which is the only reason `start` is a separate method.
+- `handle_workspace_picked` uses the machine from `ActiveModal::AddRepo` and
+  the path the picker validated; the chat that asked for the walk selects that
+  path *whether or not the store write survived* — the folder is a valid git
+  repo either way (validation already confirmed it), and a failed
+  `workspaces.json` write is separately reported through the store's own
+  failure event.
+- `cancel_add_repo` invalidates the picker's in-flight host request
+  (`picker.cancel`) before dropping it. Cancellation comes from Root with the
+  walk still in flight; the success path deliberately does not cancel,
+  because the pending request was already consumed by the validation that
+  produced the event.
+
+Forget-machine specifics:
+- `NOTHING_IS_DELETED` — the reassurance shown on every removal
+  confirmation. A missing machine is unreachable by definition, so this string
+  is a statement of fact about what forgetting does, not a promise being made
+  to the user. `FORGET_ACTION_LABEL` is "Remove" over a danger accent;
+  `FORGET_CANCEL_LABEL` is "Cancel".
+- `open_removal_confirmation` builds nothing itself — it fills in
+  `ui::dialog::Confirmation` and hands `ui::dialog::open_confirmation` two
+  entity callbacks, so the confirmation shares the app-wide dialog width for
+  free by not having a width of its own.
+- `forget_machine`: the store owns the entire cascade behind one
+  `workspaces.json` write — tracking removal, the ghost sidebar row
+  disappearing, and the machine's sessions vanishing all fall out of that
+  single write. This flow's only remaining job is to release the modal and
+  tell the shell whose chat (if any) is now homeless. A failed write reports
+  itself (via the store's own failure event) and forgets nothing, but the
+  confirmation still closes — leaving it open would only offer the user the
+  same failing button again.
+- `removal_message`: the session count quoted is *sidebar rows*, which is all
+  that a missing machine's sessions can still be to this client — their actual
+  transcripts live on a disk this client will never be able to reach again.
+
+Both user-initiated flows silently ignore a second request while any modal is
+open: Root holds one dialog at a time, and the one that is up already has the
+user's attention.
+
 ## crates/harvester/src/workbench/picker.rs
 
 The add-repository folder picker (docs/SPEC.md §Flows "Add repository"): the
 walk state machine, the host ops that drive it, and its rendering. A child
-module of the composition shell, paired with `repo_flow`, so the
-add-repository path owns itself end to end.
+module of the composition shell, paired with the `AddRepo` arm of
+`workbench/modal.rs`, so the add-repository path owns itself end to end.
 
 Key architectural fact: the picker is the *one* surface that talks to the
 machines worker rather than to a bridge. Walking a machine's directories is
@@ -2578,17 +2389,28 @@ does not resize under the pointer when a listing arrives or a filter narrows
 the results.
 
 `PickerRequest` — the one host op a folder picker has in flight, and what its
-answer needs to be applied. Exactly one at a time: rows and the Add button
-ignore clicks while a request is out, so the modal never has two answers to
-reconcile. The correlating token belongs to `Pending`, not to this enum.
+answer needs to be applied. It is the `Pending<T>` context, not a duplicate of
+the wire command: it survives to the answer, which never echoes it back.
+Exactly one at a time: rows and the Add button ignore clicks while a request
+is out, so the modal never has two answers to reconcile. The correlating token
+belongs to `Pending`, not to this enum.
 - `Listing { path }`: the path is the *request's* value, never echoed back
   from the answer — nothing comes back over the wire that the walk should
   trust as the path, so it must track its own intent.
 
-`Walk::opening`: starts a walk on a machine by immediately asking for
+`Walk::new` builds an idle walk; `FolderPicker::start` is what asks for
 `$HOME` — no connection/daemon involved (SPEC §Workspace: "no daemon or
 provider involvement"). This means browsing a machine Harvester never
-bootstrapped costs one round trip, not an install.
+bootstrapped costs one round trip, not an install. The ask and the send are
+one step: a walk is only "busy" once a command has actually been minted, so
+the modal can never render its waiting note over a request that was never
+sent. `start` exists as its own method only because the send needs the
+picker's entity, which does not exist yet inside `cx.new`; there is no staged
+command and no take-dance behind it.
+
+There is no `active` flag. Cancellation invalidates the outstanding token
+(`Walk::cancel`), which is what makes every later answer a no-op, and the
+owning `ActiveModal::AddRepo` drops the picker immediately afterwards.
 
 `Walk::ask`: every request goes through this one method, which is what makes
 "one at a time, matched by its token" hold by construction rather than by
@@ -2615,8 +2437,10 @@ the failure reason left in `error` for the modal to show.
 walk deliberately keeps showing the *previous* directory rather than clearing
 state, and only surfaces the reason via `error`.
 
-`Walk::accept_validation`: on success there is nothing further to do — the
-walk is spent, and its owning flow (`AddRepoFlow`) drops it.
+`Walk::accept_validation`: on success it reports the path it validated and
+nothing else — the machine is the modal's own (it chose it), so
+`WorkspacePicked` carries only the path. The walk is spent, and
+`workbench/modal.rs` drops it.
 
 `Walk::waiting_note`: which note to show is a question about *the walk*, not
 about the specific request in flight. An empty path uniquely means `$HOME`
@@ -2634,13 +2458,16 @@ builds a dialog's body from the *root* view's render, where reading the
 workbench entity directly would mean reading an entity that is mid-update —
 see `crate::choices` for the general rule this follows.
 
-`handle_store_event`: `StoreEvent` answers relevant to the picker are wrapped
-into `PickerAnswer` and handled via `window.defer` — a successful answer
-usually starts the next host command, and store events are emitted while
-`FleetStore` itself is leased, so continuing the walk must wait until that
-source update has completed (same reentrancy hazard as in `workbench.rs`).
-The `BranchResolved` machines event is explicitly ignored here — it belongs
-to the chat's branch indicator, not the picker.
+`handle_store_event`: the picker's three answers (`HomeResolved`, `DirListed`,
+`WorkspaceValidated`) are matched and delegated straight to their handlers.
+There is no `PickerAnswer` carrier and no `window.defer`: that pair existed
+only to move an owned answer into a deferred callback, and the reentrancy it
+was guarding against does not exist — store events are dispatched after
+`FleetStore`'s own update has returned (see `workbench.rs` above), so
+continuing the walk, which usually sends the next host command through
+`store.send_host_command`, is a plain call. The `BranchResolved` machines
+event is explicitly ignored here — it belongs to the chat's branch indicator,
+not the picker.
 
 `FolderPicker::open_dialog`: Enter key handling belongs to the focused
 directory `List` (`on_ok` always returns `false`), and the dialog only closes
@@ -2656,43 +2483,6 @@ here: whether the walk can submit is walk state, not chrome.
 `join_remote_path` / `parent_remote_path`: paths are always absolute (the
 walk starts at the remote `$HOME`), so the only special case either function
 needs to handle is the root's trailing slash / being its own parent.
-
-## crates/harvester/src/workbench/repo_flow.rs
-
-Add-repository orchestration (`AddRepoFlow`): hands the daemon-free host walk
-to `FolderPicker` on the machine the asking chat is already targeting. The
-machine is never *chosen* here — a repository is picked inside the chat that
-is about to run in it, and that chat already has a machine before its repo
-picker even opens. So this flow is scoped to exactly the folder walk, its
-Root modal lease, and nothing else (docs/SPEC.md §Flows "Add repository").
-
-Lifecycle invariant: the flow owns one generation-tagged run (`FlowId`) and
-one modal lease. Ending a run drops its picker subscription, invalidates the
-picker, and releases the lease together, so a delayed host answer or modal
-callback arriving after the run ended cannot revive or corrupt a new run.
-
-`AddRepoState`: window-free lifecycle guard for late picker/modal callbacks
-(testable without gpui). `running: Option<(FlowId, String)>` pairs the active
-run's generation with the machine being browsed, so a stale callback that
-still names the right machine but the wrong generation is still correctly
-rejected by `is_picker`.
-
-`AddRepoFlow::open`: a second request while a walk is already open is
-silently ignored — Root only ever holds one dialog at a time, and the modal
-lease is already spent on the in-progress run.
-
-`handle_workspace_picked`: after a successful validation, the chat that asked
-for this walk selects the path it validated *whether or not the store write
-survived* — the folder is a valid git repo either way (validation already
-confirmed that), and a failed `workspaces.json` write is separately reported
-to the user via the store's own failure event.
-
-`end`: a successful validation is emitted while `FolderPicker` is leased, so
-calling `update` on it here would re-enter that same entity — not safe.
-Since its pending request is already consumed by that point, simply dropping
-both retained handles (`picker`, `picker_events`) is sufficient teardown.
-Cancellation, by contrast, comes from Root and is allowed to invalidate the
-picker immediately via `picker.cancel(cx)`.
 
 ## crates/harvester/src/workbench/sidebar.rs
 
@@ -2784,9 +2574,18 @@ to a different session:
 - `ForgetMachine { machine }`: only reachable after the shell has asked the
   user to confirm (docs/SPEC.md §Flows "Forget machine").
 
-`Sidebar::select_session`: the *shell* owns which chat is current; this method
-only updates the highlight that presents that choice — it is not a projection
-of fleet state and must not be inferred from the store.
+Which row is highlighted is read from the store (`is_selected_session`), not
+held here. The sidebar cannot see the chat, and the highlight used to be a
+copy of the chat's sid pushed in by the shell — the stale-projection shape
+docs/SPEC.md C12 exists to kill. The store already knows the answer: a
+session becomes current when this client attaches to it, which is the same
+event that builds or promotes the chat. The one thing attachment cannot say
+is "the user is composing a new session", so the shell clears the selection
+when it opens an unstarted chat.
+
+Deliberate consequence: while a chat is `Starting` (its sid minted, its
+`StartSession` in flight) nothing is highlighted, because no session row
+exists for that sid yet. That was true of the pushed mirror too.
 
 `render_new_session_button`: this is the sidebar's one action and the only
 way into every session. A chat opens with no session behind it and picks
@@ -2825,14 +2624,41 @@ will rewrite the file whole, self-healing the corruption.
 
 `save()` reports errors to the *caller* rather than stderr, because the
 statusbar (not stderr) is the right place for the user to see a save
-failure. The write itself stages to a sibling file (`*.json.next`) and
-renames it into place — the same atomic-swap pattern the daemon installer
-uses. Writing the real file directly would truncate it before the new
-content is fully written, so a crash mid-write would leave torn JSON; `load`
-would then read that torn file as an empty list, and the *next* save would
-persist that emptiness over the user's entire workspace configuration. Using
-a sibling file (not a `/tmp` file) keeps the rename on one filesystem, which
-is what makes the rename atomic.
+failure. The write itself stages to a sibling file and renames it into place
+— the same atomic-swap pattern the daemon install script and the
+bundled-provider installer use. Writing the real file directly would truncate
+it before the new content is fully written, so a crash mid-write would leave
+torn JSON; `load` would then read that torn file as an empty list, and the
+*next* save would persist that emptiness over the user's entire workspace
+configuration. Using a sibling file (not a `/tmp` file) keeps the rename on
+one filesystem, which is what makes the rename atomic.
+
+The staged name is per-writer, not shared: `staged_path` appends the process
+id to `STAGED_EXTENSION_PREFIX` (`workspaces.json.next.<pid>`) — the same
+discipline the daemon install script already had in shell (`.next.$$`). A
+single fixed staging name is not a staging file at all when two clients are
+open — each writes the *other's* half-written bytes into the same path and
+one of them renames a file it did not finish, which is the torn-JSON case
+the staging exists to prevent. `write_staged_file` then `sync_all`s before the
+rename: a rename is only atomic with respect to *the directory entry*, so
+without the fsync a power loss can leave the entry pointing at a file whose
+contents never reached the disk. When either step fails the staged file is
+removed (`remove_staged_file`, quiet on `NotFound`, stderr otherwise) —
+unique names mean a leaked one is leaked forever rather than being
+overwritten by the next save.
+
+What this does **not** buy is multi-client safety: `Catalog` reads
+`workspaces.json` once at startup, mutates its in-memory list, and rewrites
+the whole file on every change (see the catalog section). Two clients open
+at once are therefore last-write-win at the *catalog* level — one client's
+"add folder" silently erases another client's "forget", because the loser is
+writing a list built from a snapshot taken before the winner's change. The
+single-writer assumption is deliberate for now (workspaces are personal
+configuration a user edits from the window in front of them, and the VM's
+disk — not this file — remains the authority on sessions); the atomicity work
+above only guarantees that whichever list wins is a *complete, well-formed*
+list. Reload-on-change (inotify, or a re-read + merge before each save) is
+the fix the day two windows becomes a real workflow.
 
 ## crates/harvester/tests/no_comments.rs
 
@@ -2850,10 +2676,24 @@ char literal or a lifetime. Heuristic — `'\` is always a char literal; `'x'`
 (`'static`, `'a>`, loop labels) is a lifetime and only the quote is consumed.
 Multi-byte scalar values work because the scan iterates `char`s, not bytes.
 
-Skipped directories: `target` (build output) and `bin` (spike binaries —
-throwaway code is exempt from house rules). The scan roots at the parent of
-`CARGO_MANIFEST_DIR`, i.e. `crates/`, so every workspace crate is covered from
-this one test regardless of which crate hosts it.
+Skipped directories (`is_skipped_directory`): `target` (build output) at any
+depth, and `bin` **only directly under a crate's `src/`** — that is the
+Cargo-defined home of spike binaries, and throwaway code is exempt from house
+rules. The parent check is the whole point: matching the bare name `bin` at
+any depth would silently exempt any future `src/anything/bin/` module from the
+lint. The scan roots at the parent of `CARGO_MANIFEST_DIR`, i.e. `crates/`, so
+every crate is covered from this one test regardless of which crate hosts it —
+including `crates/harvester-gallery`, which is *not* a workspace member. The
+walk is over the filesystem, not over `cargo metadata`, and that is what lets
+the gallery's quarantine (see `docs/internals/harvester-gallery.md`) keep the
+lint instead of escaping it.
+
+The line counter has one non-obvious case: inside a string literal, a
+backslash immediately followed by LF is Rust's line-continuation escape, so
+`skip_string` counts that newline before skipping past it. Missing it does not
+change *whether* a comment is found, only the line number reported for it —
+and every offender after the continuation drifts by one, which is exactly the
+kind of quietly-wrong output that wastes a reader's time.
 
 ## Recorded gaps (visual layer)
 

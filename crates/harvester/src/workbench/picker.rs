@@ -20,23 +20,7 @@ enum PickerRequest {
     Validation { path: String },
 }
 
-enum PickerAnswer {
-    Home {
-        token: RequestToken,
-        result: Result<String, String>,
-    },
-    Listing {
-        token: RequestToken,
-        result: Result<Vec<RemoteDirEntry>, String>,
-    },
-    Validation {
-        token: RequestToken,
-        error: Option<String>,
-    },
-}
-
 pub(super) struct WorkspacePicked {
-    pub machine: String,
     pub path: String,
 }
 
@@ -79,22 +63,15 @@ struct Walk {
 }
 
 impl Walk {
-    fn opening(
-        machine: String,
-        machine_label: String,
-        tokens: RequestTokens,
-    ) -> (Walk, PickerCommand) {
-        let mut walk = Walk {
+    fn new(machine: String, machine_label: String, tokens: RequestTokens) -> Self {
+        Self {
             machine,
             machine_label,
             path: String::new(),
             pending: Pending::default(),
             error: None,
             tokens,
-        };
-        let command = walk.ask(PickerRequest::Home);
-
-        (walk, command)
+        }
     }
 
     fn ask(&mut self, request: PickerRequest) -> PickerCommand {
@@ -164,11 +141,7 @@ impl Walk {
         }
     }
 
-    fn accept_validation(
-        &mut self,
-        token: RequestToken,
-        error: Option<String>,
-    ) -> Option<(String, String)> {
+    fn accept_validation(&mut self, token: RequestToken, error: Option<String>) -> Option<String> {
         self.pending.accept(token)?;
 
         match error {
@@ -177,7 +150,7 @@ impl Walk {
 
                 None
             }
-            None => Some((self.machine.clone(), self.path.clone())),
+            None => Some(self.path.clone()),
         }
     }
 
@@ -348,8 +321,6 @@ pub(super) struct FolderPicker {
     store: Entity<FleetStore>,
     walk: Walk,
     entries: Entity<ListState<EntriesDelegate>>,
-    opening: Option<PickerCommand>,
-    active: bool,
     _subscriptions: [gpui::Subscription; 2],
 }
 
@@ -362,7 +333,7 @@ impl FolderPicker {
     ) -> Self {
         let label = store.read(cx).label(&machine);
         let tokens = store.read(cx).tokens();
-        let (walk, home) = Walk::opening(machine, label, tokens);
+        let walk = Walk::new(machine, label, tokens);
         let entries =
             cx.new(|cx| ListState::new(EntriesDelegate::new(), window, cx).searchable(true));
         let subscriptions = [
@@ -374,27 +345,17 @@ impl FolderPicker {
             store,
             walk,
             entries,
-            opening: Some(home),
-            active: true,
             _subscriptions: subscriptions,
         }
     }
 
     pub(super) fn start(&mut self, cx: &mut Context<Self>) {
-        if !self.active {
-            return;
-        }
-
-        let Some(home) = self.opening.take() else {
-            return;
-        };
+        let home = self.walk.ask(PickerRequest::Home);
 
         self.send_request(home, cx);
     }
 
     pub(super) fn cancel(&mut self, cx: &mut Context<Self>) {
-        self.active = false;
-        self.opening = None;
         self.walk.cancel();
         cx.notify();
     }
@@ -431,10 +392,6 @@ impl FolderPicker {
     }
 
     fn send_request(&mut self, command: PickerCommand, cx: &mut Context<Self>) {
-        if !self.active {
-            return;
-        }
-
         let host = match self.store.read(cx).host_for(&self.walk.machine) {
             Ok(host) => host,
             Err(detail) => {
@@ -458,31 +415,18 @@ impl FolderPicker {
         &mut self,
         _store: &Entity<FleetStore>,
         event: &StoreEvent,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.active {
-            return;
-        }
-
-        let answer = match event {
+        match event {
             StoreEvent::Machines(machines::Event::HomeResolved { token, result }) => {
-                PickerAnswer::Home {
-                    token: *token,
-                    result: result.clone(),
-                }
+                self.handle_home_resolved(*token, result.clone(), cx)
             }
             StoreEvent::Machines(machines::Event::DirListed { token, result }) => {
-                PickerAnswer::Listing {
-                    token: *token,
-                    result: result.clone(),
-                }
+                self.handle_dir_listed(*token, result.clone(), cx)
             }
             StoreEvent::Machines(machines::Event::WorkspaceValidated { token, error }) => {
-                PickerAnswer::Validation {
-                    token: *token,
-                    error: error.clone(),
-                }
+                self.handle_workspace_validated(*token, error.clone(), cx)
             }
             StoreEvent::Bridge { .. }
             | StoreEvent::Machines(
@@ -491,26 +435,7 @@ impl FolderPicker {
                 | machines::Event::ProviderFailed { .. }
                 | machines::Event::BranchResolved { .. },
             )
-            | StoreEvent::Failed(_) => return,
-        };
-        let picker = cx.entity();
-
-        window.defer(cx, move |_, cx| {
-            picker.update(cx, |picker, cx| picker.handle_answer(answer, cx));
-        });
-    }
-
-    fn handle_answer(&mut self, answer: PickerAnswer, cx: &mut Context<Self>) {
-        if !self.active {
-            return;
-        }
-
-        match answer {
-            PickerAnswer::Home { token, result } => self.handle_home_resolved(token, result, cx),
-            PickerAnswer::Listing { token, result } => self.handle_dir_listed(token, result, cx),
-            PickerAnswer::Validation { token, error } => {
-                self.handle_workspace_validated(token, error, cx)
-            }
+            | StoreEvent::Failed(_) => {}
         }
     }
 
@@ -551,13 +476,13 @@ impl FolderPicker {
         error: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let Some((machine, path)) = self.walk.accept_validation(token, error) else {
+        let Some(path) = self.walk.accept_validation(token, error) else {
             cx.notify();
 
             return;
         };
 
-        cx.emit(WorkspacePicked { machine, path });
+        cx.emit(WorkspacePicked { path });
     }
 
     pub(super) fn open_dialog<T: 'static>(
@@ -662,11 +587,14 @@ mod tests {
     use harvester_client_core::RequestTokens;
 
     fn opening_walk() -> (Walk, PickerCommand) {
-        Walk::opening(
+        let mut walk = Walk::new(
             "exe-dev/bloggy".to_string(),
             "bloggy".to_string(),
             RequestTokens::default(),
-        )
+        );
+        let home = walk.ask(PickerRequest::Home);
+
+        (walk, home)
     }
 
     fn listed(name: &str, is_dir: bool) -> RemoteDirEntry {
@@ -695,6 +623,23 @@ mod tests {
     fn the_root_is_its_own_parent() {
         assert_eq!(parent_remote_path("/"), "/");
         assert_eq!(parent_remote_path("/home"), "/");
+    }
+
+    #[test]
+    fn a_new_walk_gates_nothing_until_it_asks_for_home() {
+        let mut walk = Walk::new(
+            "exe-dev/bloggy".to_string(),
+            "bloggy".to_string(),
+            RequestTokens::default(),
+        );
+
+        assert!(!walk.busy());
+        assert_eq!(walk.waiting_note(), None);
+
+        walk.ask(PickerRequest::Home);
+
+        assert!(walk.busy());
+        assert_eq!(walk.waiting_note(), Some("finding home directory…"));
     }
 
     #[test]
@@ -736,10 +681,7 @@ mod tests {
         );
         assert_eq!(
             walk.accept_validation(validate.token, None),
-            Some((
-                "exe-dev/bloggy".to_string(),
-                "/home/exedev/repo".to_string()
-            ))
+            Some("/home/exedev/repo".to_string())
         );
     }
 

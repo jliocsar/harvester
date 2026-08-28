@@ -15,10 +15,10 @@ pub(super) fn present_machine(state: MachineState<'_>, machine: &str) -> Machine
             pane_message: Some(format!("connecting to {machine}…")),
             statusbar_link: Some("connecting…".to_string()),
         },
-        MachineState::Connected { daemon_version } => MachinePresentation {
+        MachineState::Connected => MachinePresentation {
             tone: Tone::Live,
             pane_message: Some("select a session".to_string()),
-            statusbar_link: Some(format!("{machine} · harvesterd {daemon_version}")),
+            statusbar_link: Some(machine.to_string()),
         },
         MachineState::ConnectFailed { detail } => MachinePresentation {
             tone: Tone::Failed,
@@ -84,19 +84,15 @@ mod tests {
     }
 
     #[test]
-    fn a_live_bridge_names_its_daemon_version() {
-        let presentation = present_machine(
-            MachineState::Connected {
-                daemon_version: "build-1",
-            },
-            "vm",
-        );
+    fn a_live_bridge_is_named_by_its_machine_alone() {
+        let presentation = present_machine(MachineState::Connected, "vm");
 
         assert_eq!(presentation.tone, Tone::Live);
         assert_eq!(
-            presentation.statusbar_link.as_deref(),
-            Some("vm · harvesterd build-1")
+            presentation.pane_message.as_deref(),
+            Some("select a session")
         );
+        assert_eq!(presentation.statusbar_link.as_deref(), Some("vm"));
     }
 
     #[test]

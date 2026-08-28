@@ -3,10 +3,9 @@ use harvester_client_core::MachineCandidate;
 
 use crate::models::ModelChoice;
 use crate::session_state::{ModelSelection, ModelsState};
+use crate::ui::DEFAULT_MODEL_ROW;
 use crate::workspaces::folder_name;
 
-pub(super) const DEFAULT_MODEL_ROW: &str = "Default (pi chooses)";
-pub(super) const ADD_REPO_ROW: &str = "Add new…";
 pub(super) const NO_MACHINE_LABEL: &str = "No machines";
 pub(super) const CHOOSE_MACHINE_LABEL: &str = "Choose machine";
 pub(super) const CHOOSE_REPO_LABEL: &str = "Choose repository";

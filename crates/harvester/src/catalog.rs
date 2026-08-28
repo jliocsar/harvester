@@ -21,6 +21,7 @@ pub struct Catalog {
     sessions: Vec<MachineSession>,
     workspaces: Vec<Workspace>,
     opening: Option<OpeningSession>,
+    selected_sid: Option<String>,
 }
 
 struct OpeningSession {
@@ -38,6 +39,7 @@ impl Catalog {
             sessions: Vec::new(),
             workspaces,
             opening: None,
+            selected_sid: None,
         }
     }
 
@@ -66,7 +68,32 @@ impl Catalog {
 
     pub fn session_attached(&mut self, machine: &str, sid: &str) -> bool {
         let changed = self.set_session_status(sid, SessionStatus::Running);
+
+        self.selected_sid = Some(sid.to_string());
+
         self.abandon_open_on(machine) || changed
+    }
+
+    pub fn clear_selected_session(&mut self) {
+        self.selected_sid = None;
+    }
+
+    pub fn is_selected_session(&self, sid: &str) -> bool {
+        self.selected_sid.as_deref() == Some(sid)
+    }
+
+    fn forget_selection_without_a_session(&mut self) {
+        let listed = self.selected_sid.as_ref().is_some_and(|selected| {
+            self.sessions
+                .iter()
+                .any(|session| session.info.sid == *selected)
+        });
+
+        if listed {
+            return;
+        }
+
+        self.selected_sid = None;
     }
 
     pub fn session_exited(&mut self, sid: &str) -> bool {
@@ -95,6 +122,7 @@ impl Catalog {
         }
 
         self.sessions.retain(|session| session.machine != machine);
+        self.forget_selection_without_a_session();
         self.abandon_open_on(machine);
 
         Ok(())
@@ -532,6 +560,82 @@ mod tests {
         assert_eq!(catalog.visible_session_count_on("machine-gone"), 0);
         assert_eq!(catalog.visible_session_count_on("machine-kept"), 1);
         assert_eq!(catalog.opening_sid(), None);
+    }
+
+    #[test]
+    fn the_attached_session_is_the_selected_row_until_a_new_chat_clears_it() {
+        let mut catalog = catalog(&[]);
+
+        catalog.record_sessions(
+            "machine",
+            vec![
+                session("first", "/repo", 20, SessionStatus::Running),
+                session("second", "/repo", 10, SessionStatus::Running),
+            ],
+        );
+
+        assert!(!catalog.is_selected_session("first"));
+
+        catalog.session_attached("machine", "first");
+
+        assert!(catalog.is_selected_session("first"));
+
+        catalog.session_attached("machine", "second");
+
+        assert!(!catalog.is_selected_session("first"));
+        assert!(catalog.is_selected_session("second"));
+
+        catalog.clear_selected_session();
+
+        assert!(!catalog.is_selected_session("second"));
+    }
+
+    #[test]
+    fn a_starting_session_is_selected_only_once_its_row_exists() {
+        let mut catalog = catalog(&[]);
+
+        catalog.begin_open("machine".to_string(), "started".to_string());
+
+        assert!(!catalog.is_selected_session("started"));
+        assert!(catalog.visible_sessions().is_empty());
+
+        catalog.insert_started_session_at(
+            "machine".to_string(),
+            "started".to_string(),
+            "first prompt".to_string(),
+            "/repo".to_string(),
+            1,
+        );
+        catalog.session_attached("machine", "started");
+
+        assert!(catalog.is_selected_session("started"));
+    }
+
+    #[test]
+    fn forgetting_a_machine_drops_only_the_selection_that_lost_its_row() {
+        let mut catalog = catalog(&[]);
+
+        catalog.record_sessions(
+            "machine-gone",
+            vec![session("gone", "/repo", 20, SessionStatus::Running)],
+        );
+        catalog.record_sessions(
+            "machine-kept",
+            vec![session("kept", "/repo", 10, SessionStatus::Running)],
+        );
+        catalog.session_attached("machine-gone", "gone");
+        catalog
+            .forget_machine("machine-gone")
+            .expect("no stored repo means no write to fail");
+
+        assert!(!catalog.is_selected_session("gone"));
+
+        catalog.session_attached("machine-kept", "kept");
+        catalog
+            .forget_machine("machine-gone")
+            .expect("no stored repo means no write to fail");
+
+        assert!(catalog.is_selected_session("kept"));
     }
 
     #[test]

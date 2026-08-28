@@ -42,18 +42,9 @@ pub enum Command {
         cwd: String,
         token: RequestToken,
     },
-    ListSessionModels {
+    PiRequest {
         sid: String,
-        token: RequestToken,
-    },
-    GetSessionState {
-        sid: String,
-        token: RequestToken,
-    },
-    SetModel {
-        sid: String,
-        provider: String,
-        model_id: String,
+        cmd: Value,
         token: RequestToken,
     },
     Stop {
@@ -68,9 +59,7 @@ pub enum Command {
 
 #[derive(Debug)]
 pub enum Event {
-    Connected {
-        daemon_version: String,
-    },
+    Connected,
     ConnectFailed {
         detail: String,
     },
@@ -101,29 +90,24 @@ pub enum Event {
     RequestFailed {
         detail: String,
     },
+    PromptFailed {
+        sid: String,
+        detail: String,
+    },
     ModelsListed {
         token: RequestToken,
         result: Result<Value, String>,
     },
-    SessionModelsListed {
+    PiAnswered {
         sid: String,
         token: RequestToken,
-        result: Result<Value, String>,
-    },
-    SessionState {
-        sid: String,
-        token: RequestToken,
-        result: Result<Value, String>,
-    },
-    ModelSet {
-        sid: String,
-        token: RequestToken,
+        method: String,
         result: Result<Value, String>,
     },
     Disconnected,
 }
 
-pub struct BridgeHandle {
+pub(crate) struct BridgeHandle {
     pub commands: UnboundedSender<Command>,
 }
 
@@ -154,7 +138,7 @@ struct SessionCursor {
     leaf_id: String,
 }
 
-pub fn start(
+pub(crate) fn start(
     machine: String,
     host: Host,
     daemon_binary: Arc<Vec<u8>>,
@@ -205,9 +189,7 @@ async fn bridge_main(
             return;
         }
     };
-    events.send(Event::Connected {
-        daemon_version: connected.daemon_version,
-    });
+    events.send(Event::Connected);
 
     let (client, mut session_events) = DaemonClient::start(connected.connection);
     let context = BridgeContext {
@@ -278,20 +260,9 @@ fn dispatch(command: Command, context: &BridgeContext) {
         Command::ListModels { cwd, token } => {
             spawn_flow(flows::list_models_flow(context, cwd, token))
         }
-        Command::ListSessionModels { sid, token } => {
-            spawn_flow(flows::session_models_flow(context, sid, token))
+        Command::PiRequest { sid, cmd, token } => {
+            spawn_flow(flows::pi_request_flow(context, sid, cmd, token))
         }
-        Command::GetSessionState { sid, token } => {
-            spawn_flow(flows::session_state_flow(context, sid, token))
-        }
-        Command::SetModel {
-            sid,
-            provider,
-            model_id,
-            token,
-        } => spawn_flow(flows::set_model_flow(
-            context, sid, provider, model_id, token,
-        )),
         Command::Stop { sid } => spawn_flow(flows::stop_flow(context, sid)),
         Command::AnswerDialog {
             sid,
@@ -345,7 +316,8 @@ mod tests {
 
     use serde_json::json;
 
-    use crate::connection::{no_forward, DaemonConnection};
+    use crate::connection::DaemonConnection;
+    use crate::token::RequestTokens;
 
     const QUIET: Duration = Duration::from_millis(100);
 
@@ -359,7 +331,7 @@ mod tests {
         fn new() -> Harness {
             let (client_side, daemon_side) = tokio::io::duplex(64 * 1024);
             let (client, _session_events) =
-                DaemonClient::start(DaemonConnection::over(client_side, no_forward()));
+                DaemonClient::start(DaemonConnection::over(client_side, None));
             let (event_sender, events) = unbounded_channel();
 
             Harness {
@@ -374,39 +346,60 @@ mod tests {
                     resyncing: Arc::new(Mutex::new(HashSet::new())),
                     cursor: Arc::new(Mutex::new(None)),
                 },
-                daemon: DaemonConnection::over(daemon_side, no_forward()),
+                daemon: DaemonConnection::over(daemon_side, None),
                 events,
             }
         }
 
-        async fn serve_one(&mut self) -> Value {
-            let request = tokio::time::timeout(QUIET, self.daemon.reader.next_line_for_test())
+        async fn take_request(&mut self) -> Value {
+            tokio::time::timeout(QUIET, self.daemon.reader.next_line_for_test())
                 .await
-                .expect("the bridge sent no request");
-            let response = if request["type"] == "pi" {
-                json!({
-                    "id": request["id"],
-                    "type": "pi_response",
-                    "sid": request["sid"],
-                    "response": {"type": "response", "success": true, "data": {"entries": []}},
-                })
+                .expect("the bridge sent no request")
+        }
+
+        async fn serve_one(&mut self) -> Value {
+            let request = self.take_request().await;
+
+            if request["type"] == "pi" {
+                self.answer_pi(&request, json!({"entries": []})).await;
             } else {
-                json!({
+                let response = json!({
                     "id": request["id"],
                     "type": "harvester_response",
                     "response": {"success": true, "data": {}},
-                })
-            };
+                });
 
-            self.daemon.writer.send_json_for_test(response).await;
+                self.daemon.writer.send_json_for_test(response).await;
+            }
 
             request
         }
 
+        async fn answer_pi(&mut self, request: &Value, data: Value) {
+            let response = json!({"type": "response", "success": true, "data": data});
+
+            self.answer_pi_response(request, response).await;
+        }
+
+        async fn answer_pi_failure(&mut self, request: &Value, detail: &str) {
+            let response = json!({"type": "response", "success": false, "error": detail});
+
+            self.answer_pi_response(request, response).await;
+        }
+
+        async fn answer_pi_response(&mut self, request: &Value, response: Value) {
+            let framed = json!({
+                "id": request["id"],
+                "type": "pi_response",
+                "sid": request["sid"],
+                "response": response,
+            });
+
+            self.daemon.writer.send_json_for_test(framed).await;
+        }
+
         async fn serve_harvester_failure(&mut self, detail: &str) -> Value {
-            let request = tokio::time::timeout(QUIET, self.daemon.reader.next_line_for_test())
-                .await
-                .expect("the bridge sent no request");
+            let request = self.take_request().await;
             let response = json!({
                 "id": request["id"],
                 "type": "harvester_response",
@@ -637,6 +630,178 @@ mod tests {
         harness
             .assert_silent("one repair per session at a time")
             .await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_repair_still_delivers_the_events_it_held_back() {
+        let mut harness = Harness::new();
+
+        *harness.context.attached.lock().await = Some("01H".to_string());
+        spawn_flow(flows::resync_flow(
+            harness.context.clone(),
+            "01H".to_string(),
+        ));
+
+        let request = harness.take_request().await;
+
+        assert_eq!(command_name(&request), "get_entries");
+
+        handle_live_pi_event(
+            &harness.context,
+            "01H".to_string(),
+            json!({"type": "tool_execution_end"}),
+        );
+        harness.answer_pi_failure(&request, "pi is wedged").await;
+
+        let mut delivered = Vec::new();
+
+        while let Ok(Some((_, event))) = tokio::time::timeout(QUIET, harness.events.recv()).await {
+            if let Event::Pi { sid, event } = event {
+                delivered.push((sid, event));
+            }
+        }
+
+        assert_eq!(
+            delivered,
+            vec![("01H".to_string(), json!({"type": "tool_execution_end"}))],
+            "a failed repair replaced no snapshot, so the events it held back are still owed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repair_stops_when_the_attachment_moved_on_under_it() {
+        let mut harness = Harness::new();
+
+        *harness.context.attached.lock().await = Some("01H-first".to_string());
+        spawn_flow(flows::resync_flow(
+            harness.context.clone(),
+            "01H-first".to_string(),
+        ));
+
+        let request = harness.take_request().await;
+
+        assert_eq!(command_name(&request), "get_entries");
+
+        for _ in 0..=ATTACH_EVENT_BUFFER_CAP {
+            handle_live_pi_event(
+                &harness.context,
+                "01H-first".to_string(),
+                json!({"type": "message_update"}),
+            );
+        }
+
+        *harness.context.attached.lock().await = Some("01H-second".to_string());
+        harness.answer_pi(&request, json!({"entries": []})).await;
+
+        harness
+            .assert_silent("an overflowed retry for a session nobody is attached to is wasted work")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_stale_repair_cannot_overwrite_the_new_sessions_cursor() {
+        let mut harness = Harness::new();
+
+        *harness.context.attached.lock().await = Some("01H-first".to_string());
+        spawn_flow(flows::resync_flow(
+            harness.context.clone(),
+            "01H-first".to_string(),
+        ));
+
+        let request = harness.take_request().await;
+
+        assert_eq!(command_name(&request), "get_entries");
+
+        *harness.context.attached.lock().await = Some("01H-second".to_string());
+        *harness.context.cursor.lock().expect("cursor mutex") = Some(SessionCursor {
+            sid: "01H-second".to_string(),
+            leaf_id: "leaf-second".to_string(),
+        });
+        harness
+            .answer_pi(&request, json!({"entries": [], "leafId": "leaf-first"}))
+            .await;
+
+        let (_, event) = tokio::time::timeout(QUIET, harness.events.recv())
+            .await
+            .expect("the stale repair published nothing")
+            .expect("bridge event channel closed");
+
+        assert!(matches!(event, Event::HistoryReplaced { sid, .. } if sid == "01H-first"));
+
+        let cursor = harness.context.cursor.lock().expect("cursor mutex");
+        let held = cursor.as_ref().expect("the new session's cursor");
+
+        assert_eq!(
+            (held.sid.as_str(), held.leaf_id.as_str()),
+            ("01H-second", "leaf-second"),
+            "a repair for a replaced session must not spend the new session's cursor slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_generic_round_trip_carries_every_session_scoped_pi_command() {
+        let mut harness = Harness::new();
+
+        spawn_flow(flows::pi_request_flow(
+            harness.context.clone(),
+            "01H".to_string(),
+            json!({"type": "set_model", "provider": "test", "modelId": "opus"}),
+            RequestTokens::default().mint(),
+        ));
+
+        let request = harness.take_request().await;
+
+        assert_eq!(command_name(&request), "set_model");
+
+        harness.answer_pi_failure(&request, "Model not found").await;
+
+        let (_, event) = tokio::time::timeout(QUIET, harness.events.recv())
+            .await
+            .expect("the pi request was never answered")
+            .expect("bridge event channel closed");
+
+        assert!(
+            matches!(
+                event,
+                Event::PiAnswered { sid, method, result, .. }
+                    if sid == "01H"
+                        && method == "set_model"
+                        && result == Err("Model not found".to_string())
+            ),
+            "the answer echoes the pi command it was asked for so a non-asking consumer can \
+             recognize it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prompt_pi_refused_is_reported_against_its_own_session() {
+        let mut harness = Harness::new();
+
+        spawn_flow(flows::prompt_flow(
+            harness.context.clone(),
+            "01H".to_string(),
+            "fix it".to_string(),
+        ));
+
+        let request = harness.take_request().await;
+
+        assert_eq!(command_name(&request), "prompt");
+
+        harness.answer_pi_failure(&request, "pi is wedged").await;
+
+        let (_, event) = tokio::time::timeout(QUIET, harness.events.recv())
+            .await
+            .expect("the refused prompt was never reported")
+            .expect("bridge event channel closed");
+
+        assert!(
+            matches!(
+                event,
+                Event::PromptFailed { sid, detail }
+                    if sid == "01H" && detail == "pi is wedged"
+            ),
+            "a prompt failure is the sending chat's to render, not the machine's statusbar"
+        );
     }
 
     #[tokio::test]

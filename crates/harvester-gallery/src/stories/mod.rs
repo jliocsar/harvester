@@ -1,7 +1,6 @@
 pub mod core;
 pub mod dialog;
 pub mod note;
-pub mod prompt;
 pub mod prompt_strip;
 pub mod shell;
 pub mod sidebar;
@@ -11,31 +10,33 @@ use gpui::{div, prelude::*, px, App, Div, SharedString};
 use gpui_component::ActiveTheme as _;
 use harvester::ui::{inline_note, Tone};
 
-pub const TONES: [Tone; 6] = [
-    Tone::Muted,
-    Tone::Idle,
-    Tone::Active,
-    Tone::Pending,
-    Tone::Live,
-    Tone::Failed,
-];
-
-pub const TONE_LABELS: &[&str] = &[
-    Tone::Muted.label(),
-    Tone::Idle.label(),
-    Tone::Active.label(),
-    Tone::Pending.label(),
-    Tone::Live.label(),
-    Tone::Failed.label(),
-];
+pub const CORE_GROUP: &str = "Core";
+pub const NOTE_GROUP: &str = "Note";
+pub const SHELL_GROUP: &str = "Shell";
+pub const SIDEBAR_GROUP: &str = "Sidebar";
+pub const FLAGSHIP_GROUP: &str = "Flagship";
+pub const DIALOG_GROUP: &str = "Dialog";
 
 const PANEL_MIN_WIDTH: f32 = 320.;
 const TRANSCRIPT_PANEL_HEIGHT: f32 = 420.;
+const FALLBACK_TONE: Tone = Tone::Muted;
+const FALLBACK_TONE_INDEX: usize = 0;
+
+pub fn tone_labels() -> Vec<&'static str> {
+    Tone::ALL.iter().map(|tone| tone.label()).collect()
+}
 
 pub fn tone_at(index: usize) -> Tone {
-    match TONES.get(index) {
+    match Tone::ALL.get(index) {
         Some(tone) => *tone,
-        None => Tone::Muted,
+        None => FALLBACK_TONE,
+    }
+}
+
+pub fn tone_index(tone: Tone) -> usize {
+    match Tone::ALL.iter().position(|candidate| *candidate == tone) {
+        Some(index) => index,
+        None => FALLBACK_TONE_INDEX,
     }
 }
 

@@ -82,7 +82,7 @@ fn string_field(event: &Value, field: &str) -> Option<String> {
 }
 
 impl DialogAnswer {
-    pub fn to_response(&self, dialog_id: &str) -> Value {
+    pub(crate) fn to_response(&self, dialog_id: &str) -> Value {
         match self {
             DialogAnswer::Value(value) => {
                 json!({"type": "extension_ui_response", "id": dialog_id, "value": value})

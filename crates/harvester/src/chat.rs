@@ -12,15 +12,15 @@ use crate::session_state::{self, ModelSelection, ModelsState, SessionPhase, Sess
 use crate::store::{FleetStore, StoreEvent};
 use crate::ui::{self, Tone};
 use crate::workspaces::folder_name;
-use harvester_client_core::bridge::Event as BridgeEvent;
+use harvester_client_core::bridge::{Command, Event as BridgeEvent};
 use harvester_client_core::{machines, MachineCandidate, RequestToken};
 use prompt_presentation::{
-    machine_control_label, model_control_state, model_row_label, repo_control_label, ADD_REPO_ROW,
+    machine_control_label, model_control_state, model_row_label, repo_control_label,
 };
 
-pub use session_state::{ChatIntent as ChatRequest, ChatTarget};
+pub use session_state::ChatTarget;
 
-impl EventEmitter<session_state::ChatIntent> for Chat {}
+const UNSENT_REQUEST_DETAIL: &str = "Not connected";
 
 pub enum ChatFlowRequest {
     AddRepo { machine: String },
@@ -137,15 +137,15 @@ impl Chat {
             BridgeEvent::SessionExit { sid, exit_code } if self.renders(sid) => {
                 self.handle_session_exit(*exit_code, cx)
             }
-            BridgeEvent::SessionModelsListed { sid, token, result } if self.renders(sid) => {
-                self.handle_models_listed(*token, result.clone(), cx)
+            BridgeEvent::PromptFailed { sid, detail } if self.renders(sid) => {
+                self.handle_prompt_failed(detail.clone(), cx)
             }
-            BridgeEvent::SessionState { sid, token, result } if self.renders(sid) => {
-                self.handle_session_state(*token, result.clone(), cx)
-            }
-            BridgeEvent::ModelSet { sid, token, result } if self.renders(sid) => {
-                self.handle_model_set(*token, result, cx)
-            }
+            BridgeEvent::PiAnswered {
+                sid,
+                token,
+                method,
+                result,
+            } if self.renders(sid) => self.handle_pi_answered(method, *token, result.clone(), cx),
             _ => {}
         }
     }
@@ -203,14 +203,42 @@ impl Chat {
     }
 
     fn request_model_controls(&mut self, cx: &mut Context<Self>) {
-        for intent in self.state.request_model_controls() {
-            cx.emit(intent);
+        for command in self.state.request_model_controls() {
+            self.send(command, cx);
         }
     }
 
     fn request_model_list(&mut self, cx: &mut Context<Self>) {
-        if let Some(intent) = self.state.request_model_list() {
-            cx.emit(intent);
+        let Some(command) = self.state.request_model_list() else {
+            return;
+        };
+
+        self.send(command, cx);
+    }
+
+    fn send(&mut self, command: Command, cx: &mut Context<Self>) {
+        let machine = self.state.target().machine.clone();
+        let ends_the_turn = matches!(command, Command::Prompt { .. });
+        let sent = self
+            .store
+            .update(cx, |store, cx| store.send_gated(&machine, command, cx));
+
+        if sent {
+            return;
+        }
+
+        self.fail_unsent(ends_the_turn, cx);
+    }
+
+    fn fail_unsent(&mut self, ends_the_turn: bool, cx: &mut Context<Self>) {
+        let mut changed = self.state.fail_pending(UNSENT_REQUEST_DETAIL.to_string());
+
+        if ends_the_turn {
+            changed |= self.state.fail_prompt(UNSENT_REQUEST_DETAIL.to_string());
+        }
+
+        if changed {
+            cx.notify();
         }
     }
 
@@ -278,7 +306,7 @@ impl Chat {
         }
     }
 
-    pub fn fail_pending_requests(&mut self, detail: String, cx: &mut Context<Self>) {
+    fn fail_pending_requests(&mut self, detail: String, cx: &mut Context<Self>) {
         if self.state.fail_pending(detail) {
             cx.notify();
         }
@@ -295,27 +323,20 @@ impl Chat {
         }
     }
 
-    fn handle_session_state(
+    fn handle_pi_answered(
         &mut self,
+        method: &str,
         token: RequestToken,
         result: Result<Value, String>,
         cx: &mut Context<Self>,
     ) {
-        if self.state.accept_session_state(token, result) {
+        if self.state.accept_pi_answer(method, token, result) {
             cx.notify();
         }
     }
 
-    fn handle_model_set(
-        &mut self,
-        token: RequestToken,
-        result: &Result<Value, String>,
-        cx: &mut Context<Self>,
-    ) {
-        if self
-            .state
-            .accept_model_set(token, result.as_ref().map_err(|error| error.clone()))
-        {
+    fn handle_prompt_failed(&mut self, detail: String, cx: &mut Context<Self>) {
+        if self.state.fail_prompt(detail) {
             cx.notify();
         }
     }
@@ -345,8 +366,8 @@ impl Chat {
     }
 
     fn pick_model(&mut self, picked: Option<ModelChoice>, cx: &mut Context<Self>) {
-        if let Some(intent) = self.state.pick_model(picked) {
-            cx.emit(intent);
+        if let Some(command) = self.state.pick_model(picked) {
+            self.send(command, cx);
         }
 
         cx.notify();
@@ -427,11 +448,13 @@ impl Chat {
     }
 
     fn submit_text(&mut self, text: String, cx: &mut Context<Self>) {
-        if let Some(intent) = self.state.submit_prompt(text) {
-            cx.emit(intent);
-            self.scroll.scroll_to_bottom();
-            cx.notify();
-        }
+        let Some(command) = self.state.submit_prompt(text) else {
+            return;
+        };
+
+        self.scroll.scroll_to_bottom();
+        cx.notify();
+        self.send(command, cx);
     }
 
     fn submit_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -486,12 +509,24 @@ impl Chat {
             window,
             cx,
         );
-        let chat = cx.entity();
+        let chat_for_send = cx.entity();
+        let chat_for_stop = chat_for_send.clone();
         let send = move |window: &mut Window, cx: &mut App| {
-            chat.update(cx, |chat, cx| chat.submit_prompt(window, cx));
+            chat_for_send.update(cx, |chat, cx| chat.submit_prompt(window, cx));
+        };
+        let stop = move |_window: &mut Window, cx: &mut App| {
+            chat_for_stop.update(cx, |chat, cx| chat.stop_session(cx));
         };
 
-        ui::prompt_strip(strip, send, &self.input, cx)
+        ui::prompt_strip(strip, send, stop, &self.input, cx)
+    }
+
+    fn stop_session(&mut self, cx: &mut Context<Self>) {
+        let Some(command) = self.state.stop_command() else {
+            return;
+        };
+
+        self.send(command, cx);
     }
 
     fn handle_pick_model(
@@ -550,6 +585,7 @@ impl Chat {
             repo: self.repo_control(repo_candidates),
             branch: self.branch_label(),
             can_send: self.can_send(),
+            can_stop: self.state.can_stop(),
             focused: self.input.read(cx).focus_handle(cx).is_focused(window),
         }
     }
@@ -643,7 +679,7 @@ impl Chat {
             .collect();
 
         rows.push(ui::DropdownRow {
-            label: ADD_REPO_ROW.into(),
+            label: ui::ADD_REPO_ROW.into(),
             selected: false,
             divider_above: !repos.is_empty(),
         });

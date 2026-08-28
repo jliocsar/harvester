@@ -1,7 +1,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const SKIPPED_DIR_NAMES: &[&str] = &["target", "bin"];
+const SKIPPED_DIR_NAMES: &[&str] = &["target"];
+
+const SPIKE_DIR_NAME: &str = "bin";
+const SPIKE_PARENT_DIR_NAME: &str = "src";
 
 #[derive(Debug)]
 struct CommentSite {
@@ -25,18 +28,33 @@ fn collect_rust_files(dir: &Path, found: &mut Vec<PathBuf>) {
         let file_type = entry.file_type().expect("readable file type");
 
         if file_type.is_dir() {
-            let name = entry.file_name();
-            let skipped = SKIPPED_DIR_NAMES
-                .iter()
-                .any(|skipped_name| name == *skipped_name);
-
-            if !skipped {
+            if !is_skipped_directory(&path) {
                 collect_rust_files(&path, found);
             }
         } else if path.extension().is_some_and(|extension| extension == "rs") {
             found.push(path);
         }
     }
+}
+
+fn is_skipped_directory(path: &Path) -> bool {
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    let skipped_at_any_depth = SKIPPED_DIR_NAMES
+        .iter()
+        .any(|skipped_name| *name == **skipped_name);
+
+    if skipped_at_any_depth {
+        return true;
+    }
+
+    let sits_directly_under_a_crate_src = path
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|parent_name| *parent_name == *SPIKE_PARENT_DIR_NAME);
+
+    *name == *SPIKE_DIR_NAME && sits_directly_under_a_crate_src
 }
 
 fn first_comment_line(source: &str) -> Option<usize> {
@@ -137,6 +155,10 @@ fn skip_string(characters: &[char], opening_index: usize, line: &mut usize) -> u
         let current = characters[index];
 
         if current == '\\' {
+            if characters.get(index + 1) == Some(&'\n') {
+                *line += 1;
+            }
+
             index += 2;
         } else if current == '\n' {
             *line += 1;
@@ -228,4 +250,38 @@ fn the_scanner_sees_through_literals() {
     assert_eq!(first_comment_line("fn a() {}\n/* block */"), Some(2));
     assert_eq!(first_comment_line("let escaped = \"\\\"//\\\"\";"), None);
     assert_eq!(first_comment_line("let quote = '\\''; // after"), Some(1));
+}
+
+#[test]
+fn a_line_continuation_inside_a_string_still_counts_its_newline() {
+    let source = "let s = \"first \\\n    second\";\nlet t = 1; // here";
+
+    assert_eq!(
+        first_comment_line(source),
+        Some(3),
+        "a backslash-newline continuation is still a newline; missing it drifts \
+         every offender line number after it"
+    );
+}
+
+#[test]
+fn only_a_crates_own_src_bin_is_exempt_from_the_walk() {
+    for exempt in [
+        "/w/crates/harvester/src/bin",
+        "/w/crates/harvesterd/src/bin",
+        "/w/crates/harvester/target",
+        "/w/crates/harvester/src/target",
+    ] {
+        assert!(is_skipped_directory(Path::new(exempt)), "{exempt}");
+    }
+
+    for walked in [
+        "/w/crates/harvester-gallery/src/stories/bin",
+        "/w/crates/harvester/bin",
+        "/w/crates/bin",
+        "/w/crates/harvester/src/binary",
+        "/w/crates/harvester/src",
+    ] {
+        assert!(!is_skipped_directory(Path::new(walked)), "{walked}");
+    }
 }

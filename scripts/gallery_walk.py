@@ -23,12 +23,20 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(GPUI_MCP_ROOT, "scripts"))
 from e2e_mcp import McpClient, PROTOCOL_VERSION, header_frame
 
-GALLERY_BINARY = os.path.join(REPO_ROOT, "target/debug/gallery")
+# The gallery is a crate of its own, with its own workspace and target dir, so
+# its binary does not land in the repo-root target dir.
+GALLERY_CRATE = os.path.join(REPO_ROOT, "crates/harvester-gallery")
+GALLERY_BINARY = os.path.join(GALLERY_CRATE, "target/debug/gallery")
 SERVER_BINARY = os.path.join(GPUI_MCP_ROOT, "target/debug/gpui-mcp")
 ATTACH_ATTEMPTS = 60
 ATTACH_DELAY_SECONDS = 1.0
 DOCK_TITLE = "Controls"
 CLICK_SETTLE_SECONDS = 0.6
+# The catalog as registered in crates/harvester-gallery/src/registry.rs. Floors
+# rather than equalities, so adding a story does not fail the walk while a
+# story (or a whole group) silently disappearing does.
+EXPECTED_GROUP_COUNT = 6
+EXPECTED_STORY_COUNT = 14
 
 
 def parse_lines(snapshot_text):
@@ -194,7 +202,11 @@ def main():
             ]
 
         groups = [label for _, label, _ in group_headers(snapshot)]
-        check("sidebar lists story groups", len(groups) >= 5, f"{len(groups)} groups")
+        check(
+            "sidebar lists story groups",
+            len(groups) >= EXPECTED_GROUP_COUNT,
+            f"{len(groups)} groups",
+        )
 
         for label in groups:
             set_group(label, False)
@@ -231,7 +243,11 @@ def main():
 
             set_group(group, False)
 
-        check("walk reached every story", story_count >= 10, f"{story_count} stories")
+        check(
+            "walk reached every story",
+            story_count >= EXPECTED_STORY_COUNT,
+            f"{story_count} stories",
+        )
 
         if knob_story is None:
             check(

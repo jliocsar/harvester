@@ -23,20 +23,17 @@ pub use connection::{DaemonConnection, DaemonReader, DaemonWriter};
 pub use dialog::{DialogAnswer, DialogKind, DialogRequest};
 pub use dialog_obligation::{
     AnsweredDialog, DialogKey, DialogObligation, DialogObligations, DialogRoom, EnqueueResult,
-    Retirement,
 };
 pub use fleet::{
     BridgeEvents, Fleet, FleetError, FleetEvents, MachineCandidate, MachineState, MachinesEvents,
     Unapplied,
 };
 pub use host::Host;
-pub use machine::{MachineRef, LOCAL_MACHINE};
+pub use machine::LOCAL_MACHINE;
 pub use ssh::SshTarget;
 pub use token::{Pending, RequestToken, RequestTokens};
 pub use transcript::Transcript;
-pub use workspace::{
-    list_directory, resolve_git_branch, resolve_home, validate_git_workspace, RemoteDirEntry,
-};
+pub use workspace::RemoteDirEntry;
 
 pub type Result<T> = std::result::Result<T, Error>;
 

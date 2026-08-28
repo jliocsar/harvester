@@ -14,7 +14,7 @@ struct Cli {
     #[arg(
         long,
         value_name = "PATH",
-        default_value = "target/x86_64-unknown-linux-musl/release/harvesterd"
+        default_value = "target/x86_64-unknown-linux-musl/daemon-release/harvesterd"
     )]
     daemon_bin: PathBuf,
 
@@ -42,7 +42,7 @@ async fn main() {
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let daemon_binary = std::fs::read(&cli.daemon_bin).map_err(|error| {
         format!(
-            "read {}: {error}\n(build it: cargo build --release --target x86_64-unknown-linux-musl -p harvesterd)",
+            "read {}: {error}\n(build it: cargo build --profile daemon-release --target x86_64-unknown-linux-musl -p harvesterd)",
             cli.daemon_bin.display()
         )
     })?;
@@ -52,10 +52,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         port: None,
     };
     let connected = bootstrap_and_connect(&Host::Ssh(target.clone()), &daemon_binary).await?;
-    eprintln!(
-        "harvesterd {} on {} ({:?})",
-        connected.daemon_version, target.dest, connected.outcome
-    );
+    eprintln!("harvesterd on {} ({:?})", target.dest, connected.outcome);
 
     match cli.command {
         CliCommand::Ping => Ok(()),
@@ -66,9 +63,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
 async fn list_sessions(connection: DaemonConnection) -> Result<(), Box<dyn std::error::Error>> {
     let (client, _events) = DaemonClient::start(connection);
-    let response = client
-        .harvester(HarvesterCmd::ListSessions { cwd: None })
-        .await?;
+    let response = client.harvester(HarvesterCmd::ListSessions).await?;
     let data = response.into_result()?;
 
     println!("{}", serde_json::to_string_pretty(&data)?);

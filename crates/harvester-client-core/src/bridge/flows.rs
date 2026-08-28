@@ -13,10 +13,12 @@ use super::{
 use crate::dialog::DialogAnswer;
 use crate::token::RequestToken;
 
+const UNKNOWN_PI_ERROR: &str = "unknown error";
+
 pub(super) async fn sessions_flow(context: BridgeContext) {
     let sessions = context
         .client
-        .harvester(HarvesterCmd::ListSessions { cwd: None })
+        .harvester(HarvesterCmd::ListSessions)
         .await
         .map_err(|error| error.to_string())
         .and_then(|response| response.into_result())
@@ -32,37 +34,9 @@ pub(super) async fn sessions_flow(context: BridgeContext) {
 }
 
 pub(super) async fn open_flow(context: BridgeContext, sid: String, cwd: String) {
-    let attached = context.attached.clone();
-    let mut attachment = attached.lock().await;
-
-    if !detach_previous(&context, &mut attachment, &sid).await {
+    let Some(registration) = attach_session(&context, &sid, cwd, None, None, None).await else {
         return;
-    }
-
-    let create = context
-        .client
-        .harvester(HarvesterCmd::CreateSession {
-            sid: sid.clone(),
-            cwd,
-            provider: None,
-            model: None,
-            name: None,
-        })
-        .await;
-
-    if let Err(detail) = flatten_harvester(create) {
-        report_failure(&context, "create session", detail);
-
-        return;
-    }
-
-    let registration = AttachRegistration::register(&context.attach_buffers, &sid);
-
-    if !attach(&context, &mut attachment, &sid).await {
-        return;
-    }
-
-    drop(attachment);
+    };
 
     if replay_history(&context, sid.clone(), registration).await {
         spawn_flow(resync_flow(context, sid));
@@ -70,18 +44,20 @@ pub(super) async fn open_flow(context: BridgeContext, sid: String, cwd: String) 
 }
 
 pub(super) async fn resync_flow(context: BridgeContext, sid: String) {
-    if context.attached.lock().await.as_deref() != Some(sid.as_str()) {
-        return;
-    }
-
     let Some(_in_flight) = ResyncGuard::claim(&context, &sid) else {
         return;
     };
 
     loop {
+        if !is_attached(&context, &sid).await {
+            return;
+        }
+
         let registration = AttachRegistration::register(&context.attach_buffers, &sid);
 
         if !repair_history(&context, &sid).await {
+            deliver_buffered_events(&context, sid.clone(), registration);
+
             return;
         }
 
@@ -91,10 +67,14 @@ pub(super) async fn resync_flow(context: BridgeContext, sid: String) {
     }
 }
 
+async fn is_attached(context: &BridgeContext, sid: &str) -> bool {
+    context.attached.lock().await.as_deref() == Some(sid)
+}
+
 async fn repair_history(context: &BridgeContext, sid: &str) -> bool {
     if let Some(leaf_id) = cursor_for(context, sid) {
         if let Ok((entries, next_leaf_id)) = fetch_entries(context, sid, Some(&leaf_id)).await {
-            record_cursor(context, sid, next_leaf_id);
+            record_cursor(context, sid, next_leaf_id).await;
             context.events.send(Event::HistoryExtended {
                 sid: sid.to_string(),
                 entries,
@@ -113,7 +93,7 @@ async fn repair_history(context: &BridgeContext, sid: &str) -> bool {
         }
     };
 
-    record_cursor(context, sid, leaf_id);
+    record_cursor(context, sid, leaf_id).await;
     context.events.send(Event::HistoryReplaced {
         sid: sid.to_string(),
         entries,
@@ -152,7 +132,11 @@ fn cursor_for(context: &BridgeContext, sid: &str) -> Option<String> {
         .map(|cursor| cursor.leaf_id.clone())
 }
 
-fn record_cursor(context: &BridgeContext, sid: &str, leaf_id: Option<String>) {
+async fn record_cursor(context: &BridgeContext, sid: &str, leaf_id: Option<String>) {
+    if !is_attached(context, sid).await {
+        return;
+    }
+
     *lock_cursor(&context.cursor) = leaf_id.map(|leaf_id| SessionCursor {
         sid: sid.to_string(),
         leaf_id,
@@ -211,7 +195,7 @@ async fn replay_history(
         }
     };
 
-    record_cursor(context, &sid, leaf_id);
+    record_cursor(context, &sid, leaf_id).await;
     context.events.send(Event::Attached {
         sid: sid.clone(),
         entries,
@@ -250,35 +234,10 @@ pub(super) async fn start_session_flow(
     name: String,
     first_prompt: String,
 ) {
-    let attached = context.attached.clone();
-    let mut attached = attached.lock().await;
-
-    if !detach_previous(&context, &mut attached, &sid).await {
+    let Some(registration) = attach_session(&context, &sid, cwd, provider, model, Some(name)).await
+    else {
         return;
-    }
-
-    let create = context
-        .client
-        .harvester(HarvesterCmd::CreateSession {
-            sid: sid.clone(),
-            cwd,
-            provider,
-            model,
-            name: Some(name),
-        })
-        .await;
-
-    if let Err(detail) = flatten_harvester(create) {
-        report_failure(&context, "create session", detail);
-
-        return;
-    }
-
-    let registration = AttachRegistration::register(&context.attach_buffers, &sid);
-
-    if !attach(&context, &mut attached, &sid).await {
-        return;
-    }
+    };
 
     context.events.send(Event::Attached {
         sid: sid.clone(),
@@ -290,6 +249,47 @@ pub(super) async fn start_session_flow(
     }
 
     spawn_flow(prompt_flow(context, sid, first_prompt));
+}
+
+async fn attach_session(
+    context: &BridgeContext,
+    sid: &str,
+    cwd: String,
+    provider: Option<String>,
+    model: Option<String>,
+    name: Option<String>,
+) -> Option<AttachRegistration> {
+    let attached = context.attached.clone();
+    let mut attachment = attached.lock().await;
+
+    if !detach_previous(context, &mut attachment, sid).await {
+        return None;
+    }
+
+    let create = context
+        .client
+        .harvester(HarvesterCmd::CreateSession {
+            sid: sid.to_string(),
+            cwd,
+            provider,
+            model,
+            name,
+        })
+        .await;
+
+    if let Err(detail) = flatten_harvester(create) {
+        report_failure(context, "create session", detail);
+
+        return None;
+    }
+
+    let registration = AttachRegistration::register(&context.attach_buffers, sid);
+
+    if !attach(context, &mut attachment, sid).await {
+        return None;
+    }
+
+    Some(registration)
 }
 
 async fn detach_previous(
@@ -353,22 +353,21 @@ async fn attach(context: &BridgeContext, attached: &mut Option<String>, sid: &st
 }
 
 pub(super) async fn prompt_flow(context: BridgeContext, sid: String, text: String) {
-    match context
+    let sent = context
         .client
         .pi(
             &sid,
             json!({"type": "prompt", "message": text, "streamingBehavior": "steer"}),
         )
-        .await
-    {
-        Ok(response) if !pi_success(&response) => report_failure(
-            &context,
-            "prompt",
-            pi_error(&response).unwrap_or_else(|| "unknown error".to_string()),
-        ),
-        Ok(_accepted) => {}
-        Err(error) => report_failure(&context, "prompt", error.to_string()),
-    }
+        .await;
+    let detail = match sent {
+        Ok(response) if pi_success(&response) => return,
+        Ok(response) => pi_error(&response).unwrap_or_else(|| UNKNOWN_PI_ERROR.to_string()),
+        Err(error) => error.to_string(),
+    };
+
+    eprintln!("bridge: the prompt for session {sid} was not delivered: {detail}");
+    context.events.send(Event::PromptFailed { sid, detail });
 }
 
 pub(super) async fn list_models_flow(context: BridgeContext, cwd: String, token: RequestToken) {
@@ -384,33 +383,28 @@ pub(super) async fn list_models_flow(context: BridgeContext, cwd: String, token:
     context.events.send(Event::ModelsListed { token, result });
 }
 
-pub(super) async fn session_models_flow(context: BridgeContext, sid: String, token: RequestToken) {
-    let result = pi_flow_result(&context, &sid, json!({"type": "get_available_models"})).await;
-
-    context
-        .events
-        .send(Event::SessionModelsListed { sid, token, result });
-}
-
-pub(super) async fn session_state_flow(context: BridgeContext, sid: String, token: RequestToken) {
-    let result = pi_flow_result(&context, &sid, json!({"type": "get_state"})).await;
-
-    context
-        .events
-        .send(Event::SessionState { sid, token, result });
-}
-
-pub(super) async fn set_model_flow(
+pub(super) async fn pi_request_flow(
     context: BridgeContext,
     sid: String,
-    provider: String,
-    model_id: String,
+    cmd: Value,
     token: RequestToken,
 ) {
-    let cmd = json!({"type": "set_model", "provider": provider, "modelId": model_id});
+    let method = pi_method(&cmd);
     let result = pi_flow_result(&context, &sid, cmd).await;
 
-    context.events.send(Event::ModelSet { sid, token, result });
+    context.events.send(Event::PiAnswered {
+        sid,
+        token,
+        method,
+        result,
+    });
+}
+
+fn pi_method(cmd: &Value) -> String {
+    cmd.get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
 }
 
 pub(super) async fn stop_flow(context: BridgeContext, sid: String) {
@@ -439,7 +433,7 @@ async fn pi_flow_result(context: &BridgeContext, sid: &str, cmd: Value) -> Resul
         Ok(response) if pi_success(&response) => {
             Ok(response.get("data").cloned().unwrap_or(Value::Null))
         }
-        Ok(response) => Err(pi_error(&response).unwrap_or_else(|| "unknown error".to_string())),
+        Ok(response) => Err(pi_error(&response).unwrap_or_else(|| UNKNOWN_PI_ERROR.to_string())),
         Err(error) => Err(error.to_string()),
     }
 }

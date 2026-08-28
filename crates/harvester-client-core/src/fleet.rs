@@ -16,7 +16,7 @@ enum Machine {
 
 enum Link {
     Connecting,
-    Connected { daemon_version: String },
+    Connected,
     Failed { detail: String },
     Lost,
 }
@@ -41,7 +41,7 @@ impl Link {
     fn state(&self) -> MachineState<'_> {
         match self {
             Link::Connecting => MachineState::Connecting,
-            Link::Connected { daemon_version } => MachineState::Connected { daemon_version },
+            Link::Connected => MachineState::Connected,
             Link::Failed { detail } => MachineState::ConnectFailed { detail },
             Link::Lost => MachineState::ConnectionLost,
         }
@@ -55,17 +55,14 @@ pub enum MachineState<'a> {
     Reachable,
     Unreachable,
     Connecting,
-    Connected { daemon_version: &'a str },
+    Connected,
     ConnectFailed { detail: &'a str },
     ConnectionLost,
 }
 
 impl MachineState<'_> {
     pub fn is_live(&self) -> bool {
-        matches!(
-            self,
-            MachineState::Connecting | MachineState::Connected { .. }
-        )
+        matches!(self, MachineState::Connecting | MachineState::Connected)
     }
 }
 
@@ -257,8 +254,14 @@ impl Fleet {
     }
 
     pub fn send(&self, machine: &str, command: bridge::Command) {
-        if let Some(Machine::Linked { bridge, .. }) = self.machines.get(machine) {
-            let _ = bridge.commands.send(command);
+        let Some(Machine::Linked { bridge, .. }) = self.machines.get(machine) else {
+            eprintln!("fleet: dropping a command for {machine}, which has no bridge");
+
+            return;
+        };
+
+        if bridge.commands.send(command).is_err() {
+            eprintln!("fleet: dropping a command for {machine}: its bridge thread has stopped");
         }
     }
 
@@ -295,12 +298,7 @@ impl Fleet {
 
     fn record_bridge_event(&mut self, machine: &str, event: &bridge::Event) {
         match event {
-            bridge::Event::Connected { daemon_version } => self.set_link(
-                machine,
-                Link::Connected {
-                    daemon_version: daemon_version.clone(),
-                },
-            ),
+            bridge::Event::Connected => self.set_link(machine, Link::Connected),
             bridge::Event::ConnectFailed { detail } => self.set_link(
                 machine,
                 Link::Failed {
@@ -459,7 +457,7 @@ impl Fleet {
                 matches!(
                     machine,
                     Machine::Linked {
-                        link: Link::Connected { .. },
+                        link: Link::Connected,
                         ..
                     }
                 )
@@ -546,9 +544,7 @@ mod tests {
 
         for linked in [
             Link::Connecting,
-            Link::Connected {
-                daemon_version: "0.1.0".to_string(),
-            },
+            Link::Connected,
             Link::Failed {
                 detail: "no route to host".to_string(),
             },
@@ -631,12 +627,7 @@ mod tests {
     fn a_live_bridge_is_reused() {
         let mut fleet = fleet();
 
-        for live in [
-            Link::Connecting,
-            Link::Connected {
-                daemon_version: "0.1.0".to_string(),
-            },
-        ] {
+        for live in [Link::Connecting, Link::Connected] {
             with_link(&mut fleet, "vm", live);
 
             assert!(matches!(
@@ -917,13 +908,7 @@ mod tests {
             &mut fleet,
             &[provider_row("exe-dev/kept", Some("exedev@kept"))],
         );
-        with_link(
-            &mut fleet,
-            "exe-dev/gone",
-            Link::Connected {
-                daemon_version: "0.1.0".to_string(),
-            },
-        );
+        with_link(&mut fleet, "exe-dev/gone", Link::Connected);
 
         assert!(matches!(
             fleet.state("exe-dev/gone"),
@@ -979,13 +964,7 @@ mod tests {
 
         fleet.handle_probed("exedev@probed-only", true);
         with_link(&mut fleet, "connecting", Link::Connecting);
-        with_link(
-            &mut fleet,
-            "connected",
-            Link::Connected {
-                daemon_version: "0.1.0".to_string(),
-            },
-        );
+        with_link(&mut fleet, "connected", Link::Connected);
 
         assert_eq!(fleet.connected_machine_count(), 1);
         assert_eq!(

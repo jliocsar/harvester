@@ -18,8 +18,8 @@ A provider also *makes its own connections*: it is a separate program, so Harves
 
 - Executable bit set → registered, `<name>` is the provider id shown in the UI.
 - Non-executable files and dotfiles are ignored.
-- Harvester ships one default provider, `exe-dev`, written into this directory whenever it is **absent** — on first run, and on any later run where it is missing. Implemented in the same format as user providers; there are no privileged code paths.
-  - The consequence, since absence is the only trigger: **deleting the bundled provider does not disable it** — the next launch writes it back. **Clear the executable bit to disable any provider** (non-executable files are ignored by discovery). This applies to the bundled one only; a user provider is never written or modified by Harvester.
+- Harvester ships one default provider, `exe-dev`, and **owns that filename**: on every launch the file is (re)written whenever its bytes differ from the copy this build ships — so it is restored when missing and upgraded when a fix ships. The write is staged and renamed into place, so a concurrent run never reads a half-written script. Implemented in the same format as user providers; there are no privileged code paths.
+  - Two consequences: **deleting the bundled provider does not disable it** (the next launch writes it back), and **editing it in place does not stick** (the next launch overwrites your edit). **Clear the executable bit to disable any provider** (non-executable files are ignored by discovery), and keep local modifications in a **differently named** provider file — copy `exe-dev` to e.g. `exe-dev-mine` and edit that. Harvester never writes or modifies any file in this directory other than the bundled name it owns.
 
 ## Transport: one-shot invocations
 
@@ -148,7 +148,7 @@ That last one is the rule worth copying into any provider that shells out: **eve
 
 ## Local machine
 
-The built-in read-only "local" machine (per INITIAL_SPEC) is **not** a provider — it's hardcoded in Harvester (spawn harvesterd as a child over a Unix socket). Providers only model remote machines.
+The built-in read-only "local" machine (`SPEC.md` §Citizens → Machine) is **not** a provider — it's hardcoded in Harvester (spawn harvesterd as a child over a Unix socket). Providers only model remote machines.
 
 ## Future: TypeScript SDK (post-v1)
 

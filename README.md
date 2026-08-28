@@ -31,8 +31,23 @@ is still there.
 Early development. Contracts are designed and hands-on verified against pi
 0.83.0 and real exe.dev VMs; `harvesterd`, the wire protocol crate, the
 `exe-dev` provider, and the SSH bootstrap/connect library are implemented and
-live-tested. The gpui client exists as a first vertical slice: connect to one
-machine, list sessions, attach (or resume), send a prompt, watch it stream.
+live-tested.
+
+The gpui client has grown past its first vertical slice. Built: a fleet of
+machines behind one state per machine (probes, connect policy, status dots), a
+sessions sidebar, chat from before a session exists until after its pi exits,
+prompt-strip machine/repository/model pickers, tool-call blocks, a repairable
+transcript replica, workspaces in `~/.harvester/workspaces.json`, pi's blocking
+dialogs as modals, and the whole widget layer on `gpui-component` under
+Harvester's own dark theme (`DESIGN.md`). Several of those are built but
+unexercised — the dialogs have never been seen on screen, the `local`
+machine has never been click-tested, and the prompt strip's Stop button — the
+client half of stopping a running session, shown while a turn is in flight —
+has never been clicked against a live pi. Session rename, the cost/token
+statusbar and machine create/delete are deferred.
+
+`docs/SPEC.md`'s build-state table is the authoritative, slice-by-slice version
+of this paragraph.
 
 ## Layout
 
@@ -40,17 +55,43 @@ machine, list sessions, attach (or resume), send a prompt, watch it stream.
 docs/            specs & contracts (start at docs/SPEC.md)
 providers/
   exe-dev            the built-in machine provider (sh + jq, the contract's reference)
+scripts/
+  gallery_walk.py    drives the component gallery over MCP as its regression check
 crates/
   harvester-proto/       typed envelope for the client ↔ daemon wire (JSONL)
   harvesterd/            the per-machine daemon
   harvester-client-core/ bootstrap-over-SSH + socket forward + envelope client
   harvester-cli/         dev driver for the client library (ping / list-sessions / raw)
   harvester/             the gpui desktop client
+  harvester-gallery/     dev-only component gallery — its own workspace, not a member
 ```
 
 ## Build
 
 ```sh
 cargo build --workspace
-cargo build --release --target x86_64-unknown-linux-musl -p harvesterd   # deployable daemon
+cargo build --profile daemon-release --target x86_64-unknown-linux-musl -p harvesterd   # deployable daemon
 ```
+
+### The component gallery
+
+`crates/harvester-gallery` renders every `harvester::ui` component in
+isolation, Storybook-style. It is **excluded from the workspace on purpose**:
+it path-depends on a sibling `gpui-mcp` checkout that a clean clone does not
+have, and cargo resolves a workspace member's path dependencies whether or not
+anything enables them — so as a member it broke `cargo build --workspace` for
+everyone else. Excluded, it
+keeps its own `Cargo.lock` and `target/`, and the repo's own gate passes
+without gpui-mcp present.
+
+```sh
+cd crates/harvester-gallery && cargo run    # the catalog
+python3 scripts/gallery_walk.py             # the walk (needs gpui-mcp built)
+```
+
+The walk is the gallery's regression check: it attaches over MCP, clicks every
+story and toggles a knob, asserting from the accessibility tree that the UI
+moved. It needs a display and a built `gpui-mcp` server; `GPUI_MCP_ROOT`
+overrides where that checkout is looked for. `DESIGN.md` §10 is the gallery's
+design rationale, `docs/internals/harvester-gallery.md` its implementation
+notes.

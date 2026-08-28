@@ -47,11 +47,7 @@ impl Drop for Forward {
     }
 }
 
-pub(crate) type ForwardHandle = Arc<Option<Forward>>;
-
-pub(crate) fn no_forward() -> ForwardHandle {
-    Arc::new(None)
-}
+pub(crate) type ForwardHandle = Option<Arc<Forward>>;
 
 pub struct DaemonReader {
     reader: BufReader<Box<dyn AsyncRead + Send + Unpin>>,
@@ -139,11 +135,11 @@ pub mod raw {
 
 pub(crate) async fn connect_host(host: &Host, home: &str) -> Result<(DaemonConnection, PingData)> {
     let (socket, forward) = match host {
-        Host::Local => (PathBuf::from(home).join(DAEMON_SOCKET), no_forward()),
+        Host::Local => (PathBuf::from(home).join(DAEMON_SOCKET), None),
         Host::Ssh(target) => {
             let forward = start_forward(target, home)?;
 
-            (forward.local_socket.clone(), Arc::new(Some(forward)))
+            (forward.local_socket.clone(), Some(Arc::new(forward)))
         }
     };
 
@@ -158,8 +154,7 @@ async fn connect_socket(
 
     loop {
         if let Some(status) = forward
-            .as_ref()
-            .as_ref()
+            .as_deref()
             .map(Forward::exited)
             .transpose()?
             .flatten()
@@ -269,11 +264,11 @@ fn local_socket_path(dest: &str) -> PathBuf {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     dest.hash(&mut hasher);
 
-    crate::ssh::client_socket_dir().join(format!(
-        "{FORWARD_SOCKET_PREFIX}{}-{:016x}{FORWARD_SOCKET_SUFFIX}",
-        std::process::id(),
-        hasher.finish()
-    ))
+    crate::ssh::client_socket_dir().join(forward_socket_name(std::process::id(), hasher.finish()))
+}
+
+fn forward_socket_name(client_pid: u32, destination_hash: u64) -> String {
+    format!("{FORWARD_SOCKET_PREFIX}{client_pid}-{destination_hash:016x}{FORWARD_SOCKET_SUFFIX}")
 }
 
 pub(crate) async fn sweep_leaked_forward_sockets() {
@@ -298,8 +293,51 @@ pub(crate) async fn sweep_leaked_forward_sockets() {
             continue;
         }
 
+        let Some(owner_pid) = forward_socket_owner_pid(name) else {
+            eprintln!("harvester: leaving {name} alone: it names no owning client");
+
+            continue;
+        };
+
+        if process_is_alive(owner_pid).await {
+            continue;
+        }
+
         remove_if_refused(&path).await;
     }
+}
+
+fn forward_socket_owner_pid(name: &str) -> Option<u32> {
+    let owned = name
+        .strip_prefix(FORWARD_SOCKET_PREFIX)?
+        .strip_suffix(FORWARD_SOCKET_SUFFIX)?;
+    let (client_pid, _destination_hash) = owned.split_once('-')?;
+
+    client_pid.parse().ok()
+}
+
+async fn process_is_alive(pid: u32) -> bool {
+    let status = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(pid_liveness_script(pid))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+
+    match status {
+        Ok(status) => status.success(),
+        Err(error) => {
+            eprintln!("harvester: probing pid {pid} for liveness failed: {error}");
+
+            true
+        }
+    }
+}
+
+fn pid_liveness_script(pid: u32) -> String {
+    format!("kill -0 {pid}")
 }
 
 async fn remove_if_refused(path: &Path) {
@@ -366,6 +404,27 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("test dir cleanup");
     }
 
+    #[test]
+    fn a_forward_socket_name_says_which_client_owns_it() {
+        let name = forward_socket_name(4242, 0x0123_4567_89ab_cdef);
+
+        assert_eq!(forward_socket_owner_pid(&name), Some(4242));
+    }
+
+    #[test]
+    fn a_socket_that_names_no_client_is_left_alone() {
+        assert_eq!(forward_socket_owner_pid("harvester-ssh-9f3c.sock"), None);
+        assert_eq!(forward_socket_owner_pid("harvester-.sock"), None);
+    }
+
+    #[tokio::test]
+    async fn a_running_client_is_seen_as_alive() {
+        assert!(
+            process_is_alive(std::process::id()).await,
+            "the sweep must never poke a forward whose client is still running"
+        );
+    }
+
     #[tokio::test]
     async fn keeps_a_socket_with_a_live_listener() {
         let dir = std::env::temp_dir().join(format!("harvester-sweep-live-{}", std::process::id()));
@@ -384,7 +443,7 @@ mod tests {
     #[tokio::test]
     async fn a_connection_frames_over_any_duplex_stream() {
         let (client_side, mut daemon_side) = tokio::io::duplex(4096);
-        let mut connection = DaemonConnection::over(client_side, no_forward());
+        let mut connection = DaemonConnection::over(client_side, None);
 
         connection
             .writer
@@ -429,7 +488,7 @@ mod tests {
         let (client_side, daemon_side) = tokio::io::duplex(4096);
 
         tokio::spawn(async move {
-            let mut daemon = DaemonConnection::over(daemon_side, no_forward());
+            let mut daemon = DaemonConnection::over(daemon_side, None);
             let request = daemon.reader.next_line_for_test().await;
 
             assert_eq!(request["cmd"], json!({"type": "ping", "version": 1}));
@@ -443,7 +502,7 @@ mod tests {
                 .await;
         });
 
-        let (_connection, ping) = handshake(DaemonConnection::over(client_side, no_forward()))
+        let (_connection, ping) = handshake(DaemonConnection::over(client_side, None))
             .await
             .expect("the handshake completes");
 
@@ -456,13 +515,13 @@ mod tests {
         let (client_side, daemon_side) = tokio::io::duplex(4096);
 
         tokio::spawn(async move {
-            DaemonConnection::over(daemon_side, no_forward())
+            DaemonConnection::over(daemon_side, None)
                 .reader
                 .next_line_for_test()
                 .await;
         });
 
-        let Err(error) = handshake(DaemonConnection::over(client_side, no_forward())).await else {
+        let Err(error) = handshake(DaemonConnection::over(client_side, None)).await else {
             panic!("EOF before the response must fail");
         };
 
@@ -474,7 +533,7 @@ mod tests {
         let (client_side, daemon_side) = tokio::io::duplex(4096);
 
         tokio::spawn(async move {
-            let mut daemon = DaemonConnection::over(daemon_side, no_forward());
+            let mut daemon = DaemonConnection::over(daemon_side, None);
             daemon.reader.next_line_for_test().await;
             daemon
                 .writer
@@ -482,7 +541,7 @@ mod tests {
                 .await;
         });
 
-        let Err(error) = handshake(DaemonConnection::over(client_side, no_forward())).await else {
+        let Err(error) = handshake(DaemonConnection::over(client_side, None)).await else {
             panic!("an event is not a ping response");
         };
 

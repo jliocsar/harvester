@@ -1,0 +1,57 @@
+# The component gallery: a dev-only story catalog for `harvester::ui`.
+#
+# Its own workspace on purpose (docs/internals/harvester-gallery.md). The gpui-mcp
+# bridge below is a path dependency on a sibling checkout nobody but this
+# machine has, and cargo loads every path-dep manifest unconditionally — an
+# `optional = true` feature gate and a `cfg(any())` target table were both
+# measured and both still fail on a clean clone. A crate excluded from the
+# root workspace is the only arrangement that tolerates the missing path, so
+# `cargo check --workspace` at the repo root passes without gpui-mcp present.
+#
+# It stays under `crates/` because the no_comments test walks the filesystem
+# from `crates/`, not the workspace member list: quarantine keeps the lint.
+# The cost is this crate's own Cargo.lock and its own target/ — the gpui pins
+# below are the app's and must be bumped with it.
+[workspace]
+resolver = "2"
+
+[package]
+name = "harvester-gallery"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Same sources as crates/harvester's, pinned by this crate's own lockfile.
+gpui = { git = "https://github.com/zed-industries/zed" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
+    "font-kit",
+    "x11",
+    "wayland",
+    "runtime_shaders",
+] }
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "f96f1576", features = [
+    "tree-sitter-typescript",
+    "tree-sitter-tsx",
+    "tree-sitter-bash",
+    "tree-sitter-rust",
+    "tree-sitter-python",
+    "tree-sitter-go",
+    "tree-sitter-diff",
+    "tree-sitter-toml",
+    "tree-sitter-yaml",
+] }
+# Lets gpui-mcp (the MCP server) attach to the gallery and drive it: dump the
+# a11y tree, inject keys. Inert unless launched with `GPUI_MCP=1` on a debug
+# build. This dependency is why the crate is quarantined.
+gpui-mcp-bridge = { path = "../../../gpui-mcp/crates/gpui-mcp-bridge" }
+harvester = { path = "../harvester" }
+harvester-client-core = { path = "../harvester-client-core" }
+harvester-proto = { path = "../harvester-proto" }
+serde_json = "1"
+
+[[bin]]
+name = "gallery"
+path = "src/main.rs"
+
+[profile.dev]
+debug = "line-tables-only"

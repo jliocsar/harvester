@@ -10,7 +10,7 @@ pub struct RequestTokens {
 }
 
 impl RequestTokens {
-    pub fn mint(&self) -> RequestToken {
+    pub(crate) fn mint(&self) -> RequestToken {
         RequestToken(self.next.fetch_add(1, Ordering::Relaxed))
     }
 }
@@ -43,7 +43,7 @@ impl<T> Pending<T> {
         self.outstanding.take().map(|(_token, context)| context)
     }
 
-    pub fn is_outstanding(&self, token: RequestToken) -> bool {
+    fn is_outstanding(&self, token: RequestToken) -> bool {
         matches!(&self.outstanding, Some((outstanding, _)) if *outstanding == token)
     }
 

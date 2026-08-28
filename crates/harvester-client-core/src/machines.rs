@@ -78,12 +78,12 @@ pub struct MachineRow {
     pub target: Option<SshTarget>,
 }
 
-pub struct MachinesWorker {
+pub(crate) struct MachinesWorker {
     pub commands: UnboundedSender<Command>,
     pub events: UnboundedReceiver<Event>,
 }
 
-pub fn start() -> std::io::Result<MachinesWorker> {
+pub(crate) fn start() -> std::io::Result<MachinesWorker> {
     let (command_sender, command_receiver) = unbounded_channel();
     let (event_sender, event_receiver) = unbounded_channel();
 
@@ -277,7 +277,7 @@ fn machine_rows(provider: &Provider, machines: Vec<ProviderMachine>) -> Vec<Mach
             .to_string(),
             label: machine.label,
             provider: provider.name.clone(),
-            target: machine.ssh.target().ok(),
+            target: machine.ssh.target(),
         })
         .collect()
 }

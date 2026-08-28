@@ -112,7 +112,6 @@ impl ReplayTranscript {
 
 pub struct StoryRuntime {
     pub section_expanded: bool,
-    pub dropdown_selection: usize,
     pub prompt_input: Entity<InputState>,
     pub dialog_single_line_input: Entity<InputState>,
     pub dialog_multi_line_input: Entity<InputState>,
@@ -129,7 +128,6 @@ impl StoryRuntime {
 
         Self {
             section_expanded: true,
-            dropdown_selection: 0,
             prompt_input,
             dialog_single_line_input: create_single_line_input(
                 DIALOG_SINGLE_LINE_PLACEHOLDER.to_string(),

@@ -15,6 +15,10 @@ const INVOKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 const BUNDLED_EXE_DEV: &str = include_str!("../../../providers/exe-dev");
 
+const BUNDLED_EXE_DEV_NAME: &str = "exe-dev";
+
+const BUNDLED_PROVIDER_MODE: u32 = 0o755;
+
 #[derive(Debug, Clone)]
 pub struct Provider {
     pub name: String,
@@ -62,23 +66,16 @@ pub enum SshInfo {
 }
 
 impl SshInfo {
-    pub fn target(&self) -> Result<SshTarget> {
-        match self {
-            SshInfo::Host { host, user, port } => {
-                let dest = match user {
-                    Some(user) => format!("{user}@{host}"),
-                    None => host.clone(),
-                };
+    pub fn target(&self) -> Option<SshTarget> {
+        let SshInfo::Host { host, user, port } = self else {
+            return None;
+        };
+        let dest = match user {
+            Some(user) => format!("{user}@{host}"),
+            None => host.clone(),
+        };
 
-                Ok(SshTarget { dest, port: *port })
-            }
-            SshInfo::Argv(_) => Err(Error::Exec {
-                context: "derive ssh target",
-                detail: "the argv ssh form is not supported yet — \
-                         use {host, user, port}"
-                    .to_string(),
-            }),
-        }
+        Some(SshTarget { dest, port: *port })
     }
 }
 
@@ -93,9 +90,9 @@ fn providers_dir() -> Result<PathBuf> {
 }
 
 pub fn install_bundled_providers() -> Result<()> {
-    let path = providers_dir()?.join("exe-dev");
+    let path = providers_dir()?.join(BUNDLED_EXE_DEV_NAME);
 
-    if path.exists() {
+    if installed_matches_bundle(&path) {
         return Ok(());
     }
 
@@ -103,11 +100,28 @@ pub fn install_bundled_providers() -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    std::fs::write(&path, BUNDLED_EXE_DEV)?;
+    let staged = path.with_extension(format!("next.{}", std::process::id()));
 
-    let mut permissions = std::fs::metadata(&path)?.permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&path, permissions)?;
+    if let Err(error) = write_bundled_provider(&staged, &path) {
+        let _ = std::fs::remove_file(&staged);
+
+        return Err(error);
+    }
+
+    Ok(())
+}
+
+fn installed_matches_bundle(path: &std::path::Path) -> bool {
+    matches!(std::fs::read(path), Ok(installed) if installed == BUNDLED_EXE_DEV.as_bytes())
+}
+
+fn write_bundled_provider(staged: &std::path::Path, path: &std::path::Path) -> Result<()> {
+    std::fs::write(staged, BUNDLED_EXE_DEV)?;
+
+    let mut permissions = std::fs::metadata(staged)?.permissions();
+    permissions.set_mode(BUNDLED_PROVIDER_MODE);
+    std::fs::set_permissions(staged, permissions)?;
+    std::fs::rename(staged, path)?;
 
     Ok(())
 }
@@ -429,6 +443,33 @@ mod tests {
             .expect_err("`machines` is required by contract");
 
         assert!(error.to_string().contains("machines"), "{error}");
+    }
+
+    #[test]
+    fn only_a_byte_identical_install_is_left_alone() {
+        let dir = std::env::temp_dir().join(format!("harvester-bundle-{}", std::process::id()));
+
+        std::fs::create_dir_all(&dir).expect("test dir");
+
+        let path = dir.join(BUNDLED_EXE_DEV_NAME);
+
+        assert!(
+            !installed_matches_bundle(&path),
+            "nothing installed is not a match"
+        );
+
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").expect("write");
+
+        assert!(
+            !installed_matches_bundle(&path),
+            "a shipped fix must reach an install that predates it"
+        );
+
+        std::fs::write(&path, BUNDLED_EXE_DEV).expect("write");
+
+        assert!(installed_matches_bundle(&path));
+
+        std::fs::remove_dir_all(&dir).expect("test dir cleanup");
     }
 
     #[test]

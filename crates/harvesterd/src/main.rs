@@ -1,5 +1,6 @@
 mod daemon;
 mod fslist;
+mod models;
 mod ops;
 mod passthrough;
 mod paths;

@@ -32,6 +32,11 @@ Enforced by `crates/harvester/tests/no_comments.rs` (a string-literal-aware
 lexer over every `.rs` file; runs in `cargo test --workspace`). `src/bin/`
 spikes are exempt — throwaway code was always exempt from house rules.
 
+The ban covers Rust tokens under `crates/` and nothing else: `#` prose in Cargo
+manifests and in `providers/` scripts is allowed, and is where a build-time or
+provider-side decision is explained, because neither file has a
+`docs/internals/<crate>.md` counterpart a reader would think to open.
+
 ## Architecture invariants (do not violate)
 
 - **Disk on the VM is the only source of truth.** Pi's session `.jsonl` files are
@@ -111,7 +116,7 @@ itself is broken — node version mismatch — but the source is readable).
 
 ```sh
 cargo fmt && cargo check --workspace     # gate before handing anything over
-cargo build --release --target x86_64-unknown-linux-musl -p harvesterd  # the shippable daemon
+cargo build --profile daemon-release --target x86_64-unknown-linux-musl -p harvesterd  # the shippable daemon
 ```
 
 Protocol smoke test: run `./target/debug/harvesterd`, connect to
