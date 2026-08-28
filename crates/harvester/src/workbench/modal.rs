@@ -3,7 +3,6 @@ use gpui_component::WindowExt as _;
 use harvester_client_core::bridge::{Command, Event as BridgeEvent};
 use harvester_client_core::{
     DialogAnswer, DialogKey, DialogObligation, DialogObligations, DialogRequest, DialogRoom,
-    EnqueueResult,
 };
 
 use super::picker::{FolderPicker, WorkspacePicked};
@@ -15,13 +14,9 @@ const NOTHING_IS_DELETED: &str = "Nothing on the machine itself is deleted.";
 const FORGET_CANCEL_LABEL: &str = "Cancel";
 const FORGET_ACTION_LABEL: &str = "Remove";
 
-pub(super) struct RepoAdded {
-    pub machine: String,
-    pub path: String,
-}
-
-pub(super) struct MachineForgotten {
-    pub machine: String,
+pub(super) enum ModalOutcome {
+    RepoAdded { machine: String, path: String },
+    MachineForgotten { machine: String },
 }
 
 enum ActiveModal {
@@ -45,8 +40,7 @@ pub(super) struct ModalCoordinator {
     _store_events: Subscription,
 }
 
-impl EventEmitter<RepoAdded> for ModalCoordinator {}
-impl EventEmitter<MachineForgotten> for ModalCoordinator {}
+impl EventEmitter<ModalOutcome> for ModalCoordinator {}
 
 impl ModalCoordinator {
     pub(super) fn new(
@@ -139,11 +133,10 @@ impl ModalCoordinator {
             .store
             .update(cx, |store, cx| store.forget_machine(&machine, cx));
 
-        self.active = None;
-        self.defer_advance(window, cx);
+        self.release(window, cx);
 
         if forgotten {
-            cx.emit(MachineForgotten { machine });
+            cx.emit(ModalOutcome::MachineForgotten { machine });
         }
 
         true
@@ -154,8 +147,7 @@ impl ModalCoordinator {
             return false;
         }
 
-        self.active = None;
-        self.defer_advance(window, cx);
+        self.release(window, cx);
 
         true
     }
@@ -178,7 +170,7 @@ impl ModalCoordinator {
         self.store.update(cx, |store, cx| {
             store.add_workspace(machine.clone(), path.clone(), cx)
         });
-        cx.emit(RepoAdded { machine, path });
+        cx.emit(ModalOutcome::RepoAdded { machine, path });
         self.defer_advance(window, cx);
     }
 
@@ -189,8 +181,7 @@ impl ModalCoordinator {
 
         picker.update(cx, |picker, cx| picker.cancel(cx));
 
-        self.active = None;
-        self.defer_advance(window, cx);
+        self.release(window, cx);
 
         true
     }
@@ -250,9 +241,13 @@ impl ModalCoordinator {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let obligation = DialogObligation::new(machine.to_string(), sid.to_string(), request);
+        let obligation = DialogObligation {
+            machine: machine.to_string(),
+            sid: sid.to_string(),
+            request,
+        };
 
-        if self.obligations.enqueue(obligation) == EnqueueResult::Rejected {
+        if !self.obligations.enqueue(obligation).accepted() {
             return;
         }
 
@@ -316,9 +311,10 @@ impl ModalCoordinator {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let retired = self
-            .obligations
-            .enter_room(DialogRoom::new(machine.to_string(), sid.to_string()));
+        let retired = self.obligations.enter_room(DialogRoom {
+            machine: machine.to_string(),
+            sid: sid.to_string(),
+        });
 
         self.apply_retirement(retired, window, cx);
     }
@@ -362,6 +358,11 @@ impl ModalCoordinator {
 
     fn displays(&self, key: &DialogKey) -> bool {
         matches!(&self.active, Some(ActiveModal::PiQuestion { key: displayed }) if displayed == key)
+    }
+
+    fn release(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.active = None;
+        self.defer_advance(window, cx);
     }
 
     fn defer_advance(&self, window: &mut Window, cx: &mut Context<Self>) {

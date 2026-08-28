@@ -65,7 +65,7 @@ impl Tone {
 }
 
 pub(super) fn dim(cx: &App) -> Hsla {
-    cx.theme().muted_foreground
+    Tone::Muted.color(cx)
 }
 
 pub(super) fn faint(cx: &App) -> Hsla {

@@ -14,7 +14,7 @@ struct Cli {
     #[arg(
         long,
         value_name = "PATH",
-        default_value = "target/x86_64-unknown-linux-musl/daemon-release/harvesterd"
+        default_value = harvester_proto::DEV_DAEMON_PATH
     )]
     daemon_bin: PathBuf,
 

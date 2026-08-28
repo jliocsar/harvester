@@ -14,22 +14,22 @@ const HOLLOW_SHAPE_NAME: &str = "hollow";
 
 pub fn stories() -> Vec<Story> {
     vec![
-        Story::new(
-            CORE_GROUP,
-            TONE_SWATCHES_STORY,
-            Vec::new(),
-            Vec::new(),
-            tone_swatches,
-        ),
-        Story::new(
-            CORE_GROUP,
-            DOT_STORY,
-            vec![KnobSpec::choice(
+        Story {
+            group: CORE_GROUP,
+            name: TONE_SWATCHES_STORY,
+            knobs: Vec::new(),
+            presets: Vec::new(),
+            render: tone_swatches,
+        },
+        Story {
+            group: CORE_GROUP,
+            name: DOT_STORY,
+            knobs: vec![KnobSpec::choice(
                 TONE_KNOB,
                 &tone_labels(),
                 tone_index(Tone::Live),
             )],
-            vec![
+            presets: vec![
                 Preset::new(
                     "running session",
                     vec![(TONE_KNOB, KnobValue::Choice(tone_index(Tone::Live)))],
@@ -39,8 +39,8 @@ pub fn stories() -> Vec<Story> {
                     vec![(TONE_KNOB, KnobValue::Choice(tone_index(Tone::Failed)))],
                 ),
             ],
-            dot,
-        ),
+            render: dot,
+        },
     ]
 }
 

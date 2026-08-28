@@ -10,8 +10,9 @@ mod workspaces;
 
 pub use harvester::{assets, ui};
 
+use harvester_proto::DEV_DAEMON_PATH;
+
 const EMBEDDED_DAEMON: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/harvesterd"));
-const DEV_DAEMON_PATH: &str = "target/x86_64-unknown-linux-musl/daemon-release/harvesterd";
 
 fn main() {
     let argv_machine = std::env::args().nth(1);

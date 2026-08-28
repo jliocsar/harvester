@@ -308,7 +308,9 @@ frames/decodes/routes/encodes (the controller-layer house rule).
   typed struct: `{}`, `{"stopping": true}` and `{"stopping": false}` are
   write-only shapes nobody decodes, and a `DetachData {}`/`StopData` pair in
   `harvester-proto` was two types whose entire content was the literal they
-  produced. The shapes stay pinned by docs/DAEMON.md, by
+  produced. They still go through `data_response` (a `Value` is `Serialize`
+  like any typed payload), so a successful answer has exactly one spelling in
+  this module. The shapes stay pinned by docs/DAEMON.md, by
   `detach_answers_the_documented_empty_payload` and by
   `stopping_a_session_that_is_no_longer_running_succeeds`.
   The `already` flags on `attach`/`create_session` keep their typed payloads —
@@ -484,7 +486,9 @@ logic itself lives in `ops.rs` (harvester-native commands) and
   mechanism, not arrival order. `Raw` carries a pre-serialized wire line (sans
   trailing LF) shared straight from a session's event fan-out, written as-is
   and never re-serialized (avoids reserializing the same broadcast event once
-  per subscriber).
+  per subscriber). `Outbound::write_into` owns the framing itself — reset the
+  reused buffer, encode or copy the payload, append the trailing `LF` — so
+  the writer task's loop only owns the socket.
 - Connection teardown order in `serve_connection` matters: detach first
   (`attached.clear()`, which drops the forwarders' senders), *then* drop the
   connection's own `out_tx`. The writer task ends once the last sender is

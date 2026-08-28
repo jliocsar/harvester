@@ -267,16 +267,18 @@ fn items_from_entries(entries: &[Value]) -> Vec<Item> {
 
 fn extend_items(items: &mut Vec<Item>, entries: &[Value]) {
     let mut tool_results: HashMap<&str, &Value> = HashMap::new();
+    let mut messages: Vec<(&Value, Role)> = Vec::new();
 
     for entry in entries {
         let Some(message) = entry.get("message") else {
             continue;
         };
 
-        if message.get("role").and_then(Value::as_str) == Some("toolResult") {
-            if let Some(tool_call_id) = message.get("toolCallId").and_then(Value::as_str) {
-                tool_results.insert(tool_call_id, message);
-            }
+        match message.get("role").and_then(Value::as_str) {
+            Some("toolResult") => record_tool_result(&mut tool_results, message),
+            Some("user") => messages.push((message, Role::User)),
+            Some("assistant") => messages.push((message, Role::Assistant)),
+            _ => {}
         }
     }
 
@@ -286,41 +288,48 @@ fn extend_items(items: &mut Vec<Item>, entries: &[Value]) {
         }
     }
 
-    for entry in entries {
-        let Some(message) = entry.get("message") else {
-            continue;
-        };
-        let role = match message.get("role").and_then(Value::as_str) {
-            Some("user") => Role::User,
-            Some("assistant") => Role::Assistant,
-            _ => continue,
-        };
-        let text = message_text(message);
+    for (message, role) in messages {
+        push_message_items(items, message, role, &tool_results);
+    }
+}
 
-        if !text.is_empty() {
-            items.push(Item::Message(Message { role, text }));
+fn record_tool_result<'a>(tool_results: &mut HashMap<&'a str, &'a Value>, message: &'a Value) {
+    if let Some(tool_call_id) = message.get("toolCallId").and_then(Value::as_str) {
+        tool_results.insert(tool_call_id, message);
+    }
+}
+
+fn push_message_items(
+    items: &mut Vec<Item>,
+    message: &Value,
+    role: Role,
+    tool_results: &HashMap<&str, &Value>,
+) {
+    let text = message_text(message);
+
+    if !text.is_empty() {
+        items.push(Item::Message(Message { role, text }));
+    }
+
+    if role != Role::Assistant {
+        return;
+    }
+
+    if let Some(failure) = message_failure(message) {
+        items.push(Item::Failure(failure));
+    }
+
+    let Some(Value::Array(blocks)) = message.get("content") else {
+        return;
+    };
+
+    for block in blocks {
+        if block.get("type").and_then(Value::as_str) != Some("toolCall") {
+            continue;
         }
 
-        if role != Role::Assistant {
-            continue;
-        }
-
-        if let Some(failure) = message_failure(message) {
-            items.push(Item::Failure(failure));
-        }
-
-        let Some(Value::Array(blocks)) = message.get("content") else {
-            continue;
-        };
-
-        for block in blocks {
-            if block.get("type").and_then(Value::as_str) != Some("toolCall") {
-                continue;
-            }
-
-            if let Some(tool_block) = tool_block_from_history(block, &tool_results) {
-                items.push(Item::Tool(tool_block));
-            }
+        if let Some(tool_block) = tool_block_from_history(block, tool_results) {
+            items.push(Item::Tool(tool_block));
         }
     }
 }

@@ -236,7 +236,7 @@ fn spawn_forwarder(
 fn detach(sid: Sid, attached: &mut AttachedMap) -> HarvesterResponse {
     attached.remove(sid.as_str());
 
-    HarvesterResponse::ok(json!({}))
+    data_response(json!({}))
 }
 
 fn stop(daemon: &Daemon, sid: Sid) -> HarvesterResponse {
@@ -256,11 +256,11 @@ fn stop(daemon: &Daemon, sid: Sid) -> HarvesterResponse {
 
     session.close_stdin();
 
-    HarvesterResponse::ok(json!({"stopping": true}))
+    data_response(json!({"stopping": true}))
 }
 
 fn already_stopped() -> HarvesterResponse {
-    HarvesterResponse::ok(json!({"stopping": false}))
+    data_response(json!({"stopping": false}))
 }
 
 async fn kill_backstop(daemon: Daemon, session: Arc<Session>) {

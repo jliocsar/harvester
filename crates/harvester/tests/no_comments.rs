@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -38,161 +39,164 @@ fn collect_rust_files(dir: &Path, found: &mut Vec<PathBuf>) {
 }
 
 fn is_skipped_directory(path: &Path) -> bool {
-    let Some(name) = path.file_name() else {
+    let Some(name) = path.file_name().and_then(OsStr::to_str) else {
         return false;
     };
-    let skipped_at_any_depth = SKIPPED_DIR_NAMES
-        .iter()
-        .any(|skipped_name| *name == **skipped_name);
 
-    if skipped_at_any_depth {
+    if SKIPPED_DIR_NAMES.contains(&name) {
         return true;
     }
 
     let sits_directly_under_a_crate_src = path
         .parent()
         .and_then(Path::file_name)
-        .is_some_and(|parent_name| *parent_name == *SPIKE_PARENT_DIR_NAME);
+        .and_then(OsStr::to_str)
+        .is_some_and(|parent_name| parent_name == SPIKE_PARENT_DIR_NAME);
 
-    *name == *SPIKE_DIR_NAME && sits_directly_under_a_crate_src
+    name == SPIKE_DIR_NAME && sits_directly_under_a_crate_src
+}
+
+struct Scanner {
+    characters: Vec<char>,
+    index: usize,
+    line: usize,
+}
+
+impl Scanner {
+    fn new(source: &str) -> Self {
+        Scanner {
+            characters: source.chars().collect(),
+            index: 0,
+            line: 1,
+        }
+    }
+
+    fn current(&self) -> Option<char> {
+        self.characters.get(self.index).copied()
+    }
+
+    fn peek(&self, ahead: usize) -> Option<char> {
+        self.characters.get(self.index + ahead).copied()
+    }
+
+    fn advance(&mut self) {
+        if self.current() == Some('\n') {
+            self.line += 1;
+        }
+
+        self.index += 1;
+    }
+
+    fn advance_by(&mut self, count: usize) {
+        for _ in 0..count {
+            self.advance();
+        }
+    }
+
+    fn skip_string(&mut self) {
+        self.advance();
+
+        while let Some(current) = self.current() {
+            match current {
+                '\\' => self.advance_by(2),
+                '"' => {
+                    self.advance();
+
+                    return;
+                }
+                _ => self.advance(),
+            }
+        }
+    }
+
+    fn raw_string_quote_offset(&self) -> Option<usize> {
+        let mut offset = 0;
+
+        if matches!(self.peek(offset), Some('b' | 'c')) {
+            offset += 1;
+        }
+
+        if self.peek(offset) != Some('r') {
+            return None;
+        }
+
+        offset += 1;
+
+        while self.peek(offset) == Some('#') {
+            offset += 1;
+        }
+
+        (self.peek(offset) == Some('"')).then_some(offset)
+    }
+
+    fn skip_raw_string_or_advance(&mut self) {
+        let Some(quote_offset) = self.raw_string_quote_offset() else {
+            self.advance();
+
+            return;
+        };
+        let hash_count = (1..quote_offset)
+            .filter(|offset| self.peek(*offset) == Some('#'))
+            .count();
+
+        self.advance_by(quote_offset + 1);
+
+        while let Some(current) = self.current() {
+            if current == '"' && self.closing_hash_count() >= hash_count {
+                self.advance_by(1 + hash_count);
+
+                return;
+            }
+
+            self.advance();
+        }
+    }
+
+    fn closing_hash_count(&self) -> usize {
+        (1..)
+            .take_while(|offset| self.peek(*offset) == Some('#'))
+            .count()
+    }
+
+    fn skip_quote(&mut self) {
+        if self.peek(1) == Some('\\') {
+            self.advance_by(2);
+            self.skip_to_closing_quote();
+        } else if self.peek(1).is_some() && self.peek(2) == Some('\'') {
+            self.advance_by(3);
+        } else {
+            self.advance();
+        }
+    }
+
+    fn skip_to_closing_quote(&mut self) {
+        while let Some(current) = self.current() {
+            self.advance();
+
+            if current == '\'' {
+                return;
+            }
+        }
+    }
 }
 
 fn first_comment_line(source: &str) -> Option<usize> {
-    let characters: Vec<char> = source.chars().collect();
-    let mut line = 1;
-    let mut index = 0;
+    let mut scanner = Scanner::new(source);
 
-    while index < characters.len() {
-        let current = characters[index];
+    while let Some(current) = scanner.current() {
+        if current == '/' && matches!(scanner.peek(1), Some('/' | '*')) {
+            return Some(scanner.line);
+        }
 
-        if current == '\n' {
-            line += 1;
-            index += 1;
-        } else if current == '/' && matches!(characters.get(index + 1), Some('/' | '*')) {
-            return Some(line);
-        } else if current == '"' {
-            index = skip_string(&characters, index, &mut line);
-        } else if current == 'r' || current == 'b' || current == 'c' {
-            match raw_string_body_start(&characters, index) {
-                Some(body) => index = skip_raw_string(&characters, index, body, &mut line),
-                None => index += 1,
-            }
-        } else if current == '\'' {
-            index = skip_quote(&characters, index, &mut line);
-        } else {
-            index += 1;
+        match current {
+            '"' => scanner.skip_string(),
+            'r' | 'b' | 'c' => scanner.skip_raw_string_or_advance(),
+            '\'' => scanner.skip_quote(),
+            _ => scanner.advance(),
         }
     }
 
     None
-}
-
-fn raw_string_body_start(characters: &[char], index: usize) -> Option<usize> {
-    let mut cursor = index;
-
-    if characters.get(cursor) == Some(&'b') || characters.get(cursor) == Some(&'c') {
-        cursor += 1;
-    }
-
-    if characters.get(cursor) != Some(&'r') {
-        return None;
-    }
-
-    cursor += 1;
-
-    while characters.get(cursor) == Some(&'#') {
-        cursor += 1;
-    }
-
-    if characters.get(cursor) == Some(&'"') {
-        Some(cursor)
-    } else {
-        None
-    }
-}
-
-fn skip_raw_string(
-    characters: &[char],
-    prefix_start: usize,
-    quote_index: usize,
-    line: &mut usize,
-) -> usize {
-    let hash_count = characters[prefix_start..quote_index]
-        .iter()
-        .filter(|character| **character == '#')
-        .count();
-    let mut index = quote_index + 1;
-
-    while index < characters.len() {
-        let current = characters[index];
-
-        if current == '\n' {
-            *line += 1;
-            index += 1;
-        } else if current == '"' {
-            let closing_hashes = characters[index + 1..]
-                .iter()
-                .take_while(|character| **character == '#')
-                .count();
-
-            if closing_hashes >= hash_count {
-                return index + 1 + hash_count;
-            }
-
-            index += 1;
-        } else {
-            index += 1;
-        }
-    }
-
-    index
-}
-
-fn skip_string(characters: &[char], opening_index: usize, line: &mut usize) -> usize {
-    let mut index = opening_index + 1;
-
-    while index < characters.len() {
-        let current = characters[index];
-
-        if current == '\\' {
-            if characters.get(index + 1) == Some(&'\n') {
-                *line += 1;
-            }
-
-            index += 2;
-        } else if current == '\n' {
-            *line += 1;
-            index += 1;
-        } else if current == '"' {
-            return index + 1;
-        } else {
-            index += 1;
-        }
-    }
-
-    index
-}
-
-fn skip_quote(characters: &[char], quote_index: usize, line: &mut usize) -> usize {
-    let next = characters.get(quote_index + 1);
-
-    if next == Some(&'\\') {
-        let mut index = quote_index + 2;
-
-        while index < characters.len() && characters[index] != '\'' {
-            if characters[index] == '\n' {
-                *line += 1;
-            }
-
-            index += 1;
-        }
-
-        index + 1
-    } else if next.is_some() && characters.get(quote_index + 2) == Some(&'\'') {
-        quote_index + 3
-    } else {
-        quote_index + 1
-    }
 }
 
 #[test]

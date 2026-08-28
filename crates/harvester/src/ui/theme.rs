@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use gpui::App;
+use gpui::{App, SharedString};
 use gpui_component::{Theme, ThemeConfig, ThemeConfigColors, ThemeMode};
 
 const GRAPHITE_THEME_NAME: &str = "Graphite Dark";
@@ -56,42 +56,46 @@ fn graphite_theme_config() -> ThemeConfig {
     }
 }
 
+fn slot(hex: &'static str) -> Option<SharedString> {
+    Some(hex.into())
+}
+
 fn graphite_theme_colors() -> ThemeConfigColors {
     let mut colors = ThemeConfigColors::default();
 
-    colors.background = Some(CANVAS.into());
-    colors.foreground = Some(TEXT_BRIGHT.into());
-    colors.border = Some(HAIRLINE.into());
-    colors.ring = Some(RING.into());
-    colors.caret = Some(TEXT_BRIGHT.into());
-    colors.selection = Some(EDGE.into());
-    colors.input = Some(INPUT_WELL.into());
-    colors.popover = Some(SURFACE.into());
-    colors.popover_foreground = Some(TEXT_BRIGHT.into());
-    colors.accent = Some(HOVER.into());
-    colors.accent_foreground = Some(TEXT_BRIGHT.into());
-    colors.muted = Some(RAISED.into());
-    colors.muted_foreground = Some(TEXT_DIM.into());
-    colors.secondary = Some(RAISED.into());
-    colors.secondary_hover = Some(RAISED_HOVER.into());
-    colors.secondary_active = Some(RAISED_ACTIVE.into());
-    colors.secondary_foreground = Some(TEXT_BRIGHT.into());
-    colors.primary = Some(PRIMARY.into());
-    colors.primary_hover = Some(PRIMARY_HOVER.into());
-    colors.primary_active = Some(PRIMARY_ACTIVE.into());
-    colors.primary_foreground = Some(PRIMARY_TEXT.into());
-    colors.list_active = Some(RAISED.into());
-    colors.list_active_border = Some(EDGE.into());
-    colors.scrollbar_thumb = Some(SCROLLBAR_THUMB.into());
-    colors.sidebar = Some(CHROME.into());
-    colors.sidebar_border = Some(CHROME_HAIRLINE.into());
-    colors.sidebar_foreground = Some(TEXT_BRIGHT.into());
-    colors.sidebar_accent = Some(HOVER.into());
-    colors.title_bar = Some(CHROME.into());
-    colors.title_bar_border = Some(CHROME_HAIRLINE.into());
-    colors.status_bar = Some(CHROME.into());
-    colors.status_bar_border = Some(CHROME_HAIRLINE.into());
-    colors.window_border = Some(CHROME_HAIRLINE.into());
+    colors.background = slot(CANVAS);
+    colors.foreground = slot(TEXT_BRIGHT);
+    colors.border = slot(HAIRLINE);
+    colors.ring = slot(RING);
+    colors.caret = slot(TEXT_BRIGHT);
+    colors.selection = slot(EDGE);
+    colors.input = slot(INPUT_WELL);
+    colors.popover = slot(SURFACE);
+    colors.popover_foreground = slot(TEXT_BRIGHT);
+    colors.accent = slot(HOVER);
+    colors.accent_foreground = slot(TEXT_BRIGHT);
+    colors.muted = slot(RAISED);
+    colors.muted_foreground = slot(TEXT_DIM);
+    colors.secondary = slot(RAISED);
+    colors.secondary_hover = slot(RAISED_HOVER);
+    colors.secondary_active = slot(RAISED_ACTIVE);
+    colors.secondary_foreground = slot(TEXT_BRIGHT);
+    colors.primary = slot(PRIMARY);
+    colors.primary_hover = slot(PRIMARY_HOVER);
+    colors.primary_active = slot(PRIMARY_ACTIVE);
+    colors.primary_foreground = slot(PRIMARY_TEXT);
+    colors.list_active = slot(RAISED);
+    colors.list_active_border = slot(EDGE);
+    colors.scrollbar_thumb = slot(SCROLLBAR_THUMB);
+    colors.sidebar = slot(CHROME);
+    colors.sidebar_border = slot(CHROME_HAIRLINE);
+    colors.sidebar_foreground = slot(TEXT_BRIGHT);
+    colors.sidebar_accent = slot(HOVER);
+    colors.title_bar = slot(CHROME);
+    colors.title_bar_border = slot(CHROME_HAIRLINE);
+    colors.status_bar = slot(CHROME);
+    colors.status_bar_border = slot(CHROME_HAIRLINE);
+    colors.window_border = slot(CHROME_HAIRLINE);
 
     colors
 }

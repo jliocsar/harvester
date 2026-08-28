@@ -258,7 +258,17 @@ which `create_session` fields they filled in; a fix to the ordering rules
 below had to be made twice, which is exactly how the ordering rules get
 broken. The guard is dropped when this helper returns, so both flows now
 publish their snapshot event outside the attachment lock — previously only
-`open_flow` did.
+`open_flow` did. The `create_session` fields ride in as one `NewSession`
+value rather than positional arguments, because three adjacent
+`Option<String>`s (provider, model, name) were transposable at a call site
+with no compiler to catch it — both callers now spell the fields by name.
+
+**`WindowFlush`.** The shared vocabulary for "what did releasing an attach
+window find": `Delivered` (the held events are out, nothing further owed) or
+`Overflowed` (events were lost, a resync is owed). `deliver_buffered_events`
+and `replay_history` both answer in it; it replaced two bare `bool`s whose
+polarity was recorded only here, and it lets `resync_flow`'s loop read as a
+`match` instead of stacked negations.
 
 **`open_flow`.** `Open`'s implementation: create-or-resume, then attach.
 Resume is the *same call* as create (per DAEMON.md), and it's idempotent for
@@ -313,14 +323,17 @@ because no snapshot replaced them. Those events are still valid and still
 the only account of what happened: a discarded `tool_execution_end` leaves a
 tool card spinning on screen forever, which is the exact loss class the
 attach window exists to prevent (docs/SPEC.md, "any doubt → refetch"). The
-`RequestFailed` from `repair_history` remains the user-visible signal that
-the repair itself did not land.
+`RequestFailed` for the failed repair — published here, by `repair_history`'s
+one caller — remains the user-visible signal that the repair itself did not
+land.
 
 **`repair_history`.** Implements docs/SPEC.md C6: a delta refetch when this
 session left a cursor, a full refetch otherwise — so a long-lived session
 repairs by fetching only the handful of entries it missed rather than its
-whole history. A failed delta silently falls back to a full refetch instead
-of being reported as an error: the cursor has one specific documented failure
+whole history. It returns `Result<(), String>` and never publishes its own
+failure — `resync_flow`, the one caller, does the `report_failure`, so "who
+publishes the failure" has exactly one answer. A failed delta silently falls
+back to a full refetch instead of being reported as an error: the cursor has one specific documented failure
 mode — pi answering `Entry not found: <since>` for an id that compaction
 retired — and starting over is the documented cure. Matching pi's error text
 to special-case that would be the narrower, more brittle check; falling back
@@ -370,16 +383,19 @@ an action they never took.
 
 **`replay_history`.** The opening-fetch counterpart to `repair_history`: seeds
 a chat with a session's whole history because there's no cursor to work from
-yet (nothing has been fetched for this session before). Returns `true` when
-events were lost anyway during the fetch and a follow-up repair is owed.
+yet (nothing has been fetched for this session before). Returns
+`WindowFlush::Overflowed` when events were lost anyway during the fetch and a
+follow-up repair is owed. A failed opening fetch reports its own failure and
+answers `Delivered`: no chat was created, the dropped registration reopens
+the live stream, and nothing further is owed to the caller.
 
 **`deliver_buffered_events`.** Releases the attach window the instant the
 frontend has a chat to put events into. There is no `await` between sending
 the snapshot event and this call, so no live event can slip in ahead of the
-events the window held back. Returning `true` means the window overflowed, so
-the snapshot just published is already stale — deliberately reusing the
-daemon's own `event_gap` vocabulary/semantics rather than inventing a second
-recovery concept.
+events the window held back. `WindowFlush::Overflowed` means the snapshot
+just published is already stale — deliberately reusing the daemon's own
+`event_gap` vocabulary/semantics rather than inventing a second recovery
+concept.
 
 **`start_session_flow`.** `StartSession`'s half of `attach_session` plus the
 first prompt. `Attached` publishes with empty entries since the session
@@ -436,10 +452,11 @@ that is reported.
 
 **`pi_request_flow`.** The whole implementation of `Command::PiRequest`: run
 the verbatim `cmd` through `pi_flow_result` and publish `Event::PiAnswered`
-with the same sid, the same token, and `pi_method(&cmd)` — the command's own
-`type` string, read once here so no other layer has to re-type the command it
-just sent. It is the only place in the crate that inspects a pi payload's
-contents at all, and it inspects exactly one field it then copies verbatim.
+with the same sid, the same token, and the command's own `type` string (read
+via the shared `pi_event_type` helper in `bridge/mod.rs`), so no other layer
+has to re-type the command it just sent. It is the only place in the bridge
+that inspects a pi payload's contents at all, and it inspects exactly one
+field it then copies verbatim.
 
 **`pi_flow_result`.** Shared helper turning a pi command into the `Result`
 that picker/statusbar-facing events carry: `data` verbatim on success, pi's
@@ -605,6 +622,11 @@ same-bridge session swap).
   event — answering a dialog is the frontend's obligation now (docs/SPEC.md
   C5), and the bridge's only job is to put the question in front of it
   unaltered.
+- `pi_event_type` is the crate's one reader of a pi payload's `type` field
+  (`get("type").and_then(as_str)`). The same three-line shape had grown
+  copies in `pi_request_flow` and `Transcript::apply` (and a third in the
+  gpui crate's `is_turn_settled`); this is the crate-level home, so the next
+  place that needs a pi event's type does not write a fourth copy.
 
 **Test harness note.** `Harness` wires a `BridgeContext` to a fake daemon over
 an in-memory `tokio::io::duplex` pair — this is the whole reason
@@ -806,6 +828,8 @@ alone would be a filename believing itself. In the one case where they
 disagree (a leaked socket whose pid has since been reused by an unrelated
 process) the sweep does nothing, which is the conservative half of the
 trade: a stale file survives until the next sweep after that pid dies.
+`reclaim_if_leaked` is both stages for one candidate file, leaving the sweep
+loop itself as only "is this one of ours? then consider reclaiming it".
 
 `process_is_alive` shells out to `sh -c 'kill -0 <pid>'` (`pid_liveness_script`)
 rather than pulling `libc` in for one syscall — the same trade the project
@@ -930,7 +954,14 @@ collapse into the obligation already queued rather than create a second one.
 wrong-room request are the same non-event to a caller, and "visible" versus
 "queued" is not worth distinguishing either, because the caller's advance is
 idempotent — it shows the front when nothing is on screen and returns
-otherwise.
+otherwise. `accepted()` (`#[must_use]`) is how the one production caller
+reads it — a named question instead of an `==` against a variant — while the
+tests keep asserting the typed variants.
+
+`DialogRoom` and `DialogObligation` are plain `pub`-field structs built as
+literals; they had `new` constructors that only re-spelled the fields in
+order, so the constructors were dropped rather than kept as a second way to
+say the same thing.
 
 `answer_front` accepts exactly one answer for a given key: if the modal
 callback fires after the front obligation has already advanced (e.g. a stale
@@ -1388,6 +1419,10 @@ Worker startup sequence and its rationale:
    killed client could not clean up itself.
 
 Concurrency design of the main loop (`worker_main`):
+- The command arm of the `select!` delegates to `handle_command`, a pure
+  router whose arms call one named function per command (the house
+  match-arms-delegate rule); the four host-op spawners differ only in which
+  workspace op they run and which `Event` carries the answer.
 - Listing runs off the `select!` loop on its own task and reports back
   through a channel, so a slow provider never delays a probe tick or a
   command being answered.
@@ -1661,13 +1696,17 @@ gated otherwise.
 need their own bespoke staleness guard: a late answer, an answer to a
 superseded (re-asked) request, and an answer to a request already applied.
 
-`Pending::is_outstanding` peeks without consuming — the staleness test
-`accept` is built on. It is private: it was published for answers arriving
-in installments (a stream, a progress event), and no such caller ever
-appeared, so it stays available to `accept` and to this module's tests
-rather than standing in the crate's contract. `RequestTokens::mint` is
-`pub(crate)` for the same reason and one stronger: minting a token outside
-`Pending::ask` produces a token nothing is waiting on.
+`Pending::accept` is one `Option::take_if`: the token comparison and the
+take are a single read of `outstanding`, so there is no window in which the
+staleness test and the consumption could disagree.
+
+`Pending::is_outstanding` peeks without consuming. It is `#[cfg(test)]`: it
+was published for answers arriving in installments (a stream, a progress
+event), and no such caller ever appeared; since `accept` folded the
+staleness test into its `take_if`, the tests pinning peek semantics are its
+only remaining reader. `RequestTokens::mint` is `pub(crate)` for a similar
+reason and one stronger: minting a token outside `Pending::ask` produces a
+token nothing is waiting on.
 
 `Pending::is_waiting` answers "is any answer still wanted" without needing to
 hold the specific token — for a surface (like a modal) that just wants to gate
@@ -1827,12 +1866,16 @@ it rather than appended to.
   result at all, and it must still settle the status, or the card spins
   forever. Kept in one place because a rule about how a tool block settles
   that is written twice is a rule that only holds until one copy is edited.
-- `extend_items`: results are collected into a `tool_call_id → toolResult`
-  map ahead of the main walk because results land in later entries than their
-  calls. A result whose call is already held finishes that block in place —
-  across a delta boundary the call sits in the prefix and its result in the
-  delta, and pushing a *new* block for it would render the same call twice
-  (once finished, once running forever).
+- `extend_items` is collect-then-build: one pass over the entries sorts each
+  message by role into either the `tool_call_id → toolResult` map
+  (`record_tool_result`) or the ordered user/assistant list, and only then
+  does `push_message_items` turn that list into items. The split exists
+  because results land in later entries than their calls, so the map must be
+  complete before any call is rendered; collecting the messages in the same
+  pass just avoids walking the JSON twice. A result whose call is already
+  held finishes that block in place — across a delta boundary the call sits
+  in the prefix and its result in the delta, and pushing a *new* block for it
+  would render the same call twice (once finished, once running forever).
 - Pi persists its failure messages, so `extend_items` reads them back on
   reopen the same way the live stream does — otherwise history would be
   quietly shorter than the conversation the user actually had.
@@ -1876,6 +1919,11 @@ listing costs roughly one network round trip, not a new connection.
 `WORKSPACE_EXEC_TIMEOUT` (30s) is a ceiling on one picker exec: multiplexed
 listings normally take tens of milliseconds, so this exists purely so a
 wedged transport can't hang the picker forever.
+
+`exec_workspace_script` is the one exec-and-require-success step all four
+ops share (run under `WORKSPACE_EXEC_TIMEOUT`, fail through
+`require_success` with the op's own context word), leaving each op as its
+script plus its parse.
 
 `resolve_home`: finds the machine's `$HOME`, which is where the folder picker
 starts its walk (SPEC §Workspace). Deliberately one plain exec, never a

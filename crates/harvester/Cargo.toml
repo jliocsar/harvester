@@ -9,11 +9,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-# gpui comes from zed's git rather than crates.io because gpui-component does
-# (SPEC C11): zed split gpui into gpui + gpui_platform and never published
-# gpui_platform, so no crates.io release of either can exist. Neither URL
-# carries a `rev` — upstream pins by lockfile and so do we, which makes a bump
-# an explicit `cargo update -p gpui`, never an incidental one.
+# Zed's git without `rev`: the workspace lockfile is the pin, so a bump is an
+# explicit `cargo update -p gpui`. Full rationale in SPEC C11.
 gpui = { git = "https://github.com/zed-industries/zed" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
     "font-kit",
@@ -21,8 +18,7 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
     "wayland",
     "runtime_shaders",
 ] }
-# The widget layer. Only the languages the transcript actually renders are
-# enabled; the full `tree-sitter-languages` set is another 32 grammar crates.
+# The widget layer; only the grammars the transcript renders (SPEC C11).
 gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "f96f1576", features = [
     "tree-sitter-typescript",
     "tree-sitter-tsx",

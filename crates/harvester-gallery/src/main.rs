@@ -21,7 +21,7 @@ const GALLERY_WINDOW_WIDTH: f32 = 1100.;
 const GALLERY_WINDOW_HEIGHT: f32 = 720.;
 const FIRST_STORY_INDEX: usize = 0;
 
-type TextKnobKey = (usize, &'static str);
+type TextKnobInputs = Vec<HashMap<&'static str, Entity<InputState>>>;
 
 fn main() {
     let shell_window = ShellWindow {
@@ -45,7 +45,7 @@ pub struct Gallery {
     selected_story: usize,
     dock_expanded: bool,
     runtime: Entity<StoryRuntime>,
-    text_inputs: HashMap<TextKnobKey, Entity<InputState>>,
+    text_inputs: TextKnobInputs,
     replay_story: Option<usize>,
     _subscriptions: Vec<Subscription>,
 }
@@ -86,8 +86,8 @@ impl Gallery {
         subscriptions: &mut Vec<Subscription>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> HashMap<TextKnobKey, Entity<InputState>> {
-        let mut inputs = HashMap::new();
+    ) -> TextKnobInputs {
+        let mut inputs = Vec::with_capacity(stories.len());
 
         for (story_index, story) in stories.iter().enumerate() {
             let text_knob_names = story
@@ -95,14 +95,17 @@ impl Gallery {
                 .iter()
                 .filter(|spec| matches!(spec.kind, KnobKind::Text))
                 .map(|spec| spec.name);
+            let mut story_inputs = HashMap::new();
 
             for name in text_knob_names {
                 let value = knobs[story_index].text(name).to_string();
                 let input = cx.new(|cx| InputState::new(window, cx).default_value(value));
 
                 subscriptions.push(cx.observe(&input, |_, _, cx| cx.notify()));
-                inputs.insert((story_index, name), input);
+                story_inputs.insert(name, input);
             }
+
+            inputs.push(story_inputs);
         }
 
         inputs
@@ -133,7 +136,9 @@ impl Gallery {
     }
 
     pub(crate) fn text_knob_input(&self, name: &'static str) -> Option<&Entity<InputState>> {
-        self.text_inputs.get(&(self.selected_story, name))
+        self.text_inputs
+            .get(self.selected_story)
+            .and_then(|inputs| inputs.get(name))
     }
 
     pub(crate) fn select_story(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -201,7 +206,7 @@ impl Gallery {
                 continue;
             }
 
-            let Some(input) = self.text_inputs.get(&(story_index, spec.name)) else {
+            let Some(input) = self.text_inputs[story_index].get(spec.name) else {
                 continue;
             };
 
@@ -223,7 +228,7 @@ impl Gallery {
         cx: &mut Context<Self>,
     ) {
         if let KnobValue::Text(text) = &value {
-            let input = self.text_inputs.get(&(story_index, name)).cloned();
+            let input = self.text_inputs[story_index].get(name).cloned();
 
             if let Some(input) = input {
                 input.update(cx, |state, cx| state.set_value(text.clone(), window, cx));

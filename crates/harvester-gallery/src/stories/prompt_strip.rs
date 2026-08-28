@@ -49,13 +49,13 @@ const STRIP_WIDTH: f32 = 680.;
 const STRIP_CAPTION: &str = "The input is a real InputState — type in it";
 
 pub fn stories() -> Vec<Story> {
-    vec![Story::new(
-        FLAGSHIP_GROUP,
-        PROMPT_STRIP_STORY,
-        knobs(),
-        presets(),
-        strip,
-    )]
+    vec![Story {
+        group: FLAGSHIP_GROUP,
+        name: PROMPT_STRIP_STORY,
+        knobs: knobs(),
+        presets: presets(),
+        render: strip,
+    }]
 }
 
 fn knobs() -> Vec<KnobSpec> {
@@ -75,108 +75,139 @@ fn knobs() -> Vec<KnobSpec> {
     ]
 }
 
-fn presets() -> Vec<Preset> {
-    vec![
-        preset(
-            "ready",
-            NOTICE_NONE,
-            (READY_MODEL, true),
-            (READY_MACHINE, true),
-            (READY_REPO, true),
-            READY_BRANCH,
-            true,
-            false,
-        ),
-        preset(
-            "turn running",
-            NOTICE_NONE,
-            (READY_MODEL, true),
-            (READY_MACHINE, true),
-            (READY_REPO, true),
-            READY_BRANCH,
-            true,
-            true,
-        ),
-        preset(
-            "loading models",
-            NOTICE_NONE,
-            (LOADING_MODEL_LABEL, false),
-            (READY_MACHINE, true),
-            (READY_REPO, true),
-            READY_BRANCH,
-            false,
-            false,
-        ),
-        preset(
-            "models failed",
-            NOTICE_NONE,
-            (FAILED_MODEL_LABEL, false),
-            (READY_MACHINE, true),
-            (READY_REPO, true),
-            READY_BRANCH,
-            false,
-            false,
-        ),
-        preset(
-            "no machines",
-            NOTICE_NONE,
-            (READY_MODEL, true),
-            (NO_MACHINE_LABEL, false),
-            (NO_REPO_LABEL, false),
-            "",
-            false,
-            false,
-        ),
-        preset(
-            "starting session",
-            NOTICE_STARTING,
-            (READY_MODEL, true),
-            (READY_MACHINE, true),
-            (READY_REPO, true),
-            READY_BRANCH,
-            false,
-            false,
-        ),
-        preset(
-            "exited",
-            NOTICE_EXITED,
-            (READY_MODEL, true),
-            (READY_MACHINE, true),
-            (READY_REPO, true),
-            READY_BRANCH,
-            false,
-            false,
-        ),
-    ]
-}
-
-fn preset(
+struct StripPreset {
     name: &'static str,
     notice_index: usize,
-    model: (&str, bool),
-    machine: (&str, bool),
-    repo: (&str, bool),
-    branch: &str,
+    model_label: &'static str,
+    model_enabled: bool,
+    machine_label: &'static str,
+    machine_enabled: bool,
+    repo_label: &'static str,
+    repo_enabled: bool,
+    branch: &'static str,
     can_send: bool,
     can_stop: bool,
-) -> Preset {
-    Preset::new(
-        name,
-        vec![
-            (NOTICE_KNOB, KnobValue::Choice(notice_index)),
-            (EXIT_NOTICE_KNOB, KnobValue::Text(READY_EXIT_NOTICE.into())),
-            (MODEL_KNOB, KnobValue::Text(model.0.into())),
-            (MODEL_ENABLED_KNOB, KnobValue::Bool(model.1)),
-            (MACHINE_KNOB, KnobValue::Text(machine.0.into())),
-            (MACHINE_ENABLED_KNOB, KnobValue::Bool(machine.1)),
-            (REPO_KNOB, KnobValue::Text(repo.0.into())),
-            (REPO_ENABLED_KNOB, KnobValue::Bool(repo.1)),
-            (BRANCH_KNOB, KnobValue::Text(branch.into())),
-            (CAN_SEND_KNOB, KnobValue::Bool(can_send)),
-            (CAN_STOP_KNOB, KnobValue::Bool(can_stop)),
-            (FOCUSED_KNOB, KnobValue::Bool(true)),
-        ],
-    )
+}
+
+impl StripPreset {
+    fn into_preset(self) -> Preset {
+        Preset::new(
+            self.name,
+            vec![
+                (NOTICE_KNOB, KnobValue::Choice(self.notice_index)),
+                (EXIT_NOTICE_KNOB, KnobValue::Text(READY_EXIT_NOTICE.into())),
+                (MODEL_KNOB, KnobValue::Text(self.model_label.into())),
+                (MODEL_ENABLED_KNOB, KnobValue::Bool(self.model_enabled)),
+                (MACHINE_KNOB, KnobValue::Text(self.machine_label.into())),
+                (MACHINE_ENABLED_KNOB, KnobValue::Bool(self.machine_enabled)),
+                (REPO_KNOB, KnobValue::Text(self.repo_label.into())),
+                (REPO_ENABLED_KNOB, KnobValue::Bool(self.repo_enabled)),
+                (BRANCH_KNOB, KnobValue::Text(self.branch.into())),
+                (CAN_SEND_KNOB, KnobValue::Bool(self.can_send)),
+                (CAN_STOP_KNOB, KnobValue::Bool(self.can_stop)),
+                (FOCUSED_KNOB, KnobValue::Bool(true)),
+            ],
+        )
+    }
+}
+
+fn presets() -> Vec<Preset> {
+    [
+        StripPreset {
+            name: "ready",
+            notice_index: NOTICE_NONE,
+            model_label: READY_MODEL,
+            model_enabled: true,
+            machine_label: READY_MACHINE,
+            machine_enabled: true,
+            repo_label: READY_REPO,
+            repo_enabled: true,
+            branch: READY_BRANCH,
+            can_send: true,
+            can_stop: false,
+        },
+        StripPreset {
+            name: "turn running",
+            notice_index: NOTICE_NONE,
+            model_label: READY_MODEL,
+            model_enabled: true,
+            machine_label: READY_MACHINE,
+            machine_enabled: true,
+            repo_label: READY_REPO,
+            repo_enabled: true,
+            branch: READY_BRANCH,
+            can_send: true,
+            can_stop: true,
+        },
+        StripPreset {
+            name: "loading models",
+            notice_index: NOTICE_NONE,
+            model_label: LOADING_MODEL_LABEL,
+            model_enabled: false,
+            machine_label: READY_MACHINE,
+            machine_enabled: true,
+            repo_label: READY_REPO,
+            repo_enabled: true,
+            branch: READY_BRANCH,
+            can_send: false,
+            can_stop: false,
+        },
+        StripPreset {
+            name: "models failed",
+            notice_index: NOTICE_NONE,
+            model_label: FAILED_MODEL_LABEL,
+            model_enabled: false,
+            machine_label: READY_MACHINE,
+            machine_enabled: true,
+            repo_label: READY_REPO,
+            repo_enabled: true,
+            branch: READY_BRANCH,
+            can_send: false,
+            can_stop: false,
+        },
+        StripPreset {
+            name: "no machines",
+            notice_index: NOTICE_NONE,
+            model_label: READY_MODEL,
+            model_enabled: true,
+            machine_label: NO_MACHINE_LABEL,
+            machine_enabled: false,
+            repo_label: NO_REPO_LABEL,
+            repo_enabled: false,
+            branch: "",
+            can_send: false,
+            can_stop: false,
+        },
+        StripPreset {
+            name: "starting session",
+            notice_index: NOTICE_STARTING,
+            model_label: READY_MODEL,
+            model_enabled: true,
+            machine_label: READY_MACHINE,
+            machine_enabled: true,
+            repo_label: READY_REPO,
+            repo_enabled: true,
+            branch: READY_BRANCH,
+            can_send: false,
+            can_stop: false,
+        },
+        StripPreset {
+            name: "exited",
+            notice_index: NOTICE_EXITED,
+            model_label: READY_MODEL,
+            model_enabled: true,
+            machine_label: READY_MACHINE,
+            machine_enabled: true,
+            repo_label: READY_REPO,
+            repo_enabled: true,
+            branch: READY_BRANCH,
+            can_send: false,
+            can_stop: false,
+        },
+    ]
+    .into_iter()
+    .map(StripPreset::into_preset)
+    .collect()
 }
 
 fn strip(scene: &StoryScene, _window: &mut Window, cx: &mut App) -> AnyElement {

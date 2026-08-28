@@ -236,9 +236,9 @@ impl SessionState {
         self.model_request.ask(&self.tokens, ())
     }
 
-    pub fn request_model_controls(&mut self) -> Vec<Command> {
+    pub fn request_model_controls(&mut self) -> Option<[Command; 2]> {
         let SessionPhase::Live { sid } = &self.phase else {
-            return Vec::new();
+            return None;
         };
         let sid = sid.clone();
 
@@ -247,7 +247,7 @@ impl SessionState {
         let models = self.begin_model_fetch();
         let state = self.session_state_request.ask(&self.tokens, ());
 
-        vec![
+        Some([
             Command::PiRequest {
                 sid: sid.clone(),
                 cmd: json!({"type": PI_GET_AVAILABLE_MODELS}),
@@ -258,7 +258,7 @@ impl SessionState {
                 cmd: json!({"type": PI_GET_STATE}),
                 token: state,
             },
-        ]
+        ])
     }
 
     pub fn accept_pi_answer(
@@ -819,7 +819,9 @@ mod tests {
     fn session_state_reads_the_current_model_from_pi_state_data() {
         let mut state =
             SessionState::live("sid".to_string(), target(), &[], RequestTokens::default());
-        let controls = state.request_model_controls();
+        let controls = state
+            .request_model_controls()
+            .expect("a live session offers model controls");
         let methods: Vec<String> = controls.iter().map(pi_method).collect();
 
         assert_eq!(methods, [PI_GET_AVAILABLE_MODELS, PI_GET_STATE]);

@@ -76,15 +76,10 @@ impl KnobValues {
     }
 
     pub fn set(&mut self, name: &'static str, value: KnobValue) {
-        for entry in self.entries.iter_mut() {
-            if entry.0 == name {
-                entry.1 = value;
-
-                return;
-            }
+        match self.entries.iter_mut().find(|entry| entry.0 == name) {
+            Some(entry) => entry.1 = value,
+            None => self.entries.push((name, value)),
         }
-
-        self.entries.push((name, value));
     }
 
     pub fn value(&self, name: &str) -> Option<&KnobValue> {
@@ -139,22 +134,4 @@ pub struct Story {
     pub knobs: Vec<KnobSpec>,
     pub presets: Vec<Preset>,
     pub render: RenderStory,
-}
-
-impl Story {
-    pub fn new(
-        group: &'static str,
-        name: &'static str,
-        knobs: Vec<KnobSpec>,
-        presets: Vec<Preset>,
-        render: RenderStory,
-    ) -> Self {
-        Self {
-            name,
-            group,
-            knobs,
-            presets,
-            render,
-        }
-    }
 }

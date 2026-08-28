@@ -293,6 +293,10 @@ fn handle_pi_event(context: &BridgeContext, sid: String, event: Value) {
     context.events.send(Event::Pi { sid, event });
 }
 
+pub(crate) fn pi_event_type(value: &Value) -> Option<&str> {
+    value.get("type").and_then(Value::as_str)
+}
+
 fn flatten_harvester(
     response: std::io::Result<harvester_proto::HarvesterResponse>,
 ) -> Result<Value, String> {
@@ -357,20 +361,23 @@ mod tests {
                 .expect("the bridge sent no request")
         }
 
-        async fn serve_one(&mut self) -> Value {
+        async fn serve_harvester_ok(&mut self) -> Value {
+            let request = self.take_request().await;
+            let response = json!({
+                "id": request["id"],
+                "type": "harvester_response",
+                "response": {"success": true, "data": {}},
+            });
+
+            self.daemon.writer.send_json_for_test(response).await;
+
+            request
+        }
+
+        async fn serve_pi_entries(&mut self) -> Value {
             let request = self.take_request().await;
 
-            if request["type"] == "pi" {
-                self.answer_pi(&request, json!({"entries": []})).await;
-            } else {
-                let response = json!({
-                    "id": request["id"],
-                    "type": "harvester_response",
-                    "response": {"success": true, "data": {}},
-                });
-
-                self.daemon.writer.send_json_for_test(response).await;
-            }
+            self.answer_pi(&request, json!({"entries": []})).await;
 
             request
         }
@@ -412,13 +419,11 @@ mod tests {
         }
 
         async fn serve_open(&mut self) -> Vec<String> {
-            let mut commands = Vec::new();
-
-            for _ in 0..3 {
-                commands.push(command_name(&self.serve_one().await));
-            }
-
-            commands
+            vec![
+                command_name(&self.serve_harvester_ok().await),
+                command_name(&self.serve_harvester_ok().await),
+                command_name(&self.serve_pi_entries().await),
+            ]
         }
 
         async fn assert_silent(&mut self, why: &str) {
@@ -447,7 +452,7 @@ mod tests {
             "/work".to_string(),
         ));
 
-        assert_eq!(command_name(&harness.serve_one().await), "detach");
+        assert_eq!(command_name(&harness.serve_harvester_ok().await), "detach");
 
         let (_, event) = tokio::time::timeout(QUIET, harness.events.recv())
             .await
@@ -459,7 +464,7 @@ mod tests {
             Event::AttachmentLeft { sid } if sid == "01H-first"
         ));
         assert_eq!(
-            command_name(&harness.serve_one().await),
+            command_name(&harness.serve_harvester_ok().await),
             "create_session",
             "the replacement open continues after retirement is published"
         );
@@ -518,7 +523,7 @@ mod tests {
         ));
 
         assert_eq!(
-            command_name(&harness.serve_one().await),
+            command_name(&harness.serve_harvester_ok().await),
             "create_session",
             "an idempotent reopen keeps the existing attachment until attach confirms"
         );
@@ -585,7 +590,7 @@ mod tests {
             "/work".to_string(),
         ));
 
-        assert_eq!(command_name(&harness.serve_one().await), "detach");
+        assert_eq!(command_name(&harness.serve_harvester_ok().await), "detach");
     }
 
     #[tokio::test]
@@ -626,7 +631,10 @@ mod tests {
             );
         }
 
-        assert_eq!(command_name(&harness.serve_one().await), "get_entries");
+        assert_eq!(
+            command_name(&harness.serve_pi_entries().await),
+            "get_entries"
+        );
         harness
             .assert_silent("one repair per session at a time")
             .await;
@@ -822,7 +830,7 @@ mod tests {
                 skipped: 1,
             },
         );
-        harness.serve_one().await;
+        harness.serve_pi_entries().await;
 
         let mut published = Vec::new();
 

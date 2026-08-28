@@ -121,41 +121,7 @@ async fn worker_main(mut commands: UnboundedReceiver<Command>, events: Unbounded
         tokio::select! {
             command = commands.recv() => match command {
                 None => break,
-                Some(Command::SetAdHocMachines(machines)) => {
-                    ad_hoc_machines = machines;
-                    probe_ad_hoc(&ad_hoc_machines, &events);
-                }
-                Some(Command::ResolveHome { host, token }) => spawn_host_op(&events, async move {
-                    let result = resolve_home(&host).await.map_err(|error| error.to_string());
-
-                    Event::HomeResolved { token, result }
-                }),
-                Some(Command::ListDir { host, path, token }) => spawn_host_op(&events, async move {
-                    let result = list_directory(&host, &path)
-                        .await
-                        .map_err(|error| error.to_string());
-
-                    Event::DirListed { token, result }
-                }),
-                Some(Command::ValidateWorkspace { host, path, token }) => {
-                    spawn_host_op(&events, async move {
-                        let error = validate_git_workspace(&host, &path)
-                            .await
-                            .err()
-                            .map(|error| error.to_string());
-
-                        Event::WorkspaceValidated { token, error }
-                    })
-                }
-                Some(Command::ResolveBranch { host, path, token }) => {
-                    spawn_host_op(&events, async move {
-                        let result = resolve_git_branch(&host, &path)
-                            .await
-                            .map_err(|error| error.to_string());
-
-                        Event::BranchResolved { token, result }
-                    })
-                }
+                Some(command) => handle_command(command, &mut ad_hoc_machines, &events),
             },
             _ = list_tick.tick() => {
                 spawn_list_cycle(provider_rows.clone(), events.clone(), listed_sender.clone());
@@ -189,6 +155,84 @@ async fn worker_main(mut commands: UnboundedReceiver<Command>, events: Unbounded
             }
         }
     }
+}
+
+fn handle_command(
+    command: Command,
+    ad_hoc_machines: &mut Vec<String>,
+    events: &UnboundedSender<Event>,
+) {
+    match command {
+        Command::SetAdHocMachines(machines) => {
+            set_ad_hoc_machines(machines, ad_hoc_machines, events)
+        }
+        Command::ResolveHome { host, token } => spawn_resolve_home(host, token, events),
+        Command::ListDir { host, path, token } => spawn_list_dir(host, path, token, events),
+        Command::ValidateWorkspace { host, path, token } => {
+            spawn_validate_workspace(host, path, token, events)
+        }
+        Command::ResolveBranch { host, path, token } => {
+            spawn_resolve_branch(host, path, token, events)
+        }
+    }
+}
+
+fn set_ad_hoc_machines(
+    machines: Vec<String>,
+    ad_hoc_machines: &mut Vec<String>,
+    events: &UnboundedSender<Event>,
+) {
+    *ad_hoc_machines = machines;
+    probe_ad_hoc(ad_hoc_machines, events);
+}
+
+fn spawn_resolve_home(host: Host, token: RequestToken, events: &UnboundedSender<Event>) {
+    spawn_host_op(events, async move {
+        let result = resolve_home(&host).await.map_err(|error| error.to_string());
+
+        Event::HomeResolved { token, result }
+    })
+}
+
+fn spawn_list_dir(host: Host, path: String, token: RequestToken, events: &UnboundedSender<Event>) {
+    spawn_host_op(events, async move {
+        let result = list_directory(&host, &path)
+            .await
+            .map_err(|error| error.to_string());
+
+        Event::DirListed { token, result }
+    })
+}
+
+fn spawn_validate_workspace(
+    host: Host,
+    path: String,
+    token: RequestToken,
+    events: &UnboundedSender<Event>,
+) {
+    spawn_host_op(events, async move {
+        let error = validate_git_workspace(&host, &path)
+            .await
+            .err()
+            .map(|error| error.to_string());
+
+        Event::WorkspaceValidated { token, error }
+    })
+}
+
+fn spawn_resolve_branch(
+    host: Host,
+    path: String,
+    token: RequestToken,
+    events: &UnboundedSender<Event>,
+) {
+    spawn_host_op(events, async move {
+        let result = resolve_git_branch(&host, &path)
+            .await
+            .map_err(|error| error.to_string());
+
+        Event::BranchResolved { token, result }
+    })
 }
 
 fn spawn_host_op(

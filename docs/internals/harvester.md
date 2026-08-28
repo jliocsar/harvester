@@ -19,8 +19,13 @@ disk.
   `target/x86_64-unknown-linux-musl/daemon-release/harvesterd` — the daemon
   has its own cargo profile (`--profile daemon-release`), so the path is
   *not* `.../release/`. Why the profile exists is in
-  docs/internals/harvesterd.md; the same path is spelled again in
-  `main.rs`'s `DEV_DAEMON_PATH`.
+  docs/internals/harvesterd.md. The path itself is
+  `harvester_proto::DEV_DAEMON_PATH`, which a build script cannot import
+  normally (that would drag the proto crate and its tokio tree into the
+  build-dependency graph for one string), so `build.rs` `include!`s the
+  const's source file (`crates/harvester-proto/src/dev_daemon_path.rs`)
+  directly — the standard cargo pattern for sharing a const with a build
+  script. See docs/internals/harvester-proto.md §`DEV_DAEMON_PATH`.
 
 ## crates/harvester/src/assets.rs
 
@@ -456,21 +461,21 @@ footers, buttons, widths and input boxes live in `ui/dialog.rs`.
   the library's dialog builder closure is an `Fn` that gets re-run every
   frame, so nothing passed into it can be a consumed `FnOnce`. The alias
   exists so the per-kind wrappers below can all take the same shared callback.
-- `open_option_list` / `open_question` / `open_single_line_entry` /
-  `open_multi_line_entry` / `open_value_entry`: the whole Pi-facing half of
-  dialog chrome — each takes the shared answer callback and hands
+- `open_option_list` / `open_question` / `open_entry`: the whole Pi-facing
+  half of dialog chrome — each takes the shared answer callback and hands
   `ui::dialog` two plain callbacks, translating a click into the right
   `DialogAnswer`. `ui::dialog` therefore never sees a `DialogAnswer`,
   a `DialogKind`, or anything else from `harvester-client-core`.
 - The text box is built *here*, at display time, by the arm that needs it:
   `editor` is Pi's multi-line question kind and `input` its single-line one,
-  so `open_multi_line_entry` and `open_single_line_entry` pick different
-  `ui::dialog` input builders and hand the entity straight to
-  `open_value_entry`. Which *kind* wants which box is Pi policy and stays
-  here; how either box is configured is chrome and lives in `ui/dialog.rs`.
-  There is no input map and no "input missing" guard: an obligation that is
-  not on screen has no input entity in existence, and the one that is on
-  screen cannot be displayed twice (see `workbench/modal.rs`).
+  and the two match arms differ only in which `ui::dialog` input builder they
+  hand to `open_entry` as its `create_input` fn pointer (plus the seed string:
+  a placeholder for `input`, a prefill for `editor`). Which *kind* wants which
+  box is Pi policy and stays in the match; how either box is configured is
+  chrome and lives in `ui/dialog.rs`. There is no input map and no "input
+  missing" guard: an obligation that is not on screen has no input entity in
+  existence, and the one that is on screen cannot be displayed twice (see
+  `workbench/modal.rs`).
 - Titles: `open_pi_dialog` does not compute one fallback title for every
   kind. Each arm names its own condition — `UNTITLED_SELECT_CONDITION`
   ("Choose an option"), `UNTITLED_INPUT_CONDITION` ("Enter a value"),
@@ -616,8 +621,8 @@ Harvester's desktop-client entry point (see docs/SPEC.md).
 - `EMBEDDED_DAEMON`: the static-musl `harvesterd` baked in by `build.rs`.
   It's empty (zero bytes) in dev builds made without the musl artifact having
   been built first — `daemon_binary()` then falls back to reading
-  `DEV_DAEMON_PATH` off disk (relative to the repo-root cwd of
-  `cargo run -p harvester`) instead of failing outright. `DEV_DAEMON_PATH`
+  `harvester_proto::DEV_DAEMON_PATH` off disk (relative to the repo-root cwd
+  of `cargo run -p harvester`) instead of failing outright. `DEV_DAEMON_PATH`
   names the `daemon-release` profile's output directory, and the error it
   prints quotes the matching `--profile daemon-release` build line, so a user
   who hits the fallback can copy the command that fixes it.
@@ -740,6 +745,10 @@ else.
 - `request_model_list`: the unstarted chat's model list runs a throwaway pi
   *in a cwd*, so a chat with no repo picked yet has nothing to ask and stays
   `NotRequested` rather than spinning on a request it never made.
+- `request_model_controls`: returns `Option<[Command; 2]>` — a live session's
+  refresh is always the same pair (`get_available_models` then `get_state`),
+  and a non-live phase has nothing to ask. The array states the "exactly two"
+  in the type; `None` replaces what used to be an empty `Vec`.
 - `accept_models`: a superseded or cancelled token is stale and rejected —
   protects against a retargeted chat accepting an answer for the old target.
 - `fail_pending`: the bridge failed before an answer could arrive.
@@ -1036,7 +1045,10 @@ everything else in `ui` should ask for a `Tone`/`Dot`, never a raw `Hsla`.
   `FAINT_TEXT_OPACITY` (0.6), the one distinction the library itself has no
   token for; the same opacity constant backs `faint()` for tertiary text
   (context lines, disabled controls, disclosure chevrons), while `dim()` is
-  unfaded `muted_foreground` for secondary text/subtitles.
+  unfaded `muted_foreground` for secondary text/subtitles — it delegates to
+  `Tone::Muted.color(cx)` so "Muted means `muted_foreground`" is stated in
+  exactly one arm of `Tone::color`, and a theme re-mapping has one place to
+  land.
 - The text hierarchy is **exactly three tiers and the set is closed**:
   `cx.theme().foreground` for body text, `dim()`/`Tone::Muted` for secondary
   labels, `faint()`/`Tone::Idle` for the tertiary run. `FAINT_TEXT_OPACITY` is
@@ -1601,6 +1613,15 @@ when models failed to load" a question with one answer instead of three.
   that is disabled *or* has no rows renders as the bare button rather than an
   openable-but-empty menu. One function, so "disabled or empty means no
   popover" cannot be decided three different ways.
+- `prompt_strip_box`'s three `dropdown_control` calls stay three explicit
+  calls, decided deliberately against a `(id, icon, action-constructor)`
+  const table iterated into `.children(...)`. The calls differ in exactly the
+  three things a reader searches for — the element id, the icon and which
+  `Pick*` action a control mints — and a table would move all three behind an
+  index while saving ~20 lines of argument lists. Grepping `PickModel` or
+  `MODEL_CONTROL_ID` must land on the line that wires it; three fixed
+  controls do not earn the indirection. Revisit only if the strip grows
+  enough pickers that the table reads as a table.
 
 ## crates/harvester/src/ui/shell.rs
 
@@ -1868,6 +1889,12 @@ is the same hue-240/5%-saturation gray at a different lightness) replacing
 - Hex literals are confined to this file. No other module in `ui` contains a
   color literal of any kind; `core.rs` in particular returns theme roles
   exclusively, which is what makes SPEC C11 checkable by reading one file.
+- `graphite_theme_colors` fills the config field-by-field through
+  `slot(hex)` (= `Some(hex.into())`), so each line is the slot name and the
+  palette constant and nothing else. A single struct-update expression
+  (`ThemeConfigColors { …, ..Default::default() }`) was tried and does not
+  compile: the struct has private `blue`/`red`/… palette fields upstream, and
+  functional record update is rejected (E0451) when any field is private.
 - `UI_FONT` "Inter" / `MONO_FONT` "Geist Mono": both set as theme slots
   (`font_family`, `mono_font_family`) so `Root` styles the whole window and
   gpui-component widgets agree with our own mono runs (`core.rs` reads the
@@ -2107,18 +2134,20 @@ Field-level invariants on `Workbench`:
   obligation FIFO, the folder picker and the forget-machine confirmation
   behind one `ActiveModal` (see `workbench/modal.rs`). The shell holds it for
   its store subscription, to lend Root out on a chat's or a sidebar's request,
-  and to hear the two outcomes it must react to. The Root overlay itself is
-  still placed by `Workbench::render`.
+  and to hear the `ModalOutcome` events it must react to. The Root overlay
+  itself is still placed by `Workbench::render`.
 - `chat: Option<Entity<Chat>>` is the current conversation, whether or not a
   session exists behind it yet (an "unstarted" chat has no sid).
 - `chat_subscription: Option<Subscription>` — the current chat's flow
   requests (its bridge traffic no longer comes through here; see
   `FleetStore::send_gated`). It dies with the chat entity, so an abandoned
   unstarted pane cannot route through this shell after being dropped.
-- `_subscriptions: [Subscription; 5]` covers store repaint/event, the
-  sidebar-intent subscription, and the two modal outcomes (repo added,
-  machine forgotten) — both emitted by the same entity, subscribed
-  separately because they are answered by unrelated handlers.
+- `_subscriptions: WorkbenchSubscriptions` names each root-window
+  subscription instead of making the reader count an array: store repaint,
+  store events, sidebar intents, and modal outcomes. Repo-added and
+  machine-forgotten used to be two event types subscribed separately; they
+  are one `ModalOutcome` enum now, with `handle_modal_outcome` a pure router
+  into the two unrelated handlers (house rule: match arms delegate).
 
 Event-handling ordering rules (load-bearing, not incidental):
 - `handle_store_event` is the only bridge event the shell owns; it builds or
@@ -2322,6 +2351,23 @@ nothing there. This is also exactly what the deleted `ModalAvailable` event
 did — a queued hop from "the modal is free" to "show the Pi front" — with
 the entity round trip removed, since one owner can simply call itself.
 
+`release` names the clear-active-then-queue-the-advance pair, and is used
+only where the two steps are adjacent (`forget_machine`,
+`decline_forget_machine`, `cancel_add_repo`). The remaining paths keep the
+steps spelled out because something order-sensitive sits between them:
+`answer_front` sends Pi's answer before queueing the advance, and
+`apply_retirement`/`handle_workspace_picked` must pop Root between clearing
+`active` and deferring (see the ordering note on `apply_retirement` above).
+Folding those into `release` would be an ordering change to a slice that has
+never been exercised on screen, so it was deliberately not done.
+
+`ModalOutcome` is the coordinator's one event seam to the shell: `RepoAdded`
+routes the validated path back to the chat that asked for the walk, and
+`MachineForgotten` tells the shell whose chat is now homeless. They were two
+event types with two `Workbench` subscriptions; one entity emitting one enum
+costs one subscription and lets the shell's `handle_modal_outcome` route by
+match arm instead.
+
 Add-repository specifics:
 - `open_add_repo` creates the picker, subscribes to it, takes the modal, then
   opens the dialog and only then tells the picker to `start`. The send cannot
@@ -2409,16 +2455,22 @@ picker's entity, which does not exist yet inside `cx.new`; there is no staged
 command and no take-dance behind it.
 
 There is no `active` flag. Cancellation invalidates the outstanding token
-(`Walk::cancel`), which is what makes every later answer a no-op, and the
-owning `ActiveModal::AddRepo` drops the picker immediately afterwards.
+(`Walk::stop_waiting`), which is what makes every later answer a no-op, and
+the owning `ActiveModal::AddRepo` drops the picker immediately afterwards.
 
 `Walk::ask`: every request goes through this one method, which is what makes
 "one at a time, matched by its token" hold by construction rather than by
 convention.
 
-`Walk::request_failed`: exists because the command may never reach the
-worker at all (send failure) — without cancelling `Pending` in that case, the
-modal would stay gated forever on an answer that is never coming.
+`Walk::stop_waiting`: invalidate the outstanding token and stop gating the
+modal. It has two callers with two reasons — user cancellation
+(`FolderPicker::cancel`, from Root's dismiss path) and a command that never
+reached the worker at all (`send_request`'s send failure, without which the
+modal would stay gated forever on an answer that is never coming). They used
+to be two identically-bodied methods (`cancel`/`request_failed`); one method
+with the reasons named at the call sites removed the standing question of
+whether the two were ever meant to diverge. `Walk::fail` is `stop_waiting`
+plus the reason to display.
 
 `Walk::fail`: the reason a host op could not even be started is shown inside
 the modal rather than as a toast/notification, because the user is already
@@ -2617,6 +2669,13 @@ component (or the whole path when there is no `/`). It lives in this module
 because a workspace path is this module's domain, and both the sidebar and
 the chat need to render it the same way.
 
+`store_path()` returns `io::Result` so an unset `$HOME` is one failure story
+(`NotFound`, "$HOME unset") instead of an `Option` each caller re-explains:
+`save` propagates it like any other write error, `load` logs it and degrades.
+The `$HOME` check stays distinct from a missing *file* below — the file being
+absent is a first run and silent, the home directory being absent is worth a
+stderr line.
+
 `load()` treats a missing file as an empty list (first run, not an error).
 An unreadable or corrupt file also degrades to an empty list, logging the
 reason to stderr rather than failing the caller — the next successful save
@@ -2688,12 +2747,18 @@ walk is over the filesystem, not over `cargo metadata`, and that is what lets
 the gallery's quarantine (see `docs/internals/harvester-gallery.md`) keep the
 lint instead of escaping it.
 
-The line counter has one non-obvious case: inside a string literal, a
-backslash immediately followed by LF is Rust's line-continuation escape, so
-`skip_string` counts that newline before skipping past it. Missing it does not
-change *whether* a comment is found, only the line number reported for it —
-and every offender after the continuation drifts by one, which is exactly the
-kind of quietly-wrong output that wastes a reader's time.
+The scanner is a `Scanner` struct (characters, cursor, line) whose `advance`
+is the *only* place the cursor moves, and it counts every LF it steps over.
+That centralization is the point: the previous shape — free functions
+threading `&mut usize` line counters and returning new indices — required
+each helper to remember to count its own newlines, and one once forgot the
+string-literal line-continuation escape (backslash immediately followed by
+LF). Miscounting does not change *whether* a comment is found, only the line
+number reported for it — and every offender after the miss drifts by one,
+which is exactly the kind of quietly-wrong output that wastes a reader's
+time. With `advance` counting uniformly, that bug class is structural rather
+than remembered (pinned by
+`a_line_continuation_inside_a_string_still_counts_its_newline`).
 
 ## Recorded gaps (visual layer)
 

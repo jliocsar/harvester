@@ -13,38 +13,35 @@ use crate::sid::Sid;
 const SESSION_INFO_MARKER: &[u8] = br#""session_info""#;
 
 pub fn list_sessions(running: &HashMap<Sid, RunningSession>) -> Vec<SessionInfo> {
-    let mut sessions = Vec::new();
-    let mut line_buffer = Vec::new();
-
     let Ok(dirs) = std::fs::read_dir(paths::pi_sessions_root()) else {
-        return sessions;
+        return Vec::new();
     };
 
-    for dir in dirs.flatten() {
-        let Ok(files) = std::fs::read_dir(dir.path()) else {
-            continue;
-        };
-
-        for file in files.flatten() {
+    let mut line_buffer = Vec::new();
+    let mut sessions: Vec<SessionInfo> = dirs
+        .flatten()
+        .filter_map(|dir| std::fs::read_dir(dir.path()).ok())
+        .flat_map(|files| files.flatten())
+        .filter_map(|file| {
             let path = file.path();
 
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
+            if !is_session_jsonl(&path) {
+                return None;
             }
 
-            let mtime_ms = entry_mtime_ms(&file);
-
-            if let Some(info) = read_session_file(&path, mtime_ms, running, &mut line_buffer) {
-                sessions.push(info);
-            }
-        }
-    }
+            read_session_file(&path, entry_mtime_ms(&file), running, &mut line_buffer)
+        })
+        .collect();
 
     append_fileless_running(&mut sessions, running);
 
     sessions.sort_by_key(|session| std::cmp::Reverse(session.mtime_ms));
 
     sessions
+}
+
+fn is_session_jsonl(path: &Path) -> bool {
+    path.extension().and_then(|extension| extension.to_str()) == Some("jsonl")
 }
 
 fn append_fileless_running(

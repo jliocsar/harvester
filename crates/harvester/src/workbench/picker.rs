@@ -26,7 +26,6 @@ pub(super) struct WorkspacePicked {
 
 impl EventEmitter<WorkspacePicked> for FolderPicker {}
 
-#[derive(Clone)]
 struct PickerCommand {
     request: PickerRequest,
     token: RequestToken,
@@ -83,16 +82,12 @@ impl Walk {
         }
     }
 
-    fn request_failed(&mut self) {
-        self.pending.cancel();
-    }
-
-    fn cancel(&mut self) {
+    fn stop_waiting(&mut self) {
         self.pending.cancel();
     }
 
     fn fail(&mut self, detail: String) {
-        self.pending.cancel();
+        self.stop_waiting();
         self.error = Some(detail);
     }
 
@@ -356,7 +351,7 @@ impl FolderPicker {
     }
 
     pub(super) fn cancel(&mut self, cx: &mut Context<Self>) {
-        self.walk.cancel();
+        self.walk.stop_waiting();
         cx.notify();
     }
 
@@ -406,7 +401,7 @@ impl FolderPicker {
         });
 
         if !sent {
-            self.walk.request_failed();
+            self.walk.stop_waiting();
             cx.notify();
         }
     }
@@ -719,7 +714,7 @@ mod tests {
     fn a_command_that_never_left_ungates_the_modal() {
         let (mut walk, _home) = opening_walk();
 
-        walk.request_failed();
+        walk.stop_waiting();
 
         assert!(!walk.busy());
     }
@@ -735,7 +730,7 @@ mod tests {
 
         let validation = walk.confirm().expect("validation request");
 
-        walk.cancel();
+        walk.stop_waiting();
 
         assert!(walk.accept_validation(validation.token, None).is_none());
         assert!(!walk.busy());

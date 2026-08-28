@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::host::{parse_home, shell_quote, Host, HOME_SCRIPT};
+use crate::host::{parse_home, shell_quote, ExecOutput, Host, HOME_SCRIPT};
 use crate::{Error, Result};
 
 const WORKSPACE_EXEC_TIMEOUT: Duration = Duration::from_secs(30);
@@ -11,10 +11,20 @@ pub struct RemoteDirEntry {
     pub is_dir: bool,
 }
 
-pub(crate) async fn resolve_home(host: &Host) -> Result<String> {
-    let output = host.exec(HOME_SCRIPT, None, WORKSPACE_EXEC_TIMEOUT).await?;
+async fn exec_workspace_script(
+    host: &Host,
+    script: &str,
+    context: &'static str,
+) -> Result<ExecOutput> {
+    let output = host.exec(script, None, WORKSPACE_EXEC_TIMEOUT).await?;
 
-    output.require_success("resolve home")?;
+    output.require_success(context)?;
+
+    Ok(output)
+}
+
+pub(crate) async fn resolve_home(host: &Host) -> Result<String> {
+    let output = exec_workspace_script(host, HOME_SCRIPT, "resolve home").await?;
 
     parse_home(&output.stdout)
         .map(str::to_string)
@@ -26,9 +36,7 @@ pub(crate) async fn resolve_home(host: &Host) -> Result<String> {
 
 pub(crate) async fn list_directory(host: &Host, path: &str) -> Result<Vec<RemoteDirEntry>> {
     let script = format!("ls -1Ap -- {}", shell_quote(path));
-    let output = host.exec(&script, None, WORKSPACE_EXEC_TIMEOUT).await?;
-
-    output.require_success("list directory")?;
+    let output = exec_workspace_script(host, &script, "list directory").await?;
 
     Ok(parse_ls_entries(&output.stdout))
 }
@@ -55,16 +63,15 @@ fn parse_ls_entry(line: &str) -> Option<RemoteDirEntry> {
 
 pub(crate) async fn validate_git_workspace(host: &Host, path: &str) -> Result<()> {
     let script = format!("git -C {} rev-parse --git-dir", shell_quote(path));
-    let output = host.exec(&script, None, WORKSPACE_EXEC_TIMEOUT).await?;
 
-    output.require_success("validate workspace")
+    exec_workspace_script(host, &script, "validate workspace").await?;
+
+    Ok(())
 }
 
 pub(crate) async fn resolve_git_branch(host: &Host, path: &str) -> Result<String> {
     let script = format!("git -C {} rev-parse --abbrev-ref HEAD", shell_quote(path));
-    let output = host.exec(&script, None, WORKSPACE_EXEC_TIMEOUT).await?;
-
-    output.require_success("resolve branch")?;
+    let output = exec_workspace_script(host, &script, "resolve branch").await?;
 
     let branch = output.stdout.trim();
 

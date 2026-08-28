@@ -1,6 +1,10 @@
+mod dev_daemon_path;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
+
+pub use dev_daemon_path::DEV_DAEMON_PATH;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 

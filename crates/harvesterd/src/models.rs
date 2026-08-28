@@ -73,24 +73,30 @@ async fn query_available_models(cwd: &str) -> Result<Value, String> {
             continue;
         }
 
-        if value
-            .get("success")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            drop(stdin);
-            let _ = child.wait().await;
-
-            return Ok(value.get("data").cloned().unwrap_or(json!({})));
-        }
-
-        let detail = value
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("pi rejected get_available_models");
-
-        return Err(detail.to_string());
+        return match value.get("success").and_then(Value::as_bool) {
+            Some(true) => Ok(settle_models_success(child, stdin, value).await),
+            _ => Err(models_rejection(&value)),
+        };
     }
+}
+
+async fn settle_models_success(
+    mut child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    value: Value,
+) -> Value {
+    drop(stdin);
+    let _ = child.wait().await;
+
+    value.get("data").cloned().unwrap_or(json!({}))
+}
+
+fn models_rejection(value: &Value) -> String {
+    value
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("pi rejected get_available_models")
+        .to_string()
 }
 
 fn capture_pi_stderr(stderr: tokio::process::ChildStderr) -> JoinHandle<String> {

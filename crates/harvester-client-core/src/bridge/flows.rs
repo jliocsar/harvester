@@ -7,8 +7,8 @@ use harvester_proto::{HarvesterCmd, SessionsData};
 
 use super::attach_window::{AttachRegistration, FlushOutcome};
 use super::{
-    flatten_harvester, handle_pi_event, report_failure, spawn_flow, BridgeContext, Event,
-    SessionCursor,
+    flatten_harvester, handle_pi_event, pi_event_type, report_failure, spawn_flow, BridgeContext,
+    Event, SessionCursor,
 };
 use crate::dialog::DialogAnswer;
 use crate::token::RequestToken;
@@ -33,12 +33,30 @@ pub(super) async fn sessions_flow(context: BridgeContext) {
     }
 }
 
+struct NewSession {
+    cwd: String,
+    provider: Option<String>,
+    model: Option<String>,
+    name: Option<String>,
+}
+
+enum WindowFlush {
+    Delivered,
+    Overflowed,
+}
+
 pub(super) async fn open_flow(context: BridgeContext, sid: String, cwd: String) {
-    let Some(registration) = attach_session(&context, &sid, cwd, None, None, None).await else {
+    let details = NewSession {
+        cwd,
+        provider: None,
+        model: None,
+        name: None,
+    };
+    let Some(registration) = attach_session(&context, &sid, details).await else {
         return;
     };
 
-    if replay_history(&context, sid.clone(), registration).await {
+    if let WindowFlush::Overflowed = replay_history(&context, sid.clone(), registration).await {
         spawn_flow(resync_flow(context, sid));
     }
 }
@@ -55,14 +73,16 @@ pub(super) async fn resync_flow(context: BridgeContext, sid: String) {
 
         let registration = AttachRegistration::register(&context.attach_buffers, &sid);
 
-        if !repair_history(&context, &sid).await {
+        if let Err(detail) = repair_history(&context, &sid).await {
+            report_failure(&context, "get_entries", detail);
             deliver_buffered_events(&context, sid.clone(), registration);
 
             return;
         }
 
-        if !deliver_buffered_events(&context, sid.clone(), registration) {
-            return;
+        match deliver_buffered_events(&context, sid.clone(), registration) {
+            WindowFlush::Delivered => return,
+            WindowFlush::Overflowed => continue,
         }
     }
 }
@@ -71,7 +91,7 @@ async fn is_attached(context: &BridgeContext, sid: &str) -> bool {
     context.attached.lock().await.as_deref() == Some(sid)
 }
 
-async fn repair_history(context: &BridgeContext, sid: &str) -> bool {
+async fn repair_history(context: &BridgeContext, sid: &str) -> Result<(), String> {
     if let Some(leaf_id) = cursor_for(context, sid) {
         if let Ok((entries, next_leaf_id)) = fetch_entries(context, sid, Some(&leaf_id)).await {
             record_cursor(context, sid, next_leaf_id).await;
@@ -80,18 +100,11 @@ async fn repair_history(context: &BridgeContext, sid: &str) -> bool {
                 entries,
             });
 
-            return true;
+            return Ok(());
         }
     }
 
-    let (entries, leaf_id) = match fetch_entries(context, sid, None).await {
-        Ok(fetched) => fetched,
-        Err(detail) => {
-            report_failure(context, "get_entries", detail);
-
-            return false;
-        }
-    };
+    let (entries, leaf_id) = fetch_entries(context, sid, None).await?;
 
     record_cursor(context, sid, leaf_id).await;
     context.events.send(Event::HistoryReplaced {
@@ -99,7 +112,7 @@ async fn repair_history(context: &BridgeContext, sid: &str) -> bool {
         entries,
     });
 
-    true
+    Ok(())
 }
 
 async fn fetch_entries(
@@ -185,13 +198,13 @@ async fn replay_history(
     context: &BridgeContext,
     sid: String,
     registration: AttachRegistration,
-) -> bool {
+) -> WindowFlush {
     let (entries, leaf_id) = match fetch_entries(context, &sid, None).await {
         Ok(fetched) => fetched,
         Err(detail) => {
             report_failure(context, "get_entries", detail);
 
-            return false;
+            return WindowFlush::Delivered;
         }
     };
 
@@ -208,19 +221,19 @@ fn deliver_buffered_events(
     context: &BridgeContext,
     sid: String,
     registration: AttachRegistration,
-) -> bool {
+) -> WindowFlush {
     match registration.flush() {
         FlushOutcome::Events(events) => {
             for event in events {
                 handle_pi_event(context, sid.clone(), event);
             }
 
-            false
+            WindowFlush::Delivered
         }
         FlushOutcome::Overflowed => {
             eprintln!("bridge: held-back events overflowed for session {sid}; resyncing");
 
-            true
+            WindowFlush::Overflowed
         }
     }
 }
@@ -234,8 +247,13 @@ pub(super) async fn start_session_flow(
     name: String,
     first_prompt: String,
 ) {
-    let Some(registration) = attach_session(&context, &sid, cwd, provider, model, Some(name)).await
-    else {
+    let details = NewSession {
+        cwd,
+        provider,
+        model,
+        name: Some(name),
+    };
+    let Some(registration) = attach_session(&context, &sid, details).await else {
         return;
     };
 
@@ -244,7 +262,7 @@ pub(super) async fn start_session_flow(
         entries: Vec::new(),
     });
 
-    if deliver_buffered_events(&context, sid.clone(), registration) {
+    if let WindowFlush::Overflowed = deliver_buffered_events(&context, sid.clone(), registration) {
         spawn_flow(resync_flow(context.clone(), sid.clone()));
     }
 
@@ -254,10 +272,7 @@ pub(super) async fn start_session_flow(
 async fn attach_session(
     context: &BridgeContext,
     sid: &str,
-    cwd: String,
-    provider: Option<String>,
-    model: Option<String>,
-    name: Option<String>,
+    details: NewSession,
 ) -> Option<AttachRegistration> {
     let attached = context.attached.clone();
     let mut attachment = attached.lock().await;
@@ -270,10 +285,10 @@ async fn attach_session(
         .client
         .harvester(HarvesterCmd::CreateSession {
             sid: sid.to_string(),
-            cwd,
-            provider,
-            model,
-            name,
+            cwd: details.cwd,
+            provider: details.provider,
+            model: details.model,
+            name: details.name,
         })
         .await;
 
@@ -389,7 +404,7 @@ pub(super) async fn pi_request_flow(
     cmd: Value,
     token: RequestToken,
 ) {
-    let method = pi_method(&cmd);
+    let method = pi_event_type(&cmd).unwrap_or_default().to_string();
     let result = pi_flow_result(&context, &sid, cmd).await;
 
     context.events.send(Event::PiAnswered {
@@ -398,13 +413,6 @@ pub(super) async fn pi_request_flow(
         method,
         result,
     });
-}
-
-fn pi_method(cmd: &Value) -> String {
-    cmd.get("type")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
 }
 
 pub(super) async fn stop_flow(context: BridgeContext, sid: String) {

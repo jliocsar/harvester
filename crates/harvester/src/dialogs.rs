@@ -45,17 +45,19 @@ pub(crate) fn open_pi_dialog<T: 'static>(
         DialogKind::Confirm { message } => {
             open_question(title, message, dismissal, answer, window, cx)
         }
-        DialogKind::Input { placeholder } => open_single_line_entry(
+        DialogKind::Input { placeholder } => open_entry(
             title_or_named_condition(title, UNTITLED_INPUT_CONDITION),
             placeholder.clone().unwrap_or_default(),
+            create_single_line_input,
             dismissal,
             answer,
             window,
             cx,
         ),
-        DialogKind::Editor { prefill } => open_multi_line_entry(
+        DialogKind::Editor { prefill } => open_entry(
             title_or_named_condition(title, UNTITLED_EDITOR_CONDITION),
             prefill.clone().unwrap_or_default(),
+            create_multi_line_input,
             dismissal,
             answer,
             window,
@@ -134,40 +136,16 @@ fn condition_and_consequence(title: &str, message: &str) -> (SharedString, Share
     (title.to_string().into(), message.to_string().into())
 }
 
-fn open_single_line_entry<T: 'static>(
+fn open_entry<T: 'static>(
     title: SharedString,
-    placeholder: String,
+    seed: String,
+    create_input: fn(String, &mut Window, &mut App) -> Entity<InputState>,
     dismissal: DialogAnswer,
     answer: AnswerCallback,
     window: &mut Window,
     cx: &mut Context<T>,
 ) {
-    let input = create_single_line_input(placeholder, window, cx);
-
-    open_value_entry(title, input, dismissal, answer, window, cx);
-}
-
-fn open_multi_line_entry<T: 'static>(
-    title: SharedString,
-    prefill: String,
-    dismissal: DialogAnswer,
-    answer: AnswerCallback,
-    window: &mut Window,
-    cx: &mut Context<T>,
-) {
-    let input = create_multi_line_input(prefill, window, cx);
-
-    open_value_entry(title, input, dismissal, answer, window, cx);
-}
-
-fn open_value_entry<T: 'static>(
-    title: SharedString,
-    input: Entity<InputState>,
-    dismissal: DialogAnswer,
-    answer: AnswerCallback,
-    window: &mut Window,
-    cx: &mut Context<T>,
-) {
+    let input = create_input(seed, window, cx);
     let submitted = answer.clone();
 
     open_text(

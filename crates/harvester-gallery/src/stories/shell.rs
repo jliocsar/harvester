@@ -23,37 +23,37 @@ const SECTION_TITLES: &[&str] = &["Machines", "Sessions", "Stories"];
 const SECTION_HEADER_ID: &str = "story-collapsible-section";
 const DEFAULT_SECTION_TITLE: &str = "Machines";
 const SECTION_BODY_NOTE: &str = "The section body is collapsed by the header above";
-const STATUSBAR_TRAILING_NOTE: &str = "harvesterd · connected";
+const STATUSBAR_TRAILING_NOTE: &str = "exe-vm-7fa2";
 
 pub fn stories() -> Vec<Story> {
     vec![
-        Story::new(
-            SHELL_GROUP,
-            CHAT_HEADER_STORY,
-            vec![
+        Story {
+            group: SHELL_GROUP,
+            name: CHAT_HEADER_STORY,
+            knobs: vec![
                 KnobSpec::text(TITLE_KNOB, HEADER_TITLE),
                 KnobSpec::text(SUBTITLE_KNOB, HEADER_SUBTITLE),
             ],
-            Vec::new(),
-            header,
-        ),
-        Story::new(
-            SHELL_GROUP,
-            COLLAPSIBLE_SECTION_STORY,
-            vec![KnobSpec::choice(SECTION_TITLE_KNOB, SECTION_TITLES, 0)],
-            Vec::new(),
-            section,
-        ),
-        Story::new(
-            SHELL_GROUP,
-            STATUSBAR_FRAME_STORY,
-            vec![
+            presets: Vec::new(),
+            render: header,
+        },
+        Story {
+            group: SHELL_GROUP,
+            name: COLLAPSIBLE_SECTION_STORY,
+            knobs: vec![KnobSpec::choice(SECTION_TITLE_KNOB, SECTION_TITLES, 0)],
+            presets: Vec::new(),
+            render: section,
+        },
+        Story {
+            group: SHELL_GROUP,
+            name: STATUSBAR_FRAME_STORY,
+            knobs: vec![
                 KnobSpec::text(STATUS_TEXT_KNOB, STATUS_TEXT),
                 KnobSpec::choice(STATUS_TONE_KNOB, &tone_labels(), tone_index(Tone::Live)),
             ],
-            Vec::new(),
-            statusbar,
-        ),
+            presets: Vec::new(),
+            render: statusbar,
+        },
     ]
 }
 

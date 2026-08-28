@@ -32,23 +32,18 @@ impl Machine {
         match self {
             Machine::Probed { reachable: true } => MachineState::Reachable,
             Machine::Probed { reachable: false } => MachineState::Unreachable,
-            Machine::Linked { link, .. } => link.state(),
+
+            Machine::Linked { link, .. } => match link {
+                Link::Connecting => MachineState::Connecting,
+                Link::Connected => MachineState::Connected,
+                Link::Failed { detail } => MachineState::ConnectFailed { detail },
+                Link::Lost => MachineState::ConnectionLost,
+            },
         }
     }
 }
 
-impl Link {
-    fn state(&self) -> MachineState<'_> {
-        match self {
-            Link::Connecting => MachineState::Connecting,
-            Link::Connected => MachineState::Connected,
-            Link::Failed { detail } => MachineState::ConnectFailed { detail },
-            Link::Lost => MachineState::ConnectionLost,
-        }
-    }
-}
-
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum MachineState<'a> {
     Missing,
     Unknown,
@@ -581,11 +576,12 @@ mod tests {
             },
         );
 
-        let MachineState::ConnectFailed { detail } = fleet.state("vm") else {
-            panic!("the link state should be ConnectFailed");
-        };
-
-        assert_eq!(detail, "daemon connect: handshake timed out");
+        assert_eq!(
+            fleet.state("vm"),
+            MachineState::ConnectFailed {
+                detail: "daemon connect: handshake timed out"
+            }
+        );
     }
 
     #[test]

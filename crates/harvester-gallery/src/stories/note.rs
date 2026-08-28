@@ -18,14 +18,14 @@ const HINT_ACTION_CAPTION: &str = "The trailing slot carries the one action the 
 
 pub fn stories() -> Vec<Story> {
     vec![
-        Story::new(
-            NOTE_GROUP,
-            INLINE_NOTE_STORY,
-            vec![
+        Story {
+            group: NOTE_GROUP,
+            name: INLINE_NOTE_STORY,
+            knobs: vec![
                 KnobSpec::choice(TONE_KNOB, &tone_labels(), tone_index(Tone::Muted)),
                 KnobSpec::text(TEXT_KNOB, PROGRESS_TEXT),
             ],
-            vec![
+            presets: vec![
                 Preset::new(
                     "progress",
                     vec![
@@ -41,18 +41,18 @@ pub fn stories() -> Vec<Story> {
                     ],
                 ),
             ],
-            inline,
-        ),
-        Story::new(
-            NOTE_GROUP,
-            EMPTY_PANE_HINT_STORY,
-            vec![
+            render: inline,
+        },
+        Story {
+            group: NOTE_GROUP,
+            name: EMPTY_PANE_HINT_STORY,
+            knobs: vec![
                 KnobSpec::choice(TONE_KNOB, &tone_labels(), tone_index(Tone::Muted)),
                 KnobSpec::text(TEXT_KNOB, EMPTY_PANE_TEXT),
             ],
-            Vec::new(),
-            empty_pane,
-        ),
+            presets: Vec::new(),
+            render: empty_pane,
+        },
     ]
 }
 

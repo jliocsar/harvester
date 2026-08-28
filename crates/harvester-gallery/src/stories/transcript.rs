@@ -26,27 +26,27 @@ const RENDERED_CAPTION: &str =
 
 pub fn stories() -> Vec<Story> {
     vec![
-        Story::new(
-            FLAGSHIP_GROUP,
-            RENDERED_TRANSCRIPT_STORY,
-            vec![KnobSpec::choice(
+        Story {
+            group: FLAGSHIP_GROUP,
+            name: RENDERED_TRANSCRIPT_STORY,
+            knobs: vec![KnobSpec::choice(
                 SOURCE_KNOB,
                 TRANSCRIPT_SOURCE_LABELS,
                 FIRST_TRANSCRIPT_SOURCE_INDEX,
             )],
-            source_presets(),
-            rendered,
-        ),
-        Story::new(
-            FLAGSHIP_GROUP,
-            STREAMING_TRANSCRIPT_STORY,
-            vec![
+            presets: source_presets(),
+            render: rendered,
+        },
+        Story {
+            group: FLAGSHIP_GROUP,
+            name: STREAMING_TRANSCRIPT_STORY,
+            knobs: vec![
                 KnobSpec::flag(PLAYING_KNOB, true),
                 KnobSpec::choice(SPEED_KNOB, REPLAY_SPEED_LABELS, DEFAULT_SPEED_INDEX),
             ],
-            replay_presets(),
-            streaming,
-        ),
+            presets: replay_presets(),
+            render: streaming,
+        },
     ]
 }
 

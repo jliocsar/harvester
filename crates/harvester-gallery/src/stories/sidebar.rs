@@ -31,15 +31,15 @@ const DERIVED_SHAPE_CAPTION: &str = "The dot shape is derived from the tone, not
 
 pub fn stories() -> Vec<Story> {
     vec![
-        Story::new(
-            SIDEBAR_GROUP,
-            ROW_STORY,
-            vec![
+        Story {
+            group: SIDEBAR_GROUP,
+            name: ROW_STORY,
+            knobs: vec![
                 KnobSpec::text(LABEL_KNOB, ROW_LABEL),
                 KnobSpec::flag(SELECTED_KNOB, false),
                 KnobSpec::flag(DISABLED_KNOB, false),
             ],
-            vec![
+            presets: vec![
                 Preset::new(
                     "idle",
                     vec![
@@ -62,19 +62,19 @@ pub fn stories() -> Vec<Story> {
                     ],
                 ),
             ],
-            row,
-        ),
-        Story::new(
-            SIDEBAR_GROUP,
-            STACKED_ROW_STORY,
-            vec![
+            render: row,
+        },
+        Story {
+            group: SIDEBAR_GROUP,
+            name: STACKED_ROW_STORY,
+            knobs: vec![
                 KnobSpec::choice(TONE_KNOB, &tone_labels(), tone_index(Tone::Live)),
                 KnobSpec::text(TITLE_KNOB, ROW_LABEL),
                 KnobSpec::text(DETAIL_KNOB, STACKED_DETAIL),
                 KnobSpec::text(NOTE_KNOB, STACKED_NOTE),
                 KnobSpec::flag(SELECTED_KNOB, false),
             ],
-            vec![
+            presets: vec![
                 Preset::new(
                     "running session",
                     vec![
@@ -92,15 +92,15 @@ pub fn stories() -> Vec<Story> {
                     ],
                 ),
             ],
-            stacked_row,
-        ),
-        Story::new(
-            SIDEBAR_GROUP,
-            EMPTY_NOTE_STORY,
-            vec![KnobSpec::choice(EMPTY_TEXT_KNOB, EMPTY_NOTE_TEXTS, 0)],
-            Vec::new(),
-            empty_note,
-        ),
+            render: stacked_row,
+        },
+        Story {
+            group: SIDEBAR_GROUP,
+            name: EMPTY_NOTE_STORY,
+            knobs: vec![KnobSpec::choice(EMPTY_TEXT_KNOB, EMPTY_NOTE_TEXTS, 0)],
+            presets: Vec::new(),
+            render: empty_note,
+        },
     ]
 }
 

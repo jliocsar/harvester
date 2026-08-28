@@ -203,7 +203,11 @@ impl Chat {
     }
 
     fn request_model_controls(&mut self, cx: &mut Context<Self>) {
-        for command in self.state.request_model_controls() {
+        let Some(commands) = self.state.request_model_controls() else {
+            return;
+        };
+
+        for command in commands {
             self.send(command, cx);
         }
     }

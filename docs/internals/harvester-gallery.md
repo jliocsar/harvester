@@ -154,7 +154,10 @@ The model, deliberately data-only so a story declaration reads as a table:
   same `KnobValues` a knob control writes into, so a preset can always be
   adjusted afterwards. Presets set every knob they care about explicitly rather than
   diffing against a base, so preset order never matters.
-- `Story` is name + group + knobs + presets + a plain `fn` pointer. A `fn`
+- `Story` is name + group + knobs + presets + a plain `fn` pointer, built as
+  a bare struct literal — the five-argument positional constructor was
+  dropped so every declaration reads by field name instead of by comma
+  position. A `fn`
   (not a boxed closure) is what keeps the registry a static list: a story
   cannot capture state, which is exactly the property that forces shared live
   state into `StoryRuntime` where the gallery can observe it. It is also what
@@ -188,6 +191,14 @@ registry knows is the order groups appear in.
   names per tick; if `transcript::STREAMING_TRANSCRIPT_STORY` is ever renamed
   the lookup returns `None` and the replay simply never runs — no panic, no
   silent tick on the wrong story.
+- The `tests` module pins the walk's two floors in-process:
+  `EXPECTED_STORY_COUNT` (14) and `EXPECTED_GROUP_COUNT` (6) mirror the
+  same-named constants in `scripts/gallery_walk.py`, and the two tests assert
+  `build_stories()` and `group_names()` stay at or above them. Same floor
+  semantics as the walk — adding a story passes, losing a story or a whole
+  group fails — but checked by `cargo test` inside the crate on a headless
+  machine, not only when a display can run the walk. When the floors move,
+  bump both files together.
 
 Naming conventions the catalog holds itself to (they outlived the file split):
 group names are sentence case ("Core", "Flagship") because `section_header`
@@ -248,7 +259,12 @@ stories a fixed viewport so their internal scroll behaves like the chat's.
 - `shell.rs`: `chat_header`, `collapsible_section` (live — the expanded flag
   lives in `StoryRuntime`, so the story demonstrates the real click), and
   `statusbar_frame`. Section titles come from a *choice* knob rather than a
-  text knob because the component's signature is `&'static str`.
+  text knob because the component's signature is `&'static str`. The
+  statusbar's trailing caption is a bare machine name (`exe-vm-7fa2`,
+  matching the header fixture) because that is what the app's
+  `machine_presentation` renders for a connected machine — an earlier
+  `"harvesterd · connected"` fixture was gallery drift from a link text the
+  app never shows.
 - `sidebar.rs`: the three sidebar builders inside a `w_64` frame tinted with
   the sidebar theme slots (the app's own sidebar width — the gallery should not
   invent a second sidebar metric), because a row's selected state is only
@@ -397,8 +413,9 @@ inputs.
   the gallery moved onto the rem scale, because they are the OS window's
   physical bounds rather than layout — the one place a pixel is the honest
   unit.
-- Text knobs are backed by real `Entity<InputState>`s keyed by
-  `(story_index, knob_name)` and created **eagerly**, in
+- Text knobs are backed by real `Entity<InputState>`s held in one map per
+  story — `text_inputs` is a `Vec` indexed by story, each element a
+  `HashMap` keyed by knob name — and created **eagerly**, in
   `create_text_knob_inputs` from `Gallery::new`: every text knob of every
   story gets its input before the first frame. They used to be created lazily
   during `render`, on the theory that only a shown knob has a `Window` — but

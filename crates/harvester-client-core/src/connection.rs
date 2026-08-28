@@ -293,18 +293,22 @@ pub(crate) async fn sweep_leaked_forward_sockets() {
             continue;
         }
 
-        let Some(owner_pid) = forward_socket_owner_pid(name) else {
-            eprintln!("harvester: leaving {name} alone: it names no owning client");
-
-            continue;
-        };
-
-        if process_is_alive(owner_pid).await {
-            continue;
-        }
-
-        remove_if_refused(&path).await;
+        reclaim_if_leaked(&path, name).await;
     }
+}
+
+async fn reclaim_if_leaked(path: &Path, name: &str) {
+    let Some(owner_pid) = forward_socket_owner_pid(name) else {
+        eprintln!("harvester: leaving {name} alone: it names no owning client");
+
+        return;
+    };
+
+    if process_is_alive(owner_pid).await {
+        return;
+    }
+
+    remove_if_refused(path).await;
 }
 
 fn forward_socket_owner_pid(name: &str) -> Option<u32> {

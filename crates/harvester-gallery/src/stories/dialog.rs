@@ -50,13 +50,13 @@ const STORY_OPTIONS: &[&str] = &[
 ];
 
 pub fn stories() -> Vec<Story> {
-    vec![Story::new(
-        DIALOG_GROUP,
-        DIALOG_CHROME_STORY,
-        knobs(),
-        presets(),
-        chrome,
-    )]
+    vec![Story {
+        group: DIALOG_GROUP,
+        name: DIALOG_CHROME_STORY,
+        knobs: knobs(),
+        presets: presets(),
+        render: chrome,
+    }]
 }
 
 fn knobs() -> Vec<KnobSpec> {

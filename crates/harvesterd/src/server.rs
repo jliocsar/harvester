@@ -22,6 +22,21 @@ pub enum Outbound {
     Raw(Arc<[u8]>),
 }
 
+impl Outbound {
+    fn write_into(&self, line: &mut Vec<u8>) {
+        line.clear();
+
+        match self {
+            Outbound::Typed(outgoing) => {
+                serde_json::to_writer(&mut *line, outgoing).expect("serializable")
+            }
+            Outbound::Raw(bytes) => line.extend_from_slice(bytes),
+        }
+
+        line.push(LF);
+    }
+}
+
 #[derive(Deserialize)]
 struct RequestIdProbe {
     #[serde(default)]
@@ -66,16 +81,7 @@ fn spawn_writer(
         let mut line: Vec<u8> = Vec::with_capacity(FRAME_BUFFER_START_BYTES);
 
         while let Some(outbound) = out_rx.recv().await {
-            line.clear();
-
-            match &outbound {
-                Outbound::Typed(outgoing) => {
-                    serde_json::to_writer(&mut line, outgoing).expect("serializable");
-                }
-                Outbound::Raw(bytes) => line.extend_from_slice(bytes),
-            }
-
-            line.push(LF);
+            outbound.write_into(&mut line);
 
             if write_half.write_all(&line).await.is_err() {
                 break;

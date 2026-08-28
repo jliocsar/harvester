@@ -62,7 +62,22 @@ duplicated in both binaries) because it is the rendezvous point between them;
 drift between two copies would surface only as an unexplained connect
 timeout.
 
-### Build fingerprint (`fingerprint_reader` / `fingerprint_bytes`)
+### `DEV_DAEMON_PATH`
+
+The workspace-relative path of the shippable daemon binary
+(`target/x86_64-unknown-linux-musl/daemon-release/harvesterd`). It was spelled
+three times — `harvester/build.rs`, `harvester/src/main.rs`, and
+`harvester-cli/src/main.rs` — so a profile or target rename was a three-file
+hunt; now it is spelled once. It lives in this crate for the same reason
+`DAEMON_SOCKET_PATH` does: the binaries that need it already depend on the
+protocol crate.
+
+The const sits in its own file (`src/dev_daemon_path.rs`, re-exported from
+`lib.rs`) rather than inline in `lib.rs`, because `harvester/build.rs` shares
+it by `include!`-ing that file: a build script importing the crate normally
+would pull the whole proto dependency tree (tokio included) into the
+build-dependency graph for one string. The file must therefore stay
+free-standing — one `pub const`, no `use`, nothing else.
 
 Produces `fnv1a64-<byte count>-<hash>`: FNV-1a-64 over the file's bytes, hash
 in lowercase 16-digit hex. `FNV_OFFSET_BASIS` / `FNV_PRIME` are the reference

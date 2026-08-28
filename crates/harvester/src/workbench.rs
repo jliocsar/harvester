@@ -10,7 +10,7 @@ use harvester_client_core::bridge::Event as BridgeEvent;
 use serde_json::Value;
 
 use machine_presentation::present_machine;
-use modal::{MachineForgotten, ModalCoordinator, RepoAdded};
+use modal::{ModalCoordinator, ModalOutcome};
 use sidebar::{Sidebar, SidebarIntent};
 
 use crate::chat::{Chat, ChatFlowRequest, ChatTarget};
@@ -19,13 +19,20 @@ use crate::ui::{self, Tone};
 
 const NO_CHAT_HINT: &str = "start a new session to begin";
 
+struct WorkbenchSubscriptions {
+    _store_repaint: Subscription,
+    _store_events: Subscription,
+    _sidebar_intents: Subscription,
+    _modal_outcomes: Subscription,
+}
+
 pub struct Workbench {
     store: Entity<FleetStore>,
     sidebar: Entity<Sidebar>,
     modal: Entity<ModalCoordinator>,
     chat: Option<Entity<Chat>>,
     chat_subscription: Option<Subscription>,
-    _subscriptions: [Subscription; 5],
+    _subscriptions: WorkbenchSubscriptions,
 }
 
 impl Workbench {
@@ -38,13 +45,12 @@ impl Workbench {
         let store = cx.new(|cx| FleetStore::new(argv_machine, daemon_binary, cx));
         let sidebar = cx.new(|cx| Sidebar::new(store.clone(), cx));
         let modal = cx.new(|cx| ModalCoordinator::new(store.clone(), window, cx));
-        let subscriptions = [
-            cx.observe(&store, |_, _, cx| cx.notify()),
-            cx.subscribe_in(&store, window, Self::handle_store_event),
-            cx.subscribe_in(&sidebar, window, Self::handle_sidebar_intent),
-            cx.subscribe_in(&modal, window, Self::handle_repo_added),
-            cx.subscribe_in(&modal, window, Self::handle_machine_forgotten),
-        ];
+        let subscriptions = WorkbenchSubscriptions {
+            _store_repaint: cx.observe(&store, |_, _, cx| cx.notify()),
+            _store_events: cx.subscribe_in(&store, window, Self::handle_store_event),
+            _sidebar_intents: cx.subscribe_in(&sidebar, window, Self::handle_sidebar_intent),
+            _modal_outcomes: cx.subscribe_in(&modal, window, Self::handle_modal_outcome),
+        };
 
         Self {
             store,
@@ -100,17 +106,26 @@ impl Workbench {
         });
     }
 
-    fn handle_machine_forgotten(
+    fn handle_modal_outcome(
         &mut self,
         _modal: &Entity<ModalCoordinator>,
-        forgotten: &MachineForgotten,
+        outcome: &ModalOutcome,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        match outcome {
+            ModalOutcome::RepoAdded { machine, path } => self.handle_repo_added(machine, path, cx),
+            ModalOutcome::MachineForgotten { machine } => {
+                self.handle_machine_forgotten(machine, cx)
+            }
+        }
+    }
+
+    fn handle_machine_forgotten(&mut self, machine: &str, cx: &mut Context<Self>) {
         let targets_machine = self
             .chat
             .as_ref()
-            .is_some_and(|chat| chat.read(cx).machine() == forgotten.machine);
+            .is_some_and(|chat| chat.read(cx).machine() == machine);
 
         if !targets_machine {
             return;
@@ -121,22 +136,16 @@ impl Workbench {
         cx.notify();
     }
 
-    fn handle_repo_added(
-        &mut self,
-        _modal: &Entity<ModalCoordinator>,
-        added: &RepoAdded,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn handle_repo_added(&mut self, machine: &str, path: &str, cx: &mut Context<Self>) {
         let Some(chat) = self.chat.clone() else {
             return;
         };
 
-        if chat.read(cx).machine() != added.machine {
+        if chat.read(cx).machine() != machine {
             return;
         }
 
-        let path = added.path.clone();
+        let path = path.to_string();
 
         chat.update(cx, |chat, cx| chat.select_repo(path, cx));
     }

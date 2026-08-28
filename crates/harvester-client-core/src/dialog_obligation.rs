@@ -8,12 +8,6 @@ pub struct DialogRoom {
     pub sid: String,
 }
 
-impl DialogRoom {
-    pub fn new(machine: String, sid: String) -> Self {
-        Self { machine, sid }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DialogObligation {
     pub machine: String,
@@ -22,16 +16,11 @@ pub struct DialogObligation {
 }
 
 impl DialogObligation {
-    pub fn new(machine: String, sid: String, request: DialogRequest) -> Self {
-        Self {
-            machine,
-            sid,
-            request,
-        }
-    }
-
     pub fn room(&self) -> DialogRoom {
-        DialogRoom::new(self.machine.clone(), self.sid.clone())
+        DialogRoom {
+            machine: self.machine.clone(),
+            sid: self.sid.clone(),
+        }
     }
 
     pub fn key(&self) -> DialogKey {
@@ -52,6 +41,13 @@ pub struct DialogKey {
 pub enum EnqueueResult {
     Accepted,
     Rejected,
+}
+
+impl EnqueueResult {
+    #[must_use]
+    pub fn accepted(self) -> bool {
+        self == EnqueueResult::Accepted
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -87,7 +83,10 @@ impl DialogObligations {
     }
 
     pub fn retire_room(&mut self, machine: &str, sid: &str) -> Vec<DialogObligation> {
-        let room = DialogRoom::new(machine.to_string(), sid.to_string());
+        let room = DialogRoom {
+            machine: machine.to_string(),
+            sid: sid.to_string(),
+        };
 
         if self.rooms_by_machine.get(machine) == Some(&room) {
             self.rooms_by_machine.remove(machine);
@@ -178,21 +177,24 @@ mod tests {
     use crate::DialogKind;
 
     fn room(machine: &str, sid: &str) -> DialogRoom {
-        DialogRoom::new(machine.to_string(), sid.to_string())
+        DialogRoom {
+            machine: machine.to_string(),
+            sid: sid.to_string(),
+        }
     }
 
     fn question(machine: &str, sid: &str, id: &str) -> DialogObligation {
-        DialogObligation::new(
-            machine.to_string(),
-            sid.to_string(),
-            DialogRequest {
+        DialogObligation {
+            machine: machine.to_string(),
+            sid: sid.to_string(),
+            request: DialogRequest {
                 id: id.to_string(),
                 title: "Which branch?".to_string(),
                 kind: DialogKind::Confirm {
                     message: "sure?".to_string(),
                 },
             },
-        )
+        }
     }
 
     #[test]

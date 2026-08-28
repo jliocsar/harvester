@@ -36,13 +36,12 @@ impl<T> Pending<T> {
     }
 
     pub fn accept(&mut self, token: RequestToken) -> Option<T> {
-        if !self.is_outstanding(token) {
-            return None;
-        }
-
-        self.outstanding.take().map(|(_token, context)| context)
+        self.outstanding
+            .take_if(|(outstanding, _)| *outstanding == token)
+            .map(|(_token, context)| context)
     }
 
+    #[cfg(test)]
     fn is_outstanding(&self, token: RequestToken) -> bool {
         matches!(&self.outstanding, Some((outstanding, _)) if *outstanding == token)
     }
