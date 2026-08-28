@@ -326,7 +326,16 @@ Implications: this smells like a future pi server/daemon mode. If it ships, harv
 
 ## Watch: pi main wire changes (unreleased, WILL land in the next release)
 
-**Update 2026-08-18 (fixture-capture session): this is no longer hypothetical — fresh exeuntu VMs now ship pi 0.84.2.** Any new VM runs the post-0.83 wire unless pinned back (`exeuntu update pi --version 0.83.0`, verified working). Before harvester adopts 0.84.x, verify against a live 0.84.2 stream whether `message_update` really lost its cumulative `partial` (below) and re-run the `--session-id`/stdin-close checks. Until then, pin every VM harvester touches to 0.83.0.
+**Update 2026-08-18 (fixture-capture session): this is no longer hypothetical — fresh exeuntu VMs now ship pi 0.84.2.** Any new VM runs the post-0.83 wire unless pinned back (`exeuntu update pi --version 0.83.0`, verified working).
+
+**RESOLVED 2026-08-27 — 0.84.3 verified live, throwaway VMs `thermo-stream-check` + `thermo-084-matrix` (created and deleted), full matrix in `scripts/pi_version_matrix.py`.** Harvester no longer pins pi anywhere; the client tolerates the verified range instead (see AGENTS.md §Pi version discipline). Per-item verdicts:
+
+- **`partial` loss: CONFIRMED.** 0.84.3 `message_update` is `{type, usage, assistantMessageEvent: {type, contentIndex, delta}}` — no `partial`, no `message`. Deltas stream incrementally (~50ms apart). The client now accumulates bare `text_delta`s and still prefers `partial` where it exists (raw side-by-side captures from the incident session: `tmp/pi-083-stream.jsonl` / `tmp/pi-084-stream.jsonl`, ephemeral).
+- **Snapshot-models concern: REFUTED live.** `get_available_models` sent immediately after spawn on a throwaway `--no-session` pi returned all 57 models on the first ask, five runs out of five, 0.73–0.81s each. No retry guard needed.
+- **`--session-id`: unchanged.** Create warns on stderr ("No project session found … creating"), resume is silent, `get_state.sessionId` matches both times.
+- **stdin-close shutdown: unchanged.** Exit 0 on every close across the matrix.
+- **`extension_ui_request`: unchanged** (same `method`/`title`/`options` shape, no `timeout`, emitted at startup without the preference file; models list is empty until the integration is accepted or pre-seeded).
+- **Tool events, `get_state`, `set_model`, `get_entries`: unchanged** (`tool_execution_start/update/end` keyed by `toolCallId` with `result.content`/`isError`; `get_state` same keys plus the same `model` object; `set_model` switches live and a follow-up `get_state` confirms; `get_entries` returns `entries` + `leafId`).
 
 Verified 2026-08-04 against the pi checkout at `main` (= the 0.83.0 release plus ~212 unreleased commits; `packages/coding-agent/package.json` still reads 0.83.0):
 

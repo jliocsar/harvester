@@ -58,12 +58,25 @@ provider-side decision is explained, because neither file has a
 
 ## Pi version discipline
 
-Everything is pinned to **pi 0.83.0** (what exeuntu ships). `--session-id` and
-stdin-close shutdown are source-verified but *undocumented* API — re-verify on
-every pi upgrade (see `HARNESS_RESEARCH.md`, incl. the protocol-v2 watch item).
-When docs are ambiguous, read the shipped source at
-`/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/` (local pi binary
-itself is broken — node version mismatch — but the source is readable).
+Pi's version is deliberately **invisible to the user** — no pin, no version
+management, on any machine. The client depends only on wire surface verified
+across the supported range (currently **0.83.0 through 0.84.3**, both
+verified live on 2026-08-27), and every version-sensitive read degrades
+gracefully: streaming accepts both 0.83's cumulative `partial` and 0.84's
+bare `text_delta`s, and an unknown future shape falls back to `message_end` —
+text arrives late, never lost, never hung. This policy exists because a
+version drift (0.84.3 via a `latest` mise pin) once broke streaming
+*silently*; graceful degradation plus per-release verification replaced
+pinning as the answer.
+
+Two behaviors Harvester stands on are *undocumented* pi API and cannot be
+tolerated client-side: `--session-id` resume-or-create and stdin-close
+shutdown. When a new pi version ships, run `scripts/pi_version_matrix.py` on
+a throwaway VM (~2 minutes): it verifies both, plus the dialog channel, tool
+events, `get_state`/`set_model`/`get_entries` shapes and models availability.
+The verified matrix and the protocol-v2 watch item live in
+`HARNESS_RESEARCH.md`. When docs are ambiguous, read the shipped source under
+`~/.local/share/mise/installs/pi/<version>/`.
 
 ## Code style (extracted from review rounds — treat as house rules)
 
@@ -107,10 +120,11 @@ itself is broken — node version mismatch — but the source is readable).
   you created (`ssh exe.dev rm <name>`), and NEVER touch, rename, or delete a VM you
   did not create this session. VM user is `exedev`; keyless LLM gateway is enabled by
   pre-seeding `~/.pi/agent/exe-dev-llm-integration.json` =
-  `{"version":1,"useExeIntegration":true}`. The image tracks pi upstream (it shipped
-  0.84.2 on 2026-08-18), so pin the version this repo targets —
-  `exeuntu update pi --version 0.83.0` — before capturing anything that becomes a
-  fixture or a documented fact.
+  `{"version":1,"useExeIntegration":true}`. The image tracks pi upstream
+  (0.84.3 as of 2026-08-27); VMs are not pinned — record the VM's
+  `pi --version` alongside anything captured as a fixture or a documented
+  fact, and use `exeuntu update pi --version <v>` only when a comparison
+  needs both sides.
 
 ## Build & test
 

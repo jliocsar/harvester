@@ -152,9 +152,10 @@ reorder), but the frontend has nowhere to put those events until
 An event arriving in that window is missing from the snapshot *and* would be
 dropped by the frontend if delivered live — concretely, a lost
 `tool_execution_end` leaves a tool card spinning for the life of that chat,
-because streaming text self-repairs (every `message_update` carries the whole
-partial) but tool-end events do not. Hence the bridge holds that window back
-and flushes it right after the snapshot.
+because streaming text self-repairs (on pi 0.83 every `message_update`
+carries the whole partial; on every version `message_end` is authoritative)
+but tool-end events do not. Hence the bridge holds that window back and
+flushes it right after the snapshot.
 
 Everything in this file is pure and synchronous by design — no daemon, no pi,
 no async runtime — specifically so it is the one piece of the whole fix that
@@ -1765,16 +1766,26 @@ it rather than appended to.
   plus tool blocks rebuilt from assistant `toolCall` blocks matched to their
   `toolResult` messages — the same data the live events carry (verified
   against pi 0.83.0 session captures).
-- `Transcript::streaming` exposes the in-flight assistant message. Every
-  `message_update` carries the whole partial (never a delta), so applying one
-  is a replacement, never an accumulation.
+- `Transcript::streaming` exposes the in-flight assistant message, and
+  `apply_message_update` speaks both wire shapes pi has shipped: pi 0.83
+  re-sends the whole partial AssistantMessage on every update (replacement),
+  pi 0.84 dropped `partial` and sends only bare `text_delta`s
+  (accumulation — verified live 2026-08-27, raw captures of both versions in
+  `tmp/pi-083-stream.jsonl` / `tmp/pi-084-stream.jsonl`). A `partial` field
+  wins wherever it exists, because it is cumulative and therefore self-healing
+  under event loss; bare deltas are appended. Any future shape that matches
+  neither degrades to the `message_end` fallback — the full text appears when
+  the message finishes, late but never lost and never hung. Thinking deltas
+  and tool-call deltas never touch the streamed text.
 - `Transcript::is_busy`: a turn is running until `agent_settled`, not
   `agent_end` — retries, compaction and queued follow-ups may still run after
   `agent_end`.
 - `Transcript::replace_history` answers a resync (docs/DAEMON.md §Events): the
   fetched entries are authoritative and replace everything rendered,
-  including the in-flight partial (the next `message_update` will carry the
-  whole partial again). `busy` survives a replace: turn state belongs to the
+  including the in-flight streamed text (on 0.83 the next `message_update`
+  re-carries the whole partial; on 0.84 the preview restarts from the next
+  delta and `message_end` still lands the full message). `busy` survives a
+  replace: turn state belongs to the
   event stream, and a snapshot fetched mid-turn does not end the turn.
 - `Transcript::extend_history` folds a delta from `get_entries {since}`
   (docs/SPEC.md C6) onto what is already held — the cheap repair, versus

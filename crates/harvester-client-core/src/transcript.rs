@@ -159,16 +159,35 @@ impl Transcript {
     }
 
     fn apply_message_update(&mut self, event: &Value) {
-        let partial_text = event
-            .get("assistantMessageEvent")
-            .and_then(|update| update.get("partial"))
-            .map(message_text);
+        let Some(update) = event.get("assistantMessageEvent") else {
+            return;
+        };
 
-        if let Some(text) = partial_text {
+        if let Some(partial) = update.get("partial") {
+            let text = message_text(partial);
+
             if !text.is_empty() {
                 self.streaming = Some(text);
             }
+
+            return;
         }
+
+        if update.get("type").and_then(Value::as_str) != Some("text_delta") {
+            return;
+        }
+
+        let Some(delta) = update.get("delta").and_then(Value::as_str) else {
+            return;
+        };
+
+        if delta.is_empty() {
+            return;
+        }
+
+        self.streaming
+            .get_or_insert_with(String::new)
+            .push_str(delta);
     }
 
     fn apply_message_end(&mut self, event: &Value) {
@@ -564,6 +583,89 @@ mod tests {
         }
 
         assert_eq!(transcript.streaming(), Some("Hello there"));
+    }
+
+    #[test]
+    fn bare_deltas_accumulate_when_no_partial_is_sent() {
+        let mut transcript = Transcript::default();
+
+        transcript.apply(&json!({
+            "type": "message_update",
+            "usage": { "totalTokens": 0 },
+            "assistantMessageEvent": { "type": "text_start", "contentIndex": 1 },
+        }));
+
+        for delta in ["Riv", "ers ", "run"] {
+            transcript.apply(&json!({
+                "type": "message_update",
+                "usage": { "totalTokens": 0 },
+                "assistantMessageEvent": {
+                    "type": "text_delta",
+                    "contentIndex": 1,
+                    "delta": delta,
+                },
+            }));
+        }
+
+        assert_eq!(transcript.streaming(), Some("Rivers run"));
+    }
+
+    #[test]
+    fn a_delta_carrying_a_partial_replaces_rather_than_appends() {
+        let mut transcript = Transcript::default();
+
+        for _ in 0..2 {
+            transcript.apply(&json!({
+                "type": "message_update",
+                "assistantMessageEvent": {
+                    "type": "text_delta",
+                    "delta": "Hello",
+                    "partial": { "content": text_content("Hello") },
+                },
+            }));
+        }
+
+        assert_eq!(
+            transcript.streaming(),
+            Some("Hello"),
+            "the cumulative partial is authoritative wherever pi still sends it"
+        );
+    }
+
+    #[test]
+    fn thinking_deltas_never_reach_the_streamed_text() {
+        let mut transcript = Transcript::default();
+
+        transcript.apply(&json!({
+            "type": "message_update",
+            "assistantMessageEvent": {
+                "type": "thinking_delta",
+                "contentIndex": 0,
+                "delta": "pondering rivers",
+            },
+        }));
+
+        assert_eq!(transcript.streaming(), None);
+    }
+
+    #[test]
+    fn a_finished_message_ends_a_bare_delta_stream_too() {
+        let mut transcript = Transcript::default();
+
+        transcript.apply(&json!({
+            "type": "message_update",
+            "assistantMessageEvent": { "type": "text_delta", "delta": "half an ans" },
+        }));
+        transcript.apply(&json!({
+            "type": "message_end",
+            "message": { "role": "assistant", "content": text_content("the whole answer") },
+        }));
+
+        assert_eq!(transcript.streaming(), None);
+        assert!(matches!(
+            transcript.items(),
+            [Item::Message(Message { role: Role::Assistant, text })] if text == "the whole answer"
+        ));
     }
 
     #[test]
