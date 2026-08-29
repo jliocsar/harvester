@@ -1,7 +1,7 @@
 use gpui::{div, prelude::*, Context, Entity, EventEmitter, Role, SharedString};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::list::ListItem;
-use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _};
+use gpui_component::{ActiveTheme as _, Icon, IconName};
 use harvester_client_core::{folder_name, LOCAL_MACHINE};
 use harvester_proto::SessionStatus;
 
@@ -74,12 +74,12 @@ impl Sidebar {
     }
 
     fn render_new_session_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div().px(ui::SIDEBAR_ROW_GUTTER).pt_2().child(
+        div().px(ui::SIDEBAR_EDGE_GUTTER).py_2().child(
             Button::new("new-session")
                 .icon(IconName::Plus)
                 .label(NEW_SESSION_LABEL)
                 .ghost()
-                .small()
+                .px_3()
                 .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarIntent::NewSession))),
         )
     }
@@ -177,7 +177,6 @@ impl Sidebar {
             Button::new(("forget-machine", index))
                 .icon(Icon::default().path(TRASH_ICON_PATH))
                 .ghost()
-                .small()
                 .tooltip(FORGET_MACHINE_TOOLTIP)
                 .on_click(move |_, _, cx| {
                     let machine = machine.clone();

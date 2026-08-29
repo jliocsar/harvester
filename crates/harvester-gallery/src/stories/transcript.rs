@@ -1,6 +1,5 @@
 use gpui::{div, prelude::*, AnyElement, App, Div, Entity, Window};
 use gpui_component::button::Button;
-use gpui_component::Sizable as _;
 use harvester::ui::{empty_pane_hint, Tone};
 
 use super::{caption, story_column, story_row, transcript_panel, FLAGSHIP_GROUP};
@@ -161,7 +160,6 @@ fn replay_controls(
     let restart = Button::new(RESTART_BUTTON_ID)
         .label("Restart")
         .outline()
-        .small()
         .on_click(move |_, _, cx| {
             restarting_runtime.update(cx, |runtime, cx| {
                 runtime.replay.restart();

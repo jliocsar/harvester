@@ -1,6 +1,7 @@
-use gpui::{div, prelude::*, px, App, Div, ElementId, Hsla, SharedString};
+use gpui::{div, prelude::*, px, App, Div, ElementId, Entity, Hsla, SharedString};
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::{v_flex, ActiveTheme as _, Icon, IconName, Sizable as _};
+use gpui_component::input::{Input, InputState};
+use gpui_component::{v_flex, ActiveTheme as _, Icon, IconName};
 
 const FAINT_TEXT_OPACITY: f32 = 0.6;
 
@@ -118,7 +119,11 @@ pub fn empty_pane_hint(tone: Tone, text: impl Into<SharedString>, cx: &App) -> D
 }
 
 pub fn empty_pane_action(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
-    Button::new(id).label(label).primary().small()
+    Button::new(id).label(label).primary()
+}
+
+pub fn text_input(input: &Entity<InputState>) -> Input {
+    Input::new(input).text_base()
 }
 
 pub(super) fn disclosure_chevron(expanded: bool) -> Icon {

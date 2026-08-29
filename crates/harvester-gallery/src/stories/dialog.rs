@@ -1,5 +1,4 @@
 use gpui::{div, prelude::*, rems, AnyElement, App, Div, FontWeight, Window};
-use gpui_component::input::Input;
 use gpui_component::v_flex;
 use gpui_component::ActiveTheme as _;
 use harvester::ui::dialog::{
@@ -7,6 +6,8 @@ use harvester::ui::dialog::{
     title_or_named_condition, ActionAccent, Confirmation, CANCEL_LABEL,
     CONFIRMATION_DIALOG_WIDTH_IN_REMS, SELECT_DIALOG_WIDTH_IN_REMS, TEXT_DIALOG_WIDTH_IN_REMS,
 };
+
+use harvester::ui::text_input;
 
 use super::{caption, panel, story_column, DIALOG_GROUP};
 use crate::story::{KnobSpec, KnobValue, Preset, Story, StoryScene};
@@ -116,9 +117,9 @@ fn chrome(scene: &StoryScene, _window: &mut Window, cx: &mut App) -> AnyElement 
             panel(cx)
                 .w(rems(TEXT_DIALOG_WIDTH_IN_REMS))
                 .child(caption(TEXT_CAPTION, cx))
-                .child(Input::new(&single_line))
+                .child(text_input(&single_line))
                 .child(caption(MULTI_LINE_CAPTION, cx))
-                .child(Input::new(&multi_line)),
+                .child(text_input(&multi_line)),
         )
         .child(caption(FOUNDATION_CAPTION, cx))
         .into_any_element()

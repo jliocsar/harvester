@@ -55,12 +55,12 @@ exactly that constraint, six other sites already used them, and the three
 stragglers now do too. A shrink constraint reaches the layout engine as the
 keyword it is, and nothing in the app writes `px` for it.
 
-Two dev-and-dialog surfaces outside `ui/` still carry a pixel height because
-they frame content rather than express product rhythm: the folder picker's
-entry list (`ENTRY_LIST_HEIGHT`, 280) and the gallery's story panel frames
-(`PANEL_MIN_WIDTH` 320, `TRANSCRIPT_PANEL_HEIGHT` 420, `STRIP_WIDTH` 680).
-Both are recorded in the internals notes. Beyond the two exceptions in the table
-above, nothing in `crates/harvester/src/ui/` is measured in pixels.
+Product and gallery framing stays on the same axis too: the folder picker's
+entry list is `20rem`, the gallery's story panel is at least `23rem`, its
+transcript viewport is `30rem`, and the prompt-strip story is `61rem` — the
+inner width of the chat pane at the default window size. Beyond the raster
+boundaries and OS-window bounds in the table above, visual layout is not
+measured in pixels.
 
 Corner radii are the deliberate counter-case: they come from the theme
 (`cx.theme().radius` / `radius_lg`) rather than from gpui's `rounded_md`/
@@ -76,14 +76,26 @@ up when you zoom the type is wrong.
 
 | Tier | Token | Size at rem 14 | Used for |
 | --- | --- | --- | --- |
-| Body | inherited theme `font_size` | 14px | message prose, row titles, empty-pane hints, dialog bodies |
-| Secondary | `text_sm` | 12.25px | section headers, pane subtitles, sidebar detail lines, inline notes, the status band, the whole tool-call card |
+| Body | inherited theme `font_size` / `text_base` | 14px | message prose, row titles, empty-pane hints, dialog bodies, composer text, standard action labels |
+| Secondary | `text_sm` | 12.25px | section headers, pane subtitles, sidebar detail lines, inline notes, the status band, the whole tool-call card, prompt selectors and branch |
 
 `text_xs` is not used anywhere in the crate. At rem 14 it renders 10.5px, under
 the guide's ~12px typography floor, and the smallest text the app draws is also
 the text that most needs to stay legible (code, diffs, status). `text_sm` is the
 app's one secondary tier; something that needs to recede further than that
 should leave the surface or move behind a disclosure.
+
+The body tier is also the **standard control baseline**. `Button`'s medium
+default already renders `text_base`, and Harvester's `text_input` factory
+corrects the library's medium `Input`, which otherwise renders `text_sm`.
+Prompt selectors are the one compact control tier: model, machine, repository
+and the read-only branch use `text_sm`, while the branch `Tag` explicitly
+corrects the library's fixed `text_xs` treatment upward. Editable text and
+commit actions therefore stay at 14px; compact selection context sits one tier
+below, never under the typography floor. Shell chrome reaches that secondary
+tier through one `secondary_text` builder: a sidebar's transient “opening…”
+note and detail, the chat-header subtitle, and every statusbar item therefore
+resolve to the exact same 12.25px.
 
 **Three brightness tiers, and the set is closed.**
 
@@ -255,18 +267,48 @@ What the standard tier looks like in practice:
 - the transcript column is `gap_4` / `py_4`, because it is the one surface the
   user reads continuously.
 
-**Density is a property of a local context, not of a control.** Compact is for
-toolbars and repeated dense controls. The prompt strip's pickers and send button
-are `.small()`; the sidebar's New-session button is `.small()`; the gallery's
-knob controls sit at the library's medium default, because a control dock's job
-is to be operable rather than to be small. The pickers are `.small()` and not
-`.xsmall()` specifically so they match the send button's height — a strip whose
-pickers sit a few pixels shorter than the button beside them reads as three
-loose controls rather than one row.
+**Density is a property of hierarchy before it is a property of size.** The
+composer and actions keep the 14px body baseline. The three prompt selectors
+are compact context about where the message will go, so they and the read-only
+branch take the secondary tier without shrinking below it.
 
-Use the component's own size API rather than a custom height. A height that
-changes only the outer box, leaving typography, icon and padding behind, is
-an incomplete change.
+Standard actions use the library's **medium default**. At rem 14 that means a
+28px (`h_8`) button with 14px text: send, stop, New session, dialog actions,
+empty-state actions, row actions, and gallery controls share one baseline.
+
+Prompt selectors use `.small()` for coordinated 12.25px text, icon, padding and
+caret, then correct only the library's overly short 21px frame to `1.875rem`
+(26.25px). The result is one rem half-step — 1.75px — below the standard
+control in both type and height. Icon and label use `gap_1p5` (5.25px): the
+picker adds the final half-step as icon margin because the library fixes small
+buttons at `gap_1`, while the branch can set the gap directly. The branch `Tag`
+uses the same frame and `text_sm`; its icon is `size_3p5`. This explicit text
+correction is necessary because the library renders Tag text as `text_xs` at
+every nominal size.
+
+The folder picker's modal search field is the deliberate size exception. It
+uses the library's large `List` because that is the only supported size that
+renders the built-in filter at `text_base`; medium silently falls to
+`text_sm`. A primary search field may carry the larger frame, but not smaller
+text.
+
+**The product gap ladder is closed:**
+
+| Token | Size at rem 14 | Relationship |
+| --- | --- | --- |
+| `gap_1` | 3.5px | lines or fragments inside one code body |
+| `gap_1p5` | 5.25px | icon and label inside one compact selector |
+| `gap_2` | 7px | peers in one row: controls, header parts, dialog actions |
+| `gap_3` | 10.5px | related blocks inside one compact surface |
+| `gap_4` | 14px | distinct content items or groups |
+
+Padding uses the same rem steps. The prompt controls row starts at `pl_2`, a
+visible 7px margin between the prompt frame and the first picker's hover
+surface; its trailing edge remains `pr_3` so the send button aligns with the
+input above. Use the component's own size API wherever it changes typography,
+icon and padding together. A frame correction may follow that complete size
+change, as the compact prompt controls do; a custom height that leaves the
+other metrics behind is incomplete.
 
 ---
 
@@ -298,16 +340,24 @@ one owner rather than each inventing a literal:
 - The chat column is `px_3` throughout — `chat_header`, the transcript, and
   `prompt_strip` all take the same step, so three siblings in one pane cannot
   drift apart. The transcript owns that padding outright; neither the chat pane
-  nor the gallery's transcript panel adds any of its own.
-- The sidebar resolves from one pair: `SIDEBAR_ROW_GUTTER` (0.25rem, the row
-  pill's margin from the sidebar edge) and `SIDEBAR_ROW_PADDING` (0.75rem, the
-  pill's own padding). `SIDEBAR_CONTENT_INSET` is their computed sum — the lane
-  the row *text* starts in — and full-bleed siblings align to it. Section
-  headers read the same two constants, and `workbench/sidebar.rs` reads the
-  gutter so the New-session button's own padding completes the same inset.
+  nor the gallery's transcript panel adds any of its own. Inside the prompt
+  box, the input is `px_3`; the controls row deliberately uses `pl_2` so the
+  first compact picker's hover surface has a visible left margin, while the
+  icon-only send button's trailing edge resolves directly from `pr_3`.
+- The sidebar resolves from one pair: `SIDEBAR_EDGE_GUTTER` (0.25rem) and
+  `SIDEBAR_ROW_PADDING` (0.75rem). Their computed sum,
+  `SIDEBAR_CONTENT_INSET` (1rem), is the section title/chevron spine and the
+  outer margin of every selectable row, so a selected pill's two borders land
+  on those content edges. Rows keep their own inner padding and therefore read
+  as children of the section rather than competing with its title. The New
+  session wrapper reads the edge gutter while its medium button supplies
+  `px_3`; together they complete the same 1rem inset exactly.
 - `SIDEBAR_STATUS_LANE` (1rem) is a fixed functional lane. The status dot sits
   at its leading edge and the stacked row's detail line is indented by it, so
-  the dot's diameter can change without moving a character of text.
+  the dot's diameter can change without moving a character of text. The New
+  session action is a medium control inside symmetric `py_2`, so the sidebar's
+  primary entry point has the same type and frame as every other action without
+  losing the row spine.
 - The gallery's stage, preset row, knob grid and empty notes all pass through
   one `with_content_inset` function.
 
@@ -367,7 +417,9 @@ Pick the component by its **semantic role**, not by its shape:
 - The branch indicator is a `Tag`, not a disabled picker. It never opens
   anything, and rendering it as a dead dropdown trigger made it look like a
   control the user had failed to earn. `Tag` is this library's chip;
-  `Badge` is a notification overlay dot and is not the same thing.
+  `Badge` is a notification overlay dot and is not the same thing. Its visual
+  metrics are normalized to the compact prompt selectors beside it because
+  semantic difference should not produce a broken baseline.
 - Sidebar rows are `ListItem`s, so hover, selected and disabled treatments come
   from the library rather than from three call sites.
 - Button variants follow the guide: `primary` for the one emphasised commitment
@@ -574,7 +626,7 @@ the sentence and the action are two things; `p_8` is the major-region step an
 empty state wants, because crowding its one sentence against the edges is how an
 empty state reads as broken rather than as waiting.
 
-`empty_pane_action` is the trailing slot: one small primary `Button`, at most
+`empty_pane_action` is the trailing slot: one medium primary `Button`, at most
 one per empty state. An empty pane that states a problem without offering the
 one way out of it is a dead end — and the alternative, every empty pane
 hand-rolling its own button, is how the tone rule got broken the last time.
@@ -660,15 +712,6 @@ worth fixing blind. A contract that hides its own exceptions is worthless.
   crate-private. Wrapping the button in a labelled `div` is theatre — a div with
   no role is filtered out of the tree, and a wrapper *with* a role is not the
   focusable node. The real fix is upstream.
-- **Two optical insets drifted when the controls stepped up a size.** The prompt
-  strip's controls row and the sidebar's New-session button were both solved
-  against the library's extra-small button padding (and the sidebar's older row
-  padding). Both controls are `small` now and the row padding grew, so in each
-  case the control's leading content sits about a quarter-rem inboard of the
-  text it should align with. The rule in both places is unchanged — the row's
-  own inset plus the library's padding for the button size in use equals the
-  neighbour's inset — what is missing is re-solving it, which wants an eye on
-  the rendered result rather than arithmetic alone.
 - **`KeyboardFocusRing` has no inset variant.** A control inside a clipping
   container cannot use it, because an overflow-hidden parent masks a shadow
   drawn outside the child's box. The tool-block header therefore hand-rolls the

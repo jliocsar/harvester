@@ -2,11 +2,10 @@ use gpui::{
     div, prelude::*, rems, AnyElement, Context, Div, Role, SharedString, Stateful, Styled, Window,
 };
 use gpui_component::button::{Button, ButtonGroup};
-use gpui_component::input::Input;
 use gpui_component::{ActiveTheme as _, Selectable as _};
 use harvester::ui::{
-    chat_header, collapsible_section, inline_note, sidebar_row, statusbar_frame, KeyboardFocusRing,
-    Tone,
+    chat_header, collapsible_section, inline_note, sidebar_row, statusbar_frame, text_input,
+    KeyboardFocusRing, Tone,
 };
 
 use crate::stories::caption;
@@ -342,7 +341,7 @@ fn render_text_knob(gallery: &Gallery, name: &'static str) -> AnyElement {
 
     div()
         .w_56()
-        .child(Input::new(input).aria_label(name))
+        .child(text_input(input).aria_label(name))
         .into_any_element()
 }
 

@@ -1,18 +1,18 @@
 use std::rc::Rc;
 
 use gpui::{
-    div, prelude::*, Action, Anchor, AnyElement, App, Div, ElementId, Entity, FocusHandle,
+    div, prelude::*, rems, Action, Anchor, AnyElement, App, Div, ElementId, Entity, FocusHandle,
     Focusable as _, SharedString, Window,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::input::{Enter, Input, InputState};
+use gpui_component::input::{Enter, InputState};
 use gpui_component::menu::{DropdownMenu as _, PopupMenu};
 use gpui_component::tag::Tag;
 use gpui_component::{ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _};
 
 use crate::assets::GIT_BRANCH_ICON_PATH;
 
-use super::core::{inline_note, truncated_to_max_chars, Tone};
+use super::core::{inline_note, text_input, truncated_to_max_chars, Tone};
 
 const MODEL_CONTROL_ID: &str = "chat-model";
 const MACHINE_CONTROL_ID: &str = "chat-machine";
@@ -32,6 +32,7 @@ const PROMPT_INPUT_PLACEHOLDER: &str = "Message pi — Enter to send";
 const PROMPT_INPUT_ROWS: (usize, usize) = (1, 8);
 
 const CONTROL_LABEL_MAX_CHARS: usize = 24;
+const COMPACT_CONTROL_HEIGHT_IN_REMS: f32 = 1.875;
 
 const SEND_KEYSTROKE: Enter = Enter {
     secondary: false,
@@ -103,7 +104,8 @@ fn prompt_box_control(
     Button::new(id)
         .ghost()
         .small()
-        .icon(icon)
+        .h(rems(COMPACT_CONTROL_HEIGHT_IN_REMS))
+        .icon(icon.mr_0p5())
         .label(truncated_control_label(label))
         .dropdown_caret(true)
         .disabled(!enabled)
@@ -162,7 +164,6 @@ fn create_dropdown_menu(
 fn prompt_box_stop(id: impl Into<ElementId>) -> Button {
     Button::new(id)
         .outline()
-        .small()
         .icon(Icon::new(IconName::CircleX))
         .label(STOP_LABEL)
         .tooltip(STOP_TOOLTIP)
@@ -171,7 +172,6 @@ fn prompt_box_stop(id: impl Into<ElementId>) -> Button {
 fn prompt_box_send(id: impl Into<ElementId>, enabled: bool) -> Button {
     Button::new(id)
         .primary()
-        .small()
         .icon(Icon::new(IconName::ArrowUp))
         .rounded_full()
         .disabled(!enabled)
@@ -261,7 +261,7 @@ fn prompt_strip_box(
         .then(|| prompt_box_stop(STOP_CONTROL_ID).on_click(move |_, window, cx| stop(window, cx)));
 
     prompt_box(strip.focused, cx)
-        .child(prompt_box_input(Input::new(input).appearance(false).p_0()))
+        .child(prompt_box_input(text_input(input).appearance(false).p_0()))
         .child(
             prompt_box_controls()
                 .child(model)
@@ -302,6 +302,8 @@ fn branch_indicator(branch: Option<SharedString>) -> Option<Tag> {
     Some(
         Tag::secondary()
             .small()
+            .h(rems(COMPACT_CONTROL_HEIGHT_IN_REMS))
+            .text_sm()
             .flex_none()
             .child(branch_indicator_body(branch)),
     )
@@ -311,8 +313,8 @@ fn branch_indicator_body(branch: SharedString) -> Div {
     div()
         .flex()
         .items_center()
-        .gap_1()
-        .child(Icon::default().path(GIT_BRANCH_ICON_PATH).size_3())
+        .gap_1p5()
+        .child(Icon::default().path(GIT_BRANCH_ICON_PATH).size_3p5())
         .child(branch)
 }
 

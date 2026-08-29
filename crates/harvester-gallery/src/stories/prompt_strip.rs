@@ -1,4 +1,4 @@
-use gpui::{prelude::*, AnyElement, App, Window};
+use gpui::{prelude::*, rems, AnyElement, App, Window};
 use harvester::ui::{
     prompt_strip, DropdownRow, PromptStrip, PromptStripControl, PromptStripNotice, ADD_REPO_ROW,
     DEFAULT_MODEL_ROW,
@@ -45,7 +45,7 @@ const MODEL_ROW_LABELS: &[&str] = &[
 const MACHINE_ROW_LABELS: &[&str] = &["local", READY_MACHINE, "exe-vm-0c19"];
 const REPO_ROW_LABELS: &[&str] = &[READY_REPO, "taskline", ADD_REPO_ROW];
 const REPO_DIVIDER_INDEX: usize = 2;
-const STRIP_WIDTH: f32 = 680.;
+const STRIP_WIDTH_IN_REMS: f32 = 61.;
 const STRIP_CAPTION: &str = "The input is a real InputState — type in it";
 
 pub fn stories() -> Vec<Story> {
@@ -215,7 +215,7 @@ fn strip(scene: &StoryScene, _window: &mut Window, cx: &mut App) -> AnyElement {
     let props = strip_props(scene.knobs);
 
     story_column()
-        .w(gpui::px(STRIP_WIDTH))
+        .w(rems(STRIP_WIDTH_IN_REMS))
         .child(
             panel(cx)
                 .p_0()

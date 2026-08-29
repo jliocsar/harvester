@@ -99,3 +99,16 @@ fn graphite_theme_colors() -> ThemeConfigColors {
 
     colors
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{graphite_theme_config, BASE_FONT_SIZE};
+
+    #[test]
+    fn one_base_size_drives_ui_and_monospace_type() {
+        let config = graphite_theme_config();
+
+        assert_eq!(config.font_size, Some(BASE_FONT_SIZE));
+        assert_eq!(config.mono_font_size, Some(BASE_FONT_SIZE));
+    }
+}

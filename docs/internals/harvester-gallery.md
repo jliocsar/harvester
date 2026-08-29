@@ -245,9 +245,11 @@ Also here are the layout primitives `story_column`, `story_row`, `caption`
 `panel` sits on the `popover` slot with `rounded_lg` and `shadow_sm` — the
 raised-surface tier of the graphite ladder — so a story's framing matches
 how real raised components (tool cards, popovers) sit on the canvas.
-`PANEL_MIN_WIDTH` (320) keeps a one-line component from collapsing to its
-text width on the stage; `TRANSCRIPT_PANEL_HEIGHT` (420) gives the transcript
-stories a fixed viewport so their internal scroll behaves like the chat's.
+`PANEL_MIN_WIDTH_IN_REMS` (23) keeps a one-line component from collapsing to
+its text width on the stage; `TRANSCRIPT_PANEL_HEIGHT_IN_REMS` (30) gives the
+transcript stories a fixed viewport so their internal scroll behaves like the
+chat's. Both used to be pixel frames (320 and 420); moving them onto the theme's
+rem axis keeps the catalog scaling with the components it claims to show.
 
 - `core.rs`: the tone swatch grid (all six tones × the derived dot × the
   tone's own `label()` × colored text, `w_20` lanes aligning both label
@@ -292,7 +294,13 @@ stories a fixed viewport so their internal scroll behaves like the chat's.
   It installs no `on_action` listener either, so a pick opens and dismisses the
   real menu and changes nothing — which is the honest rendering of a strip with
   no chat behind it. The input is a real `Entity<InputState>` from the runtime,
-  so typing, focus ring and auto-grow are the genuine article.
+  so typing, focus ring and auto-grow are the genuine article. The story width
+  is `61rem`, the default app window's chat-pane inner width after its `w_64`
+  sidebar and `px_3` pane gutters; the former 680px frame cropped the strip's
+  full ready-state composition, which was the frame lying rather than the
+  component overflowing its real home. The selectors later stepped down to the
+  compact tier, but the story still previews the width the product actually
+  gives them rather than back-solving a tighter showcase.
   The two rows that are not sample data — the repository list's trailing
   `ui::ADD_REPO_ROW` and the model list's leading `ui::DEFAULT_MODEL_ROW` —
   are the app's own consts, not copies. They used to be copies, and they had
@@ -311,7 +319,8 @@ stories a fixed viewport so their internal scroll behaves like the chat's.
   place a reviewer can discover that without reading the code; the
   streaming story renders the replay transcript plus its control row (restart
   button, `applied / total` progress, and the paused/finished note). Play and
-  speed are knobs; restart is a button because it is an action, not a state.
+  speed are knobs; restart is a medium button because it is an action, not a
+  state, and story controls follow the same 14px baseline as app controls.
 - `dialog.rs`: `Confirmation` + `button_row` + the `select`
   option list + both input kinds, rendered **inline on the canvas**, never
   through `window.open_dialog`. See the recorded gap below. Each surface is
@@ -323,9 +332,11 @@ stories a fixed viewport so their internal scroll behaves like the chat's.
   the same "The agent needs a yes or no" condition `dialogs.rs` uses. The
   The cancel button's word is `ui::dialog::CANCEL_LABEL`, the app's own const,
   for the same reason `ADD_REPO_ROW` and `DEFAULT_MODEL_ROW` are: the gallery
-  constructs no component *and no copy* the app constructs itself. Its
-  neighbour `CANCEL_LABEL_KNOB` stays local — that is a knob name, which is
-  gallery chrome, not user-facing copy.
+  constructs no component *and no copy* the app constructs itself. Both input
+  states render through `ui::text_input`, the same body-tier factory the real
+  dialog uses, so the story cannot silently restore gpui-component's smaller
+  medium-input text. Its neighbour `CANCEL_LABEL_KNOB` stays local — that is a
+  knob name, which is gallery chrome, not user-facing copy.
   The option list is painted as a plain column of `option_row`s rather than as
   a live `List`, with one row forced selected so the selected style is reviewable:
   a story render function runs on every frame and cannot own a list state
@@ -521,8 +532,11 @@ signature already asks for.
   with `min_w_56`/`max_w_80` and is allowed to shrink (`flex_shrink_1`) — the
   `w_64` matches the app's sidebar exactly, because the gallery should not
   invent a second sidebar metric, and the bounds are what keep a narrow window
-  squeezing the sidebar rather than the stage. `STAGE_MEASURE_IN_REMS` (64) is
-  the only measure left as a named const here: it caps the stage's content
+  squeezing the sidebar rather than the stage. Story entries use the shared
+  `ui::sidebar_row`, whose outer margin is the section content inset; a selected
+  story's borders therefore align with the group title and chevron without a
+  gallery-only correction. `STAGE_MEASURE_IN_REMS` (64) is the only measure
+  left as a named const here: it caps the stage's content
   column so a component never stretches to a width no real pane would give it,
   and it is in rems so that cap scales with the type it is capping.
 - Each region is described by three constraints — a minimum, a comfortable
@@ -559,7 +573,9 @@ signature already asks for.
   default knob string in the registry except the long dialog message (the
   `Input` scrolls that one), and it is also what keeps three to four knobs on a
   dock row at the default window width instead of collapsing the grid into a
-  column.
+  column. It renders through `ui::text_input`, so gallery chrome itself
+  dogfoods the app's 14px input baseline instead of the library's hidden
+  12.25px medium-input default.
 - Every other former sizing const is now a rem step read straight off the
   library scale: the knob grid caps at `max_h_56` (it must not eat the stage
   when a story has a dozen knobs — the prompt strip does — and scrolls past

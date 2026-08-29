@@ -1,9 +1,9 @@
 use gpui::{
-    div, prelude::*, px, App, Context, Entity, EventEmitter, IntoElement, Render, SharedString,
+    div, prelude::*, rems, App, Context, Entity, EventEmitter, IntoElement, Render, SharedString,
     Task, Window,
 };
 use gpui_component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
-use gpui_component::{Disableable as _, IndexPath, WindowExt as _};
+use gpui_component::{Disableable as _, IndexPath, Sizable as _, WindowExt as _};
 use harvester_client_core::machines;
 use harvester_client_core::{Pending, RemoteDirEntry, RequestToken, RequestTokens};
 
@@ -11,7 +11,7 @@ use crate::store::{FleetStore, StoreEvent};
 use crate::ui::dialog::{action_button, button_row, dismiss_button, ActionAccent, CANCEL_LABEL};
 use crate::ui::{self, Tone};
 
-const ENTRY_LIST_HEIGHT: f32 = 280.;
+const ENTRY_LIST_HEIGHT_IN_REMS: f32 = 20.;
 
 const ADD_REPOSITORY_TITLE: &str = "Add repository";
 const ADD_REPOSITORY_ACTION_LABEL: &str = "Add";
@@ -568,7 +568,8 @@ impl Render for FolderPicker {
             .child(
                 List::new(&self.entries)
                     .search_placeholder(ENTRY_FILTER_PLACEHOLDER)
-                    .h(px(ENTRY_LIST_HEIGHT)),
+                    .large()
+                    .h(rems(ENTRY_LIST_HEIGHT_IN_REMS)),
             )
             .children(self.walk.error.clone().map(|error| {
                 ui::inline_note(Tone::Failed, error, cx)

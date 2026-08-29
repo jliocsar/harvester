@@ -1188,12 +1188,12 @@ everything else in `ui` should ask for a `Tone`, never a raw `Hsla`.
   theme's `font_size` slot (`BASE_FONT_SIZE`, see `ui/theme.rs`), which the
   window root restates as `text_size(cx.theme().font_size)` so every
   descendant inherits it, and which is simultaneously the rem unit every
-  rem-based padding, gap and height in `ui` scales off. Sidebar rows no longer
-  restate it either: `ListItem` inherits the ambient size once nobody
-  overrides it. Anything wanting *smaller* text asks for `text_sm`, the
-  library's own token — **not** `text_xs`, which at rem 14 renders 10.5px and
-  falls under the gpui-component design guide's ~12px typography floor.
-  `text_sm` (12.25px at rem 14) is the app's one secondary tier.
+  rem-based padding, gap and height in `ui` scales off. Sidebar rows and
+  medium `Button`s inherit that 14px body tier. Anything wanting *smaller*
+  text asks for `text_sm`, the library's own token — **not** `text_xs`, which
+  at rem 14 renders 10.5px and falls under the gpui-component design guide's
+  ~12px typography floor. `text_sm` (12.25px at rem 14) is the app's one
+  secondary tier.
 - `Tone` is what a component is being told about its *subject*, in place of
   raw color: `Muted` (secondary label), `Idle` (backgrounded — an unprobed
   machine), `Active` (what the user is doing right now), `Pending` (working,
@@ -1293,6 +1293,12 @@ everything else in `ui` should ask for a `Tone`, never a raw `Hsla`.
   ("Geist Mono", set in `ui/theme.rs`) so every mono run in the app agrees
   with gpui-component's own widgets. No startup resolution, no fallback
   logic — the theme is the single owner of font names.
+- `text_input(input)` is the one renderer for an `InputState` at the body
+  tier. gpui-component's medium `Input` defaults to `text_sm` even though a
+  medium `Button` defaults to `text_base`; wrapping `Input::new(input)` with
+  `text_base` here closes that hidden mismatch once for the prompt, dialogs,
+  and the gallery's own text controls. The state factories stay with the
+  surface that decides input behavior; this factory decides only typography.
 - `truncated_to_max_chars(text, max_chars)` is the app's one display
   truncator, and its contract is that the result is **at most `max_chars`
   characters with `TRUNCATION_ELLIPSIS` already counted inside that number**.
@@ -1359,7 +1365,7 @@ from happening again.
   empty state reads as broken rather than as waiting. The signature did not
   change when the action slot was added, so every existing caller keeps
   rendering exactly what it rendered before.
-- `empty_pane_action` is that action: a small primary `Button`, one per empty
+- `empty_pane_action` is that action: a medium primary `Button`, one per empty
   state. An empty pane that states a problem without offering the one way out
   of it is a dead end, and the alternative — every empty pane hand-rolling its
   own button — is how the tone rule got broken the last time.
@@ -1411,6 +1417,11 @@ exist yet.
   handful of lines is the right initial shape. It stays a bare pair of integers
   rather than becoming a rem measure because it is a row *count* handed to
   `auto_grow`, not geometry.
+- `create_single_line_input` and `create_multi_line_input` decide the input
+  state and behavior; `core::text_input` decides how either state is rendered.
+  `open_text` and the gallery's dialog story both call that same renderer, so
+  the library's 12.25px medium-input default cannot drift back into one surface
+  while dialog buttons and body copy remain at 14px.
 - `title_or_named_condition(title, named_condition)`: the title shown when a
   caller has no title to give (Pi omits its own on some dialogs). It replaced a
   single `UNTITLED` const ("The agent is asking") because one generic fallback
@@ -1570,8 +1581,8 @@ while the implementation stays split across cohesive modules (`core`,
 `dialog`, `prompt`, `shell`, `theme`, `transcript`) rather than one broad file.
 That list is shorter than it was: `sidebar` folded into `shell` (one alignment
 spine, one file) and `tool_block` into `transcript` (its only consumer). The
-flat `ui::` surface did not move a name in either merge — `sidebar_row`,
-`sidebar_stacked_row`, `sidebar_empty_note` and `SIDEBAR_ROW_GUTTER` are
+flat `ui::` surface did not move a builder in either merge — `sidebar_row`,
+`sidebar_stacked_row`, and `sidebar_empty_note` are
 re-exported from `shell` now and are still spelled `ui::sidebar_row` and so on
 at every call site, because the export list is a contract with the screens and
 the gallery, not a mirror of the file layout. Only names a *screen* calls are re-exported: a
@@ -1591,9 +1602,11 @@ matters here. It is now the *only* dot export — the `Dot`-taking `status_dot`
 and the `Dot` type itself had no callers at all and are gone (see
 `ui/core.rs`). `empty_pane_action` is exported on the same footing — it is the
 trailing button slot `empty_pane_hint` grew, catalogued before the first
-screen adopts it. `create_prompt_input` is the third of the widget factories
-(`ui::dialog`'s two inputs are the others) and is exported for the reason
-those are: the chat screen and the gallery must build the same
+screen adopts it. `text_input` is the shared visual factory that keeps direct
+`Input` renderers at the 14px body tier; prompt and dialog state construction
+remain in their own modules. `create_prompt_input` is the third of the widget
+factories (`ui::dialog`'s two inputs are the others) and is exported for the
+reason those are: the chat screen and the gallery must build the same
 `InputState`, and the export is what makes that a fact rather than a
 convention.
 
@@ -1601,9 +1614,9 @@ Two of the re-exports are not builders at all and are worth naming for that
 reason. `KeyboardFocusRing` (from `shell`) is a trait with a blanket impl, so
 it has to be imported by name at the call site to be usable —
 `use crate::ui::{self, KeyboardFocusRing as _}` in `workbench/sidebar.rs` is
-the shape. `SIDEBAR_ROW_GUTTER` (from `shell`) is a metric rather than a
+the shape. `SIDEBAR_EDGE_GUTTER` (from `shell`) is a metric rather than a
 component: the sidebar's own screen needs it to line its New-session button up
-with the rows below, which is the one case where a caller genuinely has to
+with the section spine, which is the one case where a caller genuinely has to
 know a number `ui` owns.
 `dialog` is the one submodule declared `pub mod` instead of being re-exported
 flat: its names are generic on purpose (`open_text`, `button_row`,
@@ -1644,13 +1657,18 @@ deleted the lot and brought arrow-key/Enter/Escape navigation with them. What
 is left in this file is only what the library does not know: which icon a
 control wears, what its rows say, and what a pick *means*.
 
-- Consequently there are no sizing consts left. The controls are
-  `Button::ghost().small()` and cap at `max_w_56` (14rem — a long model or
-  repo name still cannot push the rest of the row off the strip); the send
-  button is `Button::primary().small().rounded_full()`. The pickers are
-  `.small()` and not `.xsmall()` specifically so they match the send button's
-  height: a strip whose pickers sit a few pixels shorter than the button
-  beside them reads as three loose controls rather than one row.
+- `COMPACT_CONTROL_HEIGHT_IN_REMS` (1.875, 26.25px at rem 14) is the prompt
+  selector frame. The three pickers first use `.small()`, which changes text,
+  icon, caret, gap and horizontal padding together, then replace only the
+  library's cramped 21px height with this one-half-step reduction from the 28px
+  standard action. Their text is `text_sm` (12.25px), the same 1.75px step down
+  from body text. The library fixes a small button's icon/label gap at `gap_1`,
+  so `prompt_box_control` gives the icon `mr_0p5`; the effective `gap_1p5`
+  (5.25px) is the middle rung between cramped and two separate controls. Send
+  and stop remain medium 14px/28px actions. The pickers cap
+  at `max_w_56` (14rem — a long model or repo name still cannot push the rest
+  of the row off the strip), and send stays
+  `Button::primary().rounded_full()`.
 - The `max_w_56` cap is not cosmetic: `Button` lays its label out in a
   `flex_none` child with no ellipsis lane of its own, so without a cap an
   unusually long model name pushes the send button out of the box — a clipped
@@ -1699,22 +1717,20 @@ control wears, what its rows say, and what a pick *means*.
   the app hardcoded them — a preview surface that reconstructs the component
   it previews is the drift the catalog exists to prevent.
 - `prompt_box_input(input)` is the input well's padding (`px_3`, `pt_3`,
-  `pb_2`) and nothing else. It is private to this module: `prompt_strip_box`
-  is its only caller and no screen or story draws a bare input well, so it
-  fails the `ui/mod.rs` re-export rule (only names a *screen* calls are
-  published). It stays a named builder rather than an inline `div()` because
-  the controls row's inset is solved *against* this one — the two numbers are
-  a pair, and the next reader has to be able to see both.
-- `prompt_box_controls()`: `pl_2` + `pr_3`, `gap_2`. The asymmetry is
-  deliberate — the button's own internal padding supplies the rest of the left
-  inset, while the send button carries none, so `pr_3` is what lands it on the
-  same margin as the input above. The rule the left inset is solved against is
-  optical: the controls row is inset one step less than the input row so that
-  the first picker's *content* starts on the same x as the input's first
-  character, which means the row's own padding plus the library's padding for
-  the button size in use has to add up to the input's `px_3`. It is a
-  deliberate off-scale correction, documented here because that is the price of
-  making one.
+  `pb_2`) and nothing else. Its child is rendered through `core::text_input`,
+  because authored composer text stays at the 14px body tier even though the
+  compact selection context below it uses `text_sm`. It is private to this
+  module: `prompt_strip_box` is its only caller and no screen or story draws a
+  bare input well, so it fails the `ui/mod.rs` re-export rule (only names a
+  *screen* calls are published). It stays a named builder rather than an inline
+  `div()` because the controls row's inset is solved *against* this one — the
+  two numbers are a pair, and the next reader has to be able to see both.
+- `prompt_box_controls()`: `pl_2` + `pr_3`, `gap_2`. The left inset is a visible
+  7px margin for the first picker's hover surface; aligning its icon to the
+  input character had put the trigger box itself against the prompt edge, which
+  looked cramped even though the arithmetic was exact. The icon-only send
+  button has no horizontal padding around a label, so `pr_3` still lands its
+  trailing edge on the input's opposite margin.
 - `DropdownRow` is the one shape a picker's rows are described in, and it is
   now purely a description: `label`, `selected` (the choice in effect — the
   menu draws its own check mark) and `divider_above` (a separator meaning what
@@ -1778,19 +1794,20 @@ control wears, what its rows say, and what a pick *means*.
   with no machine or repository selected refuses the prompt inside its own
   state machine; the disabled rendering is just how the strip communicates
   that *before* the user starts typing.
-- `branch_indicator` is a `Tag::secondary().small()`, not a disabled picker.
-  It never opens anything, and rendering it as a dead dropdown trigger made it
-  look like a control the user had failed to earn. A tag reads as a label
-  about the session, which is all it ever was. `Tag` is this library's chip —
+- `branch_indicator` is a `Tag::secondary()`, not a disabled picker. It never
+  opens anything, and rendering it as a dead dropdown trigger made it look like
+  a control the user had failed to earn. A tag reads as a label about the
+  session, which is all it ever was. `Tag` is this library's chip —
   `gpui_component::Badge` is a notification overlay dot, not the same thing —
   and the `secondary` variant is chosen because a branch name carries no
   success, warning or danger meaning; a strip with a row of colored badges in
-  it is a hierarchy decision nobody made. There is exactly one badge on the
-  strip and it stays quiet. Its icon/label `gap_1` is the "parts of one
-  control" step, not the "separate controls" one. It is still the only place in
-  `ui` that names an asset path (`assets::GIT_BRANCH_ICON_PATH`, at `size_3`),
-  and still the reason `assets` and `ui` had to land on the same side of the
-  lib/bin split.
+  it is a hierarchy decision nobody made. The library renders Tag text as
+  `text_xs` at every nominal size, so this instance explicitly takes the same
+  `COMPACT_CONTROL_HEIGHT_IN_REMS`, `text_sm`, `size_3p5` icon, and `gap_1p5`
+  as the compact picker treatment: its semantics differ from the pickers, but its
+  visible baseline does not. It is still the only place in `ui` that names an
+  asset path (`assets::GIT_BRANCH_ICON_PATH`), and still the reason `assets`
+  and `ui` had to land on the same side of the lib/bin split.
 
 ### `PromptStrip` — the whole bottom row as one value
 
@@ -1943,30 +1960,22 @@ sentence case like every other heading.
   order resolves by `(path, insertion index)`, meaning equal indices fall back
   to paint order; that is why every tab stop in the app uses index 0 and still
   walks in visual order.
-- **The alignment spine.** The row metrics are rems, and they are the one place
-  the sidebar's leading edges are written down. `SIDEBAR_ROW_GUTTER`
-  (`rems(0.25)`) is the row's outer margin — what insets the hover/selection
-  fill from the sidebar edge — and `SIDEBAR_ROW_PADDING` (`rems(0.75)`) its
-  inner padding. These were one shared 6px number on the theory that margin and
-  padding should match; they no longer do, because the margin's job (keep the
-  fill off the edge) needs far less room than the padding's job (keep the label
-  off the fill's edge), and at rem 14 the shared value was too much for one and
-  too little for the other. `SIDEBAR_CONTENT_INSET` is their sum — the lane the
-  row *text* starts in — and is what non-row content (`sidebar_empty_note`)
-  aligns to so a note and a row title share one left edge. The point of all of
-  that is a single spine: four siblings describe the same level of the sidebar
-  — the New-session button, the section headers, the rows and the empty note —
-  and each used to invent its own leading edge from its own literal. They now
-  all resolve from this one pair, so changing the gutter moves every one of
-  them together instead of starting a hunt. `SIDEBAR_CONTENT_INSET` is
-  *computed* (`rems(GUTTER.0 + PADDING.0)`) rather than typed a second time;
-  `Rems` is a tuple struct and `rems` is a `const fn`, so the sum costs nothing
-  at runtime and cannot drift. `SIDEBAR_ROW_GUTTER` is the one metric that
-  leaves this module — `workbench/sidebar.rs` reads it so the New-session
-  button's own padding completes the same inset — and it is exported for that
-  single caller; the padding and the inset stay private now that
-  `section_header` sits in the same file as the rows it aligns to, which is
-  what the merge bought.
+- **The alignment spine.** The sidebar metrics are rems, and they are the one
+  place its horizontal edges are written down. `SIDEBAR_EDGE_GUTTER`
+  (`rems(0.25)`) keeps section-header and New-session hit areas off the window
+  edge; `SIDEBAR_ROW_PADDING` (`rems(0.75)`) keeps content off a control's own
+  edge. `SIDEBAR_CONTENT_INSET` is their computed 1rem sum and has two jobs:
+  it is where a section's title starts and chevron ends, and it is the outer
+  margin of every `sidebar_row`. A selected row's left and right borders
+  therefore align with the title and chevron above it, while the row's own
+  padding indents its contents one level further so rows still read as children
+  of the section. `sidebar_empty_note` starts at the same 1rem section spine.
+  The inset is computed (`rems(EDGE_GUTTER.0 + PADDING.0)`) rather than typed a
+  second time; `Rems` is a tuple struct and `rems` is a `const fn`, so the sum
+  costs nothing at runtime and cannot drift. `SIDEBAR_EDGE_GUTTER` is the one
+  metric that leaves this module — `workbench/sidebar.rs` reads it so the
+  New-session button's `px_3` completes the same inset — and it is exported for
+  that single caller.
 - Row padding is `py_2` (was `py_1`), matching the standard-tier step the rest
   of the chrome took: a session row carries two lines of `text_sm` and at
   `py_1` the stacked rows ran together into one grey block.
@@ -1987,10 +1996,13 @@ sentence case like every other heading.
   not clickable) opts out with `tab_stop(false)` — still focusable
   programmatically, just skipped by Tab, because a row with no click handler is
   a dead end to land on — and a caller that is opts into the ring with
-  `keyboard_focus_ring`. The ring cannot live inside `sidebar_row` itself: it
-  needs `cx` for the theme's ring color and this builder takes only an id, so
-  the split is deliberate — the row owns reachability, the call site owns the
-  ring. It no longer restates a text size — the ambient body size is correct
+  `keyboard_focus_ring`. Its `mx(SIDEBAR_CONTENT_INSET)` applies to every row,
+  not only a selected one, so selection never changes layout and the selected
+  border always lands on the section's title/chevron spine. The ring cannot
+  live inside `sidebar_row` itself: it needs `cx` for the theme's ring color and
+  this builder takes only an id, so the split is deliberate — the row owns
+  reachability, the call site owns the ring. It no longer restates a text size
+  — the ambient body size is correct
   now that nothing overrides it. The size was *removed* rather than read from
   the theme for the same reason the ring stayed outside: both roots that can
   host a row (the workbench root and the gallery's chrome root) set the theme's
@@ -1999,12 +2011,13 @@ sentence case like every other heading.
   wants the size restored at that root, never back on the row.
 - `sidebar_stacked_row` takes a **`Tone`, never a shape**: the shape is derived
   by `Tone::is_hollow` inside `status_dot_for_tone` (see `ui/core.rs`), so no
-  caller picks solid-versus-hollow any more. It is one shape for both lists: status lane + title on the first line,
-  an optional inline `note` (transient status, e.g. "opening…") after the
-  title, and an optional `detail` second line (the row's context — provider, or
-  folder · machine). Both secondary texts are `text_sm` and resolve their color
-  through `Tone::Muted` rather than `cx.theme().muted_foreground` directly, so
-  `ui` keeps its rule that a component asks for a meaning, never a theme field
+  caller picks solid-versus-hollow any more. It is one shape for both lists:
+  status lane + title on the first line, an optional inline `note` (transient
+  status, e.g. "opening…") after the title, and an optional `detail` second
+  line (the row's context — provider, or folder · machine). Both secondary
+  texts start from `secondary_text()` and resolve their color through
+  `Tone::Muted` rather than `cx.theme().muted_foreground` directly, so `ui`
+  keeps its rule that a component asks for a meaning, never a theme field
   (SPEC C11).
 - `status_lane` is a private builder rather than a bare dot because the dot has
   to *say* something: it carries `Tone::label` as both its `aria_label` and its
@@ -2016,11 +2029,17 @@ sentence case like every other heading.
   siblings.
 - `sidebar_empty_note` is the "no sessions yet" line. It is a plain note, not a
   row: an empty list has nothing to select, so it must not look clickable.
-- The statusbar band is `h_8` (2rem, 28px) — one line of `text_sm` with real
+- `secondary_text()` is the shell's one 12.25px (`text_sm`) constructor. The
+  stacked row's "opening…" note and detail, the empty-list note, section
+  headers, the chat-header subtitle, and `statusbar_frame` all begin there;
+  grep `secondary_text()` in `ui/shell.rs` proves the shared source. Color and
+  truncation remain specific to each role, but their type size cannot drift.
+- The statusbar band is `h_8` (2rem, 28px) — one secondary line with real
   breathing room, still short enough to read as a status strip rather than a
   second toolbar. There is no `STATUSBAR_HEIGHT` const any more: the rem step
   *is* the number, and restating it in pixels would just be a second place for
-  it to be wrong. Its text is `text_sm`.
+  it to be wrong. Peers inside the band use `gap_2`, the same compact-row
+  relationship as headers and dialog actions.
 - `collapsible_section` is the whole disclosure control — header, chevron,
   click target, `Role::Button`/`aria_label`/`aria_expanded`, tab stop and
   focus ring in one call — because a header that toggles nothing is not a
@@ -2038,13 +2057,12 @@ sentence case like every other heading.
   a disclosure control that cannot disclose. The chevron is the shared
   `disclosure_chevron` icon from `core.rs`, which inherits the header's faint
   color from the ambient text style.
-- `section_header`'s box is aligned to the sidebar's rows, not to itself: it
-  takes the same `mx(SIDEBAR_ROW_GUTTER)` / `px(SIDEBAR_ROW_PADDING)` pair
-  `sidebar_row` does and rounds `rounded_md`, so its focus ring draws the same
-  pill in the same lane as the row underneath it. That shared pair is the whole
-  argument for one file: a sidebar-shaped header that the gallery's dock
-  happens to reuse has to resolve from the row's geometry, and reading it
-  across a module boundary meant publishing a padding constant to one caller.
+- `section_header`'s content defines the selectable-row boundary: its
+  `mx(SIDEBAR_EDGE_GUTTER)` + `px(SIDEBAR_ROW_PADDING)` place the title and
+  chevron at `SIDEBAR_CONTENT_INSET`, and `sidebar_row` uses that computed inset
+  as its own outer margin. A sidebar-shaped header that the gallery happens to
+  reuse and an app row therefore cannot disagree about where a selected border
+  belongs.
   Its padding doubled with the rest of the chrome, `pt_2`/`pb_1` →
   `pt_4`/`pb_2`, which keeps the deliberate 2:1 asymmetry (more air above a
   heading than below it, so the heading binds downward to the rows it labels)
@@ -2053,8 +2071,8 @@ sentence case like every other heading.
   the user actually sees, and at `pb_1` there was under 4px between the text
   and the ring's lower edge.
 - `chat_header` is `py_3` for the same reason the statusbar grew, and its
-  subtitle is `text_sm`. The subtitle slot has a rule: it names the next action
-  or the target, never a restatement of the title. The chat pane pairs "New
+  subtitle comes from `secondary_text()`. The subtitle slot has a rule: it
+  names the next action or the target, never a restatement of the title. The chat pane pairs "New
   session" with "Pick a machine and a repository below", or a live session's
   title with `<folder> on <machine>`; the gallery pairs a story name with its
   group, which is the story's location. A subtitle that only echoed its title
@@ -2121,10 +2139,11 @@ is the same hue-240/5%-saturation gray at a different lightness) replacing
   the whole app's density in one step, which is exactly why no component is
   allowed to restate a size in pixels that could have been a rem. Setting the
   mono size to the same value keeps a code run in a tool block on the same
-  line box as the prose around it. It also fixes the app's secondary text
-  tier: `text_sm` is 12.25px at rem 14 and `text_xs` would be 10.5px, under
-  the ~12px typography floor, which is why `text_xs` appears nowhere in
-  `crates/harvester`.
+  line box as the prose around it. It also fixes both typography tiers:
+  medium controls and body text are 14px, `text_sm` is 12.25px, and `text_xs`
+  would be 10.5px under the ~12px typography floor, which is why `text_xs`
+  appears nowhere in `crates/harvester`. The inline theme test pins both
+  `font_size` and `mono_font_size` to this one const.
 - The mechanism behind that is `gpui_component::Root::render` calling
   `window.set_rem_size(cx.theme().font_size)`: this one theme slot *is* the
   window's rem unit, for the library's own controls as much as for ours. The
@@ -2761,9 +2780,14 @@ this file's unit tests. `FolderPicker` is the view: the walk plus the
 virtualized list its rows live in. This split is what makes the walk testable
 without gpui machinery.
 
-`ENTRY_LIST_HEIGHT = 280.` — fixed height for the entries list so the dialog
-does not resize under the pointer when a listing arrives or a filter narrows
-the results.
+`ENTRY_LIST_HEIGHT_IN_REMS = 20.` — fixed height for the entries list so the
+dialog does not resize under the pointer when a listing arrives or a filter
+narrows the results. Twenty rem is 280px at the default 14px axis, preserving
+the settled geometry while making it scale with the rest of the dialog. The
+`List` uses its large size only because that is the library's supported route
+to `text_base` for the built-in search field; medium silently renders 12.25px.
+The larger search frame is appropriate for the modal's primary filtering
+control, while its list rows remain body-sized.
 
 Copy constants, one per user-facing string (DESIGN.md §8):
 `ADD_REPOSITORY_TITLE` ("Add repository"), `ADD_REPOSITORY_ACTION_LABEL`
@@ -2913,8 +2937,13 @@ repository is picked inside the chat that is about to use it, and
 `workspaces.json` is that picker's backing store rather than being surfaced
 as a sidebar citizen with its own list.
 
-The New session button is a plain `ghost` `small` `Button`, sized to its own
-content rather than stretched to the sidebar. It used to ask for `w_full()`
+The New session button is a plain medium `ghost` `Button`, sized to its own
+content rather than stretched to the sidebar and wrapped in symmetric `py_2`.
+The control now shares the 14px/28px baseline used by every other action, and
+the wrapper fixes the old top-only spacing. Its `px_3` is an optical correction
+to the medium button's `px_2p5`: combined with `SIDEBAR_EDGE_GUTTER` (0.25rem),
+the Plus icon starts at the shared `SIDEBAR_CONTENT_INSET` (1rem) exactly. It
+used to ask for `w_full()`
 and `justify_start()`, and rendered neither: gpui-component's `Button` builds
 its label as an inner `h_flex().size_full().items_center().justify_center()`
 added as a child *after* `refine_style` applies the caller's style, so the
@@ -2982,10 +3011,11 @@ rather than in `ui/shell.rs`:
 - Machine rows pass `present_machine(...).tone` to `ui::sidebar_stacked_row`,
   which derives the dot's shape itself (`Tone::is_hollow`). Shape follows
   meaning, and there is only one place that decides it.
-- The New-session button aligns to `ui::SIDEBAR_ROW_GUTTER` rather than a local
-  `px_2`, so it sits in the same lane as the rows and the section headers
-  below it, and the forget-machine button moved from `.xsmall()` to `.small()`
-  with the rest of the chrome's density step.
+- The New-session wrapper aligns to `ui::SIDEBAR_EDGE_GUTTER` rather than a
+  local `px_2`, and the button's `px_3` completes the shared 1rem content inset
+  without changing its medium height or typography. The forget-machine action
+  and New session action both use the medium default now; icon-only and
+  labelled actions share the same 28px control frame.
 
 `SidebarIntent` — what a sidebar click asks the composition shell to do,
 captured from the rendered row so a later store repaint cannot move the click
@@ -3203,15 +3233,6 @@ something yet, with the reason it was not worth fixing blind.
   the accessibility tree, and a wrapper *with* a role is not the focusable
   node, so an assistive-technology user still lands on an unnamed button. The
   real fix is upstream.
-- **Two optical insets drifted when the controls stepped up a size.** Both the
-  prompt strip's controls row and the sidebar's New-session button were solved
-  against the library's *extra-small* button padding and the sidebar's older
-  row padding respectively. Both controls are `small` now and the row padding
-  grew, so in each case the control's leading content sits a quarter-rem
-  inboard of the text it is supposed to align with. The rule in both places is
-  still "the row's own inset plus the library's padding equals the neighbour's
-  inset"; what is missing is re-solving it, which is one step in each file and
-  wants an eye on the rendered result rather than arithmetic alone.
 - **`KeyboardFocusRing` has no inset variant.** A control inside a clipping
   container cannot use it, because an overflow-hidden parent masks a shadow
   drawn outside the child's box. The tool block header therefore hand-rolls the

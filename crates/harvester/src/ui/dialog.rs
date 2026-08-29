@@ -5,9 +5,11 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::dialog::{CancelDialog, DialogAction, DialogClose, DialogFooter};
-use gpui_component::input::{Input, InputState};
+use gpui_component::input::InputState;
 use gpui_component::list::{List, ListDelegate, ListItem, ListState};
 use gpui_component::{ActiveTheme as _, IndexPath, WindowExt as _};
+
+use super::core::text_input;
 
 pub const CONFIRMATION_DIALOG_WIDTH_IN_REMS: f32 = 30.;
 pub const SELECT_DIALOG_WIDTH_IN_REMS: f32 = 36.;
@@ -209,7 +211,7 @@ pub fn open_text<T: 'static>(
             .title(title.clone())
             .width(dialog_width(TEXT_DIALOG_WIDTH_IN_REMS, window))
             .close_button(false)
-            .child(Input::new(&shown))
+            .child(text_input(&shown))
             .footer(action_footer(
                 cancel_button(TEXT_CANCEL_BUTTON_ID, CANCEL_LABEL),
                 action_button(

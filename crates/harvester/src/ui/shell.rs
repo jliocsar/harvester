@@ -8,9 +8,9 @@ use gpui_component::{h_flex, v_flex, ActiveTheme as _};
 
 use super::core::{dim, disclosure_chevron, faint, status_dot_for_tone, Tone};
 
-pub const SIDEBAR_ROW_GUTTER: Rems = rems(0.25);
+pub const SIDEBAR_EDGE_GUTTER: Rems = rems(0.25);
 const SIDEBAR_ROW_PADDING: Rems = rems(0.75);
-const SIDEBAR_CONTENT_INSET: Rems = rems(SIDEBAR_ROW_GUTTER.0 + SIDEBAR_ROW_PADDING.0);
+const SIDEBAR_CONTENT_INSET: Rems = rems(SIDEBAR_EDGE_GUTTER.0 + SIDEBAR_ROW_PADDING.0);
 const SIDEBAR_STATUS_LANE: Rems = rems(1.);
 
 const FOCUS_RING_SPREAD: Pixels = px(1.5);
@@ -34,9 +34,13 @@ pub trait KeyboardFocusRing: InteractiveElement + Sized {
 
 impl<E: InteractiveElement + Sized> KeyboardFocusRing for E {}
 
+fn secondary_text() -> Div {
+    div().text_sm()
+}
+
 pub fn sidebar_row(id: impl Into<ElementId>) -> ListItem {
     ListItem::new(id)
-        .mx(SIDEBAR_ROW_GUTTER)
+        .mx(SIDEBAR_CONTENT_INSET)
         .px(SIDEBAR_ROW_PADDING)
         .py_2()
         .rounded_md()
@@ -80,18 +84,16 @@ fn stacked_row_title(title: SharedString, note: Option<SharedString>, cx: &App) 
         .gap_2()
         .child(div().overflow_hidden().text_ellipsis().child(title))
         .children(note.map(|note| {
-            div()
+            secondary_text()
                 .flex_none()
-                .text_sm()
                 .text_color(Tone::Muted.color(cx))
                 .child(note)
         }))
 }
 
 fn stacked_row_detail(detail: SharedString, cx: &App) -> Div {
-    div()
+    secondary_text()
         .pl(SIDEBAR_STATUS_LANE)
-        .text_sm()
         .text_color(Tone::Muted.color(cx))
         .overflow_hidden()
         .text_ellipsis()
@@ -99,18 +101,17 @@ fn stacked_row_detail(detail: SharedString, cx: &App) -> Div {
 }
 
 pub fn sidebar_empty_note(text: &'static str, cx: &App) -> Div {
-    div()
+    secondary_text()
         .px(SIDEBAR_CONTENT_INSET)
         .py_2()
-        .text_sm()
         .text_color(Tone::Muted.color(cx))
         .child(text)
 }
 
 fn section_header(id: impl Into<ElementId>, title: &'static str, cx: &App) -> Stateful<Div> {
-    div()
+    secondary_text()
         .id(id)
-        .mx(SIDEBAR_ROW_GUTTER)
+        .mx(SIDEBAR_EDGE_GUTTER)
         .px(SIDEBAR_ROW_PADDING)
         .pt_4()
         .pb_2()
@@ -118,7 +119,6 @@ fn section_header(id: impl Into<ElementId>, title: &'static str, cx: &App) -> St
         .flex()
         .items_center()
         .gap_2()
-        .text_sm()
         .text_color(faint(cx))
         .tab_index(SECTION_HEADER_TAB_INDEX)
         .keyboard_focus_ring(cx)
@@ -160,8 +160,7 @@ pub fn chat_header(title: SharedString, subtitle: SharedString, cx: &App) -> Div
                 .child(title),
         )
         .child(
-            div()
-                .text_sm()
+            secondary_text()
                 .text_color(faint(cx))
                 .overflow_hidden()
                 .text_ellipsis()
@@ -170,15 +169,14 @@ pub fn chat_header(title: SharedString, subtitle: SharedString, cx: &App) -> Div
 }
 
 pub fn statusbar_frame(cx: &App) -> Div {
-    div()
+    secondary_text()
         .h_8()
         .flex_none()
         .flex()
         .items_center()
-        .gap_3()
+        .gap_2()
         .px_3()
         .border_t_1()
         .border_color(cx.theme().status_bar_border)
         .bg(cx.theme().status_bar)
-        .text_sm()
 }
