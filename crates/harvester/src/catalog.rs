@@ -1,5 +1,5 @@
 use harvester_client_core::LOCAL_MACHINE;
-use harvester_proto::{SessionInfo, SessionStatus};
+use harvester_proto::{unix_millis_now, SessionInfo, SessionStatus};
 
 use crate::session_state::ChatTarget;
 use crate::workspaces::{self, Workspace};
@@ -317,13 +317,6 @@ impl Catalog {
                 .then_with(|| b.info.sid.cmp(&a.info.sid))
         });
     }
-}
-
-fn unix_millis_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|since_epoch| since_epoch.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

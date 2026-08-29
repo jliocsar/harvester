@@ -105,6 +105,59 @@ The verified matrix and the protocol-v2 watch item live in
   swallowing silently.
 - Long boring descriptive names beat short clever ones.
 
+## One-way rules (there is exactly one way to do each of these)
+
+Landed by the 2026-08-29 simplification round, which found the same job done two
+or three ways in about thirty places. Each rule below is written so a reviewer can
+check it with a grep. All violation counts are currently zero — keep them there.
+
+- **A constant both ends of the wire must agree on lives in `harvester-proto`,
+  with a test pinning its contents.** `DIALOG_METHODS` was duplicated
+  byte-for-byte in the daemon and the client, with nothing relating them; drift
+  would have parked a pi dialog nobody could answer.
+- **One implementation per computation, in the lowest crate both callers already
+  depend on.** `unix_millis_now`, `$HOME` resolution, stage-then-rename,
+  `message_text`, fixture loading and "last path component" were each written
+  twice; three had already diverged, two of those silently changing behaviour.
+  Before writing a helper, grep for it.
+- **A pi wire token is named in `harvester-proto` only when more than one crate
+  reads it.** A token confined to one match arm in one file stays a literal —
+  naming it buys indirection, not safety.
+- **Every struct literal and every constructor return type is written `Self`.**
+- **Every match arm calls one named function unless its body is a single
+  expression.** Value construction and `Err`-log-and-return arms are exempt.
+- **No error type exists unless something matches on its variants.** Three error
+  vocabularies are permanent and correct: pi's JSON failure payload (an
+  invariant), `std::io::Error`, and a display `String` at the client-core → app
+  seam. A fourth must justify itself with a match site. `FleetError` could not.
+- **`pub` means "re-exported from `lib.rs`"; everything else is `pub(crate)`.**
+  `token.rs` is the reference implementation.
+- **A window-free `present_*` function returns one presentation value; the view
+  only reads entities and renders it.** `workbench/machine_presentation.rs` and
+  `models::present_prompt_strip` are the pattern.
+- **One truncation helper, and the budget includes the ellipsis.**
+  `ui::core::truncated_to_max_chars`. Extractors that never ellipsise are a
+  different operation and stay separate.
+- **Outside `ui/`, `cx.theme()` is for structural slots only; every text colour
+  comes from a `Tone`.** Greppable: `cx.theme()` outside `ui/` should name only
+  `sidebar`, `background`, `foreground`, `border`, `radius`, `font_size`.
+- **The gallery constructs no component the app constructs itself; both call one
+  `ui::` factory.** The gallery drifting from the app has now cost us twice.
+- **A module with a non-trivial pure function carries an inline
+  `#[cfg(test)] mod tests`.** `tests/` is reserved for checks that walk the
+  filesystem (`no_comments.rs`, `fixtures.rs`).
+- **Every `.rs` file under `crates/` is covered by a `##` section in
+  `docs/internals/<crate>.md`** naming either the file or its directory (a
+  directory section is only for a set of files that are one repeated shape, like
+  `gallery/src/stories/`). And a doc sentence claiming "the one place that X"
+  must name the grep that proves it — three such claims were false when checked.
+
+Two clippy opinions this codebase deliberately rejects, both from the `pedantic`
+group and neither on by default: `map_unwrap_or` (42 sites use
+`.map(f).unwrap_or(d)`; 2 used `map_or` and were converged onto the majority) and
+`unnecessary_wraps` (test helpers return `Option<T>` on purpose, to compare
+against the function under test).
+
 ## Working with the user
 
 - **Co-design, never fait accompli**: present judgment calls as numbered options

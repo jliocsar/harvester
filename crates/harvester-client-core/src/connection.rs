@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use harvester_proto::{
-    encode_frame, read_frame, HarvesterCmd, HarvesterResponse, Outgoing, PingData, Request,
+    encode_frame, lock, read_frame, HarvesterCmd, HarvesterResponse, Outgoing, PingData, Request,
     PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
@@ -34,7 +34,7 @@ pub(crate) struct Forward {
 
 impl Forward {
     fn exited(&self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        self.child.lock().expect("forward child mutex").try_wait()
+        lock(&self.child, "forward child").try_wait()
     }
 }
 
@@ -94,10 +94,10 @@ impl DaemonConnection {
     pub(crate) fn over(
         stream: impl AsyncRead + AsyncWrite + Send + Unpin + 'static,
         forward: ForwardHandle,
-    ) -> DaemonConnection {
+    ) -> Self {
         let (read_half, write_half) = tokio::io::split(stream);
 
-        DaemonConnection {
+        Self {
             reader: DaemonReader {
                 reader: BufReader::new(Box::new(read_half)),
                 line_buffer: Vec::new(),
@@ -148,10 +148,10 @@ struct ClientInner {
 }
 
 impl DaemonClient {
-    pub fn start(connection: DaemonConnection) -> (DaemonClient, UnboundedReceiver<SessionEvent>) {
+    pub fn start(connection: DaemonConnection) -> (Self, UnboundedReceiver<SessionEvent>) {
         let DaemonConnection { mut reader, writer } = connection;
         let (event_sender, event_receiver) = unbounded_channel();
-        let client = DaemonClient {
+        let client = Self {
             inner: Arc::new(ClientInner {
                 writer: AsyncMutex::new(writer),
                 pending: Mutex::new(HashMap::new()),
@@ -243,7 +243,7 @@ impl DaemonClient {
             return;
         };
 
-        let Some(waiter) = self.lock_pending().remove(&id) else {
+        let Some(waiter) = lock(&self.inner.pending, "pending").remove(&id) else {
             eprintln!("daemon client: dropped response for request {id}");
 
             return;
@@ -253,11 +253,7 @@ impl DaemonClient {
     }
 
     fn fail_all_pending(&self) {
-        self.lock_pending().clear();
-    }
-
-    fn lock_pending(&self) -> MutexGuard<'_, HashMap<u64, oneshot::Sender<Outgoing>>> {
-        self.inner.pending.lock().expect("pending mutex")
+        lock(&self.inner.pending, "pending").clear();
     }
 }
 
@@ -267,14 +263,10 @@ struct PendingRequestGuard {
 }
 
 impl PendingRequestGuard {
-    fn register(
-        client: &DaemonClient,
-        id: u64,
-        sender: oneshot::Sender<Outgoing>,
-    ) -> PendingRequestGuard {
-        client.lock_pending().insert(id, sender);
+    fn register(client: &DaemonClient, id: u64, sender: oneshot::Sender<Outgoing>) -> Self {
+        lock(&client.inner.pending, "pending").insert(id, sender);
 
-        PendingRequestGuard {
+        Self {
             client: client.clone(),
             id,
         }
@@ -283,7 +275,7 @@ impl PendingRequestGuard {
 
 impl Drop for PendingRequestGuard {
     fn drop(&mut self) {
-        self.client.lock_pending().remove(&self.id);
+        lock(&self.client.inner.pending, "pending").remove(&self.id);
     }
 }
 
@@ -551,13 +543,14 @@ mod tests {
 
     use tokio::net::UnixListener;
 
+    use crate::scratch::ScratchDir;
+
     #[tokio::test]
     async fn removes_a_socket_whose_listener_is_gone() {
-        let dir = std::env::temp_dir().join(format!("harvester-sweep-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("test dir");
-
+        let dir = ScratchDir::create("sweep");
         let dead = dir.join("harvester-1-dead.sock");
         let listener = UnixListener::bind(&dead).expect("bind");
+
         drop(listener);
 
         assert!(dead.exists(), "dropping a listener must leave the file");
@@ -565,8 +558,6 @@ mod tests {
         remove_if_refused(&dead).await;
 
         assert!(!dead.exists(), "a refusing socket must be reclaimed");
-
-        std::fs::remove_dir_all(&dir).expect("test dir cleanup");
     }
 
     #[test]
@@ -592,17 +583,13 @@ mod tests {
 
     #[tokio::test]
     async fn keeps_a_socket_with_a_live_listener() {
-        let dir = std::env::temp_dir().join(format!("harvester-sweep-live-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("test dir");
-
+        let dir = ScratchDir::create("sweep-live");
         let live = dir.join("harvester-1-live.sock");
         let _listener = UnixListener::bind(&live).expect("bind");
 
         remove_if_refused(&live).await;
 
         assert!(live.exists(), "a live forward must not be reclaimed");
-
-        std::fs::remove_dir_all(&dir).expect("test dir cleanup");
     }
 
     #[tokio::test]

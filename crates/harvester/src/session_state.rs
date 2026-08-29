@@ -4,11 +4,10 @@ use crate::models::{self, ModelChoice};
 use harvester_client_core::bridge::Command;
 use harvester_client_core::transcript::Transcript;
 use harvester_client_core::{Pending, RequestToken, RequestTokens};
+use harvester_proto::{PI_AGENT_SETTLED, PI_GET_AVAILABLE_MODELS};
 
 const SESSION_NAME_MAX_CHARS: usize = 48;
 
-const PI_AGENT_SETTLED: &str = "agent_settled";
-const PI_GET_AVAILABLE_MODELS: &str = "get_available_models";
 const PI_GET_STATE: &str = "get_state";
 
 pub const PI_SET_MODEL: &str = "set_model";
@@ -91,29 +90,38 @@ pub struct SessionState {
 
 impl SessionState {
     pub fn unstarted(target: ChatTarget, tokens: RequestTokens) -> Self {
-        Self {
-            phase: SessionPhase::Unstarted,
+        Self::new(
+            SessionPhase::Unstarted,
+            Transcript::new(&[]),
+            ModelSelection::LaunchDefault,
             target,
-            transcript: Transcript::new(&[]),
-            models: ModelsState::NotRequested,
-            selection: ModelSelection::LaunchDefault,
-            branch: None,
-            exited: None,
             tokens,
-            model_request: Pending::default(),
-            session_state_request: Pending::default(),
-            set_model_request: Pending::default(),
-            branch_request: Pending::default(),
-        }
+        )
     }
 
     pub fn live(sid: String, target: ChatTarget, entries: &[Value], tokens: RequestTokens) -> Self {
-        Self {
-            phase: SessionPhase::Live { sid },
+        Self::new(
+            SessionPhase::Live { sid },
+            Transcript::new(entries),
+            ModelSelection::LivePending,
             target,
-            transcript: Transcript::new(entries),
+            tokens,
+        )
+    }
+
+    fn new(
+        phase: SessionPhase,
+        transcript: Transcript,
+        selection: ModelSelection,
+        target: ChatTarget,
+        tokens: RequestTokens,
+    ) -> Self {
+        Self {
+            phase,
+            target,
+            transcript,
             models: ModelsState::NotRequested,
-            selection: ModelSelection::LivePending,
+            selection,
             branch: None,
             exited: None,
             tokens,

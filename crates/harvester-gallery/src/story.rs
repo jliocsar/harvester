@@ -2,7 +2,7 @@ use gpui::{AnyElement, App, Entity, SharedString, Window};
 
 use crate::runtime::StoryRuntime;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum KnobValue {
     Bool(bool),
     Choice(usize),

@@ -18,11 +18,12 @@ pub use dialog::{
     DialogRequest, DialogRoom, EnqueueResult,
 };
 pub use fleet::{
-    BridgeEvents, Fleet, FleetError, FleetEvents, MachineCandidate, MachineState, MachinesEvents,
-    Unapplied, LOCAL_MACHINE,
+    BridgeEvents, Fleet, FleetEvents, MachineCandidate, MachineState, MachinesEvents, Unapplied,
+    LOCAL_MACHINE,
 };
-pub use host::{Host, SshTarget};
+pub use host::{folder_name, Host, SshTarget};
 pub use machines::RemoteDirEntry;
+pub use provider::SUPPORTED_PROVIDER_PROTOCOL;
 pub use token::{Pending, RequestToken, RequestTokens};
 pub use transcript::Transcript;
 
@@ -44,6 +45,15 @@ pub enum Error {
         provider: String,
         detail: String,
     },
+    NotConnectable {
+        machine: String,
+    },
+    BridgeStart {
+        machine: String,
+        detail: String,
+    },
+    HostWorkerMissing,
+    HostWorkerStopped,
 }
 
 impl std::fmt::Display for Error {
@@ -58,6 +68,14 @@ impl std::fmt::Display for Error {
                  is the daemon binary you are shipping stale?"
             ),
             Error::Provider { provider, detail } => write!(f, "provider {provider}: {detail}"),
+            Error::NotConnectable { machine } => {
+                write!(f, "machine {machine} is not connectable")
+            }
+            Error::BridgeStart { machine, detail } => {
+                write!(f, "start bridge for {machine}: {detail}")
+            }
+            Error::HostWorkerMissing => write!(f, "machines worker is not running"),
+            Error::HostWorkerStopped => write!(f, "machines worker stopped"),
         }
     }
 }
@@ -67,5 +85,52 @@ impl std::error::Error for Error {}
 impl From<std::io::Error> for Error {
     fn from(error: std::io::Error) -> Self {
         Error::Io(error)
+    }
+}
+
+pub(crate) fn run_on_tokio_thread(
+    main: impl std::future::Future<Output = ()>,
+) -> std::io::Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    runtime.block_on(main);
+
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) mod scratch {
+    use std::path::PathBuf;
+
+    pub(crate) struct ScratchDir {
+        path: PathBuf,
+    }
+
+    impl ScratchDir {
+        pub(crate) fn create(label: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("harvester-{label}-{}", std::process::id()));
+
+            std::fs::create_dir_all(&path).expect("a scratch directory under the temp dir");
+
+            Self { path }
+        }
+
+        pub(crate) fn join(&self, name: &str) -> PathBuf {
+            self.path.join(name)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            if let Err(error) = std::fs::remove_dir_all(&self.path) {
+                eprintln!(
+                    "harvester: leaving scratch directory {} behind: {error}",
+                    self.path.display()
+                );
+            }
+        }
     }
 }

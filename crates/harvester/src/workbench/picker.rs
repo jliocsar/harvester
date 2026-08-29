@@ -3,15 +3,21 @@ use gpui::{
     Task, Window,
 };
 use gpui_component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
-use gpui_component::{ActiveTheme as _, Disableable as _, IndexPath, WindowExt as _};
+use gpui_component::{Disableable as _, IndexPath, WindowExt as _};
 use harvester_client_core::machines;
 use harvester_client_core::{Pending, RemoteDirEntry, RequestToken, RequestTokens};
 
 use crate::store::{FleetStore, StoreEvent};
-use crate::ui::dialog::{action_button, button_row, dismiss_button, ActionAccent};
+use crate::ui::dialog::{action_button, button_row, dismiss_button, ActionAccent, CANCEL_LABEL};
 use crate::ui::{self, Tone};
 
 const ENTRY_LIST_HEIGHT: f32 = 280.;
+
+const ADD_REPOSITORY_TITLE: &str = "Add repository";
+const ADD_REPOSITORY_ACTION_LABEL: &str = "Add";
+const ENTRY_FILTER_PLACEHOLDER: &str = "Filter…";
+const FINDING_HOME_NOTE: &str = "finding home directory…";
+const LISTING_DIRECTORY_NOTE: &str = "loading…";
 
 #[derive(Clone)]
 enum PickerRequest {
@@ -136,16 +142,20 @@ impl Walk {
         }
     }
 
-    fn accept_validation(&mut self, token: RequestToken, error: Option<String>) -> Option<String> {
+    fn accept_validation(
+        &mut self,
+        token: RequestToken,
+        result: Result<(), String>,
+    ) -> Option<String> {
         self.pending.accept(token)?;
 
-        match error {
-            Some(detail) => {
+        match result {
+            Err(detail) => {
                 self.error = Some(detail);
 
                 None
             }
-            None => Some(self.path.clone()),
+            Ok(()) => Some(self.path.clone()),
         }
     }
 
@@ -197,10 +207,10 @@ impl Walk {
         }
 
         if self.path.is_empty() {
-            return Some("finding home directory…");
+            return Some(FINDING_HOME_NOTE);
         }
 
-        Some("loading…")
+        Some(LISTING_DIRECTORY_NOTE)
     }
 }
 
@@ -316,7 +326,8 @@ pub(super) struct FolderPicker {
     store: Entity<FleetStore>,
     walk: Walk,
     entries: Entity<ListState<EntriesDelegate>>,
-    _subscriptions: [gpui::Subscription; 2],
+    _list_events: gpui::Subscription,
+    _store_events: gpui::Subscription,
 }
 
 impl FolderPicker {
@@ -331,16 +342,15 @@ impl FolderPicker {
         let walk = Walk::new(machine, label, tokens);
         let entries =
             cx.new(|cx| ListState::new(EntriesDelegate::new(), window, cx).searchable(true));
-        let subscriptions = [
-            cx.subscribe_in(&entries, window, Self::handle_list_event),
-            cx.subscribe_in(&store, window, Self::handle_store_event),
-        ];
+        let list_events = cx.subscribe_in(&entries, window, Self::handle_list_event);
+        let store_events = cx.subscribe_in(&store, window, Self::handle_store_event);
 
         Self {
             store,
             walk,
             entries,
-            _subscriptions: subscriptions,
+            _list_events: list_events,
+            _store_events: store_events,
         }
     }
 
@@ -389,8 +399,8 @@ impl FolderPicker {
     fn send_request(&mut self, command: PickerCommand, cx: &mut Context<Self>) {
         let host = match self.store.read(cx).host_for(&self.walk.machine) {
             Ok(host) => host,
-            Err(detail) => {
-                self.walk.fail(detail);
+            Err(error) => {
+                self.walk.fail(error.to_string());
                 cx.notify();
 
                 return;
@@ -420,8 +430,8 @@ impl FolderPicker {
             StoreEvent::Machines(machines::Event::DirListed { token, result }) => {
                 self.handle_dir_listed(*token, result.clone(), cx)
             }
-            StoreEvent::Machines(machines::Event::WorkspaceValidated { token, error }) => {
-                self.handle_workspace_validated(*token, error.clone(), cx)
+            StoreEvent::Machines(machines::Event::WorkspaceValidated { token, result }) => {
+                self.handle_workspace_validated(*token, result.clone(), cx)
             }
             StoreEvent::Bridge { .. }
             | StoreEvent::Machines(
@@ -468,10 +478,10 @@ impl FolderPicker {
     fn handle_workspace_validated(
         &mut self,
         token: RequestToken,
-        error: Option<String>,
+        result: Result<(), String>,
         cx: &mut Context<Self>,
     ) {
-        let Some(path) = self.walk.accept_validation(token, error) else {
+        let Some(path) = self.walk.accept_validation(token, result) else {
             cx.notify();
 
             return;
@@ -495,7 +505,7 @@ impl FolderPicker {
             let dismissed = dismissed.clone();
 
             dialog
-                .title("Add repository")
+                .title(ADD_REPOSITORY_TITLE)
                 .close_button(false)
                 .child(picker.clone())
                 .on_ok(|_, _, _| false)
@@ -510,7 +520,7 @@ impl FolderPicker {
             .flex()
             .gap_2()
             .text_sm()
-            .text_color(cx.theme().muted_foreground)
+            .text_color(Tone::Muted.color(cx))
             .child(
                 div()
                     .flex_1()
@@ -532,14 +542,18 @@ impl FolderPicker {
         let can_submit = self.walk.can_submit();
 
         button_row(
-            dismiss_button("picker-cancel", "Cancel"),
-            action_button("picker-add", "Add", ActionAccent::Primary)
-                .disabled(!can_submit)
-                .on_click(cx.listener(|picker, _, _, cx| {
-                    let command = picker.walk.confirm();
+            dismiss_button("picker-cancel", CANCEL_LABEL),
+            action_button(
+                "picker-add",
+                ADD_REPOSITORY_ACTION_LABEL,
+                ActionAccent::Primary,
+            )
+            .disabled(!can_submit)
+            .on_click(cx.listener(|picker, _, _, cx| {
+                let command = picker.walk.confirm();
 
-                    picker.dispatch(command, cx);
-                })),
+                picker.dispatch(command, cx);
+            })),
         )
     }
 }
@@ -553,7 +567,7 @@ impl Render for FolderPicker {
             .child(self.render_location(cx))
             .child(
                 List::new(&self.entries)
-                    .search_placeholder("Filter…")
+                    .search_placeholder(ENTRY_FILTER_PLACEHOLDER)
                     .h(px(ENTRY_LIST_HEIGHT)),
             )
             .children(self.walk.error.clone().map(|error| {
@@ -675,7 +689,7 @@ mod tests {
             matches!(&validate.request, PickerRequest::Validation { path } if path == "/home/exedev/repo")
         );
         assert_eq!(
-            walk.accept_validation(validate.token, None),
+            walk.accept_validation(validate.token, Ok(())),
             Some("/home/exedev/repo".to_string())
         );
     }
@@ -732,7 +746,7 @@ mod tests {
 
         walk.stop_waiting();
 
-        assert!(walk.accept_validation(validation.token, None).is_none());
+        assert!(walk.accept_validation(validation.token, Ok(())).is_none());
         assert!(!walk.busy());
     }
 
@@ -746,7 +760,7 @@ mod tests {
         walk.accept_listing(listing.token, Ok(Vec::new()));
 
         let validate = walk.confirm().expect("a directory to add");
-        let stored = walk.accept_validation(validate.token, Some("not a git repo".to_string()));
+        let stored = walk.accept_validation(validate.token, Err("not a git repo".to_string()));
 
         assert_eq!(stored, None);
         assert_eq!(walk.error.as_deref(), Some("not a git repo"));

@@ -62,24 +62,94 @@ duplicated in both binaries) because it is the rendezvous point between them;
 drift between two copies would surface only as an unexplained connect
 timeout.
 
+### `DIALOG_METHODS`
+
+The four `extension_ui_request` methods that block pi until they are answered
+(`select`, `confirm`, `input`, `editor`). Fire-and-forget kinds (`notify`,
+`setStatus`, …) are ordinary events, not dialogs.
+
+This is **one list the protocol requires both ends to agree on**, which is why
+it lives here and not in either end. The daemon copy decides whether a dialog
+is held open (`session/dialog.rs`'s `id_awaiting_answer`); the client copy
+decides whether one is rendered (`client-core`'s `DialogRequest::parse`). They
+were byte-identical duplicates, and if a future pi adds a fifth blocking method
+that only one side learns, the daemon parks a dialog nobody can answer and pi
+blocks forever — the exact failure CLAUDE.md's "never leave a pi dialog
+unanswered" invariant exists to prevent.
+`the_blocking_dialog_methods_are_exactly_the_four_documented_ones` pins the
+contents, so a change here is a deliberate, visible one.
+
+### The shared pi wire tokens
+
+`PI_EXTENSION_UI_RESPONSE`, `PI_GET_AVAILABLE_MODELS` and `PI_AGENT_SETTLED`
+are pi's own vocabulary, named here because each is written in **more than one
+crate** and a typo in one of them is a silent behaviour change rather than a
+compile error.
+
+Deliberately *not* an exhaustive `pi` module: the ~20 other pi tokens each live
+inside a single `match` in a single file (`client-core`'s transcript event
+match is the bulk of them), where the literal reads better than a constant and
+cannot drift because every spelling is one screen apart. Naming those would buy
+indirection, not safety. A token earns a name here the moment a second crate
+writes it.
+
+### `STAGED_FILE_SUFFIX` and `replace_atomically`
+
+`replace_atomically(path, bytes, mode)` is the one stage-then-rename in Rust:
+write a staged sibling, apply `mode` when asked, `fsync`, rename over the
+target, and unlink the staged file if any step fails. It was written twice —
+the workspace store and the bundled-provider installer — and the two copies
+**disagreed on the property the idiom exists for**: one called `sync_all()`
+before the rename, the other used `fs::write` with no fsync at all, so a crash
+could leave a renamed-but-empty provider script that the installer's
+byte-equality check then rejected forever.
+
+- The staged name is the target's own path plus `.{STAGED_FILE_SUFFIX}.<pid>`
+  — a *sibling*, because a rename is only atomic within one filesystem, and
+  *pid-suffixed*, because a staging name shared by two processes is not a
+  staging file at all. That spelling reproduces both former call sites exactly
+  (`workspaces.json` → `workspaces.json.next.<pid>`, `exe-dev` →
+  `exe-dev.next.<pid>`), pinned by
+  `the_staged_file_is_a_sibling_named_for_the_writing_process`.
+- Order is write → chmod → `sync_all` → rename. The chmod comes *before* the
+  fsync so the mode is as durable as the bytes; the caller passes `None` when
+  the target's mode is whatever `create` gives it.
+- It lives in this crate because it is the lowest crate both callers already
+  depend on, not because it is protocol.
+- It does **not** create the target's parent directory. Both callers already
+  `create_dir_all` their own directory, and a durability primitive quietly
+  minting directories is a different job.
+
+There is a third stage-then-rename, in `bootstrap.rs`'s shell script. That one
+is deliberately left alone: it runs on the *remote* machine, where no Rust of
+ours is executing.
+
+### `unix_millis_now`
+
+Milliseconds since the Unix epoch, degrading to `0` rather than erroring on a
+clock before 1970. It lives here because both writers of
+`SessionInfo.mtime_ms` — harvesterd's session spawn and the client's catalog —
+were byte-identical copies filling *the same field of a type this crate owns*.
+
+### `lock`
+
+`lock(&mutex, "sessions")` is the one spelling of "take this
+`std::sync::Mutex`, and if it is poisoned, panic naming which one". It replaces
+a family of near-identical three-line `lock_*` helpers across five files, each
+of which was the same `.lock().expect("<name> mutex")` with a different noun.
+The `what` label is the mutex's own field name, so a poison panic still says
+which lock died. It is a free function rather than an extension trait because
+the repo has exactly one trait and a trait for this would be the second.
+
 ### `DEV_DAEMON_PATH`
 
-The workspace-relative path of the shippable daemon binary
-(`target/x86_64-unknown-linux-musl/daemon-release/harvesterd`). It was spelled
-three times — `harvester/build.rs`, `harvester/src/main.rs`, and
-`harvester-cli/src/main.rs` — so a profile or target rename was a three-file
-hunt; now it is spelled once. It lives in this crate for the same reason
-`DAEMON_SOCKET_PATH` does: the binaries that need it already depend on the
-protocol crate.
+See `## crates/harvester-proto/src/dev_daemon_path.rs` below — the const is
+declared there and re-exported from `lib.rs`.
 
-The const sits in its own file (`src/dev_daemon_path.rs`, re-exported from
-`lib.rs`) rather than inline in `lib.rs`, because `harvester/build.rs` shares
-it by `include!`-ing that file: a build script importing the crate normally
-would pull the whole proto dependency tree (tokio included) into the
-build-dependency graph for one string. The file must therefore stay
-free-standing — one `pub const`, no `use`, nothing else.
+### The build fingerprint
 
-Produces `fnv1a64-<byte count>-<hash>`: FNV-1a-64 over the file's bytes, hash
+`fingerprint_reader` / `fingerprint_bytes` produce
+`fnv1a64-<byte count>-<hash>`: FNV-1a-64 over the file's bytes, hash
 in lowercase 16-digit hex. `FNV_OFFSET_BASIS` / `FNV_PRIME` are the reference
 FNV-1a-64 constants.
 
@@ -210,3 +280,31 @@ with `json!` on one side and hand-dug with `.get()` on the other.
   and must agree on byte-for-byte; an unpinned rewrite could silently break
   every machine's upgrade detection (never upgrade, or upgrade every
   connect).
+- `ScratchDir` is a hand-rolled RAII temp directory for the
+  `replace_atomically` tests. It is deliberately not `tempfile`: this crate has
+  no dev-dependencies and one twelve-line guard is cheaper than a dependency
+  edge for four tests. Cleanup is a `Drop` impl, not a trailing statement, so a
+  failing assert cannot leak the directory.
+
+## crates/harvester-proto/src/dev_daemon_path.rs
+
+One `pub const`, `DEV_DAEMON_PATH`: the workspace-relative path of the
+shippable daemon binary
+(`target/x86_64-unknown-linux-musl/daemon-release/harvesterd`). It was spelled
+three times — `harvester/build.rs`, `harvester/src/main.rs`, and
+`harvester-cli/src/main.rs` — so a profile or target rename was a three-file
+hunt; now it is spelled once. It lives in this crate for the same reason
+`DAEMON_SOCKET_PATH` does: the binaries that need it already depend on the
+protocol crate.
+
+**Why it is its own file rather than a line in `lib.rs`**: `harvester/build.rs`
+shares it by `include!("../harvester-proto/src/dev_daemon_path.rs")`. A build
+script that `use`d the crate normally would drag the whole proto dependency
+tree — tokio included — into the build-dependency graph for one string.
+
+That `include!` is what makes this file's shape load-bearing: it is textually
+pasted into another crate's build script, so it **must stay free-standing —
+one `pub const`, no `use`, no `mod`, nothing else**. Anything referring to a
+name this file does not itself declare would compile here and fail there.
+`lib.rs` re-exports the const (`pub use dev_daemon_path::DEV_DAEMON_PATH`) so
+every ordinary reader sees it as `harvester_proto::DEV_DAEMON_PATH`.

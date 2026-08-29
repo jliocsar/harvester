@@ -1,5 +1,10 @@
 mod dev_daemon_path;
 
+use std::io::Write as _;
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
@@ -14,6 +19,14 @@ pub const LF: u8 = b'\n';
 pub const CR: u8 = b'\r';
 
 pub const FRAME_BUFFER_START_BYTES: usize = 64 * 1024;
+
+pub const DIALOG_METHODS: [&str; 4] = ["select", "confirm", "input", "editor"];
+
+pub const PI_EXTENSION_UI_RESPONSE: &str = "extension_ui_response";
+pub const PI_GET_AVAILABLE_MODELS: &str = "get_available_models";
+pub const PI_AGENT_SETTLED: &str = "agent_settled";
+
+pub const STAGED_FILE_SUFFIX: &str = "next";
 
 const FINGERPRINT_CHUNK_BYTES: usize = 64 * 1024;
 
@@ -76,6 +89,61 @@ pub fn encode_frame<T: Serialize>(value: &T) -> serde_json::Result<Vec<u8>> {
     frame.push(LF);
 
     Ok(frame)
+}
+
+pub fn unix_millis_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since_epoch| since_epoch.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+pub fn lock<'mutex, T>(mutex: &'mutex Mutex<T>, what: &str) -> MutexGuard<'mutex, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| panic!("{what} mutex poisoned: {poisoned}"))
+}
+
+pub fn replace_atomically(path: &Path, bytes: &[u8], mode: Option<u32>) -> std::io::Result<()> {
+    let staged = staged_sibling_path(path);
+    let staged_then_renamed =
+        write_staged_file(&staged, bytes, mode).and_then(|()| std::fs::rename(&staged, path));
+
+    if let Err(error) = staged_then_renamed {
+        remove_staged_file(&staged);
+
+        return Err(error);
+    }
+
+    Ok(())
+}
+
+fn staged_sibling_path(path: &Path) -> PathBuf {
+    let mut staged = path.as_os_str().to_os_string();
+
+    staged.push(format!(".{STAGED_FILE_SUFFIX}.{}", std::process::id()));
+
+    PathBuf::from(staged)
+}
+
+fn write_staged_file(staged: &Path, bytes: &[u8], mode: Option<u32>) -> std::io::Result<()> {
+    let mut file = std::fs::File::create(staged)?;
+
+    file.write_all(bytes)?;
+
+    if let Some(mode) = mode {
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    }
+
+    file.sync_all()
+}
+
+fn remove_staged_file(staged: &Path) {
+    match std::fs::remove_file(staged) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => eprintln!("harvester-proto: remove {}: {error}", staged.display()),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -981,5 +1049,166 @@ mod tests {
         };
 
         assert_eq!(response.into_result(), Err("unknown error".to_string()));
+    }
+
+    #[test]
+    fn the_blocking_dialog_methods_are_exactly_the_four_documented_ones() {
+        assert_eq!(DIALOG_METHODS, ["select", "confirm", "input", "editor"]);
+    }
+
+    #[test]
+    fn the_shared_pi_tokens_are_spelled_the_way_pi_spells_them() {
+        assert_eq!(PI_EXTENSION_UI_RESPONSE, "extension_ui_response");
+        assert_eq!(PI_GET_AVAILABLE_MODELS, "get_available_models");
+        assert_eq!(PI_AGENT_SETTLED, "agent_settled");
+    }
+
+    #[test]
+    fn unix_millis_now_reads_as_milliseconds_not_seconds() {
+        const START_OF_2020_MILLIS: u64 = 1_577_836_800_000;
+
+        assert!(unix_millis_now() > START_OF_2020_MILLIS);
+    }
+
+    #[test]
+    fn lock_hands_out_a_usable_guard() {
+        let counter = Mutex::new(0_u32);
+
+        *lock(&counter, "counter") += 1;
+
+        assert_eq!(*lock(&counter, "counter"), 1);
+    }
+
+    struct ScratchDir {
+        path: PathBuf,
+    }
+
+    impl ScratchDir {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("harvester-proto-{label}-{}", std::process::id()));
+
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("a scratch dir must be creatable");
+
+            Self { path }
+        }
+
+        fn join(&self, name: &str) -> PathBuf {
+            self.path.join(name)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn staged_siblings_of(path: &Path) -> Vec<PathBuf> {
+        let parent = path.parent().expect("a scratch path has a parent");
+        let target = path.file_name().expect("a scratch path has a file name");
+
+        std::fs::read_dir(parent)
+            .expect("the scratch dir is readable")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|found| found.file_name() != Some(target))
+            .collect()
+    }
+
+    #[test]
+    fn the_staged_file_is_a_sibling_named_for_the_writing_process() {
+        for (target, expected) in [
+            (
+                "/home/someone/.harvester/workspaces.json",
+                format!(
+                    "/home/someone/.harvester/workspaces.json.next.{}",
+                    std::process::id()
+                ),
+            ),
+            (
+                "/home/someone/.harvester/providers/exe-dev",
+                format!(
+                    "/home/someone/.harvester/providers/exe-dev.next.{}",
+                    std::process::id()
+                ),
+            ),
+        ] {
+            let staged = staged_sibling_path(Path::new(target));
+
+            assert_eq!(
+                staged,
+                PathBuf::from(expected),
+                "a staging name shared by two processes is not a staging file at all"
+            );
+            assert_eq!(
+                staged.parent(),
+                Path::new(target).parent(),
+                "the rename is only atomic while both names live on one filesystem"
+            );
+        }
+    }
+
+    #[test]
+    fn replace_atomically_writes_the_bytes_and_leaves_nothing_staged() {
+        let scratch = ScratchDir::new("write");
+        let path = scratch.join("payload.json");
+
+        replace_atomically(&path, b"{\"a\":1}", None).expect("a fresh write must succeed");
+
+        assert_eq!(
+            std::fs::read(&path).expect("the target exists"),
+            b"{\"a\":1}"
+        );
+        assert_eq!(staged_siblings_of(&path), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn replace_atomically_overwrites_an_existing_target() {
+        let scratch = ScratchDir::new("overwrite");
+        let path = scratch.join("payload.json");
+
+        replace_atomically(&path, b"old", None).expect("the first write must succeed");
+        replace_atomically(&path, b"new", None).expect("the second write must succeed");
+
+        assert_eq!(std::fs::read(&path).expect("the target exists"), b"new");
+        assert_eq!(staged_siblings_of(&path), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn replace_atomically_applies_the_requested_mode() {
+        let scratch = ScratchDir::new("mode");
+        let path = scratch.join("provider-script");
+
+        replace_atomically(&path, b"#!/bin/sh\n", Some(0o755)).expect("a fresh write must succeed");
+
+        let mode = std::fs::metadata(&path)
+            .expect("the target exists")
+            .permissions()
+            .mode();
+
+        assert_eq!(mode & 0o777, 0o755, "an executable must land executable");
+    }
+
+    #[test]
+    fn replace_atomically_leaves_no_staged_file_behind_when_it_fails() {
+        let scratch = ScratchDir::new("failure");
+        let path = scratch.join("no-such-dir").join("payload.json");
+
+        let failure = replace_atomically(&path, b"unreachable", None);
+
+        assert!(
+            failure.is_err(),
+            "writing under a missing dir cannot succeed"
+        );
+        assert!(
+            !path.exists(),
+            "a failed replace must not create the target"
+        );
+        assert!(
+            std::fs::read_dir(scratch.join("no-such-dir")).is_err(),
+            "nothing may be created under a directory that does not exist"
+        );
     }
 }

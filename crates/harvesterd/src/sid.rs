@@ -18,7 +18,7 @@ fn is_valid_session_id(candidate: &str) -> bool {
 pub struct Sid(String);
 
 impl Sid {
-    pub fn parse(raw: &str) -> Result<Sid, String> {
+    pub fn parse(raw: &str) -> Result<Self, String> {
         if !is_valid_session_id(raw) {
             return Err(format!(
                 "invalid sid '{raw}': must be non-empty, contain only \
@@ -27,7 +27,7 @@ impl Sid {
             ));
         }
 
-        Ok(Sid(raw.to_owned()))
+        Ok(Self(raw.to_string()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -44,12 +44,6 @@ impl Borrow<str> for Sid {
 impl fmt::Display for Sid {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
-    }
-}
-
-impl From<Sid> for String {
-    fn from(sid: Sid) -> String {
-        sid.0
     }
 }
 

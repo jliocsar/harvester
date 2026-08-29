@@ -105,13 +105,7 @@ impl Host {
             }
         };
 
-        match tokio::time::timeout(timeout, run(command, stdin_data)).await {
-            Ok(result) => result,
-            Err(_elapsed) => Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("timed out after {timeout:?}"),
-            )),
-        }
+        run_within(command, stdin_data, timeout).await
     }
 }
 
@@ -127,6 +121,16 @@ pub(crate) fn parse_home(stdout: &str) -> Option<&str> {
 
 pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+pub fn folder_name(path: &str) -> &str {
+    let normalized = path.trim_end_matches('/');
+
+    if normalized.is_empty() && path.starts_with('/') {
+        return "/";
+    }
+
+    normalized.rsplit('/').next().unwrap_or(normalized)
 }
 
 pub(crate) struct ExecOutput {
@@ -152,10 +156,21 @@ impl ExecOutput {
     }
 }
 
-pub(crate) async fn run(
-    mut command: Command,
+pub(crate) async fn run_within(
+    command: Command,
     stdin_data: Option<&[u8]>,
+    timeout: Duration,
 ) -> std::io::Result<ExecOutput> {
+    match tokio::time::timeout(timeout, run(command, stdin_data)).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("timed out after {timeout:?}"),
+        )),
+    }
+}
+
+async fn run(mut command: Command, stdin_data: Option<&[u8]>) -> std::io::Result<ExecOutput> {
     command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -196,6 +211,14 @@ mod tests {
     use super::*;
 
     const A_MOMENT: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn folder_name_uses_the_last_path_component() {
+        assert_eq!(folder_name("/tmp/repo/src/main.rs"), "main.rs");
+        assert_eq!(folder_name("Cargo.toml"), "Cargo.toml");
+        assert_eq!(folder_name("/tmp/repo/"), "repo");
+        assert_eq!(folder_name("/"), "/");
+    }
 
     async fn echo(value: &str) -> String {
         Host::Local

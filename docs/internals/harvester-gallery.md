@@ -2,8 +2,12 @@
 
 The dev-only component catalog for `harvester::ui`, and the notes that would
 be comments if this codebase allowed any. Organized by module, same as
-`docs/internals/harvester.md`; the gallery lived inside that crate until the
-quarantine described below, so its history is in that file's git log.
+`docs/internals/harvester.md`: one `##` heading per module path, so a
+`grep '^## '` audit across `docs/internals/` sees this crate's modules the
+way it sees every other crate's. (The three `###` subsections under the
+crate heading are the quarantine story, not modules.) The gallery lived
+inside `crates/harvester` until the quarantine described below, so its
+history is in that file's git log.
 
 ## crates/harvester-gallery/ — the component gallery
 
@@ -135,7 +139,7 @@ or a theme slot, and the chrome itself is built from `ui::` components
 `inline_note`, `KeyboardFocusRing`) — the gallery dogfoods the library it
 catalogs.
 
-### crates/harvester-gallery/src/story.rs
+## crates/harvester-gallery/src/story.rs
 
 The model, deliberately data-only so a story declaration reads as a table:
 
@@ -170,7 +174,7 @@ The model, deliberately data-only so a story declaration reads as a table:
   that survives across frames and can notify the view, and in gpui that means
   an entity handle, not a value.
 
-### crates/harvester-gallery/src/registry.rs
+## crates/harvester-gallery/src/registry.rs
 
 The registry is a *concatenation*, not a catalog: `build_stories()` chains the
 seven per-module `stories()` functions in sidebar order and flattens them. It
@@ -214,7 +218,7 @@ wants. The gallery's `aria_label`s ("stories", "stage") are likewise kept
 verbatim: they are accessibility-tree selectors that agent tooling keys on, not
 visible copy to be styled.
 
-### crates/harvester-gallery/src/stories/
+## crates/harvester-gallery/src/stories/
 
 One module per `ui` module plus the two flagships. Each module declares its
 own stories in a `pub fn stories() -> Vec<Story>` at the top of the file and
@@ -248,10 +252,12 @@ stories a fixed viewport so their internal scroll behaves like the chat's.
 - `core.rs`: the tone swatch grid (all six tones × the derived dot × the
   tone's own `label()` × colored text, `w_20` lanes aligning both label
   columns) and the single-dot story. Neither story picks a dot shape any more:
-  the swatch shows the one dot `Tone::dot` derives, and the dot story *reports*
-  the derived shape (`derived_dot_label`) instead of letting a knob set it —
-  a catalog whose controls can produce a combination the app cannot render is
-  lying about the component.
+  the swatch shows the one dot `status_dot_for_tone` draws, and the dot story
+  *reports* the shape `Tone::is_hollow` decides (`derived_dot_label`) instead
+  of letting a knob set it — a catalog whose controls can produce a
+  combination the app cannot render is lying about the component. The story is
+  still named "Dot" after the concept; the `ui::Dot` type it used to match on
+  is gone, and one bool is all the derivation ever was.
 - `note.rs`: `inline_note` and `empty_pane_hint`; the hint gets an `h_48` box
   because it is a `size_full` component and would otherwise have no height to
   fill on the stage, and it is rendered *with* an `empty_pane_action` child so
@@ -315,15 +321,20 @@ stories a fixed viewport so their internal scroll behaves like the chat's.
   story that guessed the widths would be showing you the wrong thing. The
   untitled-confirmation knob path goes through `title_or_named_condition` with
   the same "The agent needs a yes or no" condition `dialogs.rs` uses. The
-  option list is painted as a plain column of `option_row`s rather than as a
-  live `List`, with one row forced selected so the selected style is reviewable:
+  The cancel button's word is `ui::dialog::CANCEL_LABEL`, the app's own const,
+  for the same reason `ADD_REPO_ROW` and `DEFAULT_MODEL_ROW` are: the gallery
+  constructs no component *and no copy* the app constructs itself. Its
+  neighbour `CANCEL_LABEL_KNOB` stays local — that is a knob name, which is
+  gallery chrome, not user-facing copy.
+  The option list is painted as a plain column of `option_row`s rather than as
+  a live `List`, with one row forced selected so the selected style is reviewable:
   a story render function runs on every frame and cannot own a list state
   without putting one in `StoryRuntime`, and a list state rebuilt per frame
   could never hold a selection to show. The rows are the dialog's own builder,
   so what the story shows is honest; what it cannot show is scrolling and
   keyboard traversal.
 
-### crates/harvester-gallery/src/runtime.rs
+## crates/harvester-gallery/src/runtime.rs
 
 `StoryRuntime` is the single entity holding everything a story needs to
 survive a frame: the collapsible section's flag, the prompt strip's
@@ -351,10 +362,23 @@ that one subscription is why story render functions can stay plain `fn`s.
   (200) is how often a *paused* or unselected replay re-checks whether it
   should start again; a paused loop must keep breathing because the knob it
   waits on lives in the gallery, not in the task.
-- `PROMPT_INPUT_ROWS` (1–8) and the dialog placeholders mirror the app's own
-  values so the story is the real component, not a lookalike.
+- The prompt strip's input is `harvester::ui::create_prompt_input(window, cx)`
+  — the app's own factory, not a lookalike. The gallery used to build it here
+  from a `PROMPT_INPUT_PLACEHOLDER`/`PROMPT_INPUT_ROWS` pair it named itself
+  while `chat.rs` hardcoded the same four builder calls, which is the
+  reconstruct-the-component-you-preview failure the catalog exists to prevent;
+  both consts moved into `ui/prompt.rs` beside the factory and are private
+  there. Only the two dialog strings are still declared here
+  (`DIALOG_SINGLE_LINE_PLACEHOLDER`, `DIALOG_MULTI_LINE_PREFILL`): they are
+  *sample content* for `ui::dialog`'s two input factories, which take their
+  text as an argument, so there is nothing on the app side to agree with.
+- `RenderedTranscript::transcript` and `ReplayTranscript::transcript` both
+  answer `Result<&Transcript, &str>`. The failure half used to be an owned
+  `String`, which cost a `clone` on every frame that had a broken fixture
+  purely to satisfy the signature; the caller only ever hands it to
+  `ui::empty_pane_hint`, which copies it into a `SharedString` anyway.
 
-### crates/harvester-gallery/src/fixtures.rs
+## crates/harvester-gallery/src/fixtures.rs
 
 Fixtures are loaded **at runtime**, from
 `env!("CARGO_MANIFEST_DIR")/../harvester/fixtures/*.jsonl`, not
@@ -381,16 +405,36 @@ the gallery is launched from still does not matter.
   catalog is that the other stories still work when one fixture is gone.
 - Parsing follows the house LF-only framing rule (`harvester_proto::{LF, CR}`,
   split on `LF`, strip one trailing `CR`), the same as everything else that
-  reads pi JSONL.
+  reads pi JSONL. `read_events` is only the `read_to_string` half; the framing
+  and the line-numbered failure message live in `parse_events`, which takes
+  the document as a `&str`. That split is what lets the framing be unit-tested
+  without a fixture on disk, which is the whole reason the module has tests
+  now.
 - **The user-prompt rule**: `Transcript::apply` deliberately ignores
   `message_end` events whose `message.role` is `"user"` — in the app, user
   text enters a transcript only through `push_user_prompt`, because the app
   already knows what the user typed. A replayer has no such knowledge, so
   `apply_event` intercepts exactly that event shape and calls
-  `push_user_prompt` with the concatenated text parts. Without it the mixed
-  fixture renders assistant turns and tool blocks with no prompts above them.
-  This is the one place the gallery is allowed to interpret a pi payload, and
-  it interprets it into the same call the app makes.
+  `push_user_prompt` with the text `harvester_client_core::transcript::message_text`
+  reads out of it. Without it the mixed fixture renders assistant turns and
+  tool blocks with no prompts above them. This is the one place the gallery is
+  allowed to interpret a pi payload, and it interprets it into the same call
+  the app makes.
+- `message_text` is **client-core's**, not a copy. The gallery had its own for
+  one release and it had already drifted: it joined text blocks with `""`
+  instead of a blank line and handled only the array shape of `content`, so a
+  multi-block pi message previewed without its paragraph breaks and a
+  bare-string prompt previewed as nothing at all — in the one surface whose
+  job is to be an honest preview. Client-core made the function `pub`; the
+  copy is gone. Any further pi-payload reading the gallery needs should arrive
+  the same way rather than be written here.
+- The tests are inline (`#[cfg(test)] mod tests`) and cover the pure half of
+  the module: LF splitting, the trailing-`CR` strip, the one-based line number
+  in a parse failure, the three `user_prompt_text` rejections, both content
+  shapes a prompt can arrive in (the two the drifted copy got wrong), the
+  failed-tool filter, and `TranscriptSource::at`'s fallback. Nothing here
+  touches the disk, so they run on a headless machine alongside
+  `registry.rs`'s two walk floors.
 - `TranscriptSource` maps the four preset/knob choices onto fixtures:
   `markdown-heavy answer` → `streaming.jsonl`, `tool run` → `tools.jsonl`,
   `mixed session` → `mixed.jsonl`, and `failed tool` → `tools.jsonl` filtered
@@ -400,7 +444,7 @@ the gallery is launched from still does not matter.
   the rest, which is enough for the block to render exactly as it does in a
   full session.
 
-### crates/harvester-gallery/src/main.rs
+## crates/harvester-gallery/src/main.rs
 
 `Gallery` owns all mutable gallery state: the story list, one `KnobValues` per
 story (so switching stories never loses your knob edits), the collapsed group
@@ -446,12 +490,30 @@ inputs.
   the shell's async task. Those three are the only `pub` items a story module
   still exports beyond its `stories()` function.
 
-### crates/harvester-gallery/src/chrome.rs
+## crates/harvester-gallery/src/chrome.rs
 
 The gallery's own screen, kept out of `main.rs` so state and layout stay
 separable. It is a sibling module of the crate root, which is why it can read
 `Gallery`'s private fields through accessors without those fields becoming
 `pub`.
+
+Naming here follows `ui/transcript.rs`'s rule rather than a blanket prefix:
+**`render_x` when the function takes a domain value, a noun when it does
+not.** `render_gallery`, `render_story_sidebar`, `render_story_group`,
+`render_story_row`, `render_stage`, `render_control_dock`, `render_knob`,
+`render_preset_button` and the three knob-kind builders are all handed a
+story, a spec or a knob value and are named for the act of rendering it;
+`stage_canvas`, `preset_buttons`, `knob_grid` and `statusbar` are frames and
+are named for the thing they are. The four used to carry the prefix too,
+which made the prefix mean nothing — it was on all fifteen functions in the
+file. `with_content_inset` / `with_dock_row_inset` sit outside the rule
+entirely: they are decorators, and their names say so.
+
+Element ids built from a knob name are handed to `.id()` / `ButtonGroup::new`
+as the `format!`'s `String`. `ElementId: From<String>` and
+`ElementId: From<SharedString>` are the same constructor, so the explicit
+`SharedString::from` wrapper the file used to carry named a conversion the
+signature already asks for.
 
 - Layout: the story sidebar spans the full window height; stage, dock, and
   statusbar stack in a column to its right, so the dock and statusbar read as
@@ -569,7 +631,7 @@ separable. It is a sibling module of the crate root, which is why it can read
   looks wrong, and it is scoped to every flagship story rather than to the one
   that happens to need the file.
 
-### Recorded gaps
+## Recorded gaps
 
 - **Dialog stories are chrome only.** `dialog chrome` renders the
   confirmation body, the button row and both inputs inline on the canvas; it

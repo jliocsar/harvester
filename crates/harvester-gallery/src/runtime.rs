@@ -1,9 +1,9 @@
 use std::time::Duration;
 
-use gpui::{App, AppContext, Entity, ScrollHandle, Window};
+use gpui::{App, Entity, ScrollHandle, Window};
 use gpui_component::input::InputState;
 use harvester::ui::dialog::{create_multi_line_input, create_single_line_input};
-use harvester::ui::TranscriptPresentation;
+use harvester::ui::{create_prompt_input, TranscriptPresentation};
 use harvester_client_core::transcript::Transcript;
 use serde_json::Value;
 
@@ -14,8 +14,6 @@ pub const REPLAY_SPEED_MULTIPLIERS: &[f32] = &[0.5, 1., 4.];
 pub const REPLAY_FRAME_INTERVAL_MS: u64 = 260;
 pub const REPLAY_IDLE_POLL_INTERVAL_MS: u64 = 200;
 
-const PROMPT_INPUT_PLACEHOLDER: &str = "Message pi — Enter to send";
-const PROMPT_INPUT_ROWS: (usize, usize) = (1, 8);
 const DIALOG_SINGLE_LINE_PLACEHOLDER: &str = "Answer the agent";
 const DIALOG_MULTI_LINE_PREFILL: &str = "The agent prefilled this editor\nwith two lines";
 
@@ -40,11 +38,8 @@ pub struct RenderedTranscript {
 }
 
 impl RenderedTranscript {
-    pub fn transcript(&self) -> Result<&Transcript, String> {
-        match &self.transcript {
-            Ok(transcript) => Ok(transcript),
-            Err(failure) => Err(failure.clone()),
-        }
+    pub fn transcript(&self) -> Result<&Transcript, &str> {
+        self.transcript.as_ref().map_err(String::as_str)
     }
 }
 
@@ -67,10 +62,10 @@ impl ReplayTranscript {
         }
     }
 
-    pub fn transcript(&self) -> Result<&Transcript, String> {
+    pub fn transcript(&self) -> Result<&Transcript, &str> {
         match &self.events {
             Ok(_) => Ok(&self.transcript),
-            Err(failure) => Err(failure.clone()),
+            Err(failure) => Err(failure.as_str()),
         }
     }
 
@@ -163,14 +158,4 @@ impl StoryRuntime {
         self.rendered.presentation = TranscriptPresentation::default();
         self.rendered.transcript = self.fixtures.transcript(TranscriptSource::at(source_index));
     }
-}
-
-fn create_prompt_input(window: &mut Window, cx: &mut App) -> Entity<InputState> {
-    cx.new(|cx| {
-        InputState::new(window, cx)
-            .placeholder(PROMPT_INPUT_PLACEHOLDER)
-            .multi_line(true)
-            .auto_grow(PROMPT_INPUT_ROWS.0, PROMPT_INPUT_ROWS.1)
-            .submit_on_enter(true)
-    })
 }

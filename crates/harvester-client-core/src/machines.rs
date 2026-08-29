@@ -3,32 +3,13 @@ use crate::provider::{
     discover_providers, install_bundled_providers, MachineKey, Provider, ProviderMachine,
 };
 use crate::token::RequestToken;
-use crate::Error;
+use crate::{run_on_tokio_thread, Error};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 const PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const LIST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 const WORKSPACE_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-pub(crate) fn run_on_tokio_thread(
-    main: impl std::future::Future<Output = ()>,
-    on_runtime_error: impl FnOnce(String),
-) {
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            on_runtime_error(format!("tokio runtime: {error}"));
-
-            return;
-        }
-    };
-
-    runtime.block_on(main);
-}
 
 #[derive(Debug)]
 pub enum Command {
@@ -78,7 +59,7 @@ pub enum Event {
     },
     WorkspaceValidated {
         token: RequestToken,
-        error: Option<String>,
+        result: Result<(), String>,
     },
     BranchResolved {
         token: RequestToken,
@@ -120,9 +101,9 @@ pub(crate) fn start() -> std::io::Result<MachinesWorker> {
 }
 
 fn run_worker_thread(commands: UnboundedReceiver<Command>, events: UnboundedSender<Event>) {
-    run_on_tokio_thread(worker_main(commands, events), |detail| {
-        eprintln!("harvester: machines worker: {detail}");
-    });
+    if let Err(error) = run_on_tokio_thread(worker_main(commands, events)) {
+        eprintln!("harvester: machines worker: tokio runtime: {error}");
+    }
 }
 
 async fn worker_main(mut commands: UnboundedReceiver<Command>, events: UnboundedSender<Event>) {
@@ -148,35 +129,55 @@ async fn worker_main(mut commands: UnboundedReceiver<Command>, events: Unbounded
             _ = list_tick.tick() => {
                 spawn_list_cycle(provider_rows.clone(), events.clone(), listed_sender.clone());
             }
-            listed = listed_receiver.recv() => {
-                let Some(rows) = listed else {
-                    break;
-                };
-
-                provider_rows = rows;
-                provider_machines = provider_rows.values().flatten().cloned().collect();
-
-                let mut listed_providers: Vec<String> = provider_rows.keys().cloned().collect();
-
-                listed_providers.sort();
-
-                let listed = Event::Listed {
-                    rows: provider_machines.clone(),
-                    listed_providers,
-                };
-
-                if events.send(listed).is_err() {
-                    break;
-                }
-
-                probe_provider_machines(&provider_machines, &events);
-            }
+            listed = listed_receiver.recv() => match listed {
+                None => break,
+                Some(rows) => match publish_listing(
+                    rows,
+                    &mut provider_rows,
+                    &mut provider_machines,
+                    &events,
+                ) {
+                    Listing::Published => {}
+                    Listing::NobodyListening => break,
+                },
+            },
             _ = probe_tick.tick() => {
                 probe_provider_machines(&provider_machines, &events);
                 probe_ad_hoc(&ad_hoc_machines, &events);
             }
         }
     }
+}
+
+enum Listing {
+    Published,
+    NobodyListening,
+}
+
+fn publish_listing(
+    listed_rows: ProviderRows,
+    provider_rows: &mut ProviderRows,
+    provider_machines: &mut Vec<MachineRow>,
+    events: &UnboundedSender<Event>,
+) -> Listing {
+    let mut listed_providers: Vec<String> = listed_rows.keys().cloned().collect();
+
+    listed_providers.sort();
+    *provider_rows = listed_rows;
+    *provider_machines = provider_rows.values().flatten().cloned().collect();
+
+    let listed = Event::Listed {
+        rows: provider_machines.clone(),
+        listed_providers,
+    };
+
+    if events.send(listed).is_err() {
+        return Listing::NobodyListening;
+    }
+
+    probe_provider_machines(provider_machines, events);
+
+    Listing::Published
 }
 
 fn handle_command(
@@ -233,12 +234,11 @@ fn spawn_validate_workspace(
     events: &UnboundedSender<Event>,
 ) {
     spawn_host_op(events, async move {
-        let error = validate_git_workspace(&host, &path)
+        let result = validate_git_workspace(&host, &path)
             .await
-            .err()
-            .map(|error| error.to_string());
+            .map_err(|error| error.to_string());
 
-        Event::WorkspaceValidated { token, error }
+        Event::WorkspaceValidated { token, result }
     })
 }
 
@@ -305,7 +305,8 @@ fn parse_ls_entries(stdout: &str) -> Vec<RemoteDirEntry> {
 fn parse_ls_entry(line: &str) -> Option<RemoteDirEntry> {
     let (name, is_dir) = line
         .strip_suffix('/')
-        .map_or((line, false), |directory| (directory, true));
+        .map(|directory| (directory, true))
+        .unwrap_or((line, false));
 
     if name.is_empty() || name.chars().any(char::is_control) {
         return None;
@@ -416,7 +417,7 @@ fn machine_rows(provider: &Provider, machines: Vec<ProviderMachine>) -> Vec<Mach
             .to_string(),
             label: machine.label,
             provider: provider.name.clone(),
-            target: machine.ssh.target(),
+            target: machine.target,
         })
         .collect()
 }

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use harvester_proto::lock;
 use serde_json::Value;
 
 pub(super) const ATTACH_EVENT_BUFFER_CAP: usize = 1024;
@@ -74,13 +75,10 @@ pub(super) struct AttachRegistration {
 }
 
 impl AttachRegistration {
-    pub(super) fn register(
-        buffers: &Arc<Mutex<AttachEventBuffers>>,
-        sid: &str,
-    ) -> AttachRegistration {
-        lock_attach_buffers(buffers).register(sid);
+    pub(super) fn register(buffers: &Arc<Mutex<AttachEventBuffers>>, sid: &str) -> Self {
+        lock(buffers, "attach buffer").register(sid);
 
-        AttachRegistration {
+        Self {
             buffers: buffers.clone(),
             sid: sid.to_string(),
             flushed: false,
@@ -90,7 +88,7 @@ impl AttachRegistration {
     pub(super) fn flush(mut self) -> FlushOutcome {
         self.flushed = true;
 
-        lock_attach_buffers(&self.buffers).flush(&self.sid)
+        lock(&self.buffers, "attach buffer").flush(&self.sid)
     }
 }
 
@@ -100,14 +98,8 @@ impl Drop for AttachRegistration {
             return;
         }
 
-        lock_attach_buffers(&self.buffers).drop_registration(&self.sid);
+        lock(&self.buffers, "attach buffer").drop_registration(&self.sid);
     }
-}
-
-pub(super) fn lock_attach_buffers(
-    buffers: &Arc<Mutex<AttachEventBuffers>>,
-) -> std::sync::MutexGuard<'_, AttachEventBuffers> {
-    buffers.lock().expect("attach buffer mutex")
 }
 
 #[cfg(test)]
@@ -125,7 +117,7 @@ mod tests {
     }
 
     fn push(buffers: &Arc<Mutex<AttachEventBuffers>>, sid: &str, event: Value) -> PushOutcome {
-        lock_attach_buffers(buffers).push(sid, event)
+        lock(buffers, "attach buffer").push(sid, event)
     }
 
     #[test]

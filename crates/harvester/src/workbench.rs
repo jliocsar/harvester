@@ -3,10 +3,11 @@ mod modal;
 mod picker;
 mod sidebar;
 
-use gpui::{div, prelude::*, px, Context, Entity, Subscription, Window};
+use gpui::{div, prelude::*, Context, Entity, Subscription, Window};
 use gpui_component::notification::NotificationType;
 use gpui_component::{ActiveTheme as _, Root, WindowExt as _};
 use harvester_client_core::bridge::Event as BridgeEvent;
+use harvester_client_core::MachineState;
 use serde_json::Value;
 
 use machine_presentation::present_machine;
@@ -19,20 +20,20 @@ use crate::ui::{self, Tone};
 
 const NO_CHAT_HINT: &str = "start a new session to begin";
 
-struct WorkbenchSubscriptions {
-    _store_repaint: Subscription,
-    _store_events: Subscription,
-    _sidebar_intents: Subscription,
-    _modal_outcomes: Subscription,
+struct OpenChat {
+    chat: Entity<Chat>,
+    _flow_requests: Subscription,
 }
 
 pub struct Workbench {
     store: Entity<FleetStore>,
     sidebar: Entity<Sidebar>,
     modal: Entity<ModalCoordinator>,
-    chat: Option<Entity<Chat>>,
-    chat_subscription: Option<Subscription>,
-    _subscriptions: WorkbenchSubscriptions,
+    chat: Option<OpenChat>,
+    _store_repaint: Subscription,
+    _store_events: Subscription,
+    _sidebar_intents: Subscription,
+    _modal_outcomes: Subscription,
 }
 
 impl Workbench {
@@ -45,20 +46,20 @@ impl Workbench {
         let store = cx.new(|cx| FleetStore::new(argv_machine, daemon_binary, cx));
         let sidebar = cx.new(|cx| Sidebar::new(store.clone(), cx));
         let modal = cx.new(|cx| ModalCoordinator::new(store.clone(), window, cx));
-        let subscriptions = WorkbenchSubscriptions {
-            _store_repaint: cx.observe(&store, |_, _, cx| cx.notify()),
-            _store_events: cx.subscribe_in(&store, window, Self::handle_store_event),
-            _sidebar_intents: cx.subscribe_in(&sidebar, window, Self::handle_sidebar_intent),
-            _modal_outcomes: cx.subscribe_in(&modal, window, Self::handle_modal_outcome),
-        };
+        let store_repaint = cx.observe(&store, |_, _, cx| cx.notify());
+        let store_events = cx.subscribe_in(&store, window, Self::handle_store_event);
+        let sidebar_intents = cx.subscribe_in(&sidebar, window, Self::handle_sidebar_intent);
+        let modal_outcomes = cx.subscribe_in(&modal, window, Self::handle_modal_outcome);
 
         Self {
             store,
             sidebar,
             modal,
             chat: None,
-            chat_subscription: None,
-            _subscriptions: subscriptions,
+            _store_repaint: store_repaint,
+            _store_events: store_events,
+            _sidebar_intents: sidebar_intents,
+            _modal_outcomes: modal_outcomes,
         }
     }
 
@@ -125,19 +126,18 @@ impl Workbench {
         let targets_machine = self
             .chat
             .as_ref()
-            .is_some_and(|chat| chat.read(cx).machine() == machine);
+            .is_some_and(|open| open.chat.read(cx).machine() == machine);
 
         if !targets_machine {
             return;
         }
 
         self.chat = None;
-        self.chat_subscription = None;
         cx.notify();
     }
 
     fn handle_repo_added(&mut self, machine: &str, path: &str, cx: &mut Context<Self>) {
-        let Some(chat) = self.chat.clone() else {
+        let Some(chat) = self.chat.as_ref().map(|open| open.chat.clone()) else {
             return;
         };
 
@@ -182,18 +182,21 @@ impl Workbench {
     }
 
     fn install_chat(&mut self, chat: Entity<Chat>, window: &mut Window, cx: &mut Context<Self>) {
-        let subscription = cx.subscribe_in(&chat, window, Self::handle_chat_flow_request);
+        let flow_requests = cx.subscribe_in(&chat, window, Self::handle_chat_flow_request);
 
         chat.update(cx, |chat, cx| chat.request_prompt_controls(cx));
 
-        self.chat = Some(chat);
-        self.chat_subscription = Some(subscription);
+        self.chat = Some(OpenChat {
+            chat,
+            _flow_requests: flow_requests,
+        });
         cx.notify();
     }
 
     fn workspace_path_of(&self, sid: &str, cx: &Context<Self>) -> String {
         self.store
             .read(cx)
+            .catalog()
             .session_cwd(sid)
             .unwrap_or_default()
             .to_string()
@@ -209,8 +212,8 @@ impl Workbench {
 
         self.discard_unstarted_chat(cx);
 
-        let already_open = self.chat.as_ref().is_some_and(|chat| {
-            let chat = chat.read(cx);
+        let already_open = self.chat.as_ref().is_some_and(|open| {
+            let chat = open.chat.read(cx);
 
             chat.sid() == Some(sid) && chat.is_live()
         });
@@ -227,18 +230,17 @@ impl Workbench {
         let unstarted = self
             .chat
             .as_ref()
-            .is_some_and(|chat| chat.read(cx).sid().is_none());
+            .is_some_and(|open| open.chat.read(cx).sid().is_none());
 
         if !unstarted {
             return;
         }
 
         self.chat = None;
-        self.chat_subscription = None;
     }
 
     fn take_starting_chat(&mut self, sid: &str, cx: &mut Context<Self>) -> Option<Entity<Chat>> {
-        let chat = self.chat.clone()?;
+        let chat = self.chat.as_ref()?.chat.clone();
         let (machine, cwd, name) = {
             let chat = chat.read(cx);
             let (starting_sid, name) = chat.starting_session()?;
@@ -262,13 +264,13 @@ impl Workbench {
     }
 
     fn open_new_session_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let already_unstarted = self.chat.as_ref().is_some_and(|chat| {
-            let chat = chat.read(cx);
+        let already_unstarted = self.chat.as_ref().is_some_and(|open| {
+            let chat = open.chat.read(cx);
 
             chat.starting_session().is_none() && chat.sid().is_none()
         });
 
-        if self.store.read(cx).opening_sid().is_some() || already_unstarted {
+        if self.store.read(cx).catalog().opening_sid().is_some() || already_unstarted {
             return;
         }
 
@@ -299,58 +301,82 @@ impl Workbench {
     }
 
     fn render_content(&self, cx: &Context<Self>) -> impl IntoElement {
-        let content = div().flex_1().min_w(px(0.)).h_full();
+        let content = div().flex_1().min_w_0().h_full();
 
-        if let Some(chat) = &self.chat {
-            return content.child(chat.clone());
+        if let Some(open) = &self.chat {
+            return content.child(open.chat.clone());
         }
 
-        let (hint, color) = match self.store.read(cx).argv_machine() {
-            Some(machine) => self.argv_machine_hint(machine, cx),
-            None => (NO_CHAT_HINT.to_string(), Tone::Idle),
-        };
+        let store = self.store.read(cx);
+        let hint = present_empty_pane(argv_machine_state(store));
 
-        content.child(ui::empty_pane_hint(color, hint, cx))
-    }
-
-    fn argv_machine_hint(&self, machine: &str, cx: &Context<Self>) -> (String, Tone) {
-        let display = present_machine(self.store.read(cx).state(machine), machine);
-
-        match display.pane_message {
-            Some(message) => (message, display.tone),
-            None => (NO_CHAT_HINT.to_string(), Tone::Idle),
-        }
+        content.child(ui::empty_pane_hint(hint.tone, hint.text, cx))
     }
 
     fn render_statusbar(&self, cx: &Context<Self>) -> impl IntoElement {
-        let (link_text, link_tone) = self.statusbar_link(cx);
+        let store = self.store.read(cx);
+        let link = present_statusbar_link(
+            argv_machine_state(store),
+            store.connected_machine_count(),
+            store.linked_machine_count(),
+        );
 
-        ui::statusbar_frame(cx).child(div().text_color(link_tone.color(cx)).child(link_text))
+        ui::statusbar_frame(cx).child(div().text_color(link.tone.color(cx)).child(link.text))
     }
+}
 
-    fn statusbar_link(&self, cx: &Context<Self>) -> (String, Tone) {
-        if let Some(link) = self.argv_statusbar_link(cx) {
-            return link;
+struct ShellMessage {
+    text: String,
+    tone: Tone,
+}
+
+fn argv_machine_state(store: &FleetStore) -> Option<(&str, MachineState<'_>)> {
+    let machine = store.argv_machine()?;
+
+    Some((machine, store.state(machine)))
+}
+
+fn present_empty_pane(argv_machine: Option<(&str, MachineState<'_>)>) -> ShellMessage {
+    let Some((machine, state)) = argv_machine else {
+        return no_chat_hint();
+    };
+    let display = present_machine(state, machine);
+
+    match display.pane_message {
+        Some(message) => ShellMessage {
+            text: message,
+            tone: display.tone,
+        },
+        None => no_chat_hint(),
+    }
+}
+
+fn no_chat_hint() -> ShellMessage {
+    ShellMessage {
+        text: NO_CHAT_HINT.to_string(),
+        tone: Tone::Idle,
+    }
+}
+
+fn present_statusbar_link(
+    argv_machine: Option<(&str, MachineState<'_>)>,
+    connected_machine_count: usize,
+    linked_machine_count: usize,
+) -> ShellMessage {
+    if let Some((machine, state)) = argv_machine {
+        let display = present_machine(state, machine);
+
+        if let Some(link) = display.statusbar_link {
+            return ShellMessage {
+                text: link,
+                tone: display.tone,
+            };
         }
-
-        let store = self.store.read(cx);
-
-        (
-            format!(
-                "{} of {} machines connected",
-                store.connected_machine_count(),
-                store.linked_machine_count()
-            ),
-            Tone::Idle,
-        )
     }
 
-    fn argv_statusbar_link(&self, cx: &Context<Self>) -> Option<(String, Tone)> {
-        let store = self.store.read(cx);
-        let machine = store.argv_machine()?;
-        let display = present_machine(store.state(machine), machine);
-
-        Some((display.statusbar_link?, display.tone))
+    ShellMessage {
+        text: format!("{connected_machine_count} of {linked_machine_count} machines connected"),
+        tone: Tone::Idle,
     }
 }
 
@@ -366,7 +392,7 @@ impl Render for Workbench {
             .child(
                 div()
                     .flex_1()
-                    .min_h(px(0.))
+                    .min_h_0()
                     .flex()
                     .child(self.sidebar.clone())
                     .child(self.render_content(cx)),

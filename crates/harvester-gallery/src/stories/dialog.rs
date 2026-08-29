@@ -4,8 +4,8 @@ use gpui_component::v_flex;
 use gpui_component::ActiveTheme as _;
 use harvester::ui::dialog::{
     action_button, button_row, cancel_button, dismiss_only_row, option_row, options_height,
-    title_or_named_condition, ActionAccent, Confirmation, CONFIRMATION_DIALOG_WIDTH_IN_REMS,
-    SELECT_DIALOG_WIDTH_IN_REMS, TEXT_DIALOG_WIDTH_IN_REMS,
+    title_or_named_condition, ActionAccent, Confirmation, CANCEL_LABEL,
+    CONFIRMATION_DIALOG_WIDTH_IN_REMS, SELECT_DIALOG_WIDTH_IN_REMS, TEXT_DIALOG_WIDTH_IN_REMS,
 };
 
 use super::{caption, panel, story_column, DIALOG_GROUP};
@@ -24,7 +24,6 @@ const DANGER_ACCENT_INDEX: usize = 1;
 const CONFIRM_TITLE: &str = "Start a session on exe-vm-7fa2?";
 const CONFIRM_MESSAGE: &str = "pi will run in ~/harvester on the branch backend-hardening.";
 const CONFIRM_ACTION_LABEL: &str = "Start";
-const CANCEL_LABEL: &str = "Cancel";
 const DESTRUCTIVE_TITLE: &str = "Forget exe-vm-0c19?";
 const DESTRUCTIVE_MESSAGE: &str =
     "The machine is no longer listed by its provider. Sessions on its disk are untouched.";

@@ -266,24 +266,32 @@ lifecycle, the session event stream) and carries no token.
   nobody can build from the app today.
 
 **`BridgeContext` fields and their invariants.**
-- `attached: Arc<AsyncMutex<Option<String>>>` — the one session this bridge
-  is attached to (single chat pane per bridge). The *async* mutex also
-  *serializes* attachment changes: a second `Open` waits out the first flow
-  rather than interleaving with it.
+- `attached: Arc<AsyncMutex<Option<Attachment>>>` — the one session this
+  bridge is attached to (single chat pane per bridge), together with that
+  session's replay cursor. The *async* mutex also *serializes* attachment
+  changes: a second `Open` waits out the first flow rather than interleaving
+  with it.
 - `attach_buffers` — live events held back while an attach flow is still
   fetching history (see `attach_window.rs`).
 - `resyncing: Arc<Mutex<HashSet<String>>>` — sessions with a repair already
   in flight, so a burst of gaps costs one `get_entries` rather than one per
   gap.
-- `cursor: Arc<Mutex<Option<SessionCursor>>>` — the attached session's replay
-  cursor from the last `get_entries` (docs/SPEC.md C6). One slot only,
-  because one bridge holds exactly one attachment.
 
-`SessionCursor` pairs pi's `leafId` with the sid it was fetched for. The sid
-half is not optional convenience: a cursor is only ever valid for the session
-it came from, and pairing them makes spending it on the wrong session
-structurally impossible rather than merely unlikely (e.g. after a
-same-bridge session swap).
+`Attachment { sid, cursor }` is one cell, not two. The cursor is pi's
+`leafId` from the last `get_entries` (docs/SPEC.md C6) and there is only ever
+one, because one bridge holds exactly one attachment. Keeping it *inside* the
+attachment is what makes the two rules structural instead of remembered: a
+cursor cannot outlive the session it was fetched for (dropping the attachment
+drops it), and it cannot be written for a session that is no longer attached
+(there is no slot to write into). This replaced a second
+`Arc<Mutex<Option<SessionCursor>>>` whose `SessionCursor` re-carried the sid
+so the two cells could be compared against each other by hand on every read
+and every write.
+
+The two cells were also a lock-ordering question nobody wanted to have to
+answer. There is now one lock on this path: no flow holds the attachment
+guard across a cursor read or write, because reading and writing the cursor
+*is* taking that guard.
 
 **Bridge main loop notes.**
 - The sidebar renders from `sessions_flow`, so it's fired immediately on
@@ -304,13 +312,14 @@ same-bridge session swap).
   event — answering a dialog is the frontend's obligation now (docs/SPEC.md
   C5), and the bridge's only job is to put the question in front of it
   unaltered.
-- `pi_event_type` is the crate's one reader of a pi payload's `type` field
-  (`get("type").and_then(as_str)`). The same three-line shape had grown
-  copies in `pi_request_flow` and `Transcript::apply` (and a third in the
-  gpui crate's `is_turn_settled`); this is the one home, so the next place
-  that needs a pi event's type does not write a fourth copy. It went private
-  in the `bridge.rs` merge — no caller outside the bridge exists today, and
-  re-widening it is a one-word change the day one appears.
+- Reading a pi payload's `type` is written `get("type").and_then(Value::as_str)`
+  everywhere, inline, with no crate-local helper. There used to be two
+  spellings of it here — a private `pi_event_type` in this module and a
+  `string_field` in `dialog.rs` returning the same read owned rather than
+  borrowed — while fifteen other sites across the workspace used the plain
+  idiom anyway. A wrapper that saves no lines is one more name a reader has
+  to look up; the std vocabulary is already the majority and is now the only
+  one.
 
 ### Flows
 
@@ -422,28 +431,25 @@ cursor, returning pi's entries plus the `leafId` that becomes the next
 cursor. Per HARNESS_RESEARCH.md, "an entry id works as a durable cursor …
 even across client restarts."
 
-**`cursor_for` / `record_cursor`.** The cursor is one global slot — the
-attached session's — filtered by sid on read rather than being cleared on
-attach: a cursor tagged with the session it came from cannot be spent on the
-session that replaced it, regardless of what order the attach and the fetch
-actually land in. A fetch that returns no `leafId` leaves no recorded cursor
-— the next repair for that session just refetches whole, which is always
-correct, never worse than guessing wrong.
+**`cursor_for` / `record_cursor`.** Both are a single guarded read of
+`attached`, filtered by sid. Read: the cursor of the attachment, if the
+attachment is still this session's; a fetch that returned no `leafId` leaves
+`cursor: None`, and the next repair for that session simply refetches whole,
+which is always correct and never worse than guessing wrong. Write: store
+into the attachment, if the attachment is still this session's.
 
-The write side is compare-and-set against the *attachment*, not against the
-slot: `record_cursor` re-reads `attached` and stores nothing unless the sid
-it was called for is still the attached one. Comparing against whatever the
-slot happens to hold would be the wrong test in both directions — it would
-refuse the legitimate handover (the newly attached session's first cursor
-would find the old session's still in the slot) and it would still let a
-stale flow claim an empty slot. The attachment is what makes a flow stale in
-the first place, so it is what the write is gated on. Without the gate, a
-resync that finishes after the pane has moved on overwrites the new
-session's cursor with its own leaf id, and the new session's next repair
-spends a foreign cursor — self-healing (pi answers `Entry not found` and the
-fallback refetches whole) but a wasted round trip born of a slot nobody
-owned. `is_attached` is the shared one-line predicate for both this and the
-resync loop's per-iteration check.
+The rule "a stale flow must not spend the new session's cursor slot" is now
+structural rather than enforced. There is no free-floating slot to claim: a
+resync that finishes after the pane has moved on finds a different sid on the
+attachment and writes nothing, and when the attachment is replaced its cursor
+goes with it, so nothing can be inherited across a session swap either. This
+used to be a hand-written compare-and-set of one shared cell against another
+— `record_cursor` re-read `attached` to decide whether the cursor cell was
+still its to write — and the failure it prevents is real: without the gate the
+new session's next repair spends a foreign cursor, self-healing (pi answers
+`Entry not found` and the fallback refetches whole) but a wasted round trip
+born of a slot nobody owned. `is_attached` remains the shared one-line
+predicate for the resync loop's per-iteration check.
 
 **`ResyncGuard`.** RAII guard enforcing "one repair per session at a time",
 for the same reason `AttachRegistration` is RAII: a flow that returns early —
@@ -493,8 +499,10 @@ two rooms attached daemon-side while the bridge's own bookkeeping remembered
 only the replacement.
 
 **`prompt_flow`.** Sends `{"type": "prompt", ..., "streamingBehavior":
-"steer"}`. Acceptance means queued, not completed — progress arrives
-separately as events, so only rejection here is notable. Rejection publishes
+"steer"}` through `pi_flow_result` and discards the `data` it returns.
+Acceptance means queued, not completed — progress arrives separately as
+events, so only rejection here is notable, which is why the shared helper's
+`Ok` half is dropped rather than read. Rejection publishes
 `Event::PromptFailed` (sid-scoped), *not* `RequestFailed` (machine-scoped):
 the frontend rendered this prompt and raised a busy indicator for it before
 the flow ran, and only the chat holding that sid can retire them. It also
@@ -528,15 +536,18 @@ that is reported.
 
 **`pi_request_flow`.** The whole implementation of `Command::PiRequest`: run
 the verbatim `cmd` through `pi_flow_result` and publish `Event::PiAnswered`
-with the same sid, the same token, and the command's own `type` string (read
-via the shared `pi_event_type` helper), so no other layer
-has to re-type the command it just sent. It is the only place in the bridge
+with the same sid, the same token, and the command's own `type` string, so no
+other layer has to re-type the command it just sent. It is the only place in the bridge
 that inspects a pi payload's contents at all, and it inspects exactly one
 field it then copies verbatim.
 
 **`pi_flow_result`.** Shared helper turning a pi command into the `Result`
 that picker/statusbar-facing events carry: `data` verbatim on success, pi's
-error string otherwise.
+error string otherwise. Every flow that wants a verdict out of pi goes
+through it — `fetch_entries`, `pi_request_flow` and `prompt_flow` — so
+`pi_success`, `pi_error` and `UNKNOWN_PI_ERROR` have exactly one reader.
+`answer_dialog_flow` is the one deliberate exception, for the reason given
+above.
 
 ### Test harness
 
@@ -845,6 +856,15 @@ abandoned), or ordinary resolution. Without RAII, a leaked entry means a
 waiter that can never be woken and a `HashMap` that only grows — so removal
 cannot safely live at a single call site and must be tied to the guard's drop.
 
+Every acquisition of the pending map — and of `Forward.child` — goes through
+`harvester_proto::lock`, which panics with the field's own name and the
+poison detail. This crate used to carry four three-line `lock_*` wrappers
+(`lock_pending` here, `lock_cursor`/`lock_resyncing` in `bridge.rs`,
+`lock_attach_buffers` in `bridge/attach_window.rs`) that were near-identical
+to three more in the daemon; there is one now, in the crate both sides already
+depend on. The convention is to pass the mutex field's own name, with no
+`" mutex"` suffix — the helper adds it.
+
 `envelope_mismatch`: the daemon echoing a request's id back on the *wrong*
 envelope type (e.g. a `Harvester` request id showing up on a `PiResponse`) is
 a daemon-contract violation — impossible under docs/DAEMON.md's contract, so
@@ -881,7 +901,17 @@ Two shape facts are easy to get wrong and are the reason this module exists:
   `DialogAnswer::to_response` sets exactly one.
 
 `DIALOG_METHODS` (`select`, `confirm`, `input`, `editor`) are the
-`extension_ui_request` methods that actually block pi until answered. The
+`extension_ui_request` methods that actually block pi until answered. The list
+lives in `harvester-proto`, not here: `harvesterd`'s dialog module decides
+from the same list whether a dialog is *held open*, and this module decides
+whether one is *rendered*. They are not two lists that happen to match — they
+are one list the protocol requires to match, and a byte-identical copy on each
+side of the daemon seam meant a future pi adding a fifth blocking method could
+teach one side and not the other, parking a dialog nobody can answer while pi
+blocks forever. A proto test pins the contents. `PI_EXTENSION_UI_RESPONSE` is
+in proto for the same reason — the daemon's dialog policy and
+`DialogAnswer::to_response` have to spell the answer envelope's `type`
+identically. The
 fire-and-forget UI methods (`notify`, `setStatus`, `setWidget`, `setTitle`, …)
 are forwarded to the client but never answered — `DialogRequest::parse`
 returning `None` for them is what keeps a response off the wire for an id pi
@@ -902,7 +932,10 @@ blocks pi regardless, so showing it untitled beats leaving it unanswerable.
 
 Pi omits absent optionals rather than sending `null` (it serializes with
 `JSON.stringify`), so "absent" and "null" collapse to the same `None` when
-reading fields like `placeholder`/`prefill`.
+reading fields like `placeholder`/`prefill`. Those reads are written inline as
+`get(field).and_then(Value::as_str)` — the crate-wide spelling; the local
+`string_field` helper that used to wrap them is gone (see `bridge.rs`, "reading
+a pi payload's `type`").
 
 `DialogAnswer::Cancelled` corresponds to Escape, or to a dialog Harvester could
 not render — identical in effect to a human dismissing the dialog in pi's own
@@ -1065,12 +1098,19 @@ actual connection, and a machine whose connect failed stays visibly failed
 until something retries it. `is_live()` (`Connecting` or `Connected`) is the
 one predicate that means "usable — commands queue on it."
 
-### `FleetError`
+### Fleet failures
 
-Every variant renders the exact sentence the statusbar showed before this
-type existed. The human-readable `detail` string *is* the payload — a
-frontend that collapsed this down to "not connectable" would throw away the
-only diagnosis a user gets for a machine that will not come up.
+`Fleet`'s fallible methods (`ensure_connection`, `host_for`,
+`send_host_command`) return `crate::Result`. The four failures they can
+actually produce — `NotConnectable`, `BridgeStart`, `HostWorkerMissing`,
+`HostWorkerStopped` — are variants of `crate::Error`, documented in the
+`lib.rs` section along with why they stopped being a separate `FleetError`
+enum.
+
+Every one of them renders the exact sentence the statusbar showed before any
+of this was typed at all. The human-readable `detail` string *is* the payload
+— a frontend that collapsed this down to "not connectable" would throw away
+the only diagnosis a user gets for a machine that will not come up.
 `HostWorkerMissing` vs `HostWorkerStopped` distinguishes "the machines
 worker thread never started, so there's no runtime to exec host ops on and
 nothing to wait for" from "it started but its thread has since ended."
@@ -1258,7 +1298,9 @@ lives in `connection.rs`, not here — this module is exec only.
 `Host::exec` always carries an explicit `timeout`: ssh's own
 `ConnectTimeout` bounds only the TCP connect step, so without a caller-side
 deadline here a wedged transport or an unbounded remote loop would hang its
-bridge forever. On the SSH arm, the remote command is re-executed through
+bridge forever. It applies that deadline by handing the built command to
+`run_within`, which is where "every child process this crate spawns is killed
+at a deadline" is actually written down. On the SSH arm, the remote command is re-executed through
 `exec sh -c <quoted script>` rather than run directly, because sshd runs
 commands through the user's *login* shell, which is only POSIX-compatible by
 luck — fish and csh reject the arithmetic, async-subshell and `&&`-chain
@@ -1280,12 +1322,34 @@ It lives next to the exec boundary because that's exactly what it protects:
 both the scripts passed to `Host::exec` and any paths interpolated into
 them.
 
+`folder_name` is the client's one "last component of a path", re-exported from
+`lib.rs` because both halves of the `harvester` crate call it and they cannot
+see each other: `ui/transcript.rs` (a file's name in a tool header) is on that
+crate's lib side, and its sidebar, chat and repo control are on the bin side.
+This crate is the lowest one both already depend on. It trims a trailing slash
+and answers `"/"` for the root, because the two implementations it replaces
+disagreed on exactly those cases — the weaker one rendered a stored repo path
+ending in `/` as an empty sidebar subtitle. The four pinned cases travel with
+it as a unit test here. It takes a path as `&str` and returns a borrow, so it
+is a display helper with no allocation and no `Path` semantics: nothing here
+touches the filesystem or resolves `..`.
+
 `ExecOutput::require_success` is the crate's single "did this exec work?"
 check: `Ok(())` on exit 0, otherwise the crate's `Error::Exec` carrying a
 caller-supplied `context` plus the child's own stdout/stderr diagnosis
 (`describe_failure`). Every non-zero exit anywhere in the crate is reported
 through this path, so the shape of an exec failure can't drift between call
 sites.
+
+`run_within` is the crate's one exec entry point: `tokio::time::timeout`
+around `run`, turning an expired deadline into an `io::Error` of kind
+`TimedOut`. Both callers reach it — `Host::exec`, which wraps a script in
+`sh -c`, and `Provider::invoke`, which spawns a bare provider executable and
+therefore bypasses the `sh -c` wrapping entirely. They used to add their own
+`tokio::time::timeout` independently, each with its own error text, which made
+the deadline a convention two call sites happened to follow rather than a
+property of the boundary. `run` itself is private now; nothing outside this
+module can spawn a child without a deadline.
 
 `run` spawns the command with `kill_on_drop` (cancelling the returned future
 kills the child; nothing lingers) and feeds `stdin_data`, if any, on its own
@@ -1418,10 +1482,16 @@ client backbone) and, underneath it, `bootstrap_and_connect` + `DaemonClient`
 for anyone driving the protocol directly (this is what the `harvester-cli`
 dev tool does).
 
+`folder_name` (from `host.rs`) is the one export that is neither a door nor a
+protocol vocabulary: it is a pure display helper, published because the two
+halves of the `harvester` crate — its lib-side `ui/` and its bin-side screens —
+both need the same answer and cannot see each other. See the `host.rs` section.
+
 The exported surface is deliberately no wider than those two doors. Names
 that only this crate's own layers call — `bridge::start`/`BridgeHandle`,
-`machines::start`/`MachinesWorker`, `machines::run_on_tokio_thread`,
-`RequestTokens::mint` and `DialogAnswer::to_response` — are `pub(crate)`.
+`machines::start`/`MachinesWorker`, `run_on_tokio_thread`,
+`RequestTokens::mint`, `DialogAnswer::to_response` and all of `provider.rs`
+— are `pub(crate)`.
 Publishing them was speculative: each was offered as "a frontend that wants
 less could use this", none ever had a caller outside the crate, and every
 published name is a promise that constrains refactors. Two former entries on
@@ -1452,6 +1522,59 @@ hidden.
 - `Provider`: a machine provider executable misbehaved — contract violation,
   timeout, or its own `{"error"}` object surfaced verbatim (docs/PROVIDERS.md
   defines the provider contract this maps to).
+- `NotConnectable`: a machine string resolved to no SSH target — an unlisted
+  provider machine, or a listed one whose entry carries the argv ssh form.
+- `BridgeStart`: the OS refused the bridge's thread, so that machine has no
+  daemon connection and never will until the user retries.
+- `HostWorkerMissing` / `HostWorkerStopped`: the machines worker never started
+  or has since gone, so a daemon-free host op (the folder picker's `$HOME`,
+  `ls`, git probes) has nowhere to run.
+
+The last four were a second enum, `FleetError`, until the simplification
+round. Nothing anywhere ever matched on its variants — every consumer called
+`to_string()` immediately, and `FleetStore::host_for` existed largely to
+demote it to a `String` — so a whole enum plus a `Display` plus an
+`std::error::Error` impl plus a `lib.rs` re-export were buying one thing:
+the ability to say `FleetError` instead of `Error`. The trade taken here is
+that `Fleet`'s synchronous API now returns a type carrying `Io`, `Provider`
+and `VersionMismatch` variants it can never produce; the rule that made it
+worth taking is "no error type exists unless something matches on its
+variants".
+
+**`run_on_tokio_thread`.** The one way this crate gets a tokio reactor. gpui
+drives its own executor and never installs a tokio reactor, so no async work
+in this crate can run on the caller's thread — every I/O-owning worker (a
+bridge's daemon connection, the machines worker) instead lives on a dedicated
+std thread that builds its own runtime and blocks on one future for its whole
+life. The runtime is current-thread on purpose: one worker is one logical
+actor, so a work-stealing pool would buy nothing and would cost extra threads.
+
+It lives at the crate root rather than inside either worker because it belongs
+to neither: it was in `machines.rs`, which made `bridge.rs` import the machines
+worker for a runtime helper that has nothing to do with machines.
+
+The *failure* case is the interesting half: building a runtime fails only when
+the OS refuses a resource, and at that point the worker cannot start at all,
+so its owner must be told in whatever way that particular worker reports
+failure. That disagreement — a `ConnectFailed` event on one side, a stderr
+line on the other — used to be an `impl FnOnce(String)` error sink parameter,
+the crate's only error-reporting callback in a codebase that otherwise reports
+through a `Result` or a channel. It is a plain `std::io::Result<()>` now and
+each caller decides at its own call site. When the build fails, `main` is
+dropped un-polled — safe here because every worker's main future does all of
+its real work only after its first poll (no worker relies on
+drop-without-polling side effects).
+
+**`scratch`.** A `#[cfg(test)]` `ScratchDir` shared by `connection.rs` and
+`provider.rs`: `create(label)` makes `<temp>/harvester-<label>-<pid>` and
+`Drop` removes it. Three tests used to hand-roll that directory and call
+`remove_dir_all` as their last statement, so any failing assertion leaked the
+directory into the temp dir — in all three copies. This crate already leans on
+RAII for exactly this class of obligation in production
+(`AttachRegistration`, `ResyncGuard`, `PendingRequestGuard`, `Forward`); the
+tests now use the same pattern. `Drop` logs rather than panics: a panicking
+`Drop` during an already-failing test would replace the assertion message with
+its own.
 
 ## crates/harvester-client-core/src/machines.rs
 
@@ -1494,7 +1617,13 @@ has no answer, so it carries none. On the `Event` side, the three host-op
 answers carry only the token of the request that asked for them — nothing
 else identifying — so a frontend applies an answer only while that token is
 still the one it has outstanding (stale in-flight requests are naturally
-ignored).
+ignored). All four answers are shaped `result: Result<_, String>`;
+`WorkspaceValidated` used to be `error: Option<String>` because
+`validate_git_workspace` returns `crate::Result<()>` and `Option` was the
+shorter way to spell "nothing to hand back on success". One sibling in four
+spelling the same thing differently cost its spawner a `.err().map(...)`
+where the other three use `.map_err(...)`, and its consumer a second shape to
+learn.
 
 `Event::Listed.listed_providers`: every provider whose `list` has succeeded
 at least once, this cycle or an earlier one. A provider absent from this set
@@ -1504,6 +1633,8 @@ provider is broken" (consumed by `Fleet::is_missing` in fleet.rs).
 
 `MachineRow.target: Option<SshTarget>` is `None` for the argv ssh escape
 hatch (unsupported yet) — such machines list, but stay unreachable/unprobed.
+It is a straight copy of `ProviderMachine.target`, which now answers the same
+question at parse time (see `provider.rs`).
 
 Worker startup sequence and its rationale:
 1. `install_bundled_providers()` — writes the bundled exe-dev provider into
@@ -1521,7 +1652,15 @@ Concurrency design of the main loop (`worker_main`):
   workspace op they run and which `Event` carries the answer.
 - Listing runs off the `select!` loop on its own task and reports back
   through a channel, so a slow provider never delays a probe tick or a
-  command being answered.
+  command being answered. The arm that receives that report delegates to
+  `publish_listing` for the same reason the command arm delegates to
+  `handle_command`: it was a 21-line body doing a null check, two field
+  reassignments, a build-and-sort, an event construction, a send, a branch on
+  the send failing, and a probe, inside a `select!` whose other arms are all
+  one line. `publish_listing` answers `Listing::Published` or
+  `Listing::NobodyListening`, and only the second ends the worker — a named
+  answer rather than a bare `bool`, matching `ConnectDecision` and
+  `WindowFlush` elsewhere in the crate.
 - `spawn_host_op`: every host op rides its own task and reports as it
   lands — a `$HOME` lookup on a cold machine costs a full SSH handshake, and
   the loop must keep probing, listing, and answering other commands
@@ -1575,29 +1714,13 @@ being reported unreachable.
 
 ### The runtime thread
 
-This was `tokio_thread.rs` until it folded in here — `run_on_tokio_thread` is
-`pub(crate)` on this module now, and `bridge.rs` reaches it as
-`machines::run_on_tokio_thread`.
-
-The one way this crate gets a tokio reactor. gpui drives its own executor and
-never installs a tokio reactor, so no async work in this crate can run on the
-caller's thread — every I/O-owning worker (a bridge's daemon connection, the
-machines worker) instead lives on a dedicated std thread that builds its own
-runtime and blocks on one future for its whole life. The runtime is
-current-thread on purpose: one worker is one logical actor, so a work-stealing
-pool would buy nothing and would cost extra threads.
-
-This was factored out of the call sites because the *failure* case is the
-interesting half: building a runtime fails only when the OS refuses a
-resource, and at that point the worker cannot start at all, so its owner must
-be told in whatever way that particular worker reports failure — which is the
-only thing the two call sites actually disagree about (one sends a
-`ConnectFailed` event, one logs to stderr).
-
-`run_on_tokio_thread`: if the runtime fails to build, `on_runtime_error` gets
-the formatted error and `main` is dropped un-polled — safe here because every
-worker's main future does all of its real work only after its first poll (no
-worker relies on drop-without-polling side effects).
+`run_on_tokio_thread` used to live here, and `bridge.rs` imported this module
+to reach it — a dependency edge from the bridge onto the machines worker that
+had nothing to do with machines. It now lives in `lib.rs`; see that section
+for what it is and why the failure case is the interesting half.
+`run_worker_thread` is the caller on this side: a runtime that will not build
+means the machines worker never starts, and there is no channel to say so on
+yet, so it goes to stderr.
 
 ### Daemon-free host ops
 
@@ -1671,7 +1794,13 @@ object on stdin, a JSON object result on stdout, diagnostics on stderr
 `list`); `create`/`delete` are a later slice.
 
 `SUPPORTED_PROVIDER_PROTOCOL = 1`: providers reporting any other protocol
-version are rejected at `check_info` (docs/PROVIDERS.md §info).
+version are rejected at `check_info` (docs/PROVIDERS.md §info). It is the one
+item in this file that is still `pub` — everything else is `pub(crate)`,
+because `lib.rs` declares `mod provider;` privately and re-exports nothing
+else from it. This const is re-exported from `lib.rs` on purpose:
+PROVIDERS.md:65 treats the exact-equality gate as a public contract point, so
+the number a provider author has to match is readable from outside the crate
+rather than being a claim only this file could check.
 
 `INVOKE_TIMEOUT` (30s): the timeout for one provider invocation, after which
 it's killed. `create` gets a separate 120s timeout by contract, added with
@@ -1692,14 +1821,25 @@ differently-named provider file (PROVIDERS.md §Discovery says this
 normatively). Disabling it is still done by clearing its executable bit
 (non-executable files are ignored by discovery), never by deleting it.
 
-The write is staged (`exe-dev.next.<pid>`) and renamed into place, for the
-same two reasons the daemon install is: a rename is atomic, so a reader
-never sees a half-written script, and two clients installing at once cannot
-interleave their writes into one path. It also dodges `ETXTBSY` from a copy
-another client is executing right now. `BUNDLED_PROVIDER_MODE` (0o755) is
-set on the staged file *before* the rename, so the provider is never
+The write goes through `harvester_proto::replace_atomically`, which stages
+`exe-dev.next.<pid>` and renames it into place, for the same two reasons the
+daemon install does: a rename is atomic, so a reader never sees a half-written
+script, and two clients installing at once cannot interleave their writes into
+one path. It also dodges `ETXTBSY` from a copy another client is executing
+right now. `BUNDLED_PROVIDER_MODE` (0o755) is passed as the helper's `mode`
+and applied to the staged file *before* the rename, so the provider is never
 momentarily present-but-unexecutable — discovery would silently skip it in
 that window. A staging file left behind by a failed write is removed.
+
+This used to be a local `write_bundled_provider` plus a staged-path dance in
+`install_bundled_providers`, with the suffix inline as `"next."`, and — unlike
+the daemon-side copy of the same idiom in `harvester/src/workspaces.rs` — it
+did **not** `sync_all()` before renaming. The two copies disagreed on exactly
+the property the idiom exists for: a crash could leave a renamed-but-empty
+provider script, which `installed_matches_bundle` would then read as "not a
+match" forever, reinstalling on every launch and never succeeding. There is
+one implementation now, in the lowest crate both callers already depend on.
+`create_dir_all` stays here — the helper does not create parents.
 
 `Provider.path` is private: every invocation must go through `invoke`, which
 is the single place enforcing the timeout, exit-code rules and stderr
@@ -1715,18 +1855,27 @@ shown in the UI is Harvester's own SSH probe, never the provider's word
 (docs/SPEC.md §Machine) — a reported `status` is validated (required by
 contract) and then dropped.
 
-`SshInfo::Argv` is parsed (a provider using it must still `list` cleanly)
-but not yet wired into an actual connection — `target()` returns
-`Option<SshTarget>` and the argv form is simply `None`. "No target" is the
-whole answer the only caller (`machines::machine_rows`, which stores an
-`Option<SshTarget>`) ever wanted; the hand-written error this used to build
-was constructed only to be thrown away with `.ok()` one line later. The
-variant still has to exist even though nothing reads its payload:
-PROVIDERS.md §list makes "such machines still list, with no target"
-normative, and without a variant to decode into, argv entries would fail to
-parse and silently vanish from the sidebar. Such a machine surfaces as
-`FleetError::NotConnectable` at the moment someone tries to use it, which is
-where a user can actually act on it.
+`ProviderMachine.target: Option<SshTarget>` answers the only question anyone
+ever asks about a machine's `ssh` block — "is there a target, and what is it"
+— at parse time, and stores the answer. `parse_ssh_target` returns `None` the
+moment it sees an `argv` key: the argv escape hatch is parsed (a provider
+using it must still `list` cleanly) but not yet wired into an actual
+connection, and PROVIDERS.md §list makes "such machines still list, with no
+target" normative, so an argv entry must not fail to parse and silently
+vanish from the sidebar. Not decoding the argv array at all is what makes
+that normative sentence true for a *malformed* argv value too, where the old
+code skipped the whole entry with a diagnostic.
+
+This replaces an `SshInfo` enum — a `Host { host, user, port }` variant, an
+`Argv(#[allow(dead_code)] Vec<String>)` variant whose payload nothing read, an
+`ArgvSshEntry` deserialize struct that existed only to fill it, and a
+`target()` method that flattened the whole thing to `Option<SshTarget>` one
+call later at `machines::machine_rows`, its only caller. Nothing outside this
+file ever named the enum. Deciding at the parse and storing the decision is
+the same information in one field.
+
+Such a machine surfaces as `Error::NotConnectable` at the moment someone
+tries to use it, which is where a user can actually act on it.
 
 `discover_providers` enumerates `~/.harvester/providers`: executable regular
 files register, dotfiles and non-executables are ignored
@@ -1750,17 +1899,29 @@ success and stdout must parse as the result object; non-zero means failure,
 optionally with a `{"error"}` object surfaced verbatim, else falling back to
 exit status + stderr. It's killed at `INVOKE_TIMEOUT` via `kill_on_drop` (the
 timeout simply drops the child future). Spawning/piping/decoding the process
-itself is `host::run`'s job (the crate's one exec helper) — this function
-keeps only what's provider-specific: the deadline and the contract's result
-classification.
+itself, *and the deadline*, are `host::run_within`'s job (the crate's one exec
+helper) — this function keeps only what's provider-specific: the contract's
+result classification. It passes `INVOKE_TIMEOUT` in rather than wrapping the
+call in its own `tokio::time::timeout`, so "every child process this crate
+spawns is killed at a deadline" is one function rather than a convention two
+call sites happen to follow. The cost is that a provider timeout now reads
+`` provider exe-dev: `list`: timed out after 30s `` instead of a
+hand-written near-identical sentence.
 
-`InfoResult.name` / `MachineEntry.status` are `#[allow(dead_code)]`: both are
-required *by contract* (so deserializing them is itself the validation that
-the provider sent them), but nothing in this crate consumes their value —
-`name` because the UI uses the provider's file name instead, `status`
-because Harvester's own SSH probe is authoritative.
+`InfoResult.name`, `InfoResult.capabilities` and `MachineEntry.status` are
+`#[allow(dead_code)]` and stay that way. **The field is not the point; the
+deserialization is.** All three are required *by contract*
+(docs/PROVIDERS.md §info, §list), so declaring them is what makes serde
+reject a provider that omitted them — deleting the fields would silently
+accept a non-conforming provider, and the `info_rejects_missing_required_fields`
+test would stop testing anything. Nothing in this crate consumes their
+*value*: `name` and `capabilities` because the UI labels machines by the
+provider's file name and no capability gate exists yet, `status` because
+Harvester's own SSH probe is authoritative (docs/SPEC.md §Machine). The
+`allow` says "read by the contract, not by the code", which is why it is not
+a smell to be cleared.
 
-`parse_ssh_info` deliberately is not an untagged enum over `{host,...}` vs
+`parse_ssh_target` deliberately is not an untagged enum over `{host,...}` vs
 `{argv,...}`: untagged enums report "data did not match any variant" on
 failure, which throws away the field-level diagnostic (e.g. "missing field
 `host`") that callers log per-entry.
@@ -1965,16 +2126,46 @@ it rather than appended to.
   result at all, and it must still settle the status, or the card spins
   forever. Kept in one place because a rule about how a tool block settles
   that is written twice is a rule that only holds until one copy is edited.
-- `extend_items` is collect-then-build: one pass over the entries sorts each
-  message by role into either the `tool_call_id → toolResult` map
-  (`record_tool_result`) or the ordered user/assistant list, and only then
-  does `push_message_items` turn that list into items. The split exists
-  because results land in later entries than their calls, so the map must be
-  complete before any call is rendered; collecting the messages in the same
-  pass just avoids walking the JSON twice. A result whose call is already
-  held finishes that block in place — across a delta boundary the call sits
-  in the prefix and its result in the delta, and pushing a *new* block for it
-  would render the same call twice (once finished, once running forever).
+- `extend_items` is one pass in entry order, with one output: user and
+  assistant messages become items (a `toolCall` block becomes a `Running`
+  tool block), and a `toolResult` entry finishes the block its
+  `toolCallId` names, via `apply_tool_result`. Nothing is collected first
+  and nothing is rendered finished at birth.
+
+  This rests on one fact about pi's own storage: a `toolResult` entry can
+  never precede its `toolCall` entry in `get_entries` output. `get_entries`
+  returns entries "in append order" and the session file is a parent-linked
+  chain, with the `toolResult` entry's `parentId` pointing at the assistant
+  entry that carries the call (pi 0.84.3 `docs/rpc.md` §get_entries,
+  `docs/session-format.md` §SessionMessageEntry). Re-verified over the three
+  captured fixtures under `crates/harvester/fixtures/`: 26 `toolResult`
+  entries, zero preceding their call.
+
+  It used to be three passes with two borrowed intermediate collections and
+  two `'a` lifetime parameters — a `tool_call_id → toolResult` map filled by a
+  `record_tool_result`, an ordered user/assistant list, then a build pass
+  threading the map through `push_message_items` into `tool_block_from_history`
+  so a block could be rendered *already finished*. Every one of those pieces
+  existed to have a call's result in hand at the moment the call was rendered.
+  Rendering it `Running` and letting the result finish it is the mechanism
+  that already had to exist for the cross-delta case, so the whole
+  arrangement was a second implementation of `find_tool_block`.
+
+  The cross-delta case is unchanged and is the reason `apply_tool_result`
+  searches `items` rather than only this slice: across a delta boundary the
+  call sits in the prefix and its result arrives in the delta, and pushing a
+  *new* block for it would render the same call twice (once finished, once
+  running forever). Pinned by
+  `a_delta_finishes_a_tool_call_left_running_before_the_cursor`; the
+  same-slice case is pinned by
+  `history_matches_tool_calls_to_their_results_across_entries`.
+- `PI_AGENT_SETTLED` is the one named token in `Transcript::apply`'s event
+  match; the other six arms are bare literals on purpose. The rule is that a
+  pi token crossing a crate boundary is named in `harvester-proto` and a token
+  living inside one match is not — `"agent_settled"` is read by the gpui
+  crate's `session_state.rs` as well as here, and a typo in one copy would be
+  a silent no-op rather than a compile error, while `"message_update"` and its
+  neighbours are read nowhere else and sit one screen apart.
 - Pi persists its failure messages, so `extend_items` reads them back on
   reopen the same way the live stream does — otherwise history would be
   quietly shorter than the conversation the user actually had.
@@ -1998,7 +2189,13 @@ it rather than appended to.
   separates "pi had nothing to say" from "pi never got to answer".
 - `message_text` renders text blocks verbatim; thinking and tool-call blocks
   are skipped because tool calls render as their own blocks, not as inline
-  text.
+  text. It joins the surviving blocks with a blank line and accepts a bare
+  string `content` as well as an array, because pi sends both. It is the one
+  helper in this module that is `pub` rather than private: the gallery's
+  fixture replayer needs the same text out of the same payload, kept its own
+  copy, and that copy had already drifted — it joined with `""` and ignored
+  the bare-string shape, so a multi-block message previewed without its
+  paragraph breaks. One `pub fn` and no second copy is the fix.
 
 The test module docstring: pi 0.83.0's wire shapes are pinned here — every
 fixture is the shape the client actually receives, and the point of this

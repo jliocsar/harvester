@@ -134,9 +134,17 @@ machine; (2) else the first stored repo on a reachable machine; (3) else the
 first reachable machine with no repo picked yet (the picker then offers only
 "Add new…"); (4) else nothing (`ChatTarget::unresolved()`).
 
-`unix_millis_now` returns wall-clock milliseconds — the same units Pi's
-session listing orders by, needed so synthesized rows sort correctly against
-real ones.
+`insert_started_session` stamps its synthesized row with
+`harvester_proto::unix_millis_now` — wall-clock milliseconds, the same units
+Pi's session listing orders by, so a synthesized row sorts correctly against
+real ones. The clock reader lives in proto because proto owns the field it
+fills (`SessionInfo.mtime_ms`) and the daemon stamps the same field with it;
+this module had a byte-identical private copy until that duplication was
+removed.
+
+`Catalog` is the store's own table and is now reached as
+`store.catalog()` from the surfaces that read it (sidebar, chat, modal). See
+the `store.rs` section for why the *fleet* is not exposed the same way.
 
 ## crates/harvester/src/chat.rs
 
@@ -160,13 +168,39 @@ whole partial message — replace, never append. `agent_settled` (not
 ### Constants
 
 The prompt strip's label constants live with the policy that reads them, in
-`models.rs` (see its own section). `chat.rs` holds
-exactly one: `UNSENT_REQUEST_DETAIL` (`"Not connected"`), the reason this
-pane records against its own controls when the store's send gate refuses a
-command. It is deliberately shorter than the notification the gate raises —
-the toast names the machine and the diagnosis, while this string is composed
-into in-pane sentences like "{detail} — pi will use its default model", and
-restating the whole toast there would read as a wall.
+`models.rs` (see its own section). What is left here is the copy this pane
+renders itself, one named const each (DESIGN.md §8):
+
+- `NEW_SESSION_LABEL` (`"New session"`) — the unstarted pane's header title,
+  and `pub` because `workbench/sidebar.rs` imports it for the button that
+  opens exactly this pane. It was written twice, as a literal here and as a
+  const there; two spellings of one product term is how a rename half-lands.
+  `chat.rs` owns it rather than the sidebar because the sidebar's button is a
+  way *into* this pane, and `workbench/sidebar.rs` is private to `workbench`
+  and unreachable from here anyway.
+- `UNSENT_REQUEST_DETAIL` (`"Not connected"`) — the reason this pane records
+  against its own controls when the store's send gate refuses a command. It is
+  deliberately shorter than the notification the gate raises — the toast names
+  the machine and the diagnosis, while this string is composed into in-pane
+  sentences via `MODEL_FALLBACK_SUFFIX`, and restating the whole toast there
+  would read as a wall.
+- `CONNECTION_LOST_DETAIL` (`"Connection lost"`) — what every request still
+  outstanding is failed with when this chat's bridge disconnects.
+- `MACHINE_CHANGED_DETAIL` (`"machine changed"`) — why an in-flight model
+  fetch was abandoned. It reaches the screen: `cancel_model_fetch` parks it in
+  `ModelsState::Failed`, which `render_unstarted_body` renders through
+  `MODEL_FALLBACK_SUFFIX`.
+- `MODEL_FALLBACK_SUFFIX` (`" — pi will use its default model"`) — the
+  consequence half of every model-failure sentence. The detail is interpolated
+  before it, so the const is the fixed tail rather than a whole template.
+- The composer's placeholder is *not* a const here any more. It moved into
+  `ui/prompt.rs` beside `create_prompt_input`, which is now the one place the
+  prompt `InputState` is built — see that section. `Chat::new` calls the
+  factory and holds the resulting entity; it no longer knows the placeholder,
+  the row bounds or the submit-on-enter rule.
+- `UNRESOLVED_TARGET_SUBTITLE` (`"Pick a machine and a repository below"`) —
+  the unstarted header's subtitle before a target is picked, which names the
+  next action rather than restating the title (DESIGN.md §8).
 
 ### `ChatFlowRequest`
 
@@ -195,9 +229,20 @@ inside the shell does not own and must not arbitrate for itself (SPEC C11).
 - `focus_input` — defers focusing the prompt input to the next frame (set at
   creation; `render` is the first place a `Window` is available to focus
   with).
-- `_subscriptions: [Subscription; 3]` — the input's Enter, the store's
-  repaints, and the store's events. Held (not detached) so all three die
-  with this pane.
+- `_prompt_submitted` / `_store_repaint` / `_store_events` — one named
+  `Subscription` field each, held (not detached) so all three die with this
+  pane. They were a `[Subscription; 3]` array, which made the field name say
+  only how many there were and pushed "which three" into this paragraph; the
+  names carry it now. Drop order is not significant — none of the three
+  observes another.
+
+  `_store_events` uses `cx.subscribe_in`, like every other store subscriber in
+  the crate (`workbench.rs`, `workbench/modal.rs`, `workbench/picker.rs`). It
+  used to be the one `cx.subscribe`, whose handler takes the emitting
+  `Entity<FleetStore>` **by value** — a clone per store event that
+  `handle_store_event` never read. The cost of converging is one unused
+  `_window: &mut Window` parameter on the handler, and this file already knew
+  the shape from `_prompt_submitted`.
 
 ### Construction
 
@@ -208,9 +253,10 @@ workbench calls once it has subscribed — the seconds an uncached
 existing session; `entries` is pi's history verbatim (empty for a session
 that has never been prompted).
 
-The prompt `InputState` is multi-line (`auto_grow`) but still sends on
-Enter: `submit_on_enter` defaults to false, and without setting it Enter
-would only insert a newline. Shift-Enter remains the newline.
+The prompt `InputState` comes from `ui::create_prompt_input`; the reasoning
+for its four settings lives in the `ui/prompt.rs` section. What stays this
+pane's business is what it does with the entity: the `subscribe_in` on
+`InputEvent` and the focus rule below.
 
 ### Event routing
 
@@ -279,13 +325,15 @@ the user touching a control, and there is no polling behind it otherwise.
 
 ### Model selection
 
-`model_picks` lists every model a chat can offer, in row order. Only a chat
-with no session yet offers the "default (pi chooses)" row — a running
-session always has a concrete model (SPEC §Flows "Switch model") — and this
-is derived from state, not stored, so there's no separate answer that could
-disagree with it. The picked model travels with the row (not as an index
+`models::model_picks(&self.state)` lists every model a chat can offer, in row
+order. Only a chat with no session yet offers the "default (pi chooses)" row —
+a running session always has a concrete model (SPEC §Flows "Switch model") —
+and this is derived from state, not stored, so there's no separate answer that
+could disagree with it. The picked model travels with the row (not as an index
 into a possibly-refetched list), so a pick always applies the model the user
-actually read.
+actually read. It lives in `models.rs` with the rest of the strip's policy and
+stays `pub` for the one caller outside a render: `handle_pick_model`, which
+re-derives the list to resolve the action's index.
 
 `pick_model`: unstarted, the pick is local (becomes a launch-line argument);
 live, it costs a `set_model` the session must confirm, so the label does not
@@ -308,13 +356,19 @@ repo, or nothing if it has none.
   (pi confirms `set_model` at runtime); the branch only ever reports.
 - The prompt box floats in the pane's padding with no separator line — the
   card's own border is the boundary.
-- `Chat` builds no prompt-strip chrome of its own. `render_bottom_row`
-  assembles a `ui::PromptStrip` value (labels, enabled flags, rows, branch,
-  `can_send`, `can_stop`, `focused`, notice) plus a `send` and a `stop`
-  closure, and hands them to `ui::prompt_strip`. Everything visual — the ids, the icons, the "disabled or
-  empty means no popover" rule, the notice's tone — lives in `ui/prompt.rs`;
-  see that section for the contract. `chat.rs` keeps only what needs the store,
-  the state machine or an `Entity`.
+- `Chat` builds no prompt-strip chrome of its own, and since the presentation
+  move it decides none of its *content* either. `render_bottom_row` reads the
+  three lists it needs from entities (model picks, machine candidates, stored
+  repos), asks the window whether the input is focused, and hands all of it to
+  `models::present_prompt_strip`, which returns the whole `ui::PromptStrip`
+  value (labels, enabled flags, rows, branch, `can_send`, `can_stop`,
+  `focused`, notice). It then wraps that with a `send` and a `stop` closure and
+  calls `ui::prompt_strip`. Everything visual — the ids, the icons, the
+  "disabled or empty means no popover" rule, the notice's tone — lives in
+  `ui/prompt.rs`; see that section for the contract. What is left in `chat.rs`
+  is exactly what needs the store, the state machine or an `Entity`.
+  `focused` is the one window-derived input, which is why it is a plain `bool`
+  parameter rather than something `present_prompt_strip` could read itself.
 - **Picks arrive as actions, not as captured closures.** The pane registers
   `handle_pick_model` / `handle_pick_machine` / `handle_pick_repo` via
   `on_action` in `render`, and each one re-reads its own candidate list and
@@ -349,18 +403,20 @@ repo, or nothing if it has none.
   which is why the button needs no disabled-while-stopping state: it stays
   live until the turn it interrupts is gone, and pressing it twice costs one
   wasted round trip and nothing else.
-- `model_control` / `machine_control` / `repo_control` still build rows for
-  a control that is disabled (a live session's machine and repository). That
-  is a Vec of labels per repaint, deliberately traded for one code path; if a
-  control ever grows an expensive row list, laziness belongs here in the
-  caller, not back in three copies of the render tail.
+- `model_control` / `machine_control` / `repo_control` (all in `models.rs`
+  now) still build rows for a control that is disabled (a live session's
+  machine and repository). That is a Vec of labels per repaint, deliberately
+  traded for one code path; if a control ever grows an expensive row list,
+  laziness belongs in the caller that reads the entities, not back in three
+  copies of the render tail.
 - The lists are built even when a notice short-circuits the strip. They are
   pure store reads, and the alternative — an early return in `chat.rs` —
   would put the notice decision in two places, which is exactly what
   `PromptStripNotice` exists to prevent.
-- `is_unstarted` is named that way rather than `unstarted` only because
-  `Chat::unstarted` is already the constructor for a chat with no session
-  behind it.
+- The branch indicator's host lookup reads `store.host_for(machine)`, which
+  now returns `harvester_client_core::Result<Host>` rather than a demoted
+  `Result<_, String>`; the failure is still only ever a stderr line, printed
+  with `{error}` where it used to print `{detail}`.
 - The models-failed line is `ui::inline_note(tone, …)`, the same primitive
   the folder picker's error uses — a tone-colored `text_sm` note. It keeps
   its original wrapping behavior: a failure detail is information, and
@@ -431,8 +487,11 @@ footers, buttons, widths and input boxes live in `ui/dialog.rs`.
   Note the limit of that rule: **the copy inside a Pi dialog is not ours.**
   Only whitespace trimming and the drop-the-duplicate rule touch what Pi wrote;
   everything else reaches the screen verbatim, phrasing and all. The literals
-  this client owns are the four untitled conditions and the two confirm button
-  labels, and nothing else.
+  this client owns are the four untitled conditions and the confirm dialog's
+  action label, and nothing else. Four unit tests pin the three branches plus
+  the both-blank case, which is the one path where the untitled condition and
+  the empty consequence have to appear together; the function is pure, so
+  `#[cfg(test)] mod tests` beside it is enough (house rule 11).
 - The machine and session id are both available on the obligation at this point
   and are deliberately kept out of the title. The dialog is modal over a
   workbench that already shows which session is attached, and a title that
@@ -442,8 +501,11 @@ footers, buttons, widths and input boxes live in `ui/dialog.rs`.
   cancelling outright, because Pi resolves a cancelled `confirm` to `false`
   anyway — so treating Escape as a refusal loses no information and removes
   one more way for the agent to hang waiting for an answer. Its labels are
-  `CONFIRM_ACTION_LABEL` ("Confirm") / `CONFIRM_CANCEL_LABEL` ("Cancel"), not
-  "Yes"/"No". They still pass through `Confirmation` rather than being baked
+  `CONFIRM_ACTION_LABEL` ("Confirm") and the shared `ui::dialog::CANCEL_LABEL`
+  ("Cancel"), not "Yes"/"No". The decline word is imported rather than
+  redeclared here: it was written four separate times across the app (this
+  file, `ui/dialog.rs`, `workbench/modal.rs`, and as a bare literal in
+  `workbench/picker.rs`), and one word on one button is one const. They still pass through `Confirmation` rather than being baked
   into the shared chrome — the forget-machine confirmation needs
   "Remove"/"Cancel" — but Pi's own vocabulary is no longer what they say:
   "Yes"/"No" only reads correctly under a question, and a Pi `confirm` title
@@ -604,21 +666,42 @@ or a `set_model` call, so it is not worth surfacing in the picker.
 maps its `models` array through `model_choice_from_value`, silently dropping
 anything that fails to parse.
 
-### Prompt-strip label policy
+### Prompt-strip presentation
 
-What each prompt-strip control *says* and whether it can be opened, as pure
-functions over state — the same split `workbench/machine_presentation.rs`
-makes for machine rows. Nothing here touches a `Window`, an `Entity` or the
-store, so the policy is unit-testable without gpui machinery, and `chat.rs`
-is left with adaptation only (read the state, build the rows, wire the
-pick).
+`present_prompt_strip(state, model_picks, machine_candidates, machine_label,
+repo_candidates, focused) -> ui::PromptStrip` is the whole prompt strip's
+content decided in one window-free function — the same shape
+`workbench/machine_presentation.rs`'s `present_machine` has for machine rows,
+and now the same rule stated once for the app:
 
-This was `chat/prompt_presentation.rs` until it folded in here and `src/chat/`
-was deleted (`src/chat.rs`, the gpui `Render` impl, is untouched and stays
-where it is). The fold is one vocabulary: the policy is label rules *over*
-`ModelChoice`, and both halves are window-free, which is what lets the tests
-below live in the same file. Merging it into `chat.rs` instead would have put
-a unit-test module inside a `Render` impl that has never had one.
+> **A window-free `present_*` function returns one presentation value; the
+> view only reads entities and renders it.**
+
+Nothing here touches a `Window`, an `Entity` or the store. Every input is
+either plain data (`&SessionState`, the three lists, the fleet's label for the
+picked machine) or the one fact only a window knows (`focused`), which is why
+that one arrives as a `bool` parameter. The whole strip is therefore
+unit-testable without gpui machinery, and it is tested here: the send gate on
+an unresolved target, a live session's frozen machine/repo controls, the
+"Add new…" row's position and divider, the starting and exited notices, and
+which model row carries the check mark.
+
+This was `chat/prompt_presentation.rs` (label functions only) until it folded
+in here and `src/chat/` was deleted, and it absorbed the rest of the strip when
+`chat.rs`'s `Render` impl was found to be building ~150 lines of controls,
+notice, `can_send` and `branch_label` that touched neither `Window` nor
+`Entity`. Merging it the other way — into `chat.rs` — would have put a
+unit-test module inside a `Render` impl that has never had one.
+
+The private helpers are the pieces of that one value: `prompt_strip_notice`,
+`model_control`, `machine_control`, `repo_control`, `is_current_model`,
+`can_send` and `is_unstarted`. `is_unstarted` is named that way rather than
+`unstarted` only because `Chat::unstarted` is already the constructor for a
+chat with no session behind it.
+
+`model_picks` is the one item here that is `pub` beyond the strip:
+`Chat::handle_pick_model` re-derives the list to resolve a picked row's index
+(see the `chat.rs` section on picks arriving as actions).
 
 - `DEFAULT_MODEL_ROW` ("Default (pi chooses)"): the unstarted chat's
   "no model chosen" row. pi launches with its own default, and saying so is
@@ -639,11 +722,23 @@ a unit-test module inside a `Render` impl that has never had one.
 - Those three consts are **private** to this module now. They were
   `pub(super)` only so the old `chat/` sibling could not accidentally be the
   one place they were named; nothing outside these functions and their tests
-  ever read them, and the fold removed the reason for the annotation. The
-  four functions stay `pub` because `chat.rs` calls all four.
+  ever read them, and the fold removed the reason for the annotation. The four
+  label functions below are private for the same reason: `present_prompt_strip`
+  is the only thing that calls them now that `chat.rs` no longer assembles the
+  strip itself.
+- `LOADING_MODELS_LABEL` ("Loading models…"), `DEFAULT_MODEL_LABEL` ("Default
+  model", read from two arms), `PENDING_MODEL_LABEL` ("Model") and
+  `UNAVAILABLE_MODEL_LABEL` ("Model unavailable") are the model control's own
+  labels. They were bare literals inside `model_control_state` while the three
+  labels above them were consts in the same file — one file spelling the rule
+  both ways, which is what made it worth finishing (DESIGN.md §8). The tests
+  below still assert the words themselves rather than the consts, so a rename
+  that changes the copy still has to be intended.
 - `model_control_state` returns the label *and* whether the control opens,
   because those are one decision: the control may only be opened when there
-  is a list behind it. A chosen model always names itself (a launch pick a
+  is a list behind it. It was the only one of the four that already did so;
+  the other three left their enabled flag behind in the view, which is the
+  asymmetry the presentation move closed. A chosen model always names itself (a launch pick a
   refetch has not landed for yet is still what the user picked); the
   unstarted default row is pickable only once a list actually loaded, which
   is why `Loading`, `NotRequested` and `Failed` all render the same words
@@ -659,7 +754,10 @@ a unit-test module inside a `Render` impl that has never had one.
   what the user recognizes a repository by, and a full `/home/exedev/…` in a
   control capped at `max_w_56` would ellipsize away exactly the end that
   identifies it. The dropdown's own rows still carry the full paths, which is
-  where two same-named checkouts are told apart.
+  where two same-named checkouts are told apart. The last-component rule is
+  `harvester_client_core::folder_name` — one implementation for the whole
+  client, trailing slash and root included (see the `ui/transcript.rs` and
+  `workspaces.rs` sections).
 
 ## crates/harvester/src/session_state.rs
 
@@ -679,7 +777,11 @@ every layer verbatim.
   first prompt's first line (used for pi's `--name`).
 - `PI_AGENT_SETTLED` ("agent_settled"): pi's turn-completion event
   (docs/SPEC.md §Rendering pi) — deliberately not `agent_end`, after which
-  retries and queued follow-ups may still run.
+  retries and queued follow-ups may still run. It is imported from
+  `harvester-proto`, not declared here: client-core's transcript matches on
+  the same token, so it is a name two crates must agree on. Same for
+  `PI_GET_AVAILABLE_MODELS`. `PI_GET_STATE` and `PI_SET_MODEL` stay local —
+  nothing outside this crate speaks them.
 
 ### `ChatTarget`
 
@@ -741,6 +843,16 @@ still open.
 `branch: Option<String>` is purely an indicator — the branch the target repo
 is on, as the last exec reported it. A failure clears it and blocks nothing
 else.
+
+### Construction
+
+`unstarted` and `live` are the two public constructors and they differ in
+exactly three facts: the phase, the transcript they start from, and what a
+model selection means. Both funnel into a private `new(phase, transcript,
+selection, target, tokens)` that writes the other nine fields once — the same
+shape `Chat::unstarted` / `Chat::live` / `Chat::new` already had one layer up.
+Two full struct literals is how a field added to one and not the other becomes
+a silent difference between a fresh chat and a resumed one.
 
 ### Method-level invariants
 
@@ -919,9 +1031,12 @@ re-emitted. Everything else goes through `apply_bridge_event` (letting the
 tables take their share) and is then re-emitted verbatim via
 `cx.emit(StoreEvent::Bridge { .. })`.
 
-`apply_bridge_event` per-arm notes:
+`apply_bridge_event` is a pure router: every arm with more than one statement
+delegates to a named handler (`handle_link_lost`, `handle_request_failed`,
+`handle_session_attached`, `handle_session_exited`), leaving the match itself
+readable as the routing table it is. Per-arm notes:
 - `Connected` only repaints (the fleet already took the link state, but the
-  connectivity dot still needs to move).
+  connectivity dot still needs to move) — one statement, so it stays inline.
 - `ConnectFailed` / `Disconnected` clear this machine's open guard — a dead
   link cannot finish an open.
 - `RequestFailed` clears the open guard and turns the daemon's detail into a
@@ -961,6 +1076,12 @@ UI's. It is called again whenever the workspace list changes.
 `ensure_connection` lazily connects through the fleet, carrying the fleet's
 failure reason verbatim into the notification — it is the only diagnosis the
 user gets for a machine that will not come up.
+
+`host_for` hands back the fleet's `harvester_client_core::Result<Host>`
+untouched. It used to demote the error to a `String` here, which was a shim
+around a second error enum (`FleetError`) that no longer exists; both callers
+(the chat's branch indicator, the folder picker) stringify at the point they
+display, which is where the sentence is actually needed.
 
 `is_live` matters because a prompt sent down a dead link fails silently into
 stderr, which looks to the user exactly like a prompt pi itself ignored — so
@@ -1023,16 +1144,45 @@ ordered and de-duplicated, and Pi's next listing remains authoritative.
 rule, evaluated against the machines the fleet can *actually* reach right
 now — this is computed per open and never stored.
 
-`is_selected_session` / `clear_selected_session` are the sidebar's window
-onto the catalog's current-session bookkeeping. The store publishes them
-because the sidebar is not allowed to see the chat, and the highlight is
-therefore read from the one place both the sidebar and the attachment path
-already meet.
+`clear_selected_session` is the store's half of the sidebar's current-session
+bookkeeping: it is the one selection change attachment cannot express, and it
+repaints. Reading the selection goes through `catalog()` (below), because the
+sidebar is not allowed to see the chat and the highlight is therefore read
+from the one place both the sidebar and the attachment path already meet.
+
+### `catalog()`, and why there is no `fleet()`
+
+`catalog(&self) -> &Catalog` replaced seven one-line forwarders that were each
+`self.catalog.<same name>` (`repos_on`, `visible_sessions`,
+`visible_session_count_on`, `session_cwd`, `opening_sid`,
+`is_selected_session`). Adding a catalog read meant editing two files for no
+decision; call sites now read `store.catalog().visible_sessions()`. `&Catalog`
+hands out no mutator, so nothing structural is lost.
+
+**The eleven fleet forwarders stay, deliberately — do not "finish the job".**
+`Fleet::send` takes `&self`, so handing out a `&Fleet` would let any caller
+send a command without going through `send_gated`, and that gate is documented
+here as *made unskippable*: a prompt down a dead link fails silently into
+stderr and looks to the user exactly like a prompt pi ignored. The forwarders
+are the price of the gate being structural rather than a convention. The two
+mutating catalog calls (`may_open_session`, `open_session`) stay on the store
+for the same reason — `may_open_session` clears the open guard as a side
+effect, which a `&Catalog` accessor cannot carry and a `catalog_mut()` would
+buy only by also handing out workspace persistence.
+
+### Tests
+
+`is_pre_session_command` is the store's window-free decision and is pinned
+against every `bridge::Command` variant, so adding a command forces a verdict
+on whether it may bring a machine up. `gate_failure` and `raise_open_guard_for`
+are *not* unit-tested and cannot be from here: both need a live `Fleet`, whose
+`start` spawns the machines worker (which runs provider executables), and
+`raise_open_guard_for` additionally needs a gpui `Context<FleetStore>`.
 
 ## crates/harvester/src/ui/core.rs
 
 `core` is the one place a semantic meaning becomes a color (SPEC C11) —
-everything else in `ui` should ask for a `Tone`/`Dot`, never a raw `Hsla`.
+everything else in `ui` should ask for a `Tone`, never a raw `Hsla`.
 
 - `core` holds **no text-size constant of its own any more**. Body text is the
   theme's `font_size` slot (`BASE_FONT_SIZE`, see `ui/theme.rs`), which the
@@ -1102,16 +1252,25 @@ everything else in `ui` should ask for a `Tone`/`Dot`, never a raw `Hsla`.
   lifecycle meaning cannot be confused with "Idle", which has one. The words
   are consts rather than inline literals, under the house rule that
   user-visible strings are named once.
-- `Tone::dot` derives the *shape* from the meaning: `Idle` and `Pending` are
-  `Hollow`, everything else `Solid`. An outline says "no verdict yet" —
-  unprobed, or working with the outcome still unknown — without spending a
-  color the theme doesn't have. Making this a function of the tone is what
+- `Tone::is_hollow` derives the dot's *shape* from the meaning: `Idle` and
+  `Pending` are hollow, everything else solid. An outline says "no verdict
+  yet" — unprobed, or working with the outcome still unknown — without spending
+  a color the theme doesn't have. Making this a function of the tone is what
   retired the last per-call-site shape choice; `status_dot_for_tone(tone, cx)`
-  is now how every caller draws a dot, and nobody picks solid-versus-hollow by
-  hand. In one sentence: hollow means the dot is a placeholder for work that
-  has not begun; solid means it stands for something real — running or
-  finished, good or bad. That is why `Failed` is solid: a settled terminal
-  state must not read as "not started".
+  is the only way to draw a dot, and nobody picks solid-versus-hollow by hand.
+  In one sentence: hollow means the dot is a placeholder for work that has not
+  begun; solid means it stands for something real — running or finished, good
+  or bad. That is why `Failed` is solid: a settled terminal state must not read
+  as "not started".
+  It is a `bool`, not a shape enum. There *was* a `Dot { Solid(Tone),
+  Hollow(Tone) }` and a `Dot`-taking `status_dot`, both exported and both with
+  zero callers — `Dot` was only ever produced by `Tone::dot` and consumed by
+  `status_dot` one line later, and the public constructor read as an invitation
+  to hand-build a shape again. Folding the match into `status_dot_for_tone` and
+  naming the rule `is_hollow` leaves the same single decision point with
+  nothing to construct: the two readers that need the *name* of the shape (the
+  machine-presentation tests and the gallery's dot story caption) ask the tone
+  directly.
 - `STATUS_DOT_DIAMETER` (6px) is the dot itself, and it is one of the few
   pixel numbers in `ui` that is deliberately **off** the rem axis. A 6px disc
   is a raster boundary rather than product geometry: it is the smallest circle
@@ -1121,10 +1280,6 @@ everything else in `ui` should ask for a `Tone`/`Dot`, never a raw `Hsla`.
   sits in (`SIDEBAR_STATUS_LANE`, the tool block's `size_4` slot) is what
   scales instead, which is also why the diameter can change without moving any
   text.
-- `Dot` (`Solid(Tone)` / `Hollow(Tone)`) is the shape vocabulary `Tone::dot`
-  answers in, and nothing hand-builds one any more: every caller names a tone
-  and lets the shape follow. `Dot` is therefore an output type, not an input
-  one, which is what keeps the shape rule in a single place.
 - `disclosure_chevron` is the one expand/collapse marker for the whole app
   (section headers, tool blocks): `ChevronDown` when expanded, `ChevronRight`
   when collapsed, at `size_3p5` — the `text_sm` line, so it sits optically
@@ -1138,6 +1293,34 @@ everything else in `ui` should ask for a `Tone`/`Dot`, never a raw `Hsla`.
   ("Geist Mono", set in `ui/theme.rs`) so every mono run in the app agrees
   with gpui-component's own widgets. No startup resolution, no fallback
   logic — the theme is the single owner of font names.
+- `truncated_to_max_chars(text, max_chars)` is the app's one display
+  truncator, and its contract is that the result is **at most `max_chars`
+  characters with `TRUNCATION_ELLIPSIS` already counted inside that number**.
+  It lives here, not beside either caller, because both `ui/prompt.rs`
+  (control labels) and `ui/transcript.rs` (tool-argument summaries) need it and
+  `core` is the module they both already import. It returns `Option<String>`
+  rather than always allocating: `None` means "already fits", which lets the
+  prompt strip hand back the caller's own `SharedString` untouched in the
+  common case, and lets the transcript return the JSON string it already built.
+  Three properties are load-bearing and pinned by unit tests here as well as
+  through the callers:
+  - The cut counts **characters, not bytes** (`chars().take(...)`), so a
+    multibyte label is never split mid-codepoint.
+  - The ellipsis is inside the budget (`max_chars - 1` kept), which is the
+    thing the two callers used to disagree about — the prompt strip landed on
+    exactly its budget, the transcript one character over, and a transcript
+    test pinned that discrepancy as if it were intended. `saturating_sub`
+    guards a `max_chars` of 0 even though no caller passes one.
+  - The kept prefix is `trim_end`ed before the mark is appended, so a cut that
+    lands on a space renders "word…" rather than "word …". That trim used to be
+    a prompt-strip detail; it is a typographic rule that holds for any caller,
+    so it lives in the helper and the transcript inherits it.
+
+  What is deliberately *not* folded in here: `sid_preview`
+  (`workbench/sidebar.rs`), `session_name_from_prompt` (`session_state.rs`) and
+  client-core's `capped_content_text`. The first two take a prefix and never
+  mark it, so an ellipsis would be wrong; the third keeps a byte-budgeted
+  *tail* of streamed output. Same word, three different operations.
 
 ### Notes and empty states
 
@@ -1245,7 +1428,11 @@ exist yet.
   own pairs because they are different dialogs, not two callers of the same one.
 - Commit-button wording is per dialog kind, not a generic "OK": `Reply` for a
   text entry, `Confirm` for a question, and `Cancel` everywhere for the
-  refusal. A `select` has no commit button at all — see below. The button should say what it is about to do, so
+  refusal. `CANCEL_LABEL` is `pub` and is the app's *only* declaration of that
+  word: `dialogs.rs`, `workbench/modal.rs` and `workbench/picker.rs` import it
+  rather than each spelling it out. It belongs here because this is the shared
+  modal chrome — every dialog in the app is assembled from this module, so the
+  refusal word is a property of the chrome and not of the flow that raised it. A `select` has no commit button at all — see below. The button should say what it is about to do, so
   a user who reads nothing but the buttons still knows what they are answering.
   `Reply` specifically replaced `Send`: `Send` is already the chat composer's
   verb for handing a turn to the agent, and one product term should name one
@@ -1358,12 +1545,24 @@ exist yet.
   dialog's cancel callback, which answers Pi. There is no dismissal path that
   closes a Pi dialog without answering it.
 
+Tests: the module's two pure functions carry an inline `#[cfg(test)] mod tests`
+(house rule 11). `title_or_named_condition` is pinned on all three inputs a
+caller can hand it — a real title, a whitespace-only one, and an empty one —
+because the trim is what stops a stray space from defeating the fallback and it
+is not visible from the call sites. `options_height` is pinned at its two
+boundaries and past them: an empty list still reserves one row (the clamp's
+lower bound, so a `List` never gets a zero height to compute a visible range
+against), a short list gets exactly its own height, and anything at or beyond
+`SELECT_VISIBLE_OPTION_ROWS` gets the same capped height and scrolls inside it.
+Nothing here touches a `Window`, which is why these are unit tests and not a
+gallery walk.
+
 ## crates/harvester/src/ui/mod.rs
 
 `ui` is Harvester's visual architecture, grouped by responsibility — not a
 palette or a parallel widget library. Components are built with
 `gpui-component`, and every color must be resolved from `cx.theme()`; the
-`ui::core` submodule exports semantic *meanings* (see `Tone`/`Dot` below) and
+`ui::core` submodule exports semantic *meanings* (see `Tone` below) and
 reusable non-color metrics only, never raw colors of its own (SPEC C11). The
 `pub use core::{...}` / `prompt::{...}` / `shell::{...}`
 re-exports exist to keep a stable `ui::…` import path for screen-level callers
@@ -1384,13 +1583,19 @@ with. Two of the re-exports are strings rather than builders — `ADD_REPO_ROW`
 and `DEFAULT_MODEL_ROW`, the two dropdown rows that are *chrome* rather than
 data (see `ui/prompt.rs`) — and they are exported for the same reason a
 builder is: both the chat screen and the gallery render them, and a copy in
-either place is drift waiting to happen. The dot builders are the exception the gallery bought: no screen calls
-`status_dot` or `status_dot_for_tone` directly (screens reach a dot through
+either place is drift waiting to happen. `status_dot_for_tone` is the exception
+the gallery bought: no screen calls it directly (screens reach a dot through
 `sidebar_stacked_row` or a tool block), but a component catalog has to be able
 to render one on its own, and the gallery is a screen in every sense that
-matters here. `empty_pane_action` is exported on the same footing — it is the
+matters here. It is now the *only* dot export — the `Dot`-taking `status_dot`
+and the `Dot` type itself had no callers at all and are gone (see
+`ui/core.rs`). `empty_pane_action` is exported on the same footing — it is the
 trailing button slot `empty_pane_hint` grew, catalogued before the first
-screen adopts it.
+screen adopts it. `create_prompt_input` is the third of the widget factories
+(`ui::dialog`'s two inputs are the others) and is exported for the reason
+those are: the chat screen and the gallery must build the same
+`InputState`, and the export is what makes that a fact rather than a
+convention.
 
 Two of the re-exports are not builders at all and are worth naming for that
 reason. `KeyboardFocusRing` (from `shell`) is a trait with a blanket impl, so
@@ -1451,12 +1656,17 @@ control wears, what its rows say, and what a pick *means*.
   unusually long model name pushes the send button out of the box — a clipped
   label is a cosmetic defect, an unreachable send button is a functional one.
   The label is therefore cut before it is handed over:
-  `truncated_control_label` keeps `CONTROL_LABEL_MAX_CHARS` (24) *characters*
-  (never bytes, so a multibyte name is never split mid-codepoint), trims the
-  trailing space so the ellipsis does not float, and appends one. All three
-  real label sources (a folder name, a fleet machine label, a model name) are
-  short in practice, so the budget should rarely bite; the unit tests pin the
-  boundary, the trim and the multibyte case.
+  `truncated_control_label` holds the label to `CONTROL_LABEL_MAX_CHARS` (24)
+  *characters* including the ellipsis. It owns the budget and nothing else —
+  the cut itself is `ui::core::truncated_to_max_chars`, shared with the
+  transcript's argument summaries, which is where the character-boundary rule
+  and the trailing-space trim now live. What stays here is the `SharedString`
+  round trip: the helper answers `None` when the text already fits, so the
+  common case hands back the caller's own `SharedString` without allocating a
+  second one. All three real label sources (a folder name, a fleet machine
+  label, a model name) are short in practice, so the budget should rarely bite;
+  the unit tests pin the boundary, the trim and the multibyte case through this
+  function, and `ui/core.rs` pins the same properties on the helper.
 - `prompt_box` rounds through `theme.radius_lg` and takes the full theme
   `ring` on focus, plain `border` at rest. The old half-opacity resting border
   plus `shadow_md` are gone: with the graphite ladder the input well already
@@ -1475,6 +1685,19 @@ control wears, what its rows say, and what a pick *means*.
   "Add a model…" row the app has never had). A shared const makes the drift
   unrepresentable. The wording rules that earned them are recorded under
   `models.rs`.
+- `create_prompt_input(window, cx)` is the one place the composer's
+  `InputState` is built, and `PROMPT_INPUT_PLACEHOLDER`
+  (`"Message pi — Enter to send"`, which names the send keystroke because the
+  send button's tooltip is the only other place that does) and
+  `PROMPT_INPUT_ROWS` (1–8) are private to it. Multi-line with `auto_grow`,
+  but still `submit_on_enter(true)`: that flag defaults to false, and without
+  it Enter would only insert a newline — Shift-Enter remains the newline. It
+  is a factory in `ui/` for the same reason `ui/dialog.rs`'s
+  `create_single_line_input`/`create_multi_line_input` are: `chat.rs` and the
+  gallery's `StoryRuntime` both need this exact widget, and while they built
+  it separately the gallery named the four values as consts on its side and
+  the app hardcoded them — a preview surface that reconstructs the component
+  it previews is the drift the catalog exists to prevent.
 - `prompt_box_input(input)` is the input well's padding (`px_3`, `pt_3`,
   `pb_2`) and nothing else. It is private to this module: `prompt_strip_box`
   is its only caller and no screen or story draws a bare input well, so it
@@ -1774,9 +1997,9 @@ sentence case like every other heading.
   font size themselves, so the row renders at exactly the size it used to
   declare with one fewer place to drift. A row mounted under some third root
   wants the size restored at that root, never back on the row.
-- `sidebar_stacked_row` takes a **`Tone`, not a `Dot`**: the shape is derived
-  by `Tone::dot` (see `ui/core.rs`), so no caller picks solid-versus-hollow any
-  more. It is one shape for both lists: status lane + title on the first line,
+- `sidebar_stacked_row` takes a **`Tone`, never a shape**: the shape is derived
+  by `Tone::is_hollow` inside `status_dot_for_tone` (see `ui/core.rs`), so no
+  caller picks solid-versus-hollow any more. It is one shape for both lists: status lane + title on the first line,
   an optional inline `note` (transient status, e.g. "opening…") after the
   title, and an optional `detail` second line (the row's context — provider, or
   folder · machine). Both secondary texts are `text_sm` and resolve their color
@@ -2063,7 +2286,7 @@ is `DiffLineKind`.
   content, and `Idle`'s extra fade (0.6 over an already-dim gray) pushed a
   perfectly legitimate result under the contrast floor. `Idle` is now reserved
   for things that are genuinely *unknown* — an unprobed machine — which is what
-  also makes `Tone::dot` render it hollow.
+  also makes `Tone::is_hollow` render its dot hollow.
 - `ToolSummary` is the one description of what a tool call *is* — verb,
   subject, whether the subject is monospace, and any line stats — computed once
   by `tool_summary` and consumed twice: `tool_label` renders it, and
@@ -2087,7 +2310,7 @@ is `DiffLineKind`.
   "Completed", not "Neutral". The same string feeds both the status dot's
   tooltip and the header's accessible name, so what the block shows on hover
   and what it says out loud cannot drift apart. The *shape* channel still comes
-  from the tone, through `Tone::dot`.
+  from the tone, through `Tone::is_hollow`.
 - `output_text` centralizes the empty-output case: "Running…" while the call is
   in flight, "No output" once it has settled. It was `"(no output)"` —
   parenthesised asides are how a UI mumbles, and a tool that genuinely printed
@@ -2150,9 +2373,23 @@ is `DiffLineKind`.
   for bash, raw args otherwise).
 - `diff_line_kind`: classifies Pi's own numbered diff line format —
   `" 1 ctx"` / `"-2 old"` / `"+2 new"` — by first byte.
-- `compact_args`: caps the raw-JSON summary for an unknown tool by *character*
-  count (`ARGS_SUMMARY_MAX_CHARS` = 80), not by byte count, so a Unicode
-  argument is never split mid-codepoint.
+- `compact_args`: caps the raw-JSON summary for an unknown tool at
+  `ARGS_SUMMARY_MAX_CHARS` (80) *characters*, ellipsis included, by handing the
+  serialized JSON to `ui::core::truncated_to_max_chars` — the same cut the
+  prompt strip's control labels take. It used to do the cut itself, with a bare
+  `'…'` literal appended *after* taking a full 80 characters, so its results
+  were 81 characters long and its own test asserted `MAX + 1`; the budget now
+  means the same thing in both places. Counting characters rather than bytes is
+  unchanged and still the point: a Unicode argument is never split
+  mid-codepoint.
+- `file_summary`'s subject is `harvester_client_core::folder_name(path)`. That
+  was a private `basename` here until the app's *other* "last path component"
+  (`workspaces.rs`'s `folder_name`, which returned `""` for `/repo/` and for
+  `/`) was found to disagree with it. This module had the correct body and the
+  pinned tests; both moved down to client-core, which is the lowest crate the
+  lib-side `ui/` and the bin-side sidebar/chat both already depend on — `ui/`
+  cannot see `workspaces.rs` at all, so nothing shorter of a shared crate would
+  have worked.
 
 ## crates/harvester/src/workbench.rs
 
@@ -2171,6 +2408,18 @@ future one cannot center themselves differently. `render_statusbar` keeps its
 own `div`: `statusbar_frame` already sets that band's text size, and
 `inline_note` would hand it truncation semantics it has no need for.
 
+Both of those lines are decided by a window-free `present_*` function
+returning one value, per the rule stated in the `models.rs` section:
+`present_empty_pane` and `present_statusbar_link` each return a `ShellMessage
+{ text, tone }`, and the two render methods only read the store and draw it.
+They returned `(String, Tone)` tuples until then, which is the same shape a
+presentation value has but with the fields unnamed and destructured at every
+call site. `argv_machine_state(store)` is the one shared read (the argv
+machine and its `MachineState`), passed in so neither presenter touches an
+entity. A statusbar link falls back to the connected/linked counts both when
+there is no argv machine and when `present_machine` has nothing to say about
+the one there is.
+
 Field-level invariants on `Workbench`:
 - `store: Entity<FleetStore>` is the single observable store; the shell reads
   it for the empty pane/statusbar and for root-window chat orchestration.
@@ -2180,18 +2429,28 @@ Field-level invariants on `Workbench`:
   its store subscription, to lend Root out on a chat's or a sidebar's request,
   and to hear the `ModalOutcome` events it must react to. The Root overlay
   itself is still placed by `Workbench::render`.
-- `chat: Option<Entity<Chat>>` is the current conversation, whether or not a
-  session exists behind it yet (an "unstarted" chat has no sid).
-- `chat_subscription: Option<Subscription>` — the current chat's flow
-  requests (its bridge traffic no longer comes through here; see
-  `FleetStore::send_gated`). It dies with the chat entity, so an abandoned
-  unstarted pane cannot route through this shell after being dropped.
-- `_subscriptions: WorkbenchSubscriptions` names each root-window
-  subscription instead of making the reader count an array: store repaint,
-  store events, sidebar intents, and modal outcomes. Repo-added and
-  machine-forgotten used to be two event types subscribed separately; they
-  are one `ModalOutcome` enum now, with `handle_modal_outcome` a pure router
-  into the two unrelated handlers (house rule: match arms delegate).
+- `chat: Option<OpenChat>` is the current conversation, whether or not a
+  session exists behind it yet (an "unstarted" chat has no sid). `OpenChat`
+  holds the `Entity<Chat>` *and* its `_flow_requests` subscription (the chat's
+  bridge traffic no longer comes through here; see `FleetStore::send_gated`).
+  They were two `Option` fields set and cleared together at three sites, where
+  a fourth site clearing one and not the other would have left a dropped chat's
+  subscription alive; one struct makes "the subscription dies with the chat" a
+  type fact rather than a convention. Every read costs one field hop
+  (`open.chat`), which is the whole price.
+- `_store_repaint` / `_store_events` / `_sidebar_intents` / `_modal_outcomes`
+  are one named `Subscription` field each, directly on `Workbench`. They were
+  a `WorkbenchSubscriptions` wrapper struct — a third shape for holding
+  subscriptions, next to the arrays in `chat.rs` and `workbench/picker.rs` and
+  the plain named fields in `workbench/sidebar.rs` and `workbench/modal.rs` —
+  and the wrapper did not even hold all of them, since the chat's own
+  subscription lived outside it. The whole crate is named fields now; a
+  wrapper earns its place only when it pairs a subscription with something
+  else that must die with it, which is what `OpenChat` above does and this did
+  not. Repo-added and machine-forgotten used to be two event types subscribed
+  separately; they are one `ModalOutcome` enum now, with
+  `handle_modal_outcome` a pure router into the two unrelated handlers (house
+  rule: match arms delegate).
 
 Event-handling ordering rules (load-bearing, not incidental):
 - `handle_store_event` is the only bridge event the shell owns; it builds or
@@ -2288,14 +2547,41 @@ something different in each place. Choosing the `tone` exactly once in
 surface and gray in another — tone and message are decided together instead
 of being independently derived per call site.
 
-The field is a `Tone`, never a `Dot`. It used to be a hand-built `Dot`, and
-every consumer threw the shape away and re-derived it from the tone, so the
+### Constants
+
+Every sentence this module owns is a named const (DESIGN.md §8), because this
+is the module that *decides* what a machine state says and the words were
+otherwise scattered across a nine-arm match: `CONNECTING_STATUSBAR_LINK`,
+`CONNECTED_PANE_MESSAGE`, `CONNECT_FAILED_STATUSBAR_LINK`,
+`CONNECTION_LOST_MESSAGE` and `MISSING_MACHINE_DETAIL`.
+
+- `CONNECTION_LOST_MESSAGE` is deliberately one const read twice: the pane
+  message and the statusbar link are the same two words for `ConnectionLost`,
+  and the reason they match is that there is nothing more to say in either
+  place, not that they happened to be typed the same.
+- `MISSING_MACHINE_DETAIL` (`"no longer listed"`) is `pub(super)` and is
+  `workbench/sidebar.rs`'s subtitle for a missing machine row. It was declared
+  in both files. This one owns it because this is where `MachineState::Missing`
+  becomes words; the sidebar is a second surface for the same verdict.
+- The two interpolated sentences keep a `format!` and name only their fixed
+  part, because a `format!` template cannot be a `const`:
+  `CONNECTING_PANE_MESSAGE_PREFIX` (`"connecting to "`, with the machine and
+  the in-progress ellipsis following it) and
+  `MISSING_MACHINE_PANE_MESSAGE_SUFFIX` (`" is no longer listed by its
+  provider"`, with the machine leading it).
+- `ConnectFailed`'s pane message and `Connected`'s statusbar link have no
+  const because neither is copy: one is the failure detail the fleet handed
+  up, the other is the machine's own name.
+
+The field is a `Tone`, never a dot shape. It used to be a hand-built `Dot`,
+and every consumer threw the shape away and re-derived it from the tone, so the
 shape recorded here was not what got drawn: a `Reachable` machine written as
-`Dot::Solid(Tone::Idle)` rendered *hollow*, which is the treatment reserved
-for a machine nobody has probed. Naming only the tone makes that class of
+solid-but-`Idle` rendered *hollow*, which is the treatment reserved for a
+machine nobody has probed. Naming only the tone makes that class of
 disagreement unrepresentable. `Reachable` is `Tone::Muted` for exactly this
 reason — it is a settled verdict and must read as solid — while `Unknown`
-keeps `Tone::Idle` and stays hollow. A unit test pins the two apart.
+keeps `Tone::Idle` and stays hollow. A unit test pins the two apart, asking
+`Tone::is_hollow` now that the `Dot` type it used to compare against is gone.
 
 `pane_message` / `statusbar_link` are both `None` for probe-only states
 (`Unreachable`, `Reachable`, `Unknown`) — nothing about a daemon connection
@@ -2433,8 +2719,9 @@ Forget-machine specifics:
 - `NOTHING_IS_DELETED` — the reassurance shown on every removal
   confirmation. A missing machine is unreachable by definition, so this string
   is a statement of fact about what forgetting does, not a promise being made
-  to the user. `FORGET_ACTION_LABEL` is "Remove" over a danger accent;
-  `FORGET_CANCEL_LABEL` is "Cancel".
+  to the user. `FORGET_ACTION_LABEL` is "Remove" over a danger accent; the
+  decline button takes the shared `ui::dialog::CANCEL_LABEL` rather than
+  redeclaring the word, which this file used to do as `FORGET_CANCEL_LABEL`.
 - `open_removal_confirmation` builds nothing itself — it fills in
   `ui::dialog::Confirmation` and hands `ui::dialog::open_confirmation` two
   entity callbacks, so the confirmation shares the app-wide dialog width for
@@ -2477,6 +2764,16 @@ without gpui machinery.
 `ENTRY_LIST_HEIGHT = 280.` — fixed height for the entries list so the dialog
 does not resize under the pointer when a listing arrives or a filter narrows
 the results.
+
+Copy constants, one per user-facing string (DESIGN.md §8):
+`ADD_REPOSITORY_TITLE` ("Add repository"), `ADD_REPOSITORY_ACTION_LABEL`
+("Add"), `ENTRY_FILTER_PLACEHOLDER` ("Filter…"), `FINDING_HOME_NOTE`
+("finding home directory…") and `LISTING_DIRECTORY_NOTE` ("loading…"). The
+Cancel label is *not* declared here — it is `ui::dialog::CANCEL_LABEL`, shared
+with every other dialog in the app. The two `EntryRow::label` literals (`"../"`
+and the trailing `/` on a directory name) stay literals on purpose: they are
+path syntax, not prose, and naming half of a path idiom is worse than naming
+none of it.
 
 `PickerRequest` — the one host op a folder picker has in flight, and what its
 answer needs to be applied. It is the `Pending<T>` context, not a duplicate of
@@ -2524,6 +2821,15 @@ chained at the call site — the same rendering as before, but the color now
 comes from the tone vocabulary instead of `cx.theme().danger`, which is the
 rule every other screen already followed (SPEC C11).
 
+`render_location` was the last place outside `ui/` that read a *non-structural*
+theme slot: it painted its caption `cx.theme().muted_foreground` directly. It
+asks for `Tone::Muted.color(cx)` now — the identical colour, stated as a
+meaning (DESIGN.md §3). It cannot use `ui::inline_note`, which is a leaf `div`
+with one child, because this is a two-child flex row (an ellipsised path beside
+an optional waiting note). Removing that read left `gpui_component::ActiveTheme`
+unused in this file, which is the mechanical proof there is nothing else: the
+whole module now names colours only through `Tone`.
+
 `Walk::accept_home`: `$HOME` landing immediately becomes a listing request
 for that same directory — the walk always starts by listing home. `None`
 return means the answer was stale (token mismatch) or the exec failed, with
@@ -2536,7 +2842,14 @@ state, and only surfaces the reason via `error`.
 `Walk::accept_validation`: on success it reports the path it validated and
 nothing else — the machine is the modal's own (it chose it), so
 `WorkspacePicked` carries only the path. The walk is spent, and
-`workbench/modal.rs` drops it.
+`workbench/modal.rs` drops it. It takes the worker's answer as
+`Result<(), String>`, matching the shape of the other three machines-worker
+answers; it was an `Option<String>` meaning "the error, if any", which read
+backwards next to its `Ok`/`Err` siblings.
+
+`send_request`'s host lookup: `store.host_for` returns client-core's own
+error type now, so the walk's displayed reason is `error.to_string()` at this
+call site rather than a `String` the store demoted on its behalf.
 
 `Walk::waiting_note`: which note to show is a question about *the walk*, not
 about the specific request in flight. An empty path uniquely means `$HOME`
@@ -2553,6 +2866,10 @@ render `disabled`.
 builds a dialog's body from the *root* view's render, where reading the
 workbench entity directly would mean reading an entity that is mid-update —
 see `crate::choices` for the general rule this follows.
+
+`_list_events` / `_store_events`: one named `Subscription` field each, which is
+how every view in the crate holds them. They were a `[gpui::Subscription; 2]`,
+where the field name counted them instead of naming them.
 
 `handle_store_event`: the picker's three answers (`HomeResolved`, `DirListed`,
 `WorkspaceValidated`) are matched and delegated straight to their handlers.
@@ -2586,7 +2903,9 @@ Sidebar presentation and intent handling. The sidebar observes `FleetStore`
 directly and owns only its local view state: the two section-collapse toggles
 and the selected-session highlight. It emits product intents carrying stable
 values (not row indexes) so a store repaint racing a click can never cause the
-click to land on the wrong session.
+click to land on the wrong session. Its one subscription is the named field
+`_store_repaint` — same vocabulary as `workbench.rs` and `chat.rs`, which hold
+a field of that exact name for the same `cx.observe`.
 
 Layout, top to bottom: New session button, machines listing, sessions list
 (docs/SPEC.md §UI "Layout"). Notably there is **no workspaces section** — a
@@ -2627,21 +2946,29 @@ by hand. The gallery's story sidebar uses the same `w_64` for the same reason.
 Constants:
 - `SID_PREVIEW_CHARS = 8` — enough of a uuidv7 to tell sessions apart at a
   glance when a session has no name.
-- `MISSING_MACHINE_DETAIL = "no longer listed"` — the subtitle shown for a
-  machine its provider stopped listing; this is also the only row kind that
-  can be forgotten.
 - `FORGET_MACHINE_TOOLTIP = "Forget this machine"` — deliberately "forget"
   rather than "delete": forgetting only edits Harvester's local record.
   Nothing on the machine itself is touched, and (being unreachable) there is
   nothing reachable to touch anyway.
 - `MACHINES_SECTION_TITLE` / `SESSIONS_SECTION_TITLE` ("Machines",
-  "Sessions"), `NO_SESSIONS_NOTE`, `NEW_SESSION_LABEL`, `OPENING_SESSION_NOTE`
-  ("opening…") — every user-visible string in this screen is now a named
+  "Sessions"), `NO_SESSIONS_NOTE`, `OPENING_SESSION_NOTE`
+  ("opening…") — every user-visible string in this screen is a named
   const rather than a literal at its call site, which is the house
   no-magic-values rule applied to copy. The two section titles are sentence
   case because `ui::section_header` no longer uppercases what it is given (see
   `ui/shell.rs`); `OPENING_SESSION_NOTE` stays lowercase because it is a
   transient status fragment trailing a title, not a heading.
+
+Two strings this screen renders are declared elsewhere and imported, because
+they are the *same* words a second surface already owns:
+- `MISSING_MACHINE_DETAIL` ("no longer listed") comes from
+  `workbench/machine_presentation.rs` — the subtitle shown for a machine its
+  provider stopped listing, which is also the only row kind that can be
+  forgotten. That module is where `MachineState::Missing` becomes words, and
+  it puts the same string in the statusbar.
+- `NEW_SESSION_LABEL` ("New session") comes from `chat.rs`, which titles the
+  pane this button opens. Both were declared twice, in one case as a const and
+  in the other as a bare literal, which is a rename waiting to half-land.
 
 Keyboard and accessibility, which is screen policy and therefore lives here
 rather than in `ui/shell.rs`:
@@ -2653,8 +2980,8 @@ rather than in `ui/shell.rs`:
   than no focus stop at all. They still carry `Role::ListItem` and an
   `aria_label`, because being unclickable does not make them unreadable.
 - Machine rows pass `present_machine(...).tone` to `ui::sidebar_stacked_row`,
-  which derives the dot's shape itself (`Tone::dot`). Shape follows meaning,
-  and there is only one place that decides it.
+  which derives the dot's shape itself (`Tone::is_hollow`). Shape follows
+  meaning, and there is only one place that decides it.
 - The New-session button aligns to `ui::SIDEBAR_ROW_GUTTER` rather than a local
   `px_2`, so it sits in the same lane as the rows and the section headers
   below it, and the forget-machine button moved from `.xsmall()` to `.small()`
@@ -2708,10 +3035,14 @@ through the provider list at use time. A value without the separator is
 treated as an ad-hoc ssh destination used verbatim (covers legacy entries
 and machines supplied on argv).
 
-`folder_name` returns a workspace's on-screen name: the path's last
-component (or the whole path when there is no `/`). It lives in this module
-because a workspace path is this module's domain, and both the sidebar and
-the chat need to render it the same way.
+A workspace's on-screen name — the path's last component — is
+`harvester_client_core::folder_name`, not this module's own helper any more.
+There were two of these: this one, which returned `""` for `/repo/` and for
+`/`, and `ui/transcript.rs`'s `basename`, which trimmed the trailing slash,
+special-cased root and had four pinned tests. A stored repo path ending in
+`/` therefore rendered as an empty sidebar subtitle and an empty repo-control
+label. The stronger body won, and it moved to client-core because `ui/` is on
+the lib side of this crate and cannot see this bin-side module at all.
 
 `store_path()` returns `io::Result` so an unset `$HOME` is one failure story
 (`NotFound`, "$HOME unset") instead of an `Option` each caller re-explains:
@@ -2736,19 +3067,27 @@ torn JSON; `load` would then read that torn file as an empty list, and the
 configuration. Using a sibling file (not a `/tmp` file) keeps the rename on
 one filesystem, which is what makes the rename atomic.
 
-The staged name is per-writer, not shared: `staged_path` appends the process
-id to `STAGED_EXTENSION_PREFIX` (`workspaces.json.next.<pid>`) — the same
-discipline the daemon install script already had in shell (`.next.$$`). A
-single fixed staging name is not a staging file at all when two clients are
-open — each writes the *other's* half-written bytes into the same path and
-one of them renames a file it did not finish, which is the torn-JSON case
-the staging exists to prevent. `write_staged_file` then `sync_all`s before the
-rename: a rename is only atomic with respect to *the directory entry*, so
-without the fsync a power loss can leave the entry pointing at a file whose
-contents never reached the disk. When either step fails the staged file is
-removed (`remove_staged_file`, quiet on `NotFound`, stderr otherwise) —
-unique names mean a leaked one is leaked forever rather than being
-overwritten by the next save.
+The write itself is `harvester_proto::replace_atomically(&path, &json, None)`
+— the whole stage-then-rename dance in one place, shared with the
+bundled-provider installer (which passes `Some(mode)`; this file wants the
+default permissions, hence `None`). `save` keeps its own `create_dir_all`,
+because the helper deliberately does not make parents.
+
+Why that helper is written the way it is, restated here because this is the
+call site the property matters for: the staged name is per-writer
+(`workspaces.json.next.<pid>`, the same discipline the daemon install script
+already had in shell as `.next.$$`), since a single fixed staging name is not a
+staging file at all when two clients are open — each writes the *other's*
+half-written bytes into the same path and one of them renames a file it did not
+finish, which is the torn-JSON case the staging exists to prevent. The staged
+file is `sync_all`ed before the rename: a rename is only atomic with respect to
+*the directory entry*, so without the fsync a power loss can leave the entry
+pointing at a file whose contents never reached the disk. When any step fails
+the staged file is removed (quiet on `NotFound`, stderr otherwise) — unique
+names mean a leaked one is leaked forever rather than being overwritten by the
+next save. The test that pinned the staged name lives with the helper now, and
+covers both spellings it has to reproduce (`…/workspaces.json` and the
+extensionless provider path).
 
 What this does **not** buy is multi-client safety: `Catalog` reads
 `workspaces.json` once at startup, mutates its in-memory list, and rewrites
@@ -2762,6 +3101,51 @@ disk — not this file — remains the authority on sessions); the atomicity wor
 above only guarantees that whichever list wins is a *complete, well-formed*
 list. Reload-on-change (inotify, or a re-read + merge before each save) is
 the fix the day two windows becomes a real workflow.
+
+## crates/harvester/tests/fixtures.rs
+
+The captured-pi regression suite: it folds each `.jsonl` under
+`crates/harvester/fixtures/` through client-core's `Transcript` and asserts
+what the renderer is entitled to assume. It lives in `tests/` rather than
+inline because it walks the filesystem (see the rule in the `no_comments.rs`
+section below); provenance for the fixtures themselves is in the
+`crates/harvester/fixtures/ (provenance)` section above.
+
+What each test pins, and why it is worth a test rather than a doc sentence:
+- `every_fixture_folds_into_a_non_empty_transcript`: every capture ends
+  settled and not mid-stream, so a fixture that was cut off mid-turn cannot
+  quietly become the baseline for "this is what a transcript looks like". It
+  also re-asserts the LF-only rule on the files themselves.
+- `the_streaming_fixture_grows_its_answer_before_it_lands`: pi's
+  `message_update` carries the *whole* partial message, so successive frames
+  must be non-shrinking and the final assistant text must start with the first
+  frame. This is the fixture-side half of the streaming rule in SPEC §Rendering
+  pi, and the one that would catch a fold that appended deltas instead of
+  replacing.
+- `the_tools_fixture_covers_every_label_path`: the capture is required to
+  exercise each built-in tool name the header policy has a builder for, plus at
+  least one unrecognized name (the fallback), one failed call, and both
+  line-stat sources (an `edit` diff and a `write` body). It is a coverage
+  assertion about the *fixture*, so shrinking the capture cannot silently
+  un-cover `ui/transcript.rs`'s summary branches.
+- `the_mixed_fixture_interleaves_tools_and_markdown_answers`: pins that the
+  capture actually alternates messages and tool blocks in both directions, and
+  carries fences, headings and numbered lists — the markdown surface the
+  transcript renders.
+
+`BUILTIN_TOOL_NAMES` is the same list `ui/transcript.rs`'s `tool_summary`
+switches on; it is duplicated here on purpose, as the thing being checked
+rather than the thing doing the checking.
+
+`fixture_events` splits on `harvester_proto::LF` and asserts against
+`harvester_proto::CR` rather than on bare `'\n'`/`'\r'` literals: it is
+reading pi JSONL, so it is bound by the same LF-only framing rule as every
+other reader in the tree, and the consts are where that rule is written down.
+The gallery reads these same three files with its own loader
+(`harvester-gallery/src/fixtures.rs`) — the two are not shared because the
+gallery is out of the workspace and nothing importable sits below both, so
+the framing consts are what keeps them from disagreeing. The remaining
+duplication is recorded in the gallery's own notes.
 
 ## crates/harvester/tests/no_comments.rs
 
@@ -2819,12 +3203,6 @@ something yet, with the reason it was not worth fixing blind.
   the accessibility tree, and a wrapper *with* a role is not the focusable
   node, so an assistive-technology user still lands on an unnamed button. The
   real fix is upstream.
-- **`Dot::tone` and the `Dot`-taking `status_dot` have no callers.** Nothing
-  hand-builds a `Dot` any more, so `Dot` is only ever produced by `Tone::dot`
-  and consumed by `status_dot`. The tidy-up is to fold `Tone::dot` into
-  `status_dot_for_tone` and delete both, leaving `Dot` as a private detail of
-  `ui/core.rs`. Small, and it wants doing before someone reads the public
-  export as an invitation to build one by hand again.
 - **Two optical insets drifted when the controls stepped up a size.** Both the
   prompt strip's controls row and the sidebar's New-session button were solved
   against the library's *extra-small* button padding and the sidebar's older

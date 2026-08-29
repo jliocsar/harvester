@@ -7,6 +7,7 @@ use crate::bridge::{self, BridgeHandle};
 use crate::host::{Host, SshTarget};
 use crate::machines::{self, MachineRow};
 use crate::provider::MachineKey;
+use crate::{Error, Result};
 
 pub const LOCAL_MACHINE: &str = "local";
 
@@ -18,7 +19,7 @@ enum MachineRef {
 }
 
 impl MachineRef {
-    fn parse(stored: &str) -> MachineRef {
+    fn parse(stored: &str) -> Self {
         if stored == LOCAL_MACHINE {
             return MachineRef::Local;
         }
@@ -88,31 +89,6 @@ pub struct MachineCandidate {
     pub label: String,
 }
 
-#[derive(Debug)]
-pub enum FleetError {
-    NotConnectable { machine: String },
-    BridgeStart { machine: String, detail: String },
-    HostWorkerMissing,
-    HostWorkerStopped,
-}
-
-impl std::fmt::Display for FleetError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FleetError::NotConnectable { machine } => {
-                write!(f, "machine {machine} is not connectable")
-            }
-            FleetError::BridgeStart { machine, detail } => {
-                write!(f, "start bridge for {machine}: {detail}")
-            }
-            FleetError::HostWorkerMissing => write!(f, "machines worker is not running"),
-            FleetError::HostWorkerStopped => write!(f, "machines worker stopped"),
-        }
-    }
-}
-
-impl std::error::Error for FleetError {}
-
 pub struct FleetEvents {
     pub bridges: BridgeEvents,
     pub machines: Option<MachinesEvents>,
@@ -147,7 +123,7 @@ pub struct Fleet {
 }
 
 impl Fleet {
-    pub fn start(daemon_binary: Vec<u8>) -> (Fleet, FleetEvents) {
+    pub fn start(daemon_binary: Vec<u8>) -> (Self, FleetEvents) {
         let (bridge_sender, bridge_receiver) = unbounded_channel();
         let worker = match machines::start() {
             Ok(worker) => Some(worker),
@@ -161,7 +137,7 @@ impl Fleet {
             Some(worker) => (Some(worker.commands), Some(worker.events)),
             None => (None, None),
         };
-        let fleet = Fleet {
+        let fleet = Self {
             daemon_binary: Arc::new(daemon_binary),
             bridge_events: bridge_sender,
             machines: HashMap::new(),
@@ -226,14 +202,14 @@ impl Fleet {
             .collect()
     }
 
-    pub fn ensure_connection(&mut self, machine: &str) -> Result<(), FleetError> {
+    pub fn ensure_connection(&mut self, machine: &str) -> Result<()> {
         match self.connect_decision(machine)? {
             ConnectDecision::Reuse => Ok(()),
             ConnectDecision::Spawn(host) => self.spawn_bridge(machine, host),
         }
     }
 
-    fn connect_decision(&self, machine: &str) -> Result<ConnectDecision, FleetError> {
+    fn connect_decision(&self, machine: &str) -> Result<ConnectDecision> {
         if self.state(machine).is_live() {
             return Ok(ConnectDecision::Reuse);
         }
@@ -241,14 +217,14 @@ impl Fleet {
         Ok(ConnectDecision::Spawn(self.host_for(machine)?))
     }
 
-    fn spawn_bridge(&mut self, machine: &str, host: Host) -> Result<(), FleetError> {
+    fn spawn_bridge(&mut self, machine: &str, host: Host) -> Result<()> {
         let started = bridge::start(
             machine.to_string(),
             host,
             self.daemon_binary.clone(),
             self.bridge_events.clone(),
         );
-        let handle = started.map_err(|error| FleetError::BridgeStart {
+        let handle = started.map_err(|error| Error::BridgeStart {
             machine: machine.to_string(),
             detail: error.to_string(),
         })?;
@@ -276,13 +252,13 @@ impl Fleet {
         }
     }
 
-    pub fn send_host_command(&self, command: machines::Command) -> Result<(), FleetError> {
+    pub fn send_host_command(&self, command: machines::Command) -> Result<()> {
         let Some(commands) = &self.host_commands else {
-            return Err(FleetError::HostWorkerMissing);
+            return Err(Error::HostWorkerMissing);
         };
 
         if commands.send(command).is_err() {
-            return Err(FleetError::HostWorkerStopped);
+            return Err(Error::HostWorkerStopped);
         }
 
         Ok(())
@@ -370,7 +346,8 @@ impl Fleet {
         let state = self
             .machines
             .get(machine)
-            .map_or(MachineState::Unknown, Machine::state);
+            .map(Machine::state)
+            .unwrap_or(MachineState::Unknown);
 
         if state.is_live() || !self.is_missing(machine) {
             return state;
@@ -399,7 +376,7 @@ impl Fleet {
         matches!(self.machines.get(machine), Some(Machine::Linked { .. }))
     }
 
-    pub fn host_for(&self, machine: &str) -> Result<Host, FleetError> {
+    pub fn host_for(&self, machine: &str) -> Result<Host> {
         let host = match MachineRef::parse(machine) {
             MachineRef::Local => Some(Host::Local),
             MachineRef::Provider(_) => self
@@ -409,7 +386,7 @@ impl Fleet {
             MachineRef::AdHoc(dest) => Some(Host::Ssh(SshTarget { dest, port: None })),
         };
 
-        host.ok_or_else(|| FleetError::NotConnectable {
+        host.ok_or_else(|| Error::NotConnectable {
             machine: machine.to_string(),
         })
     }

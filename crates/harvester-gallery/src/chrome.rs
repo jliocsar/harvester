@@ -35,7 +35,7 @@ pub fn render_gallery(
     let story_sidebar = render_story_sidebar(gallery, cx);
     let stage = render_stage(gallery, &knobs, window, cx);
     let dock = render_control_dock(gallery, &knobs, cx);
-    let statusbar = render_statusbar(gallery, cx);
+    let statusbar_band = statusbar(gallery, cx);
 
     div()
         .size_full()
@@ -52,7 +52,7 @@ pub fn render_gallery(
                 .flex_col()
                 .child(stage)
                 .child(dock)
-                .child(statusbar),
+                .child(statusbar_band),
         )
 }
 
@@ -158,10 +158,10 @@ fn render_stage(
         .flex()
         .flex_col()
         .child(header)
-        .child(render_stage_canvas(body))
+        .child(stage_canvas(body))
 }
 
-fn render_stage_canvas(body: AnyElement) -> Stateful<Div> {
+fn stage_canvas(body: AnyElement) -> Stateful<Div> {
     with_content_inset(div().id(STAGE_CANVAS_ID))
         .role(Role::Group)
         .aria_label(STAGE_LABEL)
@@ -191,8 +191,8 @@ fn render_control_dock(gallery: &Gallery, knobs: &KnobValues, cx: &mut Context<G
         cx.listener(|gallery, _, _, cx| gallery.toggle_dock(cx)),
         cx,
     );
-    let presets = render_preset_buttons(gallery, cx);
-    let knob_grid = render_knob_grid(gallery, knobs, cx);
+    let presets = preset_buttons(gallery, cx);
+    let knob_controls = knob_grid(gallery, knobs, cx);
 
     div()
         .flex_none()
@@ -202,10 +202,10 @@ fn render_control_dock(gallery: &Gallery, knobs: &KnobValues, cx: &mut Context<G
         .flex()
         .flex_col()
         .child(header)
-        .when(expanded, |dock| dock.child(presets).child(knob_grid))
+        .when(expanded, |dock| dock.child(presets).child(knob_controls))
 }
 
-fn render_preset_buttons(gallery: &Gallery, cx: &mut Context<Gallery>) -> Div {
+fn preset_buttons(gallery: &Gallery, cx: &mut Context<Gallery>) -> Div {
     let presets = &gallery.stories()[gallery.selected_story()].presets;
 
     if presets.is_empty() {
@@ -239,11 +239,7 @@ fn render_preset_button(
         )
 }
 
-fn render_knob_grid(
-    gallery: &Gallery,
-    knobs: &KnobValues,
-    cx: &mut Context<Gallery>,
-) -> AnyElement {
+fn knob_grid(gallery: &Gallery, knobs: &KnobValues, cx: &mut Context<Gallery>) -> AnyElement {
     let specs = &gallery.stories()[gallery.selected_story()].knobs;
 
     if specs.is_empty() {
@@ -284,7 +280,7 @@ fn render_knob(
     let knob_label = caption(spec.name, cx);
 
     div()
-        .id(SharedString::from(format!("knob-{}", spec.name)))
+        .id(format!("knob-{}", spec.name))
         .role(Role::Group)
         .aria_label(spec.name)
         .flex()
@@ -301,7 +297,7 @@ fn render_bool_knob(name: &'static str, value: bool, cx: &mut Context<Gallery>) 
             .selected(index == usize::from(value))
     });
 
-    ButtonGroup::new(SharedString::from(format!("knob-bool-{name}")))
+    ButtonGroup::new(format!("knob-bool-{name}"))
         .outline()
         .children(segments)
         .on_click(cx.listener(move |gallery, picked: &Vec<usize>, _, cx| {
@@ -326,7 +322,7 @@ fn render_choice_knob(
             .selected(index == selected)
     });
 
-    ButtonGroup::new(SharedString::from(format!("knob-choice-{name}")))
+    ButtonGroup::new(format!("knob-choice-{name}"))
         .outline()
         .children(segments)
         .on_click(cx.listener(move |gallery, picked: &Vec<usize>, _, cx| {
@@ -350,7 +346,7 @@ fn render_text_knob(gallery: &Gallery, name: &'static str) -> AnyElement {
         .into_any_element()
 }
 
-fn render_statusbar(gallery: &Gallery, cx: &mut Context<Gallery>) -> Div {
+fn statusbar(gallery: &Gallery, cx: &mut Context<Gallery>) -> Div {
     let story_count = gallery.stories().len();
     let fixture_failure = gallery.runtime().read(cx).fixture_failure();
 

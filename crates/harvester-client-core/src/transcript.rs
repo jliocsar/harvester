@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-
+use harvester_proto::PI_AGENT_SETTLED;
 use serde_json::Value;
 
 const TOOL_OUTPUT_MAX_BYTES: usize = 64 * 1024;
@@ -38,7 +37,7 @@ pub struct ToolBlock {
 
 impl ToolBlock {
     pub fn running(tool_call_id: String, tool_name: String, args: Value) -> Self {
-        ToolBlock {
+        Self {
             tool_call_id,
             tool_name,
             args,
@@ -87,7 +86,7 @@ impl Transcript {
     pub fn new(entries: &[Value]) -> Self {
         let items = items_from_entries(entries);
 
-        Transcript {
+        Self {
             history_len: items.len(),
             items,
             streaming: None,
@@ -151,7 +150,7 @@ impl Transcript {
             "tool_execution_start" => self.apply_tool_start(event),
             "tool_execution_update" => self.apply_tool_update(event),
             "tool_execution_end" => self.apply_tool_end(event),
-            "agent_settled" => self.end_turn(),
+            PI_AGENT_SETTLED => self.end_turn(),
             _ => return false,
         }
 
@@ -266,45 +265,33 @@ fn items_from_entries(entries: &[Value]) -> Vec<Item> {
 }
 
 fn extend_items(items: &mut Vec<Item>, entries: &[Value]) {
-    let mut tool_results: HashMap<&str, &Value> = HashMap::new();
-    let mut messages: Vec<(&Value, Role)> = Vec::new();
-
     for entry in entries {
         let Some(message) = entry.get("message") else {
             continue;
         };
 
         match message.get("role").and_then(Value::as_str) {
-            Some("toolResult") => record_tool_result(&mut tool_results, message),
-            Some("user") => messages.push((message, Role::User)),
-            Some("assistant") => messages.push((message, Role::Assistant)),
+            Some("toolResult") => apply_tool_result(items, message),
+            Some("user") => push_message_items(items, message, Role::User),
+            Some("assistant") => push_message_items(items, message, Role::Assistant),
             _ => {}
         }
     }
-
-    for (tool_call_id, result) in &tool_results {
-        if let Some(block) = find_tool_block(items, tool_call_id) {
-            fill_tool_block_from_result(block, result);
-        }
-    }
-
-    for (message, role) in messages {
-        push_message_items(items, message, role, &tool_results);
-    }
 }
 
-fn record_tool_result<'a>(tool_results: &mut HashMap<&'a str, &'a Value>, message: &'a Value) {
-    if let Some(tool_call_id) = message.get("toolCallId").and_then(Value::as_str) {
-        tool_results.insert(tool_call_id, message);
-    }
+fn apply_tool_result(items: &mut [Item], message: &Value) {
+    let Some(tool_call_id) = message.get("toolCallId").and_then(Value::as_str) else {
+        return;
+    };
+
+    let Some(block) = find_tool_block(items, tool_call_id) else {
+        return;
+    };
+
+    fill_tool_block_from_result(block, message);
 }
 
-fn push_message_items(
-    items: &mut Vec<Item>,
-    message: &Value,
-    role: Role,
-    tool_results: &HashMap<&str, &Value>,
-) {
+fn push_message_items(items: &mut Vec<Item>, message: &Value, role: Role) {
     let text = message_text(message);
 
     if !text.is_empty() {
@@ -328,7 +315,7 @@ fn push_message_items(
             continue;
         }
 
-        if let Some(tool_block) = tool_block_from_history(block, tool_results) {
+        if let Some(tool_block) = tool_block_from_history(block) {
             items.push(Item::Tool(tool_block));
         }
     }
@@ -341,22 +328,14 @@ fn find_tool_block<'a>(items: &'a mut [Item], tool_call_id: &str) -> Option<&'a 
     })
 }
 
-fn tool_block_from_history(
-    block: &Value,
-    tool_results: &HashMap<&str, &Value>,
-) -> Option<ToolBlock> {
+fn tool_block_from_history(block: &Value) -> Option<ToolBlock> {
     let tool_call_id = block.get("id").and_then(Value::as_str)?;
-    let mut tool_block = ToolBlock::running(
+
+    Some(ToolBlock::running(
         tool_call_id.to_string(),
         tool_name_or_fallback(block.get("name")),
         block.get("arguments").cloned().unwrap_or(Value::Null),
-    );
-
-    if let Some(result) = tool_results.get(tool_call_id) {
-        fill_tool_block_from_result(&mut tool_block, result);
-    }
-
-    Some(tool_block)
+    ))
 }
 
 fn fill_tool_block_from_result(tool_block: &mut ToolBlock, result: &Value) {
@@ -448,7 +427,7 @@ fn message_failure(message: &Value) -> Option<String> {
     })
 }
 
-fn message_text(message: &Value) -> String {
+pub fn message_text(message: &Value) -> String {
     let mut pieces: Vec<String> = Vec::new();
 
     match message.get("content") {
@@ -508,6 +487,45 @@ mod tests {
                 Item::Message(_) | Item::Failure(_) => None,
             })
             .collect()
+    }
+
+    fn user_entry(text: &str) -> Value {
+        json!({"message": {"role": "user", "content": text}})
+    }
+
+    fn assistant_entry(text: &str) -> Value {
+        json!({"message": {"role": "assistant", "content": text_content(text)}})
+    }
+
+    fn message_texts(transcript: &Transcript) -> Vec<&str> {
+        transcript
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                Item::Message(message) => Some(message.text.as_str()),
+                Item::Tool(_) | Item::Failure(_) => None,
+            })
+            .collect()
+    }
+
+    fn failures(transcript: &Transcript) -> Vec<&str> {
+        transcript
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                Item::Failure(detail) => Some(detail.as_str()),
+                Item::Message(_) | Item::Tool(_) => None,
+            })
+            .collect()
+    }
+
+    fn failed_turn(reason: &str) -> Value {
+        json!({
+            "role": "assistant",
+            "content": [{"type": "text", "text": ""}],
+            "stopReason": "error",
+            "errorMessage": reason,
+        })
     }
 
     #[test]
@@ -869,45 +887,6 @@ mod tests {
         }));
 
         assert_eq!(tool_blocks(&transcript)[0].line_stats(), Some((2, 1)));
-    }
-
-    fn user_entry(text: &str) -> Value {
-        json!({"message": {"role": "user", "content": text}})
-    }
-
-    fn assistant_entry(text: &str) -> Value {
-        json!({"message": {"role": "assistant", "content": text_content(text)}})
-    }
-
-    fn message_texts(transcript: &Transcript) -> Vec<&str> {
-        transcript
-            .items()
-            .iter()
-            .filter_map(|item| match item {
-                Item::Message(message) => Some(message.text.as_str()),
-                Item::Tool(_) | Item::Failure(_) => None,
-            })
-            .collect()
-    }
-
-    fn failures(transcript: &Transcript) -> Vec<&str> {
-        transcript
-            .items()
-            .iter()
-            .filter_map(|item| match item {
-                Item::Failure(detail) => Some(detail.as_str()),
-                Item::Message(_) | Item::Tool(_) => None,
-            })
-            .collect()
-    }
-
-    fn failed_turn(reason: &str) -> Value {
-        json!({
-            "role": "assistant",
-            "content": [{"type": "text", "text": ""}],
-            "stopReason": "error",
-            "errorMessage": reason,
-        })
     }
 
     #[test]

@@ -34,7 +34,7 @@ impl AssetSource for HarvesterAssets {
             EMBEDDED_ICONS
                 .iter()
                 .filter(|(embedded_path, _bytes)| embedded_path.starts_with(path))
-                .map(|(embedded_path, _bytes)| SharedString::from(*embedded_path)),
+                .map(|(embedded_path, _bytes)| (*embedded_path).into()),
         );
 
         Ok(listed)

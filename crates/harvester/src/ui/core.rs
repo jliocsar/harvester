@@ -6,6 +6,8 @@ const FAINT_TEXT_OPACITY: f32 = 0.6;
 
 const STATUS_DOT_DIAMETER: f32 = 6.;
 
+const TRUNCATION_ELLIPSIS: char = '\u{2026}';
+
 const MUTED_LABEL: &str = "Neutral";
 const IDLE_LABEL: &str = "Idle";
 const ACTIVE_LABEL: &str = "Running";
@@ -57,12 +59,22 @@ impl Tone {
         }
     }
 
-    pub fn dot(self) -> Dot {
+    pub fn is_hollow(self) -> bool {
         match self {
-            Tone::Idle | Tone::Pending => Dot::Hollow(self),
-            Tone::Muted | Tone::Active | Tone::Live | Tone::Failed => Dot::Solid(self),
+            Tone::Idle | Tone::Pending => true,
+            Tone::Muted | Tone::Active | Tone::Live | Tone::Failed => false,
         }
     }
+}
+
+pub(super) fn truncated_to_max_chars(text: &str, max_chars: usize) -> Option<String> {
+    if text.chars().count() <= max_chars {
+        return None;
+    }
+
+    let kept: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+
+    Some(format!("{}{TRUNCATION_ELLIPSIS}", kept.trim_end()))
 }
 
 pub(super) fn dim(cx: &App) -> Hsla {
@@ -73,34 +85,17 @@ pub(super) fn faint(cx: &App) -> Hsla {
     cx.theme().muted_foreground.opacity(FAINT_TEXT_OPACITY)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Dot {
-    Solid(Tone),
-    Hollow(Tone),
-}
-
-impl Dot {
-    pub fn tone(self) -> Tone {
-        match self {
-            Dot::Solid(tone) | Dot::Hollow(tone) => tone,
-        }
-    }
-}
-
 pub fn status_dot_for_tone(tone: Tone, cx: &App) -> Div {
-    status_dot(tone.dot(), cx)
-}
-
-pub fn status_dot(dot: Dot, cx: &App) -> Div {
     let base = div()
         .flex_none()
         .size(px(STATUS_DOT_DIAMETER))
         .rounded_full();
 
-    match dot {
-        Dot::Solid(tone) => base.bg(tone.color(cx)),
-        Dot::Hollow(tone) => base.border_1().border_color(tone.color(cx)),
+    if tone.is_hollow() {
+        return base.border_1().border_color(tone.color(cx));
     }
+
+    base.bg(tone.color(cx))
 }
 
 pub fn inline_note(tone: Tone, text: impl Into<SharedString>, cx: &App) -> Div {
@@ -136,4 +131,41 @@ pub(super) fn disclosure_chevron(expanded: bool) -> Icon {
 
 pub(super) fn mono_font_family(cx: &App) -> SharedString {
     cx.theme().mono_font_family.clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{truncated_to_max_chars, TRUNCATION_ELLIPSIS};
+
+    #[test]
+    fn text_that_fits_the_budget_is_left_alone() {
+        assert_eq!(truncated_to_max_chars("Sonnet", 24), None);
+        assert_eq!(truncated_to_max_chars(&"x".repeat(24), 24), None);
+    }
+
+    #[test]
+    fn the_ellipsis_is_inside_the_budget_not_beyond_it() {
+        let truncated = truncated_to_max_chars(&"x".repeat(40), 24).expect("a cut");
+
+        assert_eq!(truncated.chars().count(), 24);
+        assert!(truncated.ends_with(TRUNCATION_ELLIPSIS));
+    }
+
+    #[test]
+    fn a_multibyte_cut_lands_on_a_character_boundary() {
+        let truncated = truncated_to_max_chars(&"\u{3042}".repeat(40), 24).expect("a cut");
+
+        assert_eq!(truncated.chars().count(), 24);
+    }
+
+    #[test]
+    fn no_space_is_left_stranded_before_the_ellipsis() {
+        let padded = format!("{} tail", "y".repeat(22));
+        let truncated = truncated_to_max_chars(&padded, 24).expect("a cut");
+
+        assert_eq!(
+            truncated,
+            format!("{}{TRUNCATION_ELLIPSIS}", "y".repeat(22))
+        );
+    }
 }

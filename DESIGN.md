@@ -47,7 +47,13 @@ The exceptions are physical boundaries, not layout, and each is named:
 | `FOCUS_RING_SPREAD` 1.5px, `FOCUS_RING_OFFSET` 0 | `ui/shell.rs` | A focus ring is a hairline, in the same class as a 1px border. It must stay one crisp ring at any base font size. |
 | `STATUS_DOT_DIAMETER` 6px | `ui/core.rs` | A raster boundary: 6px is the smallest disc that still antialiases into a circle, and the rem steps on either side land it mushy or off the half-pixel grid. The dot should keep its physical size when the type grows; the lane it sits in scales instead. |
 | `MAIN_WINDOW_WIDTH/HEIGHT` 1100×720 | `main.rs`, mirrored by the gallery | The OS window's physical bounds, not layout. |
-| Flexbox `min_w(px(0.))` / `min_h(px(0.))` | `workbench.rs`, `chat.rs` | A shrink constraint, not a measurement. |
+
+A fourth row used to sit here for the flexbox shrink constraint, written
+`min_w(px(0.))` / `min_h(px(0.))` in `workbench.rs` and `chat.rs`. It was never
+an exception, only a second spelling: gpui ships `.min_w_0()` / `.min_h_0()` for
+exactly that constraint, six other sites already used them, and the three
+stragglers now do too. A shrink constraint reaches the layout engine as the
+keyword it is, and nothing in the app writes `px` for it.
 
 Two dev-and-dialog surfaces outside `ui/` still carry a pixel height because
 they frame content rather than express product rhythm: the folder picker's
@@ -171,8 +177,9 @@ Three invariants hold here:
    `success`, `danger` and `muted_foreground` are roles; `blue`, `red`, `green`
    are hues. Only a role survives a theme swap. (`Active` was `theme.blue`; that
    was the bug this rule was written for.)
-2. **Shape is derived from the tone, never chosen per call site.** `Tone::dot`
-   owns the mapping. Hollow means the dot is a placeholder for work that has not
+2. **Shape is derived from the tone, never chosen per call site.**
+   `Tone::is_hollow` owns the mapping and `status_dot_for_tone` is the only
+   builder that reads it, so there is nothing to construct and nothing to pass. Hollow means the dot is a placeholder for work that has not
    begun; solid means it stands for something real — running or finished, good
    or bad. That is why `Failed` is solid: a settled terminal state must not read
    as "not started".
@@ -186,6 +193,18 @@ Three invariants hold here:
 Where a surface needs a *structural* colour — a border, a popover fill, a
 selection — it reads the theme slot directly. `Tone` is for status, not for
 paint.
+
+That splits cleanly by module, and the split is greppable. Inside
+`crates/harvester/src/ui/` a component may read any theme slot it needs: that is
+where paint is decided. Outside it, `cx.theme()` is for structure only —
+`sidebar`, `sidebar_border`, `background`, `foreground`, `border`, `radius`,
+`font_size` — and every *text* colour comes from a `Tone`. The folder picker's
+location line was the last exception, reading `cx.theme().muted_foreground` for
+a caption; it asks for `Tone::Muted` now, which resolves to the same slot and
+states the meaning instead of the hue. That file had already been corrected once
+for the same class of mistake (its error line moved off `cx.theme().danger` onto
+`Tone::Failed`) and one call site was missed, which is why the rule is written
+as a grep rather than as a habit.
 
 ### Colour is a scarce budget
 
@@ -507,6 +526,32 @@ mumbles, and a tool that genuinely printed nothing is a fact worth stating
 plainly. The single ellipsis character marks a command that opens a dialog
 ("Add new…") or work still in progress ("Starting session…").
 
+**A truncation budget counts its own ellipsis.** One helper cuts display text —
+`ui::core::truncated_to_max_chars(text, max_chars)` — and its result is *at
+most* `max_chars` characters with the ellipsis already inside that number, so a
+budget means the same thing at every call site. It cuts on character
+boundaries, not bytes, and trims a stranded space off the cut before appending
+the mark, because "word …" reads as a missing word rather than a cut one. The
+two callers used to disagree: the prompt strip's control labels landed on
+exactly their budget while the transcript's tool-argument summaries landed one
+character over, with a test pinning the discrepancy. Extractors that never
+ellipsise — the sidebar's sid preview, the session name derived from a prompt,
+client-core's byte-budget tail keeper — are a different operation and stay
+separate.
+
+**Words the user reads are named constants, not literals.** Every user-facing
+string in `crates/harvester/src/` is a `const` beside the code that renders it,
+so the words a surface owns can be read off the top of its file and a copy
+change is a one-line diff. A string two surfaces share is declared **once**, in
+whichever module decides it, and imported by the other: `CANCEL_LABEL` lives in
+`ui/dialog.rs` because that is the shared modal chrome, `NEW_SESSION_LABEL` in
+`chat.rs` because the sidebar's button opens exactly that pane, and
+`MISSING_MACHINE_DETAIL` in `workbench/machine_presentation.rs` because that is
+where the verdict is decided. Only two kinds of literal remain: a `format!`
+template's interpolation (the fixed lead is still a const — see
+`CONNECTING_PANE_MESSAGE_PREFIX`) and path syntax that is not prose (`"../"`,
+the trailing `/` on a directory row).
+
 **Copy that belongs to Pi is not ours.** Everything inside a pi dialog — titles,
 messages, option strings — is shown verbatim. Only two transformations touch it:
 whitespace trimming, and dropping a message that exactly duplicates its title.
@@ -568,7 +613,7 @@ above, and it does three jobs:
    with the *real* constants: the dialog stories read `ui::dialog`'s own width
    constants and `options_height`, because the whole point of that story is the
    width ladder and a story that guessed the widths would be showing you the
-   wrong thing. The tone story shows the one dot `Tone::dot` derives rather than
+   wrong thing. The tone story shows the one dot `Tone::is_hollow` derives rather than
    letting a knob pick a shape — a catalog whose controls can produce a
    combination the app cannot render is lying about the component. Where a story
    *cannot* be honest, it says so in a caption or in the recorded gaps.
@@ -632,12 +677,6 @@ worth fixing blind. A contract that hides its own exceptions is worthless.
   trait with an inset mode would let it share the app's one ring.
 - **Light mode is blocked** by the memoized dark `TextViewStyle` in
   `ui/transcript.rs` (see §3). The fix and the theme toggle land together.
-- **`Dot::tone` and the `Dot`-taking `status_dot` are exported with no callers.**
-  Nothing hand-builds a `Dot` any longer, so the type is only ever produced by
-  `Tone::dot` and consumed by `status_dot`. Folding `Tone::dot` into
-  `status_dot_for_tone` would let both disappear and make `Dot` private to
-  `ui/core.rs`. Worth doing before the public export reads as an invitation to
-  build one by hand again.
 - **Two ellipses stand in for an indeterminate progress indicator**: the prompt
   strip's "Starting session…" and the streaming turn's bare "…". Decorative dots
   are the weaker answer, but this revision of gpui-component ships no

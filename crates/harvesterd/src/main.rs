@@ -135,10 +135,14 @@ async fn main() {
     );
 
     let daemon = session::Daemon::new(startup_build_fingerprint());
+
     loop {
-        match listener.accept().await {
+        let accepted = listener.accept().await;
+
+        match accepted {
             Ok((stream, _)) => {
                 let daemon = daemon.clone();
+
                 tokio::spawn(async move { server::serve_connection(daemon, stream).await });
             }
             Err(error) => eprintln!("accept failed: {error}"),

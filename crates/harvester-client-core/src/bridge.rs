@@ -1,23 +1,22 @@
 mod attach_window;
 
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Mutex as AsyncMutex;
 
-use harvester_proto::{HarvesterCmd, SessionInfo, SessionsData};
+use harvester_proto::{lock, HarvesterCmd, SessionInfo, SessionsData};
 
 use crate::bootstrap::bootstrap_and_connect;
 use crate::connection::{DaemonClient, SessionEvent};
 use crate::dialog::DialogAnswer;
 use crate::host::Host;
-use crate::machines::run_on_tokio_thread;
+use crate::run_on_tokio_thread;
 use crate::token::RequestToken;
 use attach_window::{
-    lock_attach_buffers, AttachEventBuffers, AttachRegistration, FlushOutcome, PushOutcome,
-    ATTACH_EVENT_BUFFER_CAP,
+    AttachEventBuffers, AttachRegistration, FlushOutcome, PushOutcome, ATTACH_EVENT_BUFFER_CAP,
 };
 
 const UNKNOWN_PI_ERROR: &str = "unknown error";
@@ -129,15 +128,14 @@ impl EventSender {
 struct BridgeContext {
     client: DaemonClient,
     events: EventSender,
-    attached: Arc<AsyncMutex<Option<String>>>,
+    attached: Arc<AsyncMutex<Option<Attachment>>>,
     attach_buffers: Arc<Mutex<AttachEventBuffers>>,
     resyncing: Arc<Mutex<HashSet<String>>>,
-    cursor: Arc<Mutex<Option<SessionCursor>>>,
 }
 
-struct SessionCursor {
+struct Attachment {
     sid: String,
-    leaf_id: String,
+    cursor: Option<String>,
 }
 
 pub(crate) fn start(
@@ -169,10 +167,11 @@ fn run_bridge_thread(
 ) {
     let report_events = events.clone();
 
-    run_on_tokio_thread(
-        bridge_main(host, daemon_binary, commands, events),
-        |detail| report_events.send(Event::ConnectFailed { detail }),
-    );
+    if let Err(error) = run_on_tokio_thread(bridge_main(host, daemon_binary, commands, events)) {
+        report_events.send(Event::ConnectFailed {
+            detail: format!("tokio runtime: {error}"),
+        });
+    }
 }
 
 async fn bridge_main(
@@ -200,7 +199,6 @@ async fn bridge_main(
         attached: Arc::new(AsyncMutex::new(None)),
         attach_buffers: Arc::new(Mutex::new(AttachEventBuffers::default())),
         resyncing: Arc::new(Mutex::new(HashSet::new())),
-        cursor: Arc::new(Mutex::new(None)),
     };
 
     spawn_flow(sessions_flow(context.clone()));
@@ -277,7 +275,7 @@ fn spawn_flow(flow: impl std::future::Future<Output = ()> + Send + 'static) {
 }
 
 fn handle_live_pi_event(context: &BridgeContext, sid: String, event: Value) {
-    let outcome = lock_attach_buffers(&context.attach_buffers).push(&sid, event);
+    let outcome = lock(&context.attach_buffers, "attach buffer").push(&sid, event);
 
     match outcome {
         PushOutcome::Deliver(event) => handle_pi_event(context, sid, event),
@@ -291,10 +289,6 @@ fn handle_live_pi_event(context: &BridgeContext, sid: String, event: Value) {
 
 fn handle_pi_event(context: &BridgeContext, sid: String, event: Value) {
     context.events.send(Event::Pi { sid, event });
-}
-
-fn pi_event_type(value: &Value) -> Option<&str> {
-    value.get("type").and_then(Value::as_str)
 }
 
 fn flatten_harvester(
@@ -380,11 +374,11 @@ async fn resync_flow(context: BridgeContext, sid: String) {
 }
 
 async fn is_attached(context: &BridgeContext, sid: &str) -> bool {
-    context.attached.lock().await.as_deref() == Some(sid)
+    matches!(&*context.attached.lock().await, Some(attachment) if attachment.sid == sid)
 }
 
 async fn repair_history(context: &BridgeContext, sid: &str) -> Result<(), String> {
-    if let Some(leaf_id) = cursor_for(context, sid) {
+    if let Some(leaf_id) = cursor_for(context, sid).await {
         if let Ok((entries, next_leaf_id)) = fetch_entries(context, sid, Some(&leaf_id)).await {
             record_cursor(context, sid, next_leaf_id).await;
             context.events.send(Event::HistoryExtended {
@@ -430,26 +424,23 @@ async fn fetch_entries(
     Ok((entries, leaf_id))
 }
 
-fn cursor_for(context: &BridgeContext, sid: &str) -> Option<String> {
-    lock_cursor(&context.cursor)
+async fn cursor_for(context: &BridgeContext, sid: &str) -> Option<String> {
+    let attached = context.attached.lock().await;
+
+    attached
         .as_ref()
-        .filter(|cursor| cursor.sid == sid)
-        .map(|cursor| cursor.leaf_id.clone())
+        .filter(|attachment| attachment.sid == sid)
+        .and_then(|attachment| attachment.cursor.clone())
 }
 
 async fn record_cursor(context: &BridgeContext, sid: &str, leaf_id: Option<String>) {
-    if !is_attached(context, sid).await {
+    let mut attached = context.attached.lock().await;
+
+    let Some(attachment) = attached.as_mut().filter(|attachment| attachment.sid == sid) else {
         return;
-    }
+    };
 
-    *lock_cursor(&context.cursor) = leaf_id.map(|leaf_id| SessionCursor {
-        sid: sid.to_string(),
-        leaf_id,
-    });
-}
-
-fn lock_cursor(cursor: &Mutex<Option<SessionCursor>>) -> MutexGuard<'_, Option<SessionCursor>> {
-    cursor.lock().expect("cursor mutex")
+    attachment.cursor = leaf_id;
 }
 
 struct ResyncGuard {
@@ -458,10 +449,10 @@ struct ResyncGuard {
 }
 
 impl ResyncGuard {
-    fn claim(context: &BridgeContext, sid: &str) -> Option<ResyncGuard> {
-        lock_resyncing(&context.resyncing)
+    fn claim(context: &BridgeContext, sid: &str) -> Option<Self> {
+        lock(&context.resyncing, "resync")
             .insert(sid.to_string())
-            .then(|| ResyncGuard {
+            .then(|| Self {
                 in_flight: context.resyncing.clone(),
                 sid: sid.to_string(),
             })
@@ -470,18 +461,14 @@ impl ResyncGuard {
 
 impl Drop for ResyncGuard {
     fn drop(&mut self) {
-        lock_resyncing(&self.in_flight).remove(&self.sid);
+        lock(&self.in_flight, "resync").remove(&self.sid);
     }
-}
-
-fn lock_resyncing(sessions: &Mutex<HashSet<String>>) -> MutexGuard<'_, HashSet<String>> {
-    sessions.lock().expect("resync mutex")
 }
 
 async fn forget_attachment(context: BridgeContext, sid: String) {
     let mut attached = context.attached.lock().await;
 
-    if attached.as_deref() == Some(sid.as_str()) {
+    if matches!(&*attached, Some(attachment) if attachment.sid == sid) {
         *attached = None;
     }
 }
@@ -601,18 +588,18 @@ async fn attach_session(
 
 async fn detach_previous(
     context: &BridgeContext,
-    attached: &mut Option<String>,
+    attached: &mut Option<Attachment>,
     next_sid: &str,
 ) -> bool {
-    let Some(previous_sid) = attached.as_ref() else {
+    let Some(previous) = attached.as_ref() else {
         return true;
     };
 
-    if previous_sid == next_sid {
+    if previous.sid == next_sid {
         return true;
     }
 
-    let previous_sid = previous_sid.clone();
+    let previous_sid = previous.sid.clone();
     let detach = context
         .client
         .harvester(HarvesterCmd::Detach {
@@ -637,7 +624,7 @@ async fn detach_previous(
     }
 }
 
-async fn attach(context: &BridgeContext, attached: &mut Option<String>, sid: &str) -> bool {
+async fn attach(context: &BridgeContext, attached: &mut Option<Attachment>, sid: &str) -> bool {
     let response = context
         .client
         .harvester(HarvesterCmd::Attach {
@@ -647,7 +634,10 @@ async fn attach(context: &BridgeContext, attached: &mut Option<String>, sid: &st
 
     match flatten_harvester(response) {
         Ok(_data) => {
-            *attached = Some(sid.to_string());
+            *attached = Some(Attachment {
+                sid: sid.to_string(),
+                cursor: None,
+            });
 
             true
         }
@@ -660,17 +650,10 @@ async fn attach(context: &BridgeContext, attached: &mut Option<String>, sid: &st
 }
 
 async fn prompt_flow(context: BridgeContext, sid: String, text: String) {
-    let sent = context
-        .client
-        .pi(
-            &sid,
-            json!({"type": "prompt", "message": text, "streamingBehavior": "steer"}),
-        )
-        .await;
-    let detail = match sent {
-        Ok(response) if pi_success(&response) => return,
-        Ok(response) => pi_error(&response).unwrap_or_else(|| UNKNOWN_PI_ERROR.to_string()),
-        Err(error) => error.to_string(),
+    let prompt = json!({"type": "prompt", "message": text, "streamingBehavior": "steer"});
+
+    let Err(detail) = pi_flow_result(&context, &sid, prompt).await else {
+        return;
     };
 
     eprintln!("bridge: the prompt for session {sid} was not delivered: {detail}");
@@ -689,7 +672,11 @@ async fn list_models_flow(context: BridgeContext, cwd: String, token: RequestTok
 }
 
 async fn pi_request_flow(context: BridgeContext, sid: String, cmd: Value, token: RequestToken) {
-    let method = pi_event_type(&cmd).unwrap_or_default().to_string();
+    let method = cmd
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     let result = pi_flow_result(&context, &sid, cmd).await;
 
     context.events.send(Event::PiAnswered {
@@ -756,6 +743,13 @@ mod tests {
 
     const QUIET: Duration = Duration::from_millis(100);
 
+    fn attached_to(sid: &str) -> Option<Attachment> {
+        Some(Attachment {
+            sid: sid.to_string(),
+            cursor: None,
+        })
+    }
+
     struct Harness {
         context: BridgeContext,
         daemon: DaemonConnection,
@@ -779,7 +773,6 @@ mod tests {
                     attached: Arc::new(AsyncMutex::new(None)),
                     attach_buffers: Arc::new(Mutex::new(AttachEventBuffers::default())),
                     resyncing: Arc::new(Mutex::new(HashSet::new())),
-                    cursor: Arc::new(Mutex::new(None)),
                 },
                 daemon: DaemonConnection::over(daemon_side, None),
                 events,
@@ -876,7 +869,7 @@ mod tests {
     async fn a_successful_detach_announces_the_exact_room_before_open_continues() {
         let mut harness = Harness::new();
 
-        *harness.context.attached.lock().await = Some("01H-first".to_string());
+        *harness.context.attached.lock().await = attached_to("01H-first");
         spawn_flow(open_flow(
             harness.context.clone(),
             "01H-second".to_string(),
@@ -905,7 +898,7 @@ mod tests {
     async fn a_failed_detach_reports_failure_without_announcing_room_retirement() {
         let mut harness = Harness::new();
 
-        *harness.context.attached.lock().await = Some("01H-first".to_string());
+        *harness.context.attached.lock().await = attached_to("01H-first");
         spawn_flow(open_flow(
             harness.context.clone(),
             "01H-second".to_string(),
@@ -936,8 +929,14 @@ mod tests {
             .assert_silent("a failed detach must abort the replacement open")
             .await;
         assert_eq!(
-            harness.context.attached.lock().await.as_deref(),
-            Some("01H-first"),
+            harness
+                .context
+                .attached
+                .lock()
+                .await
+                .as_ref()
+                .map(|attachment| attachment.sid.clone()),
+            Some("01H-first".to_string()),
             "the bridge must keep tracking the room it failed to leave"
         );
     }
@@ -946,7 +945,7 @@ mod tests {
     async fn opening_the_attached_session_does_not_detach_it_first() {
         let mut harness = Harness::new();
 
-        *harness.context.attached.lock().await = Some("01H-same".to_string());
+        *harness.context.attached.lock().await = attached_to("01H-same");
         spawn_flow(open_flow(
             harness.context.clone(),
             "01H-same".to_string(),
@@ -1108,7 +1107,7 @@ mod tests {
     async fn a_failed_repair_still_delivers_the_events_it_held_back() {
         let mut harness = Harness::new();
 
-        *harness.context.attached.lock().await = Some("01H".to_string());
+        *harness.context.attached.lock().await = attached_to("01H");
         spawn_flow(resync_flow(harness.context.clone(), "01H".to_string()));
 
         let request = harness.take_request().await;
@@ -1141,7 +1140,7 @@ mod tests {
     async fn a_repair_stops_when_the_attachment_moved_on_under_it() {
         let mut harness = Harness::new();
 
-        *harness.context.attached.lock().await = Some("01H-first".to_string());
+        *harness.context.attached.lock().await = attached_to("01H-first");
         spawn_flow(resync_flow(
             harness.context.clone(),
             "01H-first".to_string(),
@@ -1159,7 +1158,7 @@ mod tests {
             );
         }
 
-        *harness.context.attached.lock().await = Some("01H-second".to_string());
+        *harness.context.attached.lock().await = attached_to("01H-second");
         harness.answer_pi(&request, json!({"entries": []})).await;
 
         harness
@@ -1171,7 +1170,7 @@ mod tests {
     async fn a_stale_repair_cannot_overwrite_the_new_sessions_cursor() {
         let mut harness = Harness::new();
 
-        *harness.context.attached.lock().await = Some("01H-first".to_string());
+        *harness.context.attached.lock().await = attached_to("01H-first");
         spawn_flow(resync_flow(
             harness.context.clone(),
             "01H-first".to_string(),
@@ -1181,10 +1180,9 @@ mod tests {
 
         assert_eq!(command_name(&request), "get_entries");
 
-        *harness.context.attached.lock().await = Some("01H-second".to_string());
-        *harness.context.cursor.lock().expect("cursor mutex") = Some(SessionCursor {
+        *harness.context.attached.lock().await = Some(Attachment {
             sid: "01H-second".to_string(),
-            leaf_id: "leaf-second".to_string(),
+            cursor: Some("leaf-second".to_string()),
         });
         harness
             .answer_pi(&request, json!({"entries": [], "leafId": "leaf-first"}))
@@ -1197,12 +1195,12 @@ mod tests {
 
         assert!(matches!(event, Event::HistoryReplaced { sid, .. } if sid == "01H-first"));
 
-        let cursor = harness.context.cursor.lock().expect("cursor mutex");
-        let held = cursor.as_ref().expect("the new session's cursor");
+        let attached = harness.context.attached.lock().await;
+        let held = attached.as_ref().expect("the new session's attachment");
 
         assert_eq!(
-            (held.sid.as_str(), held.leaf_id.as_str()),
-            ("01H-second", "leaf-second"),
+            (held.sid.as_str(), held.cursor.as_deref()),
+            ("01H-second", Some("leaf-second")),
             "a repair for a replaced session must not spend the new session's cursor slot"
         );
     }

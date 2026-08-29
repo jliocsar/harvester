@@ -8,10 +8,9 @@ use harvester_client_core::{
 use super::picker::{FolderPicker, WorkspacePicked};
 use crate::dialogs::open_pi_dialog;
 use crate::store::{FleetStore, StoreEvent};
-use crate::ui::dialog::{open_confirmation, ActionAccent, Confirmation};
+use crate::ui::dialog::{open_confirmation, ActionAccent, Confirmation, CANCEL_LABEL};
 
 const NOTHING_IS_DELETED: &str = "Nothing on the machine itself is deleted.";
-const FORGET_CANCEL_LABEL: &str = "Cancel";
 const FORGET_ACTION_LABEL: &str = "Remove";
 
 pub(super) enum ModalOutcome {
@@ -94,8 +93,8 @@ impl ModalCoordinator {
         let store = self.store.read(cx);
         let removal = Confirmation {
             title: format!("Remove machine {}?", store.label(&machine)).into(),
-            message: removal_message(store.visible_session_count_on(&machine)).into(),
-            cancel_label: FORGET_CANCEL_LABEL.into(),
+            message: removal_message(store.catalog().visible_session_count_on(&machine)).into(),
+            cancel_label: CANCEL_LABEL.into(),
             action_label: FORGET_ACTION_LABEL.into(),
             action_accent: ActionAccent::Danger,
         };

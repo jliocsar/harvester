@@ -2,6 +2,15 @@ use harvester_client_core::MachineState;
 
 use crate::ui::Tone;
 
+pub(super) const MISSING_MACHINE_DETAIL: &str = "no longer listed";
+
+const CONNECTING_PANE_MESSAGE_PREFIX: &str = "connecting to ";
+const CONNECTING_STATUSBAR_LINK: &str = "connecting…";
+const CONNECTED_PANE_MESSAGE: &str = "select a session";
+const CONNECT_FAILED_STATUSBAR_LINK: &str = "connect failed";
+const CONNECTION_LOST_MESSAGE: &str = "connection lost";
+const MISSING_MACHINE_PANE_MESSAGE_SUFFIX: &str = " is no longer listed by its provider";
+
 pub(super) struct MachinePresentation {
     pub tone: Tone,
     pub pane_message: Option<String>,
@@ -12,28 +21,28 @@ pub(super) fn present_machine(state: MachineState<'_>, machine: &str) -> Machine
     match state {
         MachineState::Connecting => MachinePresentation {
             tone: Tone::Pending,
-            pane_message: Some(format!("connecting to {machine}…")),
-            statusbar_link: Some("connecting…".to_string()),
+            pane_message: Some(format!("{CONNECTING_PANE_MESSAGE_PREFIX}{machine}…")),
+            statusbar_link: Some(CONNECTING_STATUSBAR_LINK.to_string()),
         },
         MachineState::Connected => MachinePresentation {
             tone: Tone::Live,
-            pane_message: Some("select a session".to_string()),
+            pane_message: Some(CONNECTED_PANE_MESSAGE.to_string()),
             statusbar_link: Some(machine.to_string()),
         },
         MachineState::ConnectFailed { detail } => MachinePresentation {
             tone: Tone::Failed,
             pane_message: Some(detail.to_string()),
-            statusbar_link: Some("connect failed".to_string()),
+            statusbar_link: Some(CONNECT_FAILED_STATUSBAR_LINK.to_string()),
         },
         MachineState::ConnectionLost => MachinePresentation {
             tone: Tone::Failed,
-            pane_message: Some("connection lost".to_string()),
-            statusbar_link: Some("connection lost".to_string()),
+            pane_message: Some(CONNECTION_LOST_MESSAGE.to_string()),
+            statusbar_link: Some(CONNECTION_LOST_MESSAGE.to_string()),
         },
         MachineState::Missing => MachinePresentation {
             tone: Tone::Failed,
-            pane_message: Some(format!("{machine} is no longer listed by its provider")),
-            statusbar_link: Some("no longer listed".to_string()),
+            pane_message: Some(format!("{machine}{MISSING_MACHINE_PANE_MESSAGE_SUFFIX}")),
+            statusbar_link: Some(MISSING_MACHINE_DETAIL.to_string()),
         },
         MachineState::Unreachable => MachinePresentation {
             tone: Tone::Failed,
@@ -56,14 +65,13 @@ pub(super) fn present_machine(state: MachineState<'_>, machine: &str) -> Machine
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::Dot;
 
     #[test]
     fn unknown_is_an_absence_not_a_reachability_verdict() {
         let presentation = present_machine(MachineState::Unknown, "vm");
 
         assert_eq!(presentation.tone, Tone::Idle);
-        assert_eq!(presentation.tone.dot(), Dot::Hollow(Tone::Idle));
+        assert!(presentation.tone.is_hollow());
         assert_eq!(presentation.pane_message, None);
         assert_eq!(presentation.statusbar_link, None);
     }
@@ -100,8 +108,9 @@ mod tests {
         let reachable = present_machine(MachineState::Reachable, "vm");
         let unknown = present_machine(MachineState::Unknown, "vm");
 
-        assert_eq!(reachable.tone.dot(), Dot::Solid(Tone::Muted));
-        assert_eq!(unknown.tone.dot(), Dot::Hollow(Tone::Idle));
-        assert_ne!(reachable.tone.dot(), unknown.tone.dot());
+        assert_eq!(reachable.tone, Tone::Muted);
+        assert!(!reachable.tone.is_hollow());
+        assert_eq!(unknown.tone, Tone::Idle);
+        assert!(unknown.tone.is_hollow());
     }
 }

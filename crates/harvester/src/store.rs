@@ -7,7 +7,6 @@ use harvester_client_core::machines;
 use harvester_client_core::{
     BridgeEvents, Fleet, Host, MachineCandidate, MachineState, MachinesEvents, RequestTokens,
 };
-use harvester_proto::SessionInfo;
 
 pub use crate::catalog::MachineSession;
 
@@ -94,7 +93,7 @@ impl FleetStore {
 
     fn handle_bridge_event(&mut self, machine: String, event: BridgeEvent, cx: &mut Context<Self>) {
         if let BridgeEvent::Sessions(sessions) = event {
-            self.record_sessions(&machine, sessions);
+            self.catalog.record_sessions(&machine, sessions);
             cx.notify();
 
             return;
@@ -108,22 +107,13 @@ impl FleetStore {
         match event {
             BridgeEvent::Connected => cx.notify(),
             BridgeEvent::ConnectFailed { .. } | BridgeEvent::Disconnected => {
-                self.catalog.abandon_open_on(machine);
-                cx.notify();
+                self.handle_link_lost(machine, cx)
             }
             BridgeEvent::RequestFailed { detail } => {
-                self.catalog.abandon_open_on(machine);
-                self.fail(format!("{machine}: {detail}"), cx);
-                cx.notify();
+                self.handle_request_failed(machine, detail, cx)
             }
-            BridgeEvent::Attached { sid, .. } => {
-                self.catalog.session_attached(machine, sid);
-                cx.notify();
-            }
-            BridgeEvent::SessionExit { sid, .. } => {
-                self.catalog.session_exited(sid);
-                cx.notify();
-            }
+            BridgeEvent::Attached { sid, .. } => self.handle_session_attached(machine, sid, cx),
+            BridgeEvent::SessionExit { sid, .. } => self.handle_session_exited(sid, cx),
             BridgeEvent::PiAnswered {
                 method,
                 result: Err(detail),
@@ -140,6 +130,27 @@ impl FleetStore {
         }
     }
 
+    fn handle_link_lost(&mut self, machine: &str, cx: &mut Context<Self>) {
+        self.catalog.abandon_open_on(machine);
+        cx.notify();
+    }
+
+    fn handle_request_failed(&mut self, machine: &str, detail: &str, cx: &mut Context<Self>) {
+        self.catalog.abandon_open_on(machine);
+        self.fail(format!("{machine}: {detail}"), cx);
+        cx.notify();
+    }
+
+    fn handle_session_attached(&mut self, machine: &str, sid: &str, cx: &mut Context<Self>) {
+        self.catalog.session_attached(machine, sid);
+        cx.notify();
+    }
+
+    fn handle_session_exited(&mut self, sid: &str, cx: &mut Context<Self>) {
+        self.catalog.session_exited(sid);
+        cx.notify();
+    }
+
     fn handle_machines_event(&mut self, event: machines::Event, cx: &mut Context<Self>) {
         match event {
             machines::Event::Listed { .. } | machines::Event::Probed { .. } => cx.notify(),
@@ -148,10 +159,6 @@ impl FleetStore {
             }
             answer => cx.emit(StoreEvent::Machines(answer)),
         }
-    }
-
-    fn record_sessions(&mut self, machine: &str, sessions: Vec<SessionInfo>) {
-        self.catalog.record_sessions(machine, sessions);
     }
 
     fn fail(&mut self, detail: String, cx: &mut Context<Self>) {
@@ -325,6 +332,10 @@ impl FleetStore {
         self.argv_machine.as_deref()
     }
 
+    pub fn catalog(&self) -> &Catalog {
+        &self.catalog
+    }
+
     pub fn tokens(&self) -> RequestTokens {
         self.tokens.clone()
     }
@@ -341,10 +352,8 @@ impl FleetStore {
         self.fleet.state(machine).is_live()
     }
 
-    pub fn host_for(&self, machine: &str) -> Result<Host, String> {
-        self.fleet
-            .host_for(machine)
-            .map_err(|error| error.to_string())
+    pub fn host_for(&self, machine: &str) -> harvester_client_core::Result<Host> {
+        self.fleet.host_for(machine)
     }
 
     pub fn provider_machines(&self) -> &[machines::MachineRow] {
@@ -371,10 +380,6 @@ impl FleetStore {
         self.fleet.linked_machine_count()
     }
 
-    pub fn repos_on(&self, machine: &str) -> Vec<String> {
-        self.catalog.repos_on(machine)
-    }
-
     pub fn new_session_target(&self) -> ChatTarget {
         let machines: Vec<String> = self
             .fleet
@@ -384,26 +389,6 @@ impl FleetStore {
             .collect();
 
         self.catalog.default_new_session_target(&machines)
-    }
-
-    pub fn visible_sessions(&self) -> Vec<&MachineSession> {
-        self.catalog.visible_sessions()
-    }
-
-    pub fn visible_session_count_on(&self, machine: &str) -> usize {
-        self.catalog.visible_session_count_on(machine)
-    }
-
-    pub fn session_cwd(&self, sid: &str) -> Option<&str> {
-        self.catalog.session_cwd(sid)
-    }
-
-    pub fn opening_sid(&self) -> Option<&str> {
-        self.catalog.opening_sid()
-    }
-
-    pub fn is_selected_session(&self, sid: &str) -> bool {
-        self.catalog.is_selected_session(sid)
     }
 
     pub fn clear_selected_session(&mut self, cx: &mut Context<Self>) {
@@ -417,4 +402,78 @@ fn is_pre_session_command(command: &Command) -> bool {
         command,
         Command::ListModels { .. } | Command::StartSession { .. }
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harvester_client_core::{DialogAnswer, Pending, RequestToken};
+    use serde_json::json;
+
+    fn token() -> RequestToken {
+        Pending::default().ask(&RequestTokens::default(), ())
+    }
+
+    fn every_command() -> Vec<Command> {
+        vec![
+            Command::Open {
+                sid: "01H".to_string(),
+                cwd: "/work/repo".to_string(),
+            },
+            Command::Prompt {
+                sid: "01H".to_string(),
+                text: "fix it".to_string(),
+            },
+            Command::StartSession {
+                sid: "01H".to_string(),
+                cwd: "/work/repo".to_string(),
+                provider: None,
+                model: None,
+                name: "fix it".to_string(),
+                first_prompt: "fix it".to_string(),
+            },
+            Command::ListModels {
+                cwd: "/work/repo".to_string(),
+                token: token(),
+            },
+            Command::PiRequest {
+                sid: "01H".to_string(),
+                cmd: json!({"type": "get_state"}),
+                token: token(),
+            },
+            Command::Stop {
+                sid: "01H".to_string(),
+            },
+            Command::AnswerDialog {
+                sid: "01H".to_string(),
+                dialog_id: "dialog-1".to_string(),
+                answer: DialogAnswer::Cancelled,
+            },
+        ]
+    }
+
+    #[test]
+    fn only_the_two_commands_that_precede_a_session_may_bring_a_machine_up() {
+        let pre_session: Vec<bool> = every_command().iter().map(is_pre_session_command).collect();
+
+        assert_eq!(
+            pre_session,
+            [false, false, true, true, false, false, false],
+            "a command naming a running session needs a live link, not a connect attempt"
+        );
+    }
+
+    #[test]
+    fn a_start_is_pre_session_whatever_it_launches_with() {
+        let with_model = Command::StartSession {
+            sid: "01H".to_string(),
+            cwd: "/work/repo".to_string(),
+            provider: Some("anthropic".to_string()),
+            model: Some("claude".to_string()),
+            name: "fix it".to_string(),
+            first_prompt: "fix it".to_string(),
+        };
+
+        assert!(is_pre_session_command(&with_model));
+    }
 }

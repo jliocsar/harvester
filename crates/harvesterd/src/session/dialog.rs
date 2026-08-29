@@ -2,11 +2,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use harvester_proto::{lock, DIALOG_METHODS, PI_EXTENSION_UI_RESPONSE};
 use serde_json::json;
 
 use super::{LineProbe, Session};
-
-const DIALOG_METHODS: [&str; 4] = ["select", "confirm", "input", "editor"];
 
 const TIMEOUT_EVICTION_SLACK: Duration = Duration::from_secs(5);
 
@@ -45,7 +44,7 @@ impl DialogRoom {
             return false;
         }
 
-        self.pending.insert(dialog_id.to_owned(), envelope);
+        self.pending.insert(dialog_id.to_string(), envelope);
 
         true
     }
@@ -53,23 +52,19 @@ impl DialogRoom {
 
 impl Session {
     pub fn attach(&self) -> Vec<Arc<[u8]>> {
-        self.lock_room().attach()
+        lock(&self.room, "dialog room").attach()
     }
 
     pub fn detach(&self) -> Vec<String> {
-        self.lock_room().detach()
+        lock(&self.room, "dialog room").detach()
     }
 
     pub fn remove_pending_dialog(&self, dialog_id: &str) -> bool {
-        self.lock_room().remove_pending(dialog_id)
+        lock(&self.room, "dialog room").remove_pending(dialog_id)
     }
 
     fn remember_dialog(&self, dialog_id: &str, envelope: Arc<[u8]>) -> bool {
-        self.lock_room().remember(dialog_id, envelope)
-    }
-
-    fn lock_room(&self) -> std::sync::MutexGuard<'_, DialogRoom> {
-        self.room.lock().expect("dialog room mutex")
+        lock(&self.room, "dialog room").remember(dialog_id, envelope)
     }
 }
 
@@ -96,7 +91,7 @@ pub(super) fn apply_policy(
 }
 
 pub fn cancel(session: &Session, dialog_id: &str) {
-    let cancel = json!({"type": "extension_ui_response", "id": dialog_id, "cancelled": true});
+    let cancel = json!({"type": PI_EXTENSION_UI_RESPONSE, "id": dialog_id, "cancelled": true});
 
     if let Err(error) = session.write_line(&cancel) {
         eprintln!(
@@ -108,7 +103,7 @@ pub fn cancel(session: &Session, dialog_id: &str) {
 
 fn spawn_eviction(session: &Arc<Session>, dialog_id: &str, timeout_ms: u64) {
     let weak_session: Weak<Session> = Arc::downgrade(session);
-    let dialog_id = dialog_id.to_owned();
+    let dialog_id = dialog_id.to_string();
     let evict_after = Duration::from_millis(timeout_ms).saturating_add(TIMEOUT_EVICTION_SLACK);
 
     tokio::spawn(async move {
@@ -212,7 +207,7 @@ mod tests {
 
         let to_cancel = room.detach();
 
-        assert_eq!(sorted(to_cancel), vec!["d1".to_owned(), "d2".to_owned()]);
+        assert_eq!(sorted(to_cancel), vec!["d1".to_string(), "d2".to_string()]);
         assert_eq!(room.attached, 0);
         assert!(room.pending.is_empty());
     }
@@ -268,7 +263,7 @@ mod tests {
 
         let to_cancel = room.detach();
 
-        assert_eq!(to_cancel, vec!["still_open".to_owned()]);
+        assert_eq!(to_cancel, vec!["still_open".to_string()]);
     }
 
     fn probe(line: &str) -> LineProbe<'_> {

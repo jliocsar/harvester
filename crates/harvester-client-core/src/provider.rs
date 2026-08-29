@@ -2,6 +2,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use harvester_proto::replace_atomically;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -19,22 +20,22 @@ const BUNDLED_EXE_DEV_NAME: &str = "exe-dev";
 const BUNDLED_PROVIDER_MODE: u32 = 0o755;
 
 #[derive(Debug, Clone)]
-pub struct Provider {
+pub(crate) struct Provider {
     pub name: String,
     path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct MachineKey {
+pub(crate) struct MachineKey {
     pub provider: String,
     pub id: String,
 }
 
 impl MachineKey {
-    pub fn parse(stored: &str) -> Option<MachineKey> {
+    pub(crate) fn parse(stored: &str) -> Option<Self> {
         let (provider, id) = stored.split_once('/')?;
 
-        Some(MachineKey {
+        Some(Self {
             provider: provider.to_string(),
             id: id.to_string(),
         })
@@ -48,34 +49,10 @@ impl std::fmt::Display for MachineKey {
 }
 
 #[derive(Debug, Clone)]
-pub struct ProviderMachine {
+pub(crate) struct ProviderMachine {
     pub id: String,
     pub label: String,
-    pub ssh: SshInfo,
-}
-
-#[derive(Debug, Clone)]
-pub enum SshInfo {
-    Host {
-        host: String,
-        user: Option<String>,
-        port: Option<u16>,
-    },
-    Argv(#[allow(dead_code)] Vec<String>),
-}
-
-impl SshInfo {
-    pub fn target(&self) -> Option<SshTarget> {
-        let SshInfo::Host { host, user, port } = self else {
-            return None;
-        };
-        let dest = match user {
-            Some(user) => format!("{user}@{host}"),
-            None => host.clone(),
-        };
-
-        Some(SshTarget { dest, port: *port })
-    }
+    pub target: Option<SshTarget>,
 }
 
 fn providers_dir() -> Result<PathBuf> {
@@ -88,7 +65,7 @@ fn providers_dir() -> Result<PathBuf> {
     }
 }
 
-pub fn install_bundled_providers() -> Result<()> {
+pub(crate) fn install_bundled_providers() -> Result<()> {
     let path = providers_dir()?.join(BUNDLED_EXE_DEV_NAME);
 
     if installed_matches_bundle(&path) {
@@ -99,13 +76,11 @@ pub fn install_bundled_providers() -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let staged = path.with_extension(format!("next.{}", std::process::id()));
-
-    if let Err(error) = write_bundled_provider(&staged, &path) {
-        let _ = std::fs::remove_file(&staged);
-
-        return Err(error);
-    }
+    replace_atomically(
+        &path,
+        BUNDLED_EXE_DEV.as_bytes(),
+        Some(BUNDLED_PROVIDER_MODE),
+    )?;
 
     Ok(())
 }
@@ -114,18 +89,7 @@ fn installed_matches_bundle(path: &std::path::Path) -> bool {
     matches!(std::fs::read(path), Ok(installed) if installed == BUNDLED_EXE_DEV.as_bytes())
 }
 
-fn write_bundled_provider(staged: &std::path::Path, path: &std::path::Path) -> Result<()> {
-    std::fs::write(staged, BUNDLED_EXE_DEV)?;
-
-    let mut permissions = std::fs::metadata(staged)?.permissions();
-    permissions.set_mode(BUNDLED_PROVIDER_MODE);
-    std::fs::set_permissions(staged, permissions)?;
-    std::fs::rename(staged, path)?;
-
-    Ok(())
-}
-
-pub fn discover_providers() -> Result<Vec<Provider>> {
+pub(crate) fn discover_providers() -> Result<Vec<Provider>> {
     let dir = providers_dir()?;
 
     let entries = match std::fs::read_dir(&dir) {
@@ -179,13 +143,13 @@ pub fn discover_providers() -> Result<Vec<Provider>> {
 }
 
 impl Provider {
-    pub async fn check_protocol(&self) -> Result<()> {
+    pub(crate) async fn check_protocol(&self) -> Result<()> {
         let result = self.invoke("info", None).await?;
 
         check_info(&self.name, result)
     }
 
-    pub async fn list_machines(&self) -> Result<Vec<ProviderMachine>> {
+    pub(crate) async fn list_machines(&self) -> Result<Vec<ProviderMachine>> {
         let result = self.invoke("list", None).await?;
 
         parse_machine_list(&self.name, result)
@@ -195,17 +159,9 @@ impl Provider {
         let mut command = tokio::process::Command::new(&self.path);
         command.arg(operation);
 
-        let output =
-            match tokio::time::timeout(INVOKE_TIMEOUT, host::run(command, stdin_data)).await {
-                Ok(io_result) => io_result?,
-                Err(_elapsed) => {
-                    return Err(self.error(format!(
-                        "`{operation}` timed out after {}s",
-                        INVOKE_TIMEOUT.as_secs()
-                    )))
-                }
-            };
-
+        let output = host::run_within(command, stdin_data, INVOKE_TIMEOUT)
+            .await
+            .map_err(|error| self.error(format!("`{operation}`: {error}")))?;
         let stderr = output.stderr.trim();
 
         if !stderr.is_empty() {
@@ -270,11 +226,6 @@ struct MachineEntry {
 }
 
 #[derive(Deserialize)]
-struct ArgvSshEntry {
-    argv: Vec<String>,
-}
-
-#[derive(Deserialize)]
 struct HostSshEntry {
     host: String,
     #[serde(default)]
@@ -320,29 +271,30 @@ fn parse_machine_list(provider: &str, result: Value) -> Result<Vec<ProviderMachi
 
 fn parse_machine(entry: Value) -> serde_json::Result<ProviderMachine> {
     let entry: MachineEntry = serde_json::from_value(entry)?;
-    let ssh = parse_ssh_info(entry.ssh)?;
+    let target = parse_ssh_target(entry.ssh)?;
 
     Ok(ProviderMachine {
         id: entry.id,
         label: entry.label,
-        ssh,
+        target,
     })
 }
 
-fn parse_ssh_info(ssh: Value) -> serde_json::Result<SshInfo> {
+fn parse_ssh_target(ssh: Value) -> serde_json::Result<Option<SshTarget>> {
     if ssh.get("argv").is_some() {
-        let argv: ArgvSshEntry = serde_json::from_value(ssh)?;
-
-        return Ok(SshInfo::Argv(argv.argv));
+        return Ok(None);
     }
 
     let host: HostSshEntry = serde_json::from_value(ssh)?;
+    let dest = match host.user {
+        Some(user) => format!("{user}@{}", host.host),
+        None => host.host,
+    };
 
-    Ok(SshInfo::Host {
-        host: host.host,
-        user: host.user,
+    Ok(Some(SshTarget {
+        dest,
         port: host.port,
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -350,6 +302,8 @@ mod tests {
     use super::*;
 
     use serde_json::json;
+
+    use crate::scratch::ScratchDir;
 
     fn list_result(entries: Value) -> Value {
         json!({ "machines": entries })
@@ -373,13 +327,13 @@ mod tests {
         assert_eq!(machines[0].id, "bloggy");
         assert_eq!(machines[0].label, "bloggy");
 
-        let SshInfo::Host { host, user, port } = &machines[0].ssh else {
-            panic!("the host form must decode as SshInfo::Host");
-        };
+        let target = machines[0]
+            .target
+            .as_ref()
+            .expect("the host form resolves to a target");
 
-        assert_eq!(host, "bloggy.exe.xyz");
-        assert_eq!(user.as_deref(), Some("exedev"));
-        assert_eq!(*port, Some(22));
+        assert_eq!(target.dest, "exedev@bloggy.exe.xyz");
+        assert_eq!(target.port, Some(22));
     }
 
     #[test]
@@ -392,13 +346,16 @@ mod tests {
         });
         let machines =
             parse_machine_list("exe-dev", list_result(json!([entry]))).expect("must parse");
+        let target = machines[0]
+            .target
+            .as_ref()
+            .expect("the host form resolves to a target");
 
-        let SshInfo::Host { user, port, .. } = &machines[0].ssh else {
-            panic!("the host form must decode as SshInfo::Host");
-        };
-
-        assert_eq!(*user, None);
-        assert_eq!(*port, None);
+        assert_eq!(
+            target.dest, "vps.exe.xyz",
+            "an omitted user leaves the destination bare, so ssh applies its own default"
+        );
+        assert_eq!(target.port, None);
     }
 
     #[test]
@@ -411,12 +368,11 @@ mod tests {
         });
         let machines = parse_machine_list("fly", list_result(json!([entry]))).expect("must parse");
 
-        let SshInfo::Argv(argv) = &machines[0].ssh else {
-            panic!("the argv form must decode as SshInfo::Argv");
-        };
-
-        assert_eq!(argv.len(), 6);
-        assert_eq!(argv[0], "fly");
+        assert_eq!(machines.len(), 1);
+        assert!(
+            machines[0].target.is_none(),
+            "docs/PROVIDERS.md §list: such machines still list, with no target"
+        );
     }
 
     #[test]
@@ -446,10 +402,7 @@ mod tests {
 
     #[test]
     fn only_a_byte_identical_install_is_left_alone() {
-        let dir = std::env::temp_dir().join(format!("harvester-bundle-{}", std::process::id()));
-
-        std::fs::create_dir_all(&dir).expect("test dir");
-
+        let dir = ScratchDir::create("bundle");
         let path = dir.join(BUNDLED_EXE_DEV_NAME);
 
         assert!(
@@ -467,8 +420,6 @@ mod tests {
         std::fs::write(&path, BUNDLED_EXE_DEV).expect("write");
 
         assert!(installed_matches_bundle(&path));
-
-        std::fs::remove_dir_all(&dir).expect("test dir cleanup");
     }
 
     #[test]

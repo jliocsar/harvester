@@ -12,7 +12,7 @@ use gpui_component::{ActiveTheme as _, Disableable as _, Icon, IconName, Sizable
 
 use crate::assets::GIT_BRANCH_ICON_PATH;
 
-use super::core::{inline_note, Tone};
+use super::core::{inline_note, truncated_to_max_chars, Tone};
 
 const MODEL_CONTROL_ID: &str = "chat-model";
 const MACHINE_CONTROL_ID: &str = "chat-machine";
@@ -28,31 +28,42 @@ const SEND_TOOLTIP: &str = "Send";
 const STOP_LABEL: &str = "Stop";
 const STOP_TOOLTIP: &str = "Stop pi — the session can be resumed from the sidebar";
 const INPUT_KEY_CONTEXT: &str = "Input";
+const PROMPT_INPUT_PLACEHOLDER: &str = "Message pi — Enter to send";
+const PROMPT_INPUT_ROWS: (usize, usize) = (1, 8);
 
 const CONTROL_LABEL_MAX_CHARS: usize = 24;
-const CONTROL_LABEL_ELLIPSIS: char = '\u{2026}';
 
 const SEND_KEYSTROKE: Enter = Enter {
     secondary: false,
     shift: false,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Action)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Action)]
 #[action(namespace = prompt, no_json)]
 pub struct PickModel {
     pub index: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Action)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Action)]
 #[action(namespace = prompt, no_json)]
 pub struct PickMachine {
     pub index: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Action)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Action)]
 #[action(namespace = prompt, no_json)]
 pub struct PickRepo {
     pub index: usize,
+}
+
+pub fn create_prompt_input(window: &mut Window, cx: &mut App) -> Entity<InputState> {
+    cx.new(|cx| {
+        InputState::new(window, cx)
+            .placeholder(PROMPT_INPUT_PLACEHOLDER)
+            .multi_line(true)
+            .auto_grow(PROMPT_INPUT_ROWS.0, PROMPT_INPUT_ROWS.1)
+            .submit_on_enter(true)
+    })
 }
 
 fn prompt_box(focused: bool, cx: &App) -> Div {
@@ -100,13 +111,10 @@ fn prompt_box_control(
 }
 
 fn truncated_control_label(label: SharedString) -> SharedString {
-    if label.chars().count() <= CONTROL_LABEL_MAX_CHARS {
-        return label;
+    match truncated_to_max_chars(&label, CONTROL_LABEL_MAX_CHARS) {
+        Some(truncated) => truncated.into(),
+        None => label,
     }
-
-    let kept: String = label.chars().take(CONTROL_LABEL_MAX_CHARS - 1).collect();
-
-    format!("{}{CONTROL_LABEL_ELLIPSIS}", kept.trim_end()).into()
 }
 
 fn prompt_box_dropdown(

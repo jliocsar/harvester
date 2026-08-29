@@ -54,9 +54,8 @@ pub async fn serve_connection(daemon: Daemon, stream: UnixStream) {
     let mut buf: Vec<u8> = Vec::new();
 
     loop {
-        let line = match read_frame(&mut reader, &mut buf).await {
-            Ok(Some(line)) => line,
-            Ok(None) | Err(_) => break,
+        let Ok(Some(line)) = read_frame(&mut reader, &mut buf).await else {
+            break;
         };
 
         let Some(request) = decode_line(line, &out_tx).await else {

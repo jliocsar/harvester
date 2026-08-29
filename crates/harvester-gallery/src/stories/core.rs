@@ -1,5 +1,5 @@
 use gpui::{div, prelude::*, AnyElement, App, Div, Window};
-use harvester::ui::{status_dot_for_tone, Dot, Tone};
+use harvester::ui::{status_dot_for_tone, Tone};
 
 use super::{caption, story_column, story_row, tone_at, tone_index, tone_labels, CORE_GROUP};
 use crate::story::{KnobSpec, KnobValue, Preset, Story, StoryScene};
@@ -73,9 +73,10 @@ fn dot(scene: &StoryScene, _window: &mut Window, cx: &mut App) -> AnyElement {
 }
 
 fn derived_dot_label(tone: Tone) -> String {
-    let shape = match tone.dot() {
-        Dot::Solid(_) => SOLID_SHAPE_NAME,
-        Dot::Hollow(_) => HOLLOW_SHAPE_NAME,
+    let shape = if tone.is_hollow() {
+        HOLLOW_SHAPE_NAME
+    } else {
+        SOLID_SHAPE_NAME
     };
 
     format!("{shape} · {}", tone.label())

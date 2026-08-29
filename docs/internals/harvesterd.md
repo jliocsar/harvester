@@ -43,6 +43,22 @@ async-runtime thread never waits on disk.
   before anything is UTF-8-validated or JSON-parsed. Cheap prefilter — the
   overwhelming majority of lines in a conversation log are ordinary messages
   and never match, so most lines never pay for parsing.
+- `SessionHeader` / `SessionInfoEntry` are borrowed `#[derive(Deserialize)]`
+  probes over the two line shapes this module reads, the same pattern as
+  `session.rs`'s `LineProbe` and `server.rs`'s `RequestIdProbe`. They replaced
+  a `serde_json::Value` DOM dug with `.get()?.as_str()?` chains — this was the
+  last place in the crate that read a pi JSONL line through a DOM, and the
+  probes cost about three lines to be rid of it. `Value` is now only in this
+  module's tests, where it builds fixtures.
+  - `SessionHeader` makes `type`, `id` and `cwd` **required**, which is the
+    behaviour the `.get()?` chain already had: a header missing any of them
+    yields no session at all.
+  - **One deliberate behaviour change**: a `session_info` entry whose `name` is
+    present but *not a string* used to parse (as `Value`) and clear the name;
+    under the derive that line fails to deserialize, is skipped, and the
+    previous name survives. Pi never emits that shape — `name` is typed
+    `string | undefined` — so the difference is unobservable in practice, and
+    "an unreadable line changes nothing" is the safer of the two answers.
 - **Why `running` sessions are unioned into the listing, not just consulted
   for status**: pi writes a session's file *lazily*, on the first entry — so a
   session that has been spawned but never prompted has a live pi process and
@@ -73,12 +89,14 @@ async-runtime thread never waits on disk.
   append-only. Every line is first rejected by the byte-level substring
   prefilter, so only a real candidate line is ever UTF-8-validated and
   JSON-parsed.
-- `entry_display_name` follows **pi's own rule** (source-verified at
+  Name resolution follows **pi's own rule** (source-verified at
   `session-manager.ts:713-714`, "use latest, including explicit clears"): the
   name is trimmed, and an empty or whitespace-only name is treated as an
   *explicit clear*, not as a blank/missing title. A later nameless
   `session_info` entry therefore clears an earlier name — "last entry wins"
-  includes losing the name, by design.
+  includes losing the name, by design. That is the whole of what the deleted
+  `entry_display_name` helper did, and it is now the `map(trim).filter(…)`
+  pair at the end of the scan loop.
 - `append_fileless_running`: a session with no file yet has no header line, so
   everything reported about it (`cwd`, `mtime_ms`) comes from what the pid
   table recorded at spawn.
@@ -186,10 +204,14 @@ one-command handlers; `ops::spawn_list_models` is the only caller.
 - **`capture_pi_stderr` / `explain_pi_failure` / `pi_stderr_summary`**: pi's
   stderr used to be `Stdio::null()`, so a pi that died on startup produced
   only "pi exited before answering" and the reason was gone. It is piped now.
-  The drain runs as its own task and keeps reading *after* the
-  `PI_STDERR_CAPTURE_BYTES` cap is reached, appending nothing — stopping the
-  reads instead would fill the pipe and block pi, turning a crash report into
-  a hang. Both failure arms (clean EOF and a read error) route through
+  The drain runs as its own task and is literally
+  `stderr.take(PI_STDERR_CAPTURE_BYTES)` + `read_to_end`, then a
+  `copy(&mut take.into_inner(), &mut sink())` for the rest — the second half
+  is the load-bearing one: reads must *continue* past the cap or the pipe
+  fills and blocks a pi that is trying to crash, turning a crash report into a
+  hang. (This used to be a hand-rolled chunk loop where that rule was
+  invisible; the two-line version says it.) Both failure arms (clean EOF and a
+  read error) route through
   `explain_pi_failure`, which writes the whole capture to the daemon's own
   stderr — `~/.harvester/log/harvesterd.log` when started by `bootstrap.rs` —
   and appends a one-line summary to the error the client shows.
@@ -208,10 +230,15 @@ Named constants and why their values are what they are:
   `STOP_KILL_BACKSTOP` — only a wedged pi hits it, and `kill_on_drop` SIGKILLs
   on expiry, which is safe here because a `--no-session` pi has nothing
   durable to truncate.
-- `MODELS_REQUEST_ID` ("hv-models"): deliberately inside the `hv-` namespace
-  the passthrough pump routes on, even though this throwaway pi has no pump —
-  the reply filter matches it directly.
-- `PI_STDERR_CAPTURE_BYTES` (8 KiB) / `PI_STDERR_CHUNK_BYTES` (1 KiB): a
+- `MODELS_REQUEST_SUFFIX` ("models"): the request id is built as
+  `PASSTHROUGH_ID_PREFIX + MODELS_REQUEST_SUFFIX` ("hv-models") rather than
+  spelled whole, so the `hv-` namespace has one owner (`session.rs`) even
+  though this throwaway pi has no pump routing on it — here the reply filter
+  matches the id directly. It is a `format!` in `query_available_models`, not a
+  const, because Rust cannot concatenate two `&'static str` consts at compile
+  time without a macro crate, and this runs once per `list_models`, next to a
+  process spawn.
+- `PI_STDERR_CAPTURE_BYTES` (8 KiB, a `u64` because it is a `take` limit): a
   startup crash report is a few hundred bytes and a node stack trace is a
   couple of KiB, so 8 KiB holds a whole one with room spare while bounding
   what a chatty pi can make the daemon hold.
@@ -281,8 +308,14 @@ frames/decodes/routes/encodes (the controller-layer house rule).
   this module. The shapes stay pinned by docs/DAEMON.md, by
   `detach_answers_the_documented_empty_payload` and by
   `stopping_a_session_that_is_no_longer_running_succeeds`.
-  The `already` flags on `attach`/`create_session` keep their typed payloads —
-  those are a documented contract the client reads.
+  The `already` flags on `attach`/`create_session` keep their typed payloads
+  because those shapes are *pinned* — by docs/DAEMON.md and by the round-trip
+  tests in `harvester-proto` — for a client that may read them. Today's client
+  reads neither (`client-core`'s bridge discards the attach payload outright,
+  and neither `CreateSessionData` nor `AttachData` is imported outside proto
+  and harvesterd), so the typing buys a modelled wire field rather than a
+  live contract; that is still the right side to err on for a flag the
+  protocol document promises.
 - **`attach`**: subscribes to the session's broadcast channel *before* joining
   the dialog room, never the reverse. A dialog arriving between the two steps
   is auto-cancelled (room still reads as empty) — one spurious "Escape" — but
@@ -297,6 +330,15 @@ frames/decodes/routes/encodes (the controller-layer house rule).
   events for this subscriber. This is recoverable but never silent — an
   `EventGap` is sent so the client can `get_entries` to resync from its last
   seen event, then streaming continues from the oldest retained event.
+  The task body is a pure router: `replay_pending_dialogs`,
+  `forward_session_output` (itself routing to `forward_session_exit`) and
+  `report_event_gap` each own one outcome, per the house "match arms delegate"
+  rule. Each returns **"keep forwarding"** as a `bool`, so the loop has exactly
+  one `break` and every reason to stop — the client's socket closed, the
+  session exited, the broadcast channel closed — is expressed the same way.
+  `forward_session_exit` returns `false` unconditionally: `session_exit` is the
+  last thing this forwarder ever sends, and whether the client was still there
+  to receive it does not change that.
 - **`stop`** is non-blocking: it starts a polite escalation ladder and returns
   immediately. `session_exit` is the authoritative "it's done" signal; this
   response only means "shutdown initiated". A sid the pid table doesn't know
@@ -396,8 +438,10 @@ Implements verbatim pi RPC passthrough (docs/DAEMON.md §The `pi` passthrough).
     waiter on exit (mirroring pi's own RPC client's reject-pending-on-exit
     shape). A daemon-invented timeout would fabricate failures for
     slow-but-fine commands and could silently drop pi's real answer.
-- `forward_dialog_answer`: `extension_ui_response` is fire-and-forget on pi's
-  side — it resolves immediately with `response: null`. First answer wins:
+- `forward_dialog_answer`: `extension_ui_response`
+  (`harvester_proto::PI_EXTENSION_UI_RESPONSE` — a pi token this crate and
+  client-core both write, hence named in proto) is fire-and-forget on pi's
+  side: it resolves immediately with `response: null`. First answer wins:
   only the dialog's claim holder's answer is forwarded to pi; any other
   client's answer is dropped (docs/DAEMON.md dialog policy). A write failure
   here is logged loudly (not swallowed) because it means the winning answer
@@ -483,8 +527,9 @@ pids, not persisted state.
   into pi commands so the stdout pump can route a response back to its waiter
   by prefix match. The mint (`Daemon::next_passthrough_id`) and the match
   (`passthrough_response_key`) must agree on the exact string, hence one
-  shared const rather than a literal duplicated at each site. It is private
-  now that both sites live in this module.
+  shared const rather than a literal duplicated at each site. Both of those
+  live in this module; it is `pub` only because `models.rs` builds its
+  `hv-models` request id from it rather than spelling the prefix a third time.
 - `SpawnOutcome::AlreadyRunning` vs `::Spawned`: both arms return the live
   session so callers never need to reconstruct the sid they just moved in.
   "AlreadyRunning" exists because the pid table is the per-sid single-instance
@@ -501,7 +546,15 @@ pids, not persisted state.
   process.
 - `DaemonInner.sessions` uses `std::sync::Mutex` deliberately (not tokio's):
   no guard is ever held across an `.await`, and lookups happen on every
-  passthrough, so a blocking mutex is fine and simpler.
+  passthrough, so a blocking mutex is fine and simpler. Every lock in this
+  crate is taken through `harvester_proto::lock(&mutex, "<field name>")`, which
+  replaced four local three-line `lock_*` helpers here; the label is what a
+  poison panic prints, so it stays the field's own name.
+- `Daemon::session` takes `&Sid`, not `&str`, and so do the `AttachedMap`
+  lookups in `ops.rs`. Every caller already holds a validated `Sid` at that
+  point, and the old `&str` signatures forced seven `.as_str()` calls whose
+  only effect was to throw the proof of validation away one line before it was
+  needed.
 - `Daemon::running_sessions()` copies every live pi child out from under the
   lock because no guard may cross the `spawn_blocking` boundary the caller
   (fslist) is headed for. Keyed by sid because `list_sessions` asks "is this
@@ -608,8 +661,15 @@ pids, not persisted state.
     pattern.
 - **`write_line`** is deliberately synchronous at the call site: the queue
   absorbs the write so no caller — least of all the connection loop — can be
-  parked by a pi that stopped reading. A full queue reports "would block"
-  immediately instead of parking the caller.
+  parked by a pi that stopped reading. A full queue fails immediately
+  ("session stdin queue is full — pi is not reading") instead of parking the
+  caller. It returns `Result<(), &'static str>`, not `io::Result`: nothing here
+  is an OS error, the three failures are compile-time constants, and all three
+  callers (`passthrough.rs`, `ops::stop`, `dialog::cancel`) format the error
+  into a message without ever inspecting a `kind()`. Fabricating
+  `BrokenPipe`/`WouldBlock` to satisfy an `io::Result` signature was inventing
+  an errno for a channel; `&'static str` says the same thing and allocates
+  nothing.
 - **`close_stdin`** is the graceful path: drop the queue's sender, let the pump
   drain whatever is already queued (so a just-written `abort` still reaches
   pi), then drop the pipe handle — that's what delivers EOF, pi's
@@ -656,10 +716,19 @@ pids, not persisted state.
   shares the resulting bytes, and a pending dialog keeps the same `Arc` for
   later replay. The pi line is spliced in verbatim (see the `event_prefix`
   soundness note above for what protects this).
+- `spawned_at_ms` and the stderr banner's clock both come from
+  `harvester_proto::unix_millis_now`. It lives in proto, not here, because the
+  client's catalog had a byte-identical copy filling the *same*
+  `SessionInfo.mtime_ms` field.
 
 Constants:
 - `SESSION_EVENT_BUFFER` (1024): events buffered per session for slow
   subscribers before `RecvError::Lagged` kicks in.
+- `EVENT_ENVELOPE_END` (`b'}'`): the single byte `encode_event` appends to
+  close the envelope `event_prefix` opened. Named for the same reason proto
+  names `LF` and `CR` — a bare protocol byte in the middle of a
+  byte-concatenation is the one place a typo produces a corrupt frame rather
+  than a compile error.
 - `STDIN_QUEUE_DEPTH` (64): frames queued for pi's stdin before writers are
   told to back off. Only a pi that stopped draining its stdin can fill this;
   failing fast beats queueing without bound, since the caller learns
@@ -674,7 +743,10 @@ nobody can answer.
 - `DIALOG_METHODS` = `select`, `confirm`, `input`, `editor` — the
   `extension_ui_request` methods that actually block pi until answered.
   Fire-and-forget kinds (`notify`, `setStatus`, …) are ordinary events, not
-  dialogs.
+  dialogs. The list is **`harvester_proto::DIALOG_METHODS`**, not a local
+  const: the client renders exactly the methods the daemon holds open, so the
+  two must be one list. See docs/internals/harvester-proto.md for why, and for
+  the test that pins it.
 - `TIMEOUT_EVICTION_SLACK` (5s): added to a dialog's own `timeout` before the
   daemon gives up on it. Pi's timer and the daemon's timer start at different
   moments — pi arms its timer before writing the request; the daemon's starts
@@ -752,5 +824,17 @@ of those roles honest — the type itself is the proof validation happened.
   path, an argv, or the pid table.
 - `Sid::parse` takes `&str` rather than an owned `String` off the wire so a
   caller that must echo the *rejected* sid back in an error still owns it.
-- `Borrow<str>` lets a `HashMap<Sid, _>` (e.g. `AttachedMap`) be looked up by
-  `&str` without allocating a new `Sid`.
+- `Borrow<str>` lets a `HashMap<Sid, _>` be looked up by `&str` without
+  allocating a new `Sid`. It has **exactly one user**, `fslist.rs`'s
+  `running.contains_key(sid.as_str())` — verified by deleting the impl and
+  reading the one resulting compile error. That site is the reason the impl
+  exists: the sid there is an unvalidated `String` read off a session file's
+  header line, and it is deliberately *not* run through `Sid::parse`. Pi's own
+  charset is wider than anything Harvester mints, so validating a sid read off
+  disk could only ever hide a session pi can still open. Everywhere a caller
+  already holds a validated `Sid`, the map is looked up by `&Sid` directly.
+- There is no `From<Sid> for String`. It existed only so a `Sid` could be
+  spent into a wire field, and `passthrough.rs` was calling `sid.into()` and
+  `sid.to_string()` for the same conversion three times each inside one
+  function. `Display` already answers "how does a sid render", so
+  `.to_string()` is the single spelling.

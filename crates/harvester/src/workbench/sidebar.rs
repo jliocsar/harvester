@@ -2,22 +2,20 @@ use gpui::{div, prelude::*, Context, Entity, EventEmitter, Role, SharedString};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::list::ListItem;
 use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _};
-use harvester_client_core::LOCAL_MACHINE;
+use harvester_client_core::{folder_name, LOCAL_MACHINE};
 use harvester_proto::SessionStatus;
 
-use super::machine_presentation::present_machine;
+use super::machine_presentation::{present_machine, MISSING_MACHINE_DETAIL};
 use crate::assets::TRASH_ICON_PATH;
+use crate::chat::NEW_SESSION_LABEL;
 use crate::store::{FleetStore, MachineSession};
 use crate::ui::{self, KeyboardFocusRing as _, Tone};
-use crate::workspaces::folder_name;
 
 const SID_PREVIEW_CHARS: usize = 8;
-const MISSING_MACHINE_DETAIL: &str = "no longer listed";
 const FORGET_MACHINE_TOOLTIP: &str = "Forget this machine";
 const MACHINES_SECTION_TITLE: &str = "Machines";
 const SESSIONS_SECTION_TITLE: &str = "Sessions";
 const NO_SESSIONS_NOTE: &str = "No sessions yet";
-const NEW_SESSION_LABEL: &str = "New session";
 const OPENING_SESSION_NOTE: &str = "opening…";
 
 pub(super) enum SidebarIntent {
@@ -30,20 +28,20 @@ pub(super) struct Sidebar {
     store: Entity<FleetStore>,
     machines_collapsed: bool,
     sessions_collapsed: bool,
-    _store: gpui::Subscription,
+    _store_repaint: gpui::Subscription,
 }
 
 impl EventEmitter<SidebarIntent> for Sidebar {}
 
 impl Sidebar {
     pub(super) fn new(store: Entity<FleetStore>, cx: &mut Context<Self>) -> Self {
-        let store_subscription = cx.observe(&store, |_, _, cx| cx.notify());
+        let store_repaint = cx.observe(&store, |_, _, cx| cx.notify());
 
         Self {
             store,
             machines_collapsed: false,
             sessions_collapsed: false,
-            _store: store_subscription,
+            _store_repaint: store_repaint,
         }
     }
 
@@ -51,6 +49,7 @@ impl Sidebar {
         let rows: Vec<SessionRow> = self
             .store
             .read(cx)
+            .catalog()
             .visible_sessions()
             .into_iter()
             .map(|session| self.session_row(session, cx))
@@ -209,8 +208,8 @@ impl Sidebar {
                 SessionStatus::Running => Tone::Live,
                 SessionStatus::Exited => Tone::Idle,
             },
-            selected: store.is_selected_session(&info.sid),
-            opening: store.opening_sid() == Some(info.sid.as_str()),
+            selected: store.catalog().is_selected_session(&info.sid),
+            opening: store.catalog().opening_sid() == Some(info.sid.as_str()),
             sid: info.sid.clone(),
         }
     }

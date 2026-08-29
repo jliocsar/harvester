@@ -187,7 +187,7 @@ fn replay_state_note(playing: bool, finished: bool, cx: &App) -> Div {
     div()
 }
 
-fn fixture_failure(failure: String, cx: &App) -> AnyElement {
+fn fixture_failure(failure: &str, cx: &App) -> AnyElement {
     transcript_panel(cx)
         .child(empty_pane_hint(Tone::Failed, failure, cx))
         .into_any_element()

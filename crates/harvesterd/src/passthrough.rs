@@ -1,4 +1,4 @@
-use harvester_proto::Outgoing;
+use harvester_proto::{Outgoing, PI_EXTENSION_UI_RESPONSE};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
@@ -23,19 +23,19 @@ pub fn pi_passthrough(
         Err(rejection) => return Some(error_response(id, sid, rejection)),
     };
 
-    let Some(session) = daemon.session(sid.as_str()) else {
+    let Some(session) = daemon.session(&sid) else {
         let message = no_such_session_message(&sid);
 
-        return Some(error_response(id, sid.into(), message));
+        return Some(error_response(id, sid.to_string(), message));
     };
 
     if let Some(command_type) = session_swapping_command(&cmd) {
         let message = session_swap_refusal_message(command_type);
 
-        return Some(error_response(id, sid.into(), message));
+        return Some(error_response(id, sid.to_string(), message));
     }
 
-    if cmd.get("type").and_then(Value::as_str) == Some("extension_ui_response") {
+    if cmd.get("type").and_then(Value::as_str) == Some(PI_EXTENSION_UI_RESPONSE) {
         return Some(forward_dialog_answer(&session, id, sid.to_string(), &cmd));
     }
 
@@ -67,7 +67,7 @@ pub fn pi_passthrough(
 
         Outgoing::PiResponse {
             id,
-            sid: sid.into(),
+            sid: sid.to_string(),
             response,
         }
     });
@@ -155,7 +155,7 @@ mod tests {
             json!({"type": "prompt", "message": "fix the tests"}),
             json!({"type": "abort"}),
             json!({"type": "get_entries"}),
-            json!({"type": "extension_ui_response", "id": "d1", "cancelled": true}),
+            json!({"type": PI_EXTENSION_UI_RESPONSE, "id": "d1", "cancelled": true}),
         ] {
             assert_eq!(session_swapping_command(&cmd), None);
         }

@@ -13,10 +13,11 @@ pub const CONFIRMATION_DIALOG_WIDTH_IN_REMS: f32 = 30.;
 pub const SELECT_DIALOG_WIDTH_IN_REMS: f32 = 36.;
 pub const TEXT_DIALOG_WIDTH_IN_REMS: f32 = 44.;
 
+pub const CANCEL_LABEL: &str = "Cancel";
+
 const SELECT_OPTION_ROW_HEIGHT_IN_REMS: f32 = 2.;
 const SELECT_VISIBLE_OPTION_ROWS: usize = 8;
 const EDITOR_ROWS: (usize, usize) = (6, 16);
-const CANCEL_LABEL: &str = "Cancel";
 const TEXT_COMMIT_LABEL: &str = "Reply";
 const SELECT_OPTION_ROW_ID: &str = "dialog-option";
 const SELECT_CANCEL_BUTTON_ID: &str = "dialog-select-cancel";
@@ -24,6 +25,8 @@ const CONFIRMATION_CANCEL_BUTTON_ID: &str = "dialog-confirmation-cancel";
 const CONFIRMATION_ACTION_BUTTON_ID: &str = "dialog-confirmation-action";
 const TEXT_CANCEL_BUTTON_ID: &str = "dialog-text-cancel";
 const TEXT_COMMIT_BUTTON_ID: &str = "dialog-text-commit";
+
+type ChooseOption = Rc<dyn Fn(String, &mut Window, &mut App) -> bool>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionAccent {
@@ -124,7 +127,7 @@ pub fn open_select<T: 'static>(
     let cancelled = Rc::new(cancelled);
     let option_count = options.len();
     let delegate = OptionListDelegate {
-        options: options.into_iter().map(SharedString::from).collect(),
+        options: options.into_iter().map(|option| option.into()).collect(),
         selected: None,
         chosen: Rc::new(chosen),
     };
@@ -229,7 +232,7 @@ pub fn open_text<T: 'static>(
 struct OptionListDelegate {
     options: Vec<SharedString>,
     selected: Option<IndexPath>,
-    chosen: Rc<dyn Fn(String, &mut Window, &mut App) -> bool>,
+    chosen: ChooseOption,
 }
 
 impl OptionListDelegate {
@@ -308,4 +311,64 @@ fn action_footer(cancel: Button, action: Button) -> DialogFooter {
 
 fn dismiss_only_footer(cancel: Button) -> DialogFooter {
     DialogFooter::new().child(DialogClose::new().child(cancel))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        options_height, title_or_named_condition, SELECT_OPTION_ROW_HEIGHT_IN_REMS,
+        SELECT_VISIBLE_OPTION_ROWS,
+    };
+    use gpui::rems;
+
+    const NAMED_CONDITION: &str = "Choose an option";
+
+    #[test]
+    fn a_title_pi_gave_us_is_shown_verbatim() {
+        assert_eq!(
+            title_or_named_condition("Overwrite main.rs?", NAMED_CONDITION),
+            "Overwrite main.rs?"
+        );
+    }
+
+    #[test]
+    fn a_title_is_trimmed_before_it_is_judged_present() {
+        assert_eq!(
+            title_or_named_condition("  Overwrite main.rs?  ", NAMED_CONDITION),
+            "Overwrite main.rs?"
+        );
+    }
+
+    #[test]
+    fn a_blank_title_falls_back_to_the_callers_own_condition() {
+        assert_eq!(
+            title_or_named_condition("", NAMED_CONDITION),
+            NAMED_CONDITION
+        );
+        assert_eq!(
+            title_or_named_condition("   \t ", NAMED_CONDITION),
+            NAMED_CONDITION
+        );
+    }
+
+    #[test]
+    fn a_short_list_gets_exactly_its_own_height() {
+        assert_eq!(
+            options_height(3),
+            rems(SELECT_OPTION_ROW_HEIGHT_IN_REMS * 3.)
+        );
+    }
+
+    #[test]
+    fn an_empty_list_still_reserves_one_row() {
+        assert_eq!(options_height(0), rems(SELECT_OPTION_ROW_HEIGHT_IN_REMS));
+    }
+
+    #[test]
+    fn a_long_list_stops_growing_and_scrolls_instead() {
+        let capped = rems(SELECT_OPTION_ROW_HEIGHT_IN_REMS * SELECT_VISIBLE_OPTION_ROWS as f32);
+
+        assert_eq!(options_height(SELECT_VISIBLE_OPTION_ROWS), capped);
+        assert_eq!(options_height(SELECT_VISIBLE_OPTION_ROWS + 40), capped);
+    }
 }

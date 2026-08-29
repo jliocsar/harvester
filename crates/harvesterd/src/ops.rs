@@ -159,12 +159,12 @@ fn attach(
     out_tx: &mpsc::Sender<Outbound>,
     attached: &mut AttachedMap,
 ) -> HarvesterResponse {
-    let Some(session) = daemon.session(sid.as_str()) else {
+    let Some(session) = daemon.session(&sid) else {
         return no_such_session(&sid);
     };
 
     let already_attached_to_this_generation = attached
-        .get(sid.as_str())
+        .get(&sid)
         .is_some_and(|existing| Arc::ptr_eq(&existing.session, &session));
 
     if already_attached_to_this_generation {
@@ -186,60 +186,86 @@ fn spawn_forwarder(
     out_tx: mpsc::Sender<Outbound>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        for dialog in pending_dialogs {
-            if out_tx.send(Outbound::Raw(dialog)).await.is_err() {
-                return;
-            }
+        if !replay_pending_dialogs(pending_dialogs, &out_tx).await {
+            return;
         }
 
         loop {
-            let output = match events.recv().await {
-                Ok(output) => output,
+            let received = events.recv().await;
+
+            let keep_forwarding = match received {
+                Ok(output) => forward_session_output(output, &sid, &out_tx).await,
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    eprintln!("forwarder {sid}: skipped {skipped} events (slow connection)");
-
-                    let gap = Outgoing::EventGap {
-                        sid: sid.to_string(),
-                        skipped,
-                    };
-
-                    if out_tx.send(Outbound::Typed(gap)).await.is_err() {
-                        break;
-                    }
-
-                    continue;
+                    report_event_gap(skipped, &sid, &out_tx).await
                 }
-                Err(broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Closed) => false,
             };
 
-            match output {
-                SessionOutput::Event(line) => {
-                    if out_tx.send(Outbound::Raw(line)).await.is_err() {
-                        break;
-                    }
-                }
-                SessionOutput::Exit { exit_code } => {
-                    let outgoing = Outgoing::SessionExit {
-                        sid: sid.to_string(),
-                        exit_code,
-                    };
-                    let _ = out_tx.send(Outbound::Typed(outgoing)).await;
-
-                    break;
-                }
+            if !keep_forwarding {
+                break;
             }
         }
     })
 }
 
+async fn replay_pending_dialogs(
+    pending_dialogs: Vec<Arc<[u8]>>,
+    out_tx: &mpsc::Sender<Outbound>,
+) -> bool {
+    for dialog in pending_dialogs {
+        if out_tx.send(Outbound::Raw(dialog)).await.is_err() {
+            return false;
+        }
+    }
+
+    true
+}
+
+async fn forward_session_output(
+    output: SessionOutput,
+    sid: &Sid,
+    out_tx: &mpsc::Sender<Outbound>,
+) -> bool {
+    match output {
+        SessionOutput::Event(line) => out_tx.send(Outbound::Raw(line)).await.is_ok(),
+        SessionOutput::Exit { exit_code } => forward_session_exit(exit_code, sid, out_tx).await,
+    }
+}
+
+async fn forward_session_exit(
+    exit_code: Option<i32>,
+    sid: &Sid,
+    out_tx: &mpsc::Sender<Outbound>,
+) -> bool {
+    let outgoing = Outgoing::SessionExit {
+        sid: sid.to_string(),
+        exit_code,
+    };
+
+    let _ = out_tx.send(Outbound::Typed(outgoing)).await;
+
+    false
+}
+
+async fn report_event_gap(skipped: u64, sid: &Sid, out_tx: &mpsc::Sender<Outbound>) -> bool {
+    eprintln!("forwarder {sid}: skipped {skipped} events (slow connection)");
+
+    let gap = Outgoing::EventGap {
+        sid: sid.to_string(),
+        skipped,
+    };
+
+    out_tx.send(Outbound::Typed(gap)).await.is_ok()
+}
+
 fn detach(sid: Sid, attached: &mut AttachedMap) -> HarvesterResponse {
-    attached.remove(sid.as_str());
+    attached.remove(&sid);
 
     data_response(json!({}))
 }
 
 fn stop(daemon: &Daemon, sid: Sid) -> HarvesterResponse {
-    let Some(session) = daemon.session(sid.as_str()) else {
+    let Some(session) = daemon.session(&sid) else {
         return already_stopped();
     };
 

@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use harvester_client_core::transcript::{Item, Role, ToolBlock, ToolStatus, Transcript};
+use harvester_proto::{CR, LF};
 use serde_json::Value;
 
 const FIXTURE_NAMES: &[&str] = &["streaming.jsonl", "tools.jsonl", "mixed.jsonl"];
@@ -13,10 +14,10 @@ fn fixture_events(name: &str) -> Vec<Value> {
         .join(name);
     let source = fs::read_to_string(&path).expect("readable fixture file");
 
-    assert!(!source.contains('\r'), "{name} must be LF-only");
+    assert!(!source.contains(CR as char), "{name} must be LF-only");
 
     source
-        .split('\n')
+        .split(LF as char)
         .filter(|line| !line.is_empty())
         .map(|line| serde_json::from_str(line).expect("every fixture line is one JSON value"))
         .collect()

@@ -1,8 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 
+use harvester_proto::{DIALOG_METHODS, PI_EXTENSION_UI_RESPONSE};
 use serde_json::{json, Value};
-
-const DIALOG_METHODS: [&str; 4] = ["select", "confirm", "input", "editor"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DialogRequest {
@@ -27,7 +26,7 @@ pub enum DialogAnswer {
 }
 
 impl DialogRequest {
-    pub fn parse(event: &Value) -> Option<DialogRequest> {
+    pub fn parse(event: &Value) -> Option<Self> {
         if event.get("type").and_then(Value::as_str)? != "extension_ui_request" {
             return None;
         }
@@ -39,10 +38,14 @@ impl DialogRequest {
         }
 
         let id = event.get("id").and_then(Value::as_str)?;
-        let title = string_field(event, "title").unwrap_or_default();
+        let title = event
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
         let kind = parse_kind(event, method)?;
 
-        Some(DialogRequest {
+        Some(Self {
             id: id.to_string(),
             title,
             kind,
@@ -67,33 +70,40 @@ fn parse_kind(event: &Value, method: &str) -> Option<DialogKind> {
             Some(DialogKind::Select { options })
         }
         "confirm" => Some(DialogKind::Confirm {
-            message: string_field(event, "message").unwrap_or_default(),
+            message: event
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
         }),
         "input" => Some(DialogKind::Input {
-            placeholder: string_field(event, "placeholder"),
+            placeholder: event
+                .get("placeholder")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         }),
         "editor" => Some(DialogKind::Editor {
-            prefill: string_field(event, "prefill"),
+            prefill: event
+                .get("prefill")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         }),
         _ => None,
     }
-}
-
-fn string_field(event: &Value, field: &str) -> Option<String> {
-    event.get(field).and_then(Value::as_str).map(str::to_string)
 }
 
 impl DialogAnswer {
     pub(crate) fn to_response(&self, dialog_id: &str) -> Value {
         match self {
             DialogAnswer::Value(value) => {
-                json!({"type": "extension_ui_response", "id": dialog_id, "value": value})
+                json!({"type": PI_EXTENSION_UI_RESPONSE, "id": dialog_id, "value": value})
             }
             DialogAnswer::Confirmed(confirmed) => {
-                json!({"type": "extension_ui_response", "id": dialog_id, "confirmed": confirmed})
+                json!({"type": PI_EXTENSION_UI_RESPONSE, "id": dialog_id,
+                       "confirmed": confirmed})
             }
             DialogAnswer::Cancelled => {
-                json!({"type": "extension_ui_response", "id": dialog_id, "cancelled": true})
+                json!({"type": PI_EXTENSION_UI_RESPONSE, "id": dialog_id, "cancelled": true})
             }
         }
     }

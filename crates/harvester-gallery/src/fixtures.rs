@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use harvester_client_core::transcript::Transcript;
+use harvester_client_core::transcript::{message_text, Transcript};
 use harvester_proto::{CR, LF};
 use serde_json::Value;
 
@@ -20,7 +20,6 @@ pub const TRANSCRIPT_SOURCE_LABELS: &[&str] = &[
 
 const MESSAGE_END_EVENT: &str = "message_end";
 const USER_ROLE: &str = "user";
-const TEXT_CONTENT_TYPE: &str = "text";
 const TOOL_EXECUTION_END_EVENT: &str = "tool_execution_end";
 
 pub enum TranscriptSource {
@@ -33,10 +32,10 @@ pub enum TranscriptSource {
 impl TranscriptSource {
     pub fn at(index: usize) -> Self {
         match index {
-            1 => TranscriptSource::ToolRun,
-            2 => TranscriptSource::FailedTool,
-            3 => TranscriptSource::MixedSession,
-            _ => TranscriptSource::MarkdownAnswer,
+            1 => Self::ToolRun,
+            2 => Self::FailedTool,
+            3 => Self::MixedSession,
+            _ => Self::MarkdownAnswer,
         }
     }
 }
@@ -124,6 +123,11 @@ pub fn apply_event(transcript: &mut Transcript, event: &Value) {
 fn read_events(path: &Path) -> Result<Vec<Value>, String> {
     let source = fs::read_to_string(path)
         .map_err(|error| format!("fixture {} is unreadable: {error}", path.display()))?;
+
+    parse_events(&source, path)
+}
+
+fn parse_events(source: &str, path: &Path) -> Result<Vec<Value>, String> {
     let mut events = Vec::new();
 
     for (offset, line) in source.split(LF as char).enumerate() {
@@ -167,19 +171,6 @@ fn user_prompt_text(event: &Value) -> Option<String> {
     Some(text)
 }
 
-fn message_text(message: &Value) -> String {
-    let Some(parts) = message.get("content").and_then(Value::as_array) else {
-        return String::new();
-    };
-
-    parts
-        .iter()
-        .filter(|part| part.get("type").and_then(Value::as_str) == Some(TEXT_CONTENT_TYPE))
-        .filter_map(|part| part.get("text").and_then(Value::as_str))
-        .collect::<Vec<&str>>()
-        .join("")
-}
-
 fn failed_tool_events(events: &[Value]) -> impl Iterator<Item = &Value> {
     let failed_ids = failed_tool_call_ids(events);
 
@@ -199,4 +190,103 @@ fn failed_tool_call_ids(events: &[Value]) -> HashSet<&str> {
 
 fn tool_call_id(event: &Value) -> Option<&str> {
     event.get("toolCallId").and_then(Value::as_str)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use serde_json::json;
+
+    fn parsed(source: &str) -> Result<Vec<Value>, String> {
+        parse_events(source, Path::new(STREAMING_FIXTURE_NAME))
+    }
+
+    fn user_message_end(content: Value) -> Value {
+        json!({ "type": MESSAGE_END_EVENT, "message": { "role": USER_ROLE, "content": content } })
+    }
+
+    #[test]
+    fn parsing_splits_on_lf_and_drops_the_blank_lines_a_trailing_newline_leaves() {
+        let events = parsed("{\"type\":\"a\"}\n{\"type\":\"b\"}\n").expect("two events");
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1]["type"], "b");
+    }
+
+    #[test]
+    fn parsing_strips_one_trailing_carriage_return_rather_than_failing_on_it() {
+        let events = parsed("{\"type\":\"a\"}\r\n{\"type\":\"b\"}\r\n").expect("two events");
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["type"], "a");
+    }
+
+    #[test]
+    fn a_malformed_line_names_the_fixture_and_its_one_based_line_number() {
+        let failure = parsed("{\"type\":\"a\"}\nnot json\n").expect_err("a parse failure");
+
+        assert!(failure.contains(STREAMING_FIXTURE_NAME), "{failure}");
+        assert!(failure.contains(":2 "), "{failure}");
+    }
+
+    #[test]
+    fn a_user_prompt_joins_its_text_blocks_the_way_the_app_does() {
+        let event = user_message_end(json!([
+            { "type": "text", "text": "first" },
+            { "type": "thinking", "text": "not prose" },
+            { "type": "text", "text": "second" },
+        ]));
+
+        assert_eq!(user_prompt_text(&event).as_deref(), Some("first\n\nsecond"));
+    }
+
+    #[test]
+    fn a_user_prompt_sent_as_a_bare_string_still_reads_as_one() {
+        let event = user_message_end(json!("just a string"));
+
+        assert_eq!(user_prompt_text(&event).as_deref(), Some("just a string"));
+    }
+
+    #[test]
+    fn only_a_user_message_end_carrying_text_is_a_prompt() {
+        let assistant = json!({
+            "type": MESSAGE_END_EVENT,
+            "message": { "role": "assistant", "content": [{ "type": "text", "text": "hi" }] },
+        });
+        let other_event = json!({ "type": "message_update", "message": { "role": USER_ROLE } });
+        let empty = user_message_end(json!([]));
+
+        assert_eq!(user_prompt_text(&assistant), None);
+        assert_eq!(user_prompt_text(&other_event), None);
+        assert_eq!(user_prompt_text(&empty), None);
+    }
+
+    #[test]
+    fn the_failed_tool_filter_keeps_every_event_naming_a_failing_call() {
+        let events = vec![
+            json!({ "type": "tool_execution_start", "toolCallId": "a", "toolName": "bash" }),
+            json!({ "type": TOOL_EXECUTION_END_EVENT, "toolCallId": "a", "isError": true }),
+            json!({ "type": "tool_execution_start", "toolCallId": "b", "toolName": "read" }),
+            json!({ "type": TOOL_EXECUTION_END_EVENT, "toolCallId": "b" }),
+            json!({ "type": MESSAGE_END_EVENT }),
+        ];
+        let kept: Vec<&str> = failed_tool_events(&events)
+            .filter_map(tool_call_id)
+            .collect();
+
+        assert_eq!(kept, ["a", "a"]);
+    }
+
+    #[test]
+    fn an_unknown_source_index_falls_back_to_the_markdown_answer() {
+        assert!(matches!(
+            TranscriptSource::at(TRANSCRIPT_SOURCE_LABELS.len()),
+            TranscriptSource::MarkdownAnswer
+        ));
+        assert!(matches!(
+            TranscriptSource::at(2),
+            TranscriptSource::FailedTool
+        ));
+    }
 }

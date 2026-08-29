@@ -10,10 +10,14 @@ use gpui_component::highlighter::HighlightTheme;
 use gpui_component::text::{TextView, TextViewStyle};
 use gpui_component::tooltip::Tooltip;
 use gpui_component::ActiveTheme as _;
+use harvester_client_core::folder_name;
 use harvester_client_core::transcript::{Item, Message, Role, ToolBlock, ToolStatus, Transcript};
 use serde_json::Value;
 
-use super::core::{dim, disclosure_chevron, faint, mono_font_family, status_dot_for_tone, Tone};
+use super::core::{
+    dim, disclosure_chevron, faint, mono_font_family, status_dot_for_tone, truncated_to_max_chars,
+    Tone,
+};
 
 const ARGS_SUMMARY_MAX_CHARS: usize = 80;
 const MESSAGE_LINE_HEIGHT: f32 = 1.7;
@@ -393,7 +397,7 @@ fn file_summary(block: &ToolBlock) -> ToolSummary {
     ToolSummary {
         verb: verb.clone(),
         accessible_verb: verb,
-        subject: basename(path).to_string().into(),
+        subject: folder_name(path).to_string().into(),
         subject_is_monospace: false,
         line_stats: block.line_stats(),
     }
@@ -551,26 +555,10 @@ fn render_diff_line(line: &str, cx: &App) -> Div {
     tool_block_diff_line(diff_line_kind(line), line.to_string().into(), cx)
 }
 
-fn basename(path: &str) -> &str {
-    let normalized = path.trim_end_matches('/');
-
-    if normalized.is_empty() && path.starts_with('/') {
-        return "/";
-    }
-
-    normalized.rsplit('/').next().unwrap_or(normalized)
-}
-
 fn compact_args(args: &Value) -> String {
     let json = args.to_string();
 
-    if json.chars().count() <= ARGS_SUMMARY_MAX_CHARS {
-        return json;
-    }
-
-    let truncated: String = json.chars().take(ARGS_SUMMARY_MAX_CHARS).collect();
-
-    format!("{truncated}…")
+    truncated_to_max_chars(&json, ARGS_SUMMARY_MAX_CHARS).unwrap_or(json)
 }
 
 #[cfg(test)]
@@ -592,14 +580,6 @@ mod tests {
     }
 
     #[test]
-    fn basename_uses_the_last_path_component() {
-        assert_eq!(basename("/tmp/repo/src/main.rs"), "main.rs");
-        assert_eq!(basename("Cargo.toml"), "Cargo.toml");
-        assert_eq!(basename("/tmp/repo/"), "repo");
-        assert_eq!(basename("/"), "/");
-    }
-
-    #[test]
     fn compact_args_preserves_short_json_and_caps_unicode_by_character() {
         assert_eq!(
             compact_args(&json!({"path": "src/main.rs"})),
@@ -608,7 +588,7 @@ mod tests {
 
         let summary = compact_args(&Value::String("é".repeat(100)));
 
-        assert_eq!(summary.chars().count(), ARGS_SUMMARY_MAX_CHARS + 1);
+        assert_eq!(summary.chars().count(), ARGS_SUMMARY_MAX_CHARS);
         assert!(summary.ends_with('…'));
     }
 

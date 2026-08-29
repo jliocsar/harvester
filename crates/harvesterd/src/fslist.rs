@@ -1,15 +1,34 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
 use harvester_proto::{SessionInfo, SessionStatus, LF};
-use serde_json::Value;
+use serde::Deserialize;
 
 use crate::session::RunningSession;
 use crate::sid::Sid;
 
 const SESSION_INFO_MARKER: &[u8] = br#""session_info""#;
+
+#[derive(Deserialize)]
+struct SessionHeader<'line> {
+    #[serde(rename = "type", borrow)]
+    kind: Cow<'line, str>,
+    #[serde(borrow)]
+    id: Cow<'line, str>,
+    #[serde(borrow)]
+    cwd: Cow<'line, str>,
+}
+
+#[derive(Deserialize)]
+struct SessionInfoEntry<'line> {
+    #[serde(rename = "type", borrow)]
+    kind: Cow<'line, str>,
+    #[serde(borrow, default)]
+    name: Option<Cow<'line, str>>,
+}
 
 pub fn list_sessions(running: &HashMap<Sid, RunningSession>) -> Vec<SessionInfo> {
     let Ok(dirs) = std::fs::read_dir(crate::pi_sessions_root()) else {
@@ -86,14 +105,15 @@ fn read_session_file(
 
     line_buffer.clear();
     reader.read_until(LF, line_buffer).ok()?;
-    let header: Value = serde_json::from_slice(line_buffer).ok()?;
 
-    if header.get("type")?.as_str()? != "session" {
+    let header: SessionHeader<'_> = serde_json::from_slice(line_buffer).ok()?;
+
+    if header.kind != "session" {
         return None;
     }
 
-    let sid = header.get("id")?.as_str()?.to_owned();
-    let cwd = header.get("cwd")?.as_str()?.to_owned();
+    let sid = header.id.to_string();
+    let cwd = header.cwd.to_string();
 
     let name = scan_for_last_name(&mut reader, path, line_buffer);
 
@@ -141,31 +161,28 @@ fn scan_for_last_name(
             continue;
         }
 
-        if let Ok(entry) = serde_json::from_slice::<Value>(line_buffer) {
-            if entry.get("type").and_then(Value::as_str) == Some("session_info") {
-                name = entry_display_name(&entry);
-            }
+        let Ok(entry) = serde_json::from_slice::<SessionInfoEntry<'_>>(line_buffer) else {
+            continue;
+        };
+
+        if entry.kind != "session_info" {
+            continue;
         }
+
+        name = entry
+            .name
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty());
     }
 
     name
-}
-
-fn entry_display_name(entry: &Value) -> Option<String> {
-    let name = entry.get("name")?.as_str()?.trim();
-
-    if name.is_empty() {
-        return None;
-    }
-
-    Some(name.to_owned())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     const FIXTURE_MTIME_MS: u64 = 1_700_000_000_123;
     const FIXTURE_SID: &str = "01JABCDEF0123456789ABCDEFG";

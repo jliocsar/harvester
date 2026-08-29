@@ -1,17 +1,20 @@
 use std::process::Stdio;
 use std::time::Duration;
 
-use harvester_proto::{encode_frame, read_frame, HarvesterResponse, FRAME_BUFFER_START_BYTES};
+use harvester_proto::{
+    encode_frame, read_frame, HarvesterResponse, FRAME_BUFFER_START_BYTES, PI_GET_AVAILABLE_MODELS,
+};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::task::JoinHandle;
 
+use crate::session::PASSTHROUGH_ID_PREFIX;
+
 const LIST_MODELS_TIMEOUT: Duration = Duration::from_secs(15);
 
-const MODELS_REQUEST_ID: &str = "hv-models";
+const MODELS_REQUEST_SUFFIX: &str = "models";
 
-const PI_STDERR_CAPTURE_BYTES: usize = 8 * 1024;
-const PI_STDERR_CHUNK_BYTES: usize = 1024;
+const PI_STDERR_CAPTURE_BYTES: u64 = 8 * 1024;
 const PI_STDERR_SUMMARY_CHARS: usize = 200;
 const PI_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const PI_EXITED_EARLY: &str = "pi exited before answering";
@@ -27,6 +30,7 @@ pub async fn list_models(cwd: String) -> HarvesterResponse {
 }
 
 async fn query_available_models(cwd: &str) -> Result<Value, String> {
+    let request_id = format!("{PASSTHROUGH_ID_PREFIX}{MODELS_REQUEST_SUFFIX}");
     let mut child = tokio::process::Command::new("pi")
         .current_dir(cwd)
         .env("PI_OFFLINE", "1")
@@ -42,7 +46,7 @@ async fn query_available_models(cwd: &str) -> Result<Value, String> {
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = capture_pi_stderr(child.stderr.take().expect("piped stderr"));
 
-    let request = encode_frame(&json!({"id": MODELS_REQUEST_ID, "type": "get_available_models"}))
+    let request = encode_frame(&json!({"id": request_id, "type": PI_GET_AVAILABLE_MODELS}))
         .expect("serializable");
     stdin
         .write_all(&request)
@@ -69,7 +73,7 @@ async fn query_available_models(cwd: &str) -> Result<Value, String> {
             continue;
         };
 
-        if value.get("id").and_then(Value::as_str) != Some(MODELS_REQUEST_ID) {
+        if value.get("id").and_then(Value::as_str) != Some(request_id.as_str()) {
             continue;
         }
 
@@ -101,25 +105,16 @@ fn models_rejection(value: &Value) -> String {
 
 fn capture_pi_stderr(stderr: tokio::process::ChildStderr) -> JoinHandle<String> {
     tokio::spawn(async move {
-        let mut reader = BufReader::new(stderr);
+        let mut capped = stderr.take(PI_STDERR_CAPTURE_BYTES);
         let mut captured: Vec<u8> = Vec::new();
-        let mut chunk = [0u8; PI_STDERR_CHUNK_BYTES];
 
-        loop {
-            let read = match reader.read(&mut chunk).await {
-                Ok(0) => break,
-                Ok(read) => read,
-                Err(error) => {
-                    eprintln!("harvesterd: read pi stderr: {error}");
+        if let Err(error) = capped.read_to_end(&mut captured).await {
+            eprintln!("harvesterd: read pi stderr: {error}");
+        }
 
-                    break;
-                }
-            };
-            let room = PI_STDERR_CAPTURE_BYTES.saturating_sub(captured.len());
-
-            if room > 0 {
-                captured.extend_from_slice(&chunk[..read.min(room)]);
-            }
+        if let Err(error) = tokio::io::copy(&mut capped.into_inner(), &mut tokio::io::sink()).await
+        {
+            eprintln!("harvesterd: drain pi stderr: {error}");
         }
 
         String::from_utf8_lossy(&captured).into_owned()

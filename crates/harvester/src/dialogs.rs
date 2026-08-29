@@ -6,7 +6,7 @@ use harvester_client_core::{DialogAnswer, DialogKind, DialogObligation};
 
 use crate::ui::dialog::{
     create_multi_line_input, create_single_line_input, open_confirmation, open_select, open_text,
-    title_or_named_condition, ActionAccent, Confirmation,
+    title_or_named_condition, ActionAccent, Confirmation, CANCEL_LABEL,
 };
 
 type AnswerCallback = Rc<dyn Fn(DialogAnswer, &mut Window, &mut App) -> bool>;
@@ -15,7 +15,6 @@ const UNTITLED_SELECT_CONDITION: &str = "Choose an option";
 const UNTITLED_INPUT_CONDITION: &str = "Enter a value";
 const UNTITLED_EDITOR_CONDITION: &str = "Write a response";
 const UNTITLED_CONFIRM_CONDITION: &str = "The agent needs a yes or no";
-const CONFIRM_CANCEL_LABEL: &str = "Cancel";
 const CONFIRM_ACTION_LABEL: &str = "Confirm";
 
 pub(crate) fn open_pi_dialog<T: 'static>(
@@ -112,7 +111,7 @@ fn confirmation_copy(title: &str, message: &str) -> Confirmation {
     Confirmation {
         title,
         message,
-        cancel_label: CONFIRM_CANCEL_LABEL.into(),
+        cancel_label: CANCEL_LABEL.into(),
         action_label: CONFIRM_ACTION_LABEL.into(),
         action_accent: ActionAccent::Primary,
     }
@@ -156,4 +155,42 @@ fn open_entry<T: 'static>(
         window,
         cx,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{condition_and_consequence, UNTITLED_CONFIRM_CONDITION};
+
+    #[test]
+    fn a_titled_question_keeps_both_of_its_sentences() {
+        let (title, message) = condition_and_consequence("Overwrite main.rs?", "It has changes.");
+
+        assert_eq!(title, "Overwrite main.rs?");
+        assert_eq!(message, "It has changes.");
+    }
+
+    #[test]
+    fn a_message_that_only_repeats_the_title_collapses_to_the_title() {
+        let (title, message) =
+            condition_and_consequence("  Overwrite main.rs?  ", "Overwrite main.rs?");
+
+        assert_eq!(title, "Overwrite main.rs?");
+        assert_eq!(message, "");
+    }
+
+    #[test]
+    fn a_titleless_question_promotes_its_message_to_the_title() {
+        let (title, message) = condition_and_consequence("", "  Overwrite main.rs?  ");
+
+        assert_eq!(title, "Overwrite main.rs?");
+        assert_eq!(message, "");
+    }
+
+    #[test]
+    fn a_question_with_neither_still_names_the_condition() {
+        let (title, message) = condition_and_consequence("  ", "\t");
+
+        assert_eq!(title, UNTITLED_CONFIRM_CONDITION);
+        assert_eq!(message, "");
+    }
 }

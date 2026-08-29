@@ -5,9 +5,9 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 
-use harvester_proto::{encode_frame, read_frame, FRAME_BUFFER_START_BYTES};
+use harvester_proto::{encode_frame, lock, read_frame, unix_millis_now, FRAME_BUFFER_START_BYTES};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 use serde_json::Value;
@@ -25,7 +25,9 @@ const STDIN_QUEUE_DEPTH: usize = 64;
 
 const MILLIS_PER_SECOND: u64 = 1_000;
 
-const PASSTHROUGH_ID_PREFIX: &str = "hv-";
+pub const PASSTHROUGH_ID_PREFIX: &str = "hv-";
+
+const EVENT_ENVELOPE_END: u8 = b'}';
 
 #[derive(Debug, Clone)]
 pub enum SessionOutput {
@@ -88,7 +90,7 @@ struct DaemonInner {
 
 impl Daemon {
     pub fn new(build_fingerprint: String) -> Self {
-        Daemon {
+        Self {
             inner: Arc::new(DaemonInner {
                 build_fingerprint,
                 sessions: Mutex::new(HashMap::new()),
@@ -107,12 +109,12 @@ impl Daemon {
         format!("{PASSTHROUGH_ID_PREFIX}{request_number}")
     }
 
-    pub fn session(&self, sid: &str) -> Option<Arc<Session>> {
-        self.lock_sessions().get(sid).cloned()
+    pub fn session(&self, sid: &Sid) -> Option<Arc<Session>> {
+        lock(&self.inner.sessions, "sessions").get(sid).cloned()
     }
 
     pub fn running_sessions(&self) -> HashMap<Sid, RunningSession> {
-        self.lock_sessions()
+        lock(&self.inner.sessions, "sessions")
             .iter()
             .map(|(sid, session)| {
                 let running = RunningSession {
@@ -126,9 +128,9 @@ impl Daemon {
     }
 
     pub fn spawn_session(&self, args: SpawnArgs) -> std::io::Result<SpawnOutcome> {
-        let mut sessions = self.lock_sessions();
+        let mut sessions = lock(&self.inner.sessions, "sessions");
 
-        if let Some(running) = sessions.get(args.sid.as_str()) {
+        if let Some(running) = sessions.get(&args.sid) {
             return Ok(SpawnOutcome::AlreadyRunning(running.clone()));
         }
 
@@ -139,30 +141,26 @@ impl Daemon {
     }
 
     pub fn is_current_generation(&self, session: &Arc<Session>) -> bool {
-        is_current_generation_in(&self.lock_sessions(), session)
+        is_current_generation_in(&lock(&self.inner.sessions, "sessions"), session)
     }
 
     fn remove_session_if_same(&self, session: &Arc<Session>) {
-        let mut sessions = self.lock_sessions();
+        let mut sessions = lock(&self.inner.sessions, "sessions");
 
         if is_current_generation_in(&sessions, session) {
             sessions.remove(&session.sid);
         }
     }
-
-    fn lock_sessions(&self) -> MutexGuard<'_, HashMap<Sid, Arc<Session>>> {
-        self.inner.sessions.lock().expect("sessions mutex")
-    }
 }
 
 fn is_current_generation_in(sessions: &HashMap<Sid, Arc<Session>>, session: &Arc<Session>) -> bool {
     sessions
-        .get(session.sid.as_str())
+        .get(&session.sid)
         .is_some_and(|stored| Arc::ptr_eq(stored, session))
 }
 
 impl Session {
-    fn spawn(args: SpawnArgs, daemon: &Daemon) -> std::io::Result<Arc<Session>> {
+    fn spawn(args: SpawnArgs, daemon: &Daemon) -> std::io::Result<Arc<Self>> {
         let mut command = create_pi_command(&args)?;
         let mut child = command.spawn()?;
 
@@ -172,7 +170,7 @@ impl Session {
         let (stdin_sender, stdin_receiver) = mpsc::channel(STDIN_QUEUE_DEPTH);
         let event_prefix = create_event_prefix(args.sid.as_str());
 
-        let session = Arc::new(Session {
+        let session = Arc::new(Self {
             sid: args.sid,
             cwd: args.cwd,
             spawned_at_ms: unix_millis_now(),
@@ -191,31 +189,22 @@ impl Session {
         Ok(session)
     }
 
-    pub fn write_line(&self, value: &Value) -> std::io::Result<()> {
+    pub fn write_line(&self, value: &Value) -> Result<(), &'static str> {
         let line = encode_frame(value).expect("serializable");
-        let guard = self.lock_stdin_queue();
+        let guard = lock(&self.stdin_queue, "stdin_queue");
 
         let Some(sender) = guard.as_ref() else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "session stdin already closed",
-            ));
+            return Err("session stdin already closed");
         };
 
         sender.try_send(line).map_err(|error| match error {
-            mpsc::error::TrySendError::Full(_) => std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "session stdin queue is full — pi is not reading",
-            ),
-            mpsc::error::TrySendError::Closed(_) => std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "session stdin writer stopped",
-            ),
+            mpsc::error::TrySendError::Full(_) => "session stdin queue is full — pi is not reading",
+            mpsc::error::TrySendError::Closed(_) => "session stdin writer stopped",
         })
     }
 
     pub fn close_stdin(&self) {
-        drop(self.lock_stdin_queue().take());
+        drop(lock(&self.stdin_queue, "stdin_queue").take());
     }
 
     pub fn kill(&self) {
@@ -225,14 +214,17 @@ impl Session {
     pub fn register_response_waiter(&self, request_key: String) -> oneshot::Receiver<Value> {
         let (sender, receiver) = oneshot::channel();
 
-        self.lock_pending_responses().insert(request_key, sender);
+        lock(&self.pending_responses, "pending_responses").insert(request_key, sender);
 
         receiver
     }
 
     fn resolve_response(&self, request_key: &str, response: Value) {
-        let Some(waiter) = self.lock_pending_responses().remove(request_key) else {
+        let waiter = lock(&self.pending_responses, "pending_responses").remove(request_key);
+
+        let Some(waiter) = waiter else {
             eprintln!("session {}: dropped response for {request_key}", self.sid);
+
             return;
         };
 
@@ -240,17 +232,7 @@ impl Session {
     }
 
     fn fail_pending_responses(&self) {
-        self.lock_pending_responses().clear();
-    }
-
-    fn lock_stdin_queue(&self) -> MutexGuard<'_, Option<mpsc::Sender<Vec<u8>>>> {
-        self.stdin_queue.lock().expect("stdin_queue mutex")
-    }
-
-    fn lock_pending_responses(&self) -> MutexGuard<'_, HashMap<String, oneshot::Sender<Value>>> {
-        self.pending_responses
-            .lock()
-            .expect("pending_responses mutex")
+        lock(&self.pending_responses, "pending_responses").clear();
     }
 }
 
@@ -308,13 +290,6 @@ fn open_stderr_log(sid: &Sid) -> std::io::Result<std::fs::File> {
     Ok(log)
 }
 
-fn unix_millis_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|since_epoch| since_epoch.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 async fn pump_stdin(sid: Sid, mut stdin: ChildStdin, mut frames: mpsc::Receiver<Vec<u8>>) {
     while let Some(frame) = frames.recv().await {
         if let Err(error) = stdin.write_all(&frame).await {
@@ -352,9 +327,8 @@ async fn pump_stdout(
     let mut buf: Vec<u8> = Vec::with_capacity(FRAME_BUFFER_START_BYTES);
 
     loop {
-        let line = match read_frame(&mut reader, &mut buf).await {
-            Ok(Some(line)) => line,
-            Ok(None) | Err(_) => break,
+        let Ok(Some(line)) = read_frame(&mut reader, &mut buf).await else {
+            break;
         };
 
         if line.is_empty() {
@@ -425,7 +399,7 @@ fn passthrough_response_key<'probe>(probe: &'probe LineProbe<'_>) -> Option<&'pr
 }
 
 fn create_event_prefix(sid: &str) -> String {
-    let escaped_sid = serde_json::to_string(sid).expect("a str always serializes");
+    let escaped_sid = serde_json::to_string(sid).expect("serializable");
 
     format!(r#"{{"type":"event","sid":{escaped_sid},"event":"#)
 }
@@ -436,7 +410,7 @@ fn encode_event(event_prefix: &str, line: &[u8]) -> Arc<[u8]> {
 
     envelope.extend_from_slice(prefix);
     envelope.extend_from_slice(line);
-    envelope.push(b'}');
+    envelope.push(EVENT_ENVELOPE_END);
 
     Arc::from(envelope)
 }
@@ -451,7 +425,7 @@ mod tests {
 
     fn serde_serialized_event(sid: &str, event: Value) -> Vec<u8> {
         let outgoing = Outgoing::Event {
-            sid: sid.to_owned(),
+            sid: sid.to_string(),
             event,
         };
 

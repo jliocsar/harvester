@@ -1,23 +1,26 @@
 use gpui::{
-    div, prelude::*, px, App, Context, Entity, EventEmitter, Focusable, ScrollHandle, SharedString,
+    div, prelude::*, App, Context, Entity, EventEmitter, Focusable, ScrollHandle, SharedString,
     Subscription, Window,
 };
 use gpui_component::input::{InputEvent, InputState};
 use serde_json::Value;
 
-use crate::models::{
-    machine_control_label, model_control_state, model_row_label, repo_control_label, ModelChoice,
-};
-use crate::session_state::{self, ModelSelection, ModelsState, SessionPhase, SessionState};
+use crate::models::{self, ModelChoice};
+use crate::session_state::{self, ModelsState, SessionPhase, SessionState};
 use crate::store::{FleetStore, StoreEvent};
 use crate::ui::{self, Tone};
-use crate::workspaces::folder_name;
 use harvester_client_core::bridge::{Command, Event as BridgeEvent};
-use harvester_client_core::{machines, MachineCandidate, RequestToken};
+use harvester_client_core::{folder_name, machines, MachineCandidate, RequestToken};
 
 pub use session_state::ChatTarget;
 
+pub const NEW_SESSION_LABEL: &str = "New session";
+
 const UNSENT_REQUEST_DETAIL: &str = "Not connected";
+const CONNECTION_LOST_DETAIL: &str = "Connection lost";
+const MACHINE_CHANGED_DETAIL: &str = "machine changed";
+const MODEL_FALLBACK_SUFFIX: &str = " — pi will use its default model";
+const UNRESOLVED_TARGET_SUBTITLE: &str = "Pick a machine and a repository below";
 
 pub enum ChatFlowRequest {
     AddRepo { machine: String },
@@ -32,7 +35,9 @@ pub struct Chat {
     focus_input: bool,
     input: Entity<InputState>,
     scroll: ScrollHandle,
-    _subscriptions: [Subscription; 3],
+    _prompt_submitted: Subscription,
+    _store_repaint: Subscription,
+    _store_events: Subscription,
 }
 
 impl Chat {
@@ -70,18 +75,11 @@ impl Chat {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("Message pi — Enter to send")
-                .multi_line(true)
-                .auto_grow(1, 8)
-                .submit_on_enter(true)
-        });
-        let subscriptions = [
-            cx.subscribe_in(&input, window, Self::handle_prompt_submitted),
-            cx.observe(&store, |_, _, cx| cx.notify()),
-            cx.subscribe(&store, Self::handle_store_event),
-        ];
+        let input = ui::create_prompt_input(window, cx);
+        let prompt_submitted = cx.subscribe_in(&input, window, Self::handle_prompt_submitted);
+        let store_repaint = cx.observe(&store, |_, _, cx| cx.notify());
+        let store_events = cx.subscribe_in(&store, window, Self::handle_store_event);
+
         Self {
             state,
             store,
@@ -89,14 +87,17 @@ impl Chat {
             focus_input: true,
             input,
             scroll: ScrollHandle::new(),
-            _subscriptions: subscriptions,
+            _prompt_submitted: prompt_submitted,
+            _store_repaint: store_repaint,
+            _store_events: store_events,
         }
     }
 
     fn handle_store_event(
         &mut self,
-        _store: Entity<FleetStore>,
+        _store: &Entity<FleetStore>,
         event: &StoreEvent,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match event {
@@ -114,7 +115,7 @@ impl Chat {
                 self.fail_pending_requests(detail.clone(), cx)
             }
             BridgeEvent::Disconnected if self.runs_on(machine) => {
-                self.fail_pending_requests("Connection lost".to_string(), cx)
+                self.fail_pending_requests(CONNECTION_LOST_DETAIL.to_string(), cx)
             }
             BridgeEvent::RequestFailed { .. } if self.runs_on(machine) => {
                 if self.state.fail_start() {
@@ -167,7 +168,10 @@ impl Chat {
     }
 
     fn repo_candidates(&self, cx: &Context<Self>) -> Vec<String> {
-        self.store.read(cx).repos_on(&self.state.target().machine)
+        self.store
+            .read(cx)
+            .catalog()
+            .repos_on(&self.state.target().machine)
     }
 
     pub fn sid(&self) -> Option<&str> {
@@ -250,8 +254,8 @@ impl Chat {
         let target = self.state.target().clone();
         let host = match self.store.read(cx).host_for(&target.machine) {
             Ok(host) => host,
-            Err(detail) => {
-                eprintln!("harvester: branch indicator: {detail}");
+            Err(error) => {
+                eprintln!("harvester: branch indicator: {error}");
                 self.state.cancel_branch();
 
                 return;
@@ -342,30 +346,6 @@ impl Chat {
         }
     }
 
-    fn model_picks(&self) -> Vec<Option<ModelChoice>> {
-        if matches!(self.state.phase(), SessionPhase::Starting { .. }) {
-            return Vec::new();
-        }
-
-        let offer_default = matches!(self.state.phase(), SessionPhase::Unstarted);
-
-        offer_default
-            .then_some(None)
-            .into_iter()
-            .chain(self.state.model_choices().iter().cloned().map(Some))
-            .collect()
-    }
-
-    fn is_current_model(&self, pick: &Option<ModelChoice>) -> bool {
-        match (pick, self.state.selection()) {
-            (None, ModelSelection::LaunchDefault) => true,
-            (Some(choice), ModelSelection::Launch(current) | ModelSelection::Live(current)) => {
-                choice.provider == current.provider && choice.id == current.id
-            }
-            _ => false,
-        }
-    }
-
     fn pick_model(&mut self, picked: Option<ModelChoice>, cx: &mut Context<Self>) {
         if let Some(command) = self.state.pick_model(picked) {
             self.send(command, cx);
@@ -381,7 +361,8 @@ impl Chat {
             return;
         }
 
-        self.state.cancel_model_fetch("machine changed".to_string());
+        self.state
+            .cancel_model_fetch(MACHINE_CHANGED_DETAIL.to_string());
 
         if self.state.retarget(machine) {
             let first_repo = self.repo_candidates(cx).first().cloned();
@@ -472,7 +453,7 @@ impl Chat {
 
     fn unstarted_subtitle(&self, cx: &Context<Self>) -> SharedString {
         if !self.state.target().is_resolved() {
-            return "Pick a machine and a repository below".into();
+            return UNRESOLVED_TARGET_SUBTITLE.into();
         }
 
         format!(
@@ -500,15 +481,17 @@ impl Chat {
     }
 
     fn render_bottom_row(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let model_picks = self.model_picks();
+        let model_picks = models::model_picks(&self.state);
         let machine_candidates = self.machine_candidates(cx);
         let repo_candidates = self.repo_candidates(cx);
-        let strip = self.prompt_strip(
+        let focused = self.input.read(cx).focus_handle(cx).is_focused(window);
+        let strip = models::present_prompt_strip(
+            &self.state,
             &model_picks,
             &machine_candidates,
+            &self.machine_label(cx),
             &repo_candidates,
-            window,
-            cx,
+            focused,
         );
         let chat_for_send = cx.entity();
         let chat_for_stop = chat_for_send.clone();
@@ -536,7 +519,7 @@ impl Chat {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(pick) = self.model_picks().get(action.index).cloned() else {
+        let Some(pick) = models::model_picks(&self.state).get(action.index).cloned() else {
             return;
         };
 
@@ -571,136 +554,15 @@ impl Chat {
         self.select_repo(repo, cx);
     }
 
-    fn prompt_strip(
-        &self,
-        model_picks: &[Option<ModelChoice>],
-        machine_candidates: &[MachineCandidate],
-        repo_candidates: &[String],
-        window: &Window,
-        cx: &Context<Self>,
-    ) -> ui::PromptStrip {
-        ui::PromptStrip {
-            notice: self.prompt_strip_notice(),
-            model: self.model_control(model_picks),
-            machine: self.machine_control(machine_candidates, cx),
-            repo: self.repo_control(repo_candidates),
-            branch: self.branch_label(),
-            can_send: self.can_send(),
-            can_stop: self.state.can_stop(),
-            focused: self.input.read(cx).focus_handle(cx).is_focused(window),
-        }
-    }
-
-    fn prompt_strip_notice(&self) -> Option<ui::PromptStripNotice> {
-        match (self.state.exited_notice(), self.state.phase()) {
-            (Some(notice), _) => Some(ui::PromptStripNotice::SessionExited(
-                notice.to_string().into(),
-            )),
-            (None, SessionPhase::Starting { .. }) => Some(ui::PromptStripNotice::SessionStarting),
-            (None, _) => None,
-        }
-    }
-
-    fn is_unstarted(&self) -> bool {
-        matches!(self.state.phase(), SessionPhase::Unstarted)
-    }
-
-    fn can_send(&self) -> bool {
-        !self.is_unstarted() || self.state.target().is_resolved()
-    }
-
-    fn branch_label(&self) -> Option<SharedString> {
-        Some(self.state.branch()?.to_string().into())
-    }
-
-    fn model_control_state(&self) -> (SharedString, bool) {
-        model_control_state(
-            self.state.selection(),
-            self.state.models(),
-            self.state.model_choices(),
-        )
-    }
-
-    fn model_control(&self, picks: &[Option<ModelChoice>]) -> ui::PromptStripControl {
-        let (label, enabled) = self.model_control_state();
-        let rows = picks
-            .iter()
-            .map(|pick| ui::DropdownRow {
-                label: model_row_label(pick.as_ref()),
-                selected: self.is_current_model(pick),
-                divider_above: false,
-            })
-            .collect();
-
-        ui::PromptStripControl {
-            label,
-            enabled,
-            rows,
-        }
-    }
-
-    fn machine_control(
-        &self,
-        candidates: &[MachineCandidate],
-        cx: &Context<Self>,
-    ) -> ui::PromptStripControl {
-        let label = machine_control_label(
-            &self.state.target().machine,
-            &self.machine_label(cx),
-            candidates,
-        );
-        let enabled = self.is_unstarted() && !candidates.is_empty();
-        let rows = candidates
-            .iter()
-            .map(|candidate| ui::DropdownRow {
-                label: candidate.label.clone().into(),
-                selected: candidate.key == self.state.target().machine,
-                divider_above: false,
-            })
-            .collect();
-
-        ui::PromptStripControl {
-            label,
-            enabled,
-            rows,
-        }
-    }
-
-    fn repo_control(&self, repos: &[String]) -> ui::PromptStripControl {
-        let path = &self.state.target().workspace_path;
-        let label = repo_control_label(path);
-        let enabled = self.is_unstarted() && !self.state.target().machine.is_empty();
-        let mut rows: Vec<ui::DropdownRow> = repos
-            .iter()
-            .map(|repo| ui::DropdownRow {
-                label: repo.clone().into(),
-                selected: repo == path,
-                divider_above: false,
-            })
-            .collect();
-
-        rows.push(ui::DropdownRow {
-            label: ui::ADD_REPO_ROW.into(),
-            selected: false,
-            divider_above: !repos.is_empty(),
-        });
-
-        ui::PromptStripControl {
-            label,
-            enabled,
-            rows,
-        }
-    }
-
     fn render_unstarted_body(&self, cx: &App) -> impl IntoElement {
         div()
             .flex_1()
-            .min_h(px(0.))
+            .min_h_0()
             .p_3()
             .children(match self.state.models() {
                 ModelsState::Failed(detail) => Some(ui::inline_note(
                     Tone::Failed,
-                    format!("{detail} — pi will use its default model"),
+                    format!("{detail}{MODEL_FALLBACK_SUFFIX}"),
                     cx,
                 )),
                 _ => None,
@@ -728,7 +590,7 @@ impl Render for Chat {
         let pane = match self.state.phase() {
             SessionPhase::Unstarted | SessionPhase::Starting { .. } => pane
                 .child(ui::chat_header(
-                    "New session".into(),
+                    NEW_SESSION_LABEL.into(),
                     self.unstarted_subtitle(cx),
                     cx,
                 ))
