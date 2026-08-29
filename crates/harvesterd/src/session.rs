@@ -1,19 +1,20 @@
 mod dialog;
-mod launch;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::io::Write;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use harvester_proto::{encode_frame, read_frame, FRAME_BUFFER_START_BYTES};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 use serde_json::Value;
 use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin};
+use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{broadcast, mpsc, oneshot, Notify};
 
-use crate::daemon::{Daemon, PASSTHROUGH_ID_PREFIX};
 use crate::sid::Sid;
 
 pub use dialog::cancel as cancel_dialog;
@@ -21,6 +22,10 @@ pub use dialog::cancel as cancel_dialog;
 const SESSION_EVENT_BUFFER: usize = 1024;
 
 const STDIN_QUEUE_DEPTH: usize = 64;
+
+const MILLIS_PER_SECOND: u64 = 1_000;
+
+const PASSTHROUGH_ID_PREFIX: &str = "hv-";
 
 #[derive(Debug, Clone)]
 pub enum SessionOutput {
@@ -60,9 +65,105 @@ pub struct SpawnArgs {
     pub name: Option<String>,
 }
 
+pub enum SpawnOutcome {
+    Spawned(Arc<Session>),
+    AlreadyRunning(Arc<Session>),
+}
+
+pub struct RunningSession {
+    pub cwd: String,
+    pub spawned_at_ms: u64,
+}
+
+#[derive(Clone)]
+pub struct Daemon {
+    inner: Arc<DaemonInner>,
+}
+
+struct DaemonInner {
+    build_fingerprint: String,
+    sessions: Mutex<HashMap<Sid, Arc<Session>>>,
+    request_counter: AtomicU64,
+}
+
+impl Daemon {
+    pub fn new(build_fingerprint: String) -> Self {
+        Daemon {
+            inner: Arc::new(DaemonInner {
+                build_fingerprint,
+                sessions: Mutex::new(HashMap::new()),
+                request_counter: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    pub fn build_fingerprint(&self) -> &str {
+        &self.inner.build_fingerprint
+    }
+
+    pub fn next_passthrough_id(&self) -> String {
+        let request_number = self.inner.request_counter.fetch_add(1, Ordering::Relaxed);
+
+        format!("{PASSTHROUGH_ID_PREFIX}{request_number}")
+    }
+
+    pub fn session(&self, sid: &str) -> Option<Arc<Session>> {
+        self.lock_sessions().get(sid).cloned()
+    }
+
+    pub fn running_sessions(&self) -> HashMap<Sid, RunningSession> {
+        self.lock_sessions()
+            .iter()
+            .map(|(sid, session)| {
+                let running = RunningSession {
+                    cwd: session.cwd.clone(),
+                    spawned_at_ms: session.spawned_at_ms,
+                };
+
+                (sid.clone(), running)
+            })
+            .collect()
+    }
+
+    pub fn spawn_session(&self, args: SpawnArgs) -> std::io::Result<SpawnOutcome> {
+        let mut sessions = self.lock_sessions();
+
+        if let Some(running) = sessions.get(args.sid.as_str()) {
+            return Ok(SpawnOutcome::AlreadyRunning(running.clone()));
+        }
+
+        let session = Session::spawn(args, self)?;
+        sessions.insert(session.sid.clone(), session.clone());
+
+        Ok(SpawnOutcome::Spawned(session))
+    }
+
+    pub fn is_current_generation(&self, session: &Arc<Session>) -> bool {
+        is_current_generation_in(&self.lock_sessions(), session)
+    }
+
+    fn remove_session_if_same(&self, session: &Arc<Session>) {
+        let mut sessions = self.lock_sessions();
+
+        if is_current_generation_in(&sessions, session) {
+            sessions.remove(&session.sid);
+        }
+    }
+
+    fn lock_sessions(&self) -> MutexGuard<'_, HashMap<Sid, Arc<Session>>> {
+        self.inner.sessions.lock().expect("sessions mutex")
+    }
+}
+
+fn is_current_generation_in(sessions: &HashMap<Sid, Arc<Session>>, session: &Arc<Session>) -> bool {
+    sessions
+        .get(session.sid.as_str())
+        .is_some_and(|stored| Arc::ptr_eq(stored, session))
+}
+
 impl Session {
-    pub(crate) fn spawn(args: SpawnArgs, daemon: &Daemon) -> std::io::Result<Arc<Session>> {
-        let mut command = launch::create_pi_command(&args)?;
+    fn spawn(args: SpawnArgs, daemon: &Daemon) -> std::io::Result<Arc<Session>> {
+        let mut command = create_pi_command(&args)?;
         let mut child = command.spawn()?;
 
         let stdin = child.stdin.take().expect("piped stdin");
@@ -142,17 +243,69 @@ impl Session {
         self.lock_pending_responses().clear();
     }
 
-    fn lock_stdin_queue(&self) -> std::sync::MutexGuard<'_, Option<mpsc::Sender<Vec<u8>>>> {
+    fn lock_stdin_queue(&self) -> MutexGuard<'_, Option<mpsc::Sender<Vec<u8>>>> {
         self.stdin_queue.lock().expect("stdin_queue mutex")
     }
 
-    fn lock_pending_responses(
-        &self,
-    ) -> std::sync::MutexGuard<'_, HashMap<String, oneshot::Sender<Value>>> {
+    fn lock_pending_responses(&self) -> MutexGuard<'_, HashMap<String, oneshot::Sender<Value>>> {
         self.pending_responses
             .lock()
             .expect("pending_responses mutex")
     }
+}
+
+fn create_pi_command(args: &SpawnArgs) -> std::io::Result<Command> {
+    let stderr_log = open_stderr_log(&args.sid)?;
+    let mut cli_args: Vec<&str> = vec![
+        "--mode",
+        "rpc",
+        "--session-id",
+        args.sid.as_str(),
+        "--approve",
+    ];
+
+    if let Some(provider) = &args.provider {
+        cli_args.extend(["--provider", provider]);
+    }
+
+    if let Some(model) = &args.model {
+        cli_args.extend(["--model", model]);
+    }
+
+    if let Some(name) = &args.name {
+        cli_args.extend(["--name", name]);
+    }
+
+    let mut command = Command::new("pi");
+    command
+        .current_dir(&args.cwd)
+        .env("PI_OFFLINE", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env(
+            "GIT_SSH_COMMAND",
+            "ssh -o BatchMode=yes -o ConnectTimeout=5",
+        )
+        .args(cli_args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(stderr_log));
+
+    Ok(command)
+}
+
+fn open_stderr_log(sid: &Sid) -> std::io::Result<std::fs::File> {
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(crate::log_dir().join(format!("{sid}.stderr.log")))?;
+    let started_at_unix_seconds = unix_millis_now() / MILLIS_PER_SECOND;
+
+    writeln!(
+        log,
+        "--- harvesterd: spawning pi for {sid} at {started_at_unix_seconds} (unix seconds) ---"
+    )?;
+
+    Ok(log)
 }
 
 fn unix_millis_now() -> u64 {

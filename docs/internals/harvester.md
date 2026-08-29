@@ -160,7 +160,7 @@ whole partial message — replace, never append. `agent_settled` (not
 ### Constants
 
 The prompt strip's label constants live with the policy that reads them, in
-`chat/prompt_presentation.rs` (see its own section below). `chat.rs` holds
+`models.rs` (see its own section). `chat.rs` holds
 exactly one: `UNSENT_REQUEST_DETAIL` (`"Not connected"`), the reason this
 pane records against its own controls when the store's send gate refuses a
 command. It is deliberately shorter than the notification the gate raises —
@@ -368,72 +368,6 @@ repo, or nothing if it has none.
   notice is now the same primitive reached through
   `ui::prompt_strip`.
 
-## crates/harvester/src/chat/prompt_presentation.rs
-
-What each prompt-strip control *says* and whether it can be opened, as pure
-functions over state — the same split `workbench/machine_presentation.rs`
-makes for machine rows. Nothing here touches a `Window`, an `Entity` or the
-store, so the policy is unit-testable without gpui machinery, and `chat.rs`
-is left with adaptation only (read the state, build the rows, wire the
-pick).
-
-- `DEFAULT_MODEL_ROW` ("Default (pi chooses)"): the unstarted chat's
-  "no model chosen" row. pi launches with its own default, and saying so is
-  more honest than naming a model Harvester did not actually pick. The const
-  itself now lives in `ui/prompt.rs` (the gallery renders the same row); the
-  wording decision is still this module's.
-- `ADD_REPO_ROW` ("Add new…", also in `ui/prompt.rs` now): the repo picker's
-  last row, for browsing to a repository Harvester has not been told about
-  yet. It is also the *only*
-  row an empty picker has, which is what makes a fresh client's first
-  session reachable. Its ellipsis is the conventional one — the row opens a
-  dialog rather than committing anything — unlike a progress ellipsis, which
-  the app spends far more carefully.
-- `NO_MACHINE_LABEL` / `CHOOSE_MACHINE_LABEL`: what the machine control says
-  before anything is picked and when there is nothing to pick (fleet empty
-  until a provider lists).
-- `CHOOSE_REPO_LABEL`: repository control's pre-pick label.
-- `model_control_state` returns the label *and* whether the control opens,
-  because those are one decision: the control may only be opened when there
-  is a list behind it. A chosen model always names itself (a launch pick a
-  refetch has not landed for yet is still what the user picked); the
-  unstarted default row is pickable only once a list actually loaded, which
-  is why `Loading`, `NotRequested` and `Failed` all render the same words
-  with the control shut.
-- `model_row_label` exists so the "default (pi chooses)" wording is written
-  once, next to the state function that decides when that row is offered.
-- `machine_control_label` takes the fleet's label for the picked machine as
-  a plain string rather than reading the store itself, which is what keeps
-  it pure. The caller asks the store unconditionally — for an unpicked
-  machine the fleet answers with an empty string that this function never
-  looks at.
-- `repo_control_label` shows the folder name, not the path: the folder is
-  what the user recognizes a repository by, and a full `/home/exedev/…` in a
-  control capped at `max_w_56` would ellipsize away exactly the end that
-  identifies it. The dropdown's own rows still carry the full paths, which is
-  where two same-named checkouts are told apart.
-
-## crates/harvester/src/desktop_shell.rs
-
-What is *product-specific* about starting the Harvester application: the
-window title, the window size, and the fact that the root view is a
-`Workbench`. Everything generic about starting a gpui application (fonts,
-assets, theme, quit binding, `Root`) moved to `shell_bootstrap` on the lib
-side when the gallery binary appeared — see that section for the contract.
-This module is the app-only half that stayed on the bin side, because
-`Workbench` and everything under it is bin-only.
-
-- `MAIN_WINDOW_WIDTH`/`HEIGHT` (1100×720): the centered main window's fixed
-  size.
-- `main_window_title` takes the argv machine by reference and is a free
-  function rather than a method: with the bootstrap owning the window
-  lifecycle there is nothing left for a `DesktopShell` struct to hold, and
-  the two launch inputs (`argv_machine`, `daemon_binary`) travel straight
-  into the root-view closure instead.
-- The root-view closure is where `Workbench` is constructed, so the
-  bootstrap never learns the app's view type — it only ever sees an
-  `AnyView`.
-
 ## crates/harvester/src/dialogs.rs
 
 Which chrome a given Pi question deserves, and what a click on it means to
@@ -589,7 +523,7 @@ What lives lib-side:
 
 Everything else stays declared on the bin side (`main.rs`): `chat`,
 `workbench`, `dialogs`, `store`, `catalog`, `session_state`, `models`,
-`workspaces`, `desktop_shell`. Those are the *application*, not a component
+`workspaces`. Those are the *application*, not a component
 library; the gallery must not be able to reach them, and keeping them bin-side
 is what enforces that — a bin's modules are unreachable from a dependent
 crate, so the boundary is compiler-checked, not documented.
@@ -631,6 +565,29 @@ Harvester's desktop-client entry point (see docs/SPEC.md).
   `crate::assets`). See the `lib.rs` section for why the split exists and why
   this re-export is the intended shape rather than a migration step.
 
+### Starting the desktop shell
+
+`run` and `main_window_title` (private here; folded in from the former
+`desktop_shell.rs`, which was one `pub fn` with one caller) are what is
+*product-specific* about starting the Harvester application: the window
+title, the window size, and the fact that the root view is a `Workbench`.
+Everything generic about starting a gpui application (fonts, assets, theme,
+quit binding, `Root`) moved to `shell_bootstrap` on the lib side when the
+gallery binary appeared — see that section for the contract. This half stays
+on the bin side, because `Workbench` and everything under it is bin-only; the
+lib/bin quarantine is unchanged by the fold.
+
+- `MAIN_WINDOW_WIDTH`/`HEIGHT` (1100×720): the centered main window's fixed
+  size.
+- `main_window_title` takes the argv machine by reference and is a free
+  function rather than a method: with the bootstrap owning the window
+  lifecycle there is nothing left for a `DesktopShell` struct to hold, and
+  the two launch inputs (`argv_machine`, `daemon_binary`) travel straight
+  into the root-view closure instead.
+- The root-view closure is where `Workbench` is constructed, so the
+  bootstrap never learns the app's view type — it only ever sees an
+  `AnyView`.
+
 ## crates/harvester/src/models.rs
 
 Model-domain types shared by the unstarted chat's picker (pre-session) and
@@ -646,6 +603,63 @@ or a `set_model` call, so it is not worth surfacing in the picker.
 `extract_model_choices` reads pi's verbatim `get_available_models` answer and
 maps its `models` array through `model_choice_from_value`, silently dropping
 anything that fails to parse.
+
+### Prompt-strip label policy
+
+What each prompt-strip control *says* and whether it can be opened, as pure
+functions over state — the same split `workbench/machine_presentation.rs`
+makes for machine rows. Nothing here touches a `Window`, an `Entity` or the
+store, so the policy is unit-testable without gpui machinery, and `chat.rs`
+is left with adaptation only (read the state, build the rows, wire the
+pick).
+
+This was `chat/prompt_presentation.rs` until it folded in here and `src/chat/`
+was deleted (`src/chat.rs`, the gpui `Render` impl, is untouched and stays
+where it is). The fold is one vocabulary: the policy is label rules *over*
+`ModelChoice`, and both halves are window-free, which is what lets the tests
+below live in the same file. Merging it into `chat.rs` instead would have put
+a unit-test module inside a `Render` impl that has never had one.
+
+- `DEFAULT_MODEL_ROW` ("Default (pi chooses)"): the unstarted chat's
+  "no model chosen" row. pi launches with its own default, and saying so is
+  more honest than naming a model Harvester did not actually pick. The const
+  itself now lives in `ui/prompt.rs` (the gallery renders the same row); the
+  wording decision is still this module's.
+- `ADD_REPO_ROW` ("Add new…", also in `ui/prompt.rs` now): the repo picker's
+  last row, for browsing to a repository Harvester has not been told about
+  yet. It is also the *only*
+  row an empty picker has, which is what makes a fresh client's first
+  session reachable. Its ellipsis is the conventional one — the row opens a
+  dialog rather than committing anything — unlike a progress ellipsis, which
+  the app spends far more carefully.
+- `NO_MACHINE_LABEL` / `CHOOSE_MACHINE_LABEL`: what the machine control says
+  before anything is picked and when there is nothing to pick (fleet empty
+  until a provider lists).
+- `CHOOSE_REPO_LABEL`: repository control's pre-pick label.
+- Those three consts are **private** to this module now. They were
+  `pub(super)` only so the old `chat/` sibling could not accidentally be the
+  one place they were named; nothing outside these functions and their tests
+  ever read them, and the fold removed the reason for the annotation. The
+  four functions stay `pub` because `chat.rs` calls all four.
+- `model_control_state` returns the label *and* whether the control opens,
+  because those are one decision: the control may only be opened when there
+  is a list behind it. A chosen model always names itself (a launch pick a
+  refetch has not landed for yet is still what the user picked); the
+  unstarted default row is pickable only once a list actually loaded, which
+  is why `Loading`, `NotRequested` and `Failed` all render the same words
+  with the control shut.
+- `model_row_label` exists so the "default (pi chooses)" wording is written
+  once, next to the state function that decides when that row is offered.
+- `machine_control_label` takes the fleet's label for the picked machine as
+  a plain string rather than reading the store itself, which is what keeps
+  it pure. The caller asks the store unconditionally — for an unpicked
+  machine the fleet answers with an empty string that this function never
+  looks at.
+- `repo_control_label` shows the folder name, not the path: the folder is
+  what the user recognizes a repository by, and a full `/home/exedev/…` in a
+  control capped at `max_w_56` would ellipsize away exactly the end that
+  identifies it. The dropdown's own rows still carry the full paths, which is
+  where two same-named checkouts are told apart.
 
 ## crates/harvester/src/session_state.rs
 
@@ -805,7 +819,8 @@ else.
 ## crates/harvester/src/shell_bootstrap.rs
 
 Everything about starting a gpui application that is true for *any*
-Harvester window, hoisted out of `desktop_shell.rs` when the gallery binary
+Harvester window, hoisted out of the app's own window setup (then
+`desktop_shell.rs`, since folded into `main.rs`) when the gallery binary
 needed the same start-up. Lib-side, because both binaries call it.
 
 Contract: `run_desktop_shell(shell_window, build_root_view)` never returns
@@ -1124,6 +1139,54 @@ everything else in `ui` should ask for a `Tone`/`Dot`, never a raw `Hsla`.
   with gpui-component's own widgets. No startup resolution, no fallback
   logic — the theme is the single owner of font names.
 
+### Notes and empty states
+
+These three builders were `ui/note.rs` until they folded in here: their only
+non-gpui input was `core`'s own `Tone`, and `core` already owns the
+tone-taking builders (`status_dot_for_tone`), so the split was a file
+boundary with no rule behind it. The flat `ui::` re-export surface is
+unchanged — `ui/mod.rs` exports them from `core` now, which is the path the
+gallery and the screens both import through either way.
+
+The two ways Harvester states something *about* a pane rather than in it: a
+line of tone-colored text. Both existed four times as hand-rolled divs (the
+folder picker's walk error, the chat's models-failed line and exit/starting
+notice, the workbench's empty content pane), which is how the picker ended up
+reaching for `cx.theme().danger` directly instead of `Tone::Failed` — the
+same color, but a rule broken (SPEC C11). One builder each is what keeps that
+from happening again.
+
+- `inline_note` is the in-flow variant: `text_sm` and tone-colored, nothing
+  more. Truncation is not baked in — the chat's notices always wrapped and a
+  truncated failure detail hides its reason — so a call site that wants
+  ellipsis chains `overflow_hidden().text_ellipsis()` itself, as the folder
+  picker's error line does to keep the modal's height stable.
+- `empty_pane_hint` is the centered variant for a pane with nothing in it: it
+  fills its parent and centers on both axes. It inherits the window's body
+  text size rather than shrinking a tier, because it is the only thing on
+  screen in that pane and reads as content, not as an annotation — and it
+  centers its text (`text_center`) for the same reason, since a wrapped hint
+  ragged against an invisible left edge reads as a stray label. It is a
+  `v_flex` with `gap_4` and `p_8` rather than a bare centered div so a caller
+  may `.child(...)` an action underneath the sentence. Both steps are chosen as
+  relationships rather than as pixel counts: `gap_4` is the "separate groups
+  inside one section" step (the sentence and the action are two things, not
+  one), and `p_8` is the major-region step an empty state wants — the pane has
+  nothing else in it, and crowding its one sentence against the edges is how an
+  empty state reads as broken rather than as waiting. The signature did not
+  change when the action slot was added, so every existing caller keeps
+  rendering exactly what it rendered before.
+- `empty_pane_action` is that action: a small primary `Button`, one per empty
+  state. An empty pane that states a problem without offering the one way out
+  of it is a dead end, and the alternative — every empty pane hand-rolling its
+  own button — is how the tone rule got broken the last time.
+- All three take `impl Into<SharedString>` so a caller may hand over an owned
+  `format!` result without an extra clone; the two note builders take a `Tone`,
+  never a color.
+- The statusbar's link (`workbench.rs`) is deliberately *not* one of these:
+  its size already comes from `statusbar_frame`, and folding it in would add
+  ellipsis behavior to a band that has never needed it.
+
 ## crates/harvester/src/ui/dialog.rs
 
 Every piece of modal chrome Harvester draws: dialog geometry, titles, the
@@ -1302,11 +1365,17 @@ palette or a parallel widget library. Components are built with
 `gpui-component`, and every color must be resolved from `cx.theme()`; the
 `ui::core` submodule exports semantic *meanings* (see `Tone`/`Dot` below) and
 reusable non-color metrics only, never raw colors of its own (SPEC C11). The
-`pub use core::{...}` / `prompt::{...}` / `shell::{...}` / `sidebar::{...}`
+`pub use core::{...}` / `prompt::{...}` / `shell::{...}`
 re-exports exist to keep a stable `ui::…` import path for screen-level callers
 while the implementation stays split across cohesive modules (`core`,
-`dialog`, `note`, `prompt`, `shell`, `sidebar`, `tool_block`, `transcript`)
-rather than one broad file. Only names a *screen* calls are re-exported: a
+`dialog`, `prompt`, `shell`, `theme`, `transcript`) rather than one broad file.
+That list is shorter than it was: `sidebar` folded into `shell` (one alignment
+spine, one file) and `tool_block` into `transcript` (its only consumer). The
+flat `ui::` surface did not move a name in either merge — `sidebar_row`,
+`sidebar_stacked_row`, `sidebar_empty_note` and `SIDEBAR_ROW_GUTTER` are
+re-exported from `shell` now and are still spelled `ui::sidebar_row` and so on
+at every call site, because the export list is a contract with the screens and
+the gallery, not a mirror of the file layout. Only names a *screen* calls are re-exported: a
 builder used solely by other `ui` modules (`section_header`) or by its own
 module (`prompt_box_input`, assembled into `prompt_strip` and never drawn
 alone) is reached through `super::core` / kept private to its module instead,
@@ -1327,7 +1396,7 @@ Two of the re-exports are not builders at all and are worth naming for that
 reason. `KeyboardFocusRing` (from `shell`) is a trait with a blanket impl, so
 it has to be imported by name at the call site to be usable —
 `use crate::ui::{self, KeyboardFocusRing as _}` in `workbench/sidebar.rs` is
-the shape. `SIDEBAR_ROW_GUTTER` (from `sidebar`) is a metric rather than a
+the shape. `SIDEBAR_ROW_GUTTER` (from `shell`) is a metric rather than a
 component: the sidebar's own screen needs it to line its New-session button up
 with the rows below, which is the one case where a caller genuinely has to
 know a number `ui` owns.
@@ -1352,47 +1421,6 @@ calls exactly that one. The three picker *actions* (`PickModel`,
 `PickMachine`, `PickRepo`) are exported alongside them because a gpui action is
 half a contract: `ui` dispatches them and the screen listens for them, so both
 halves need the same type (see `ui/prompt.rs`).
-
-## crates/harvester/src/ui/note.rs
-
-The two ways Harvester states something *about* a pane rather than in it: a
-line of tone-colored text. Both existed four times as hand-rolled divs (the
-folder picker's walk error, the chat's models-failed line and exit/starting
-notice, the workbench's empty content pane), which is how the picker ended up
-reaching for `cx.theme().danger` directly instead of `Tone::Failed` — the
-same color, but a rule broken (SPEC C11). One builder each is what keeps that
-from happening again.
-
-- `inline_note` is the in-flow variant: `text_sm` and tone-colored, nothing
-  more. Truncation is not baked in — the chat's notices always wrapped and a
-  truncated failure detail hides its reason — so a call site that wants
-  ellipsis chains `overflow_hidden().text_ellipsis()` itself, as the folder
-  picker's error line does to keep the modal's height stable.
-- `empty_pane_hint` is the centered variant for a pane with nothing in it: it
-  fills its parent and centers on both axes. It inherits the window's body
-  text size rather than shrinking a tier, because it is the only thing on
-  screen in that pane and reads as content, not as an annotation — and it
-  centers its text (`text_center`) for the same reason, since a wrapped hint
-  ragged against an invisible left edge reads as a stray label. It is a
-  `v_flex` with `gap_4` and `p_8` rather than a bare centered div so a caller
-  may `.child(...)` an action underneath the sentence. Both steps are chosen as
-  relationships rather than as pixel counts: `gap_4` is the "separate groups
-  inside one section" step (the sentence and the action are two things, not
-  one), and `p_8` is the major-region step an empty state wants — the pane has
-  nothing else in it, and crowding its one sentence against the edges is how an
-  empty state reads as broken rather than as waiting. The signature did not
-  change when the action slot was added, so every existing caller keeps
-  rendering exactly what it rendered before.
-- `empty_pane_action` is that action: a small primary `Button`, one per empty
-  state. An empty pane that states a problem without offering the one way out
-  of it is a dead end, and the alternative — every empty pane hand-rolling its
-  own button — is how the tone rule got broken the last time.
-- All three take `impl Into<SharedString>` so a caller may hand over an owned
-  `format!` result without an extra clone; the two note builders take a `Tone`,
-  never a color.
-- The statusbar's link (`workbench.rs`) is deliberately *not* one of these:
-  its size already comes from `statusbar_frame`, and folding it in would add
-  ellipsis behavior to a band that has never needed it.
 
 ## crates/harvester/src/ui/prompt.rs
 
@@ -1438,7 +1466,7 @@ control wears, what its rows say, and what a pick *means*.
   plain `border` role now, for the same reason `faint()` became one named
   accessor instead of an inline `0.6` in two files.
 - `ADD_REPO_ROW` ("Add new…") and `DEFAULT_MODEL_ROW` ("Default (pi chooses)")
-  live here, not in `chat/prompt_presentation.rs` where they were written,
+  live here, not in `models.rs` where they were written,
   because two renderers draw them: the chat screen and the gallery's prompt
   strip story. They are the only dropdown rows that are chrome rather than
   data — every other row is a model, a machine or a repository the app was
@@ -1446,7 +1474,7 @@ control wears, what its rows say, and what a pick *means*.
   inside the very pass that shipped it (it offered "Add a folder…" and an
   "Add a model…" row the app has never had). A shared const makes the drift
   unrepresentable. The wording rules that earned them are recorded under
-  `chat/prompt_presentation.rs`.
+  `models.rs`.
 - `prompt_box_input(input)` is the input well's padding (`px_3`, `pt_3`,
   `pb_2`) and nothing else. It is private to this module: `prompt_strip_box`
   is its only caller and no screen or story draws a bare input well, so it
@@ -1625,9 +1653,18 @@ when models failed to load" a question with one answer instead of three.
 
 ## crates/harvester/src/ui/shell.rs
 
-Window chrome that is not the prompt, the transcript, or a modal: section
-headers, the chat pane's header, the statusbar frame, and the app's one
-keyboard focus ring.
+Window chrome that is not the prompt, the transcript, or a modal: the sidebar's
+row vocabulary, section headers, the chat pane's header, the statusbar frame,
+and the app's one keyboard focus ring. The sidebar rows used to live in a
+separate `ui/sidebar.rs` and were merged in here, because the split was not a
+seam: the row geometry and the section header *are* one alignment spine, and
+keeping them apart forced `section_header` to import a `pub(super)` padding
+constant back out of the sidebar module — a geometry leak that existed only
+because the spine was written down in two files. Every machine and session row
+in the app is built from the three row builders, so the two lists cannot drift
+apart visually, and the headers above them cannot drift away from the rows
+either. Only presentation lives here; which rows exist, what they say, and what
+a click means belong to `workbench/sidebar.rs`.
 
 The chrome rhythm used to be deliberately tight (a fixed 24px statusbar,
 `pt_2`/`pb_1` section headers, `py_1p5` chat header) on the theory that chrome
@@ -1683,6 +1720,79 @@ sentence case like every other heading.
   order resolves by `(path, insertion index)`, meaning equal indices fall back
   to paint order; that is why every tab stop in the app uses index 0 and still
   walks in visual order.
+- **The alignment spine.** The row metrics are rems, and they are the one place
+  the sidebar's leading edges are written down. `SIDEBAR_ROW_GUTTER`
+  (`rems(0.25)`) is the row's outer margin — what insets the hover/selection
+  fill from the sidebar edge — and `SIDEBAR_ROW_PADDING` (`rems(0.75)`) its
+  inner padding. These were one shared 6px number on the theory that margin and
+  padding should match; they no longer do, because the margin's job (keep the
+  fill off the edge) needs far less room than the padding's job (keep the label
+  off the fill's edge), and at rem 14 the shared value was too much for one and
+  too little for the other. `SIDEBAR_CONTENT_INSET` is their sum — the lane the
+  row *text* starts in — and is what non-row content (`sidebar_empty_note`)
+  aligns to so a note and a row title share one left edge. The point of all of
+  that is a single spine: four siblings describe the same level of the sidebar
+  — the New-session button, the section headers, the rows and the empty note —
+  and each used to invent its own leading edge from its own literal. They now
+  all resolve from this one pair, so changing the gutter moves every one of
+  them together instead of starting a hunt. `SIDEBAR_CONTENT_INSET` is
+  *computed* (`rems(GUTTER.0 + PADDING.0)`) rather than typed a second time;
+  `Rems` is a tuple struct and `rems` is a `const fn`, so the sum costs nothing
+  at runtime and cannot drift. `SIDEBAR_ROW_GUTTER` is the one metric that
+  leaves this module — `workbench/sidebar.rs` reads it so the New-session
+  button's own padding completes the same inset — and it is exported for that
+  single caller; the padding and the inset stay private now that
+  `section_header` sits in the same file as the rows it aligns to, which is
+  what the merge bought.
+- Row padding is `py_2` (was `py_1`), matching the standard-tier step the rest
+  of the chrome took: a session row carries two lines of `text_sm` and at
+  `py_1` the stacked rows ran together into one grey block.
+- `SIDEBAR_STATUS_LANE` (`rems(1.)`) is a fixed lane the status dot sits in,
+  and the same lane the `detail` second line is indented by. It replaced a
+  derived `STACKED_ROW_DETAIL_INDENT` that had to be recomputed by hand every
+  time the dot diameter or the dot/title gap changed (it was "6px + gap_2").
+  Declaring the lane instead of deriving it means the two can never disagree,
+  and it is why the detail line hangs under the *title* rather than under the
+  dot. The dot sits at the lane's leading edge and the row carries no outer gap
+  of its own, so the dot's diameter is free to change without moving a single
+  character of text.
+- `sidebar_row` is a `ListItem` base, not a `div`: the library owns the
+  hover/selected/disabled treatments, and machine rows rely on `disabled`
+  gating the row while still rendering a live suffix button (see
+  `render_missing_machine_row`). It sets a `tab_index` so rows are reachable by
+  keyboard; a caller that must *not* be a tab stop (the machine rows, which are
+  not clickable) opts out with `tab_stop(false)` — still focusable
+  programmatically, just skipped by Tab, because a row with no click handler is
+  a dead end to land on — and a caller that is opts into the ring with
+  `keyboard_focus_ring`. The ring cannot live inside `sidebar_row` itself: it
+  needs `cx` for the theme's ring color and this builder takes only an id, so
+  the split is deliberate — the row owns reachability, the call site owns the
+  ring. It no longer restates a text size — the ambient body size is correct
+  now that nothing overrides it. The size was *removed* rather than read from
+  the theme for the same reason the ring stayed outside: both roots that can
+  host a row (the workbench root and the gallery's chrome root) set the theme's
+  font size themselves, so the row renders at exactly the size it used to
+  declare with one fewer place to drift. A row mounted under some third root
+  wants the size restored at that root, never back on the row.
+- `sidebar_stacked_row` takes a **`Tone`, not a `Dot`**: the shape is derived
+  by `Tone::dot` (see `ui/core.rs`), so no caller picks solid-versus-hollow any
+  more. It is one shape for both lists: status lane + title on the first line,
+  an optional inline `note` (transient status, e.g. "opening…") after the
+  title, and an optional `detail` second line (the row's context — provider, or
+  folder · machine). Both secondary texts are `text_sm` and resolve their color
+  through `Tone::Muted` rather than `cx.theme().muted_foreground` directly, so
+  `ui` keeps its rule that a component asks for a meaning, never a theme field
+  (SPEC C11).
+- `status_lane` is a private builder rather than a bare dot because the dot has
+  to *say* something: it carries `Tone::label` as both its `aria_label` and its
+  tooltip. A color alone is not a status for a screen reader, and it is not one
+  for a sighted user who has not memorized six shades either.
+  `STATUS_LANE_ELEMENT_ID` is the bare string `"status"` for every row, which
+  is correct rather than lazy: gpui element ids are paths, and every row
+  already carries a unique id, so a leaf only has to be unique among its
+  siblings.
+- `sidebar_empty_note` is the "no sessions yet" line. It is a plain note, not a
+  row: an empty list has nothing to select, so it must not look clickable.
 - The statusbar band is `h_8` (2rem, 28px) — one line of `text_sm` with real
   breathing room, still short enough to read as a status strip rather than a
   second toolbar. There is no `STATUSBAR_HEIGHT` const any more: the rem step
@@ -1706,15 +1816,19 @@ sentence case like every other heading.
   `disclosure_chevron` icon from `core.rs`, which inherits the header's faint
   color from the ambient text style.
 - `section_header`'s box is aligned to the sidebar's rows, not to itself: it
-  takes `mx(SIDEBAR_ROW_GUTTER)` / `px(SIDEBAR_ROW_PADDING)` from
-  `ui/sidebar.rs` and rounds `rounded_md`, so its focus ring draws the same
-  pill in the same lane as the row underneath it. Its padding doubled with the
-  rest of the chrome, `pt_2`/`pb_1` → `pt_4`/`pb_2`, which keeps the deliberate
-  2:1 asymmetry (more air above a heading than below it, so the heading binds
-  downward to the rows it labels) while giving the header a box with real room
-  in it. That box used to be invisible; now it rounds and takes a focus ring,
-  so its shape is something the user actually sees, and at `pb_1` there was
-  under 4px between the text and the ring's lower edge.
+  takes the same `mx(SIDEBAR_ROW_GUTTER)` / `px(SIDEBAR_ROW_PADDING)` pair
+  `sidebar_row` does and rounds `rounded_md`, so its focus ring draws the same
+  pill in the same lane as the row underneath it. That shared pair is the whole
+  argument for one file: a sidebar-shaped header that the gallery's dock
+  happens to reuse has to resolve from the row's geometry, and reading it
+  across a module boundary meant publishing a padding constant to one caller.
+  Its padding doubled with the rest of the chrome, `pt_2`/`pb_1` →
+  `pt_4`/`pb_2`, which keeps the deliberate 2:1 asymmetry (more air above a
+  heading than below it, so the heading binds downward to the rows it labels)
+  while giving the header a box with real room in it. That box used to be
+  invisible; now it rounds and takes a focus ring, so its shape is something
+  the user actually sees, and at `pb_1` there was under 4px between the text
+  and the ring's lower edge.
 - `chat_header` is `py_3` for the same reason the statusbar grew, and its
   subtitle is `text_sm`. The subtitle slot has a rule: it names the next action
   or the target, never a restatement of the title. The chat pane pairs "New
@@ -1728,87 +1842,6 @@ sentence case like every other heading.
   carry affordance instead. The library agrees by default: `Button` sets
   `cursor_default()` and only opts into a pointer for its link and text
   variants.
-
-## crates/harvester/src/ui/sidebar.rs
-
-The sidebar's row vocabulary — every machine and session row in the app is
-built from these three, so the two lists cannot drift apart visually. Only
-presentation lives here; which rows exist, what they say, and what a click
-means belong to `workbench/sidebar.rs`.
-
-- The row metrics are rems, and two of them are `pub`/`pub(super)` because
-  other code has to line up with them. `SIDEBAR_ROW_GUTTER` (`rems(0.25)`) is
-  the row's outer margin — what insets the hover/selection fill from the
-  sidebar edge — and `SIDEBAR_ROW_PADDING` (`rems(0.75)`) its inner padding.
-  These were one shared 6px number on the theory that margin and padding
-  should match; they no longer do, because the margin's job (keep the fill off
-  the edge) needs far less room than the padding's job (keep the label off the
-  fill's edge), and at rem 14 the shared value was too much for one and too
-  little for the other. `SIDEBAR_CONTENT_INSET` is their sum — the lane the
-  row *text* starts in — and is what non-row content (`sidebar_empty_note`)
-  aligns to so a note and a row title share one left edge. `section_header`
-  in `ui/shell.rs` reads the same two constants, and `workbench/sidebar.rs`
-  reads `SIDEBAR_ROW_GUTTER` for the New-session button.
-  The point of all of that is a single alignment spine. Four siblings describe
-  the same level of the sidebar — the New-session button, the section headers,
-  the rows and the empty note — and each used to invent its own leading edge
-  from its own literal. They now all resolve from this one pair, so changing
-  the gutter moves every one of them together instead of starting a hunt.
-  `SIDEBAR_CONTENT_INSET` is *computed* (`rems(GUTTER.0 + PADDING.0)`) rather
-  than typed a second time; `Rems` is a tuple struct and `rems` is a `const fn`,
-  so the sum costs nothing at runtime and cannot drift. `ui/shell.rs` reaching
-  into `ui/sidebar.rs` for geometry is the intended direction: the sidebar owns
-  the inset, and `collapsible_section` is a sidebar-shaped header that the
-  gallery's dock happens to reuse.
-- Row padding is `py_2` (was `py_1`), matching the standard-tier step the rest
-  of the chrome took: a session row carries two lines of `text_sm` and at
-  `py_1` the stacked rows ran together into one grey block.
-- `SIDEBAR_STATUS_LANE` (`rems(1.)`) is a fixed lane the status dot sits in,
-  and the same lane the `detail` second line is indented by. It replaced a
-  derived `STACKED_ROW_DETAIL_INDENT` that had to be recomputed by hand every
-  time the dot diameter or the dot/title gap changed (it was "6px + gap_2").
-  Declaring the lane instead of deriving it means the two can never disagree,
-  and it is why the detail line hangs under the *title* rather than under the
-  dot. The dot sits at the lane's leading edge and the row carries no outer
-  gap of its own, so the dot's diameter is free to change without moving a
-  single character of text.
-- `sidebar_row` is a `ListItem` base, not a `div`: the library owns the
-  hover/selected/disabled treatments, and machine rows rely on `disabled`
-  gating the row while still rendering a live suffix button (see
-  `render_missing_machine_row`). It sets a `tab_index` so rows are reachable
-  by keyboard; a caller that must *not* be a tab stop (the machine rows, which
-  are not clickable) opts out with `tab_stop(false)` — still focusable
-  programmatically, just skipped by Tab, because a row with no click handler is
-  a dead end to land on — and a caller that is opts into the ring with
-  `keyboard_focus_ring`. The ring cannot live inside `sidebar_row` itself: it
-  needs `cx` for the theme's ring color and this builder takes only an id, so
-  the split is deliberate — the row owns reachability, the call site owns the
-  ring. It no longer restates a text
-  size — the ambient body size is correct now that nothing overrides it. The
-  size was *removed* rather than read from the theme for the same reason the
-  ring stayed outside: both roots that can host a row (the workbench root and
-  the gallery's chrome root) set the theme's font size themselves, so the row
-  renders at exactly the size it used to declare with one fewer place to drift.
-  A row mounted under some third root wants the size restored at that root,
-  never back on the row.
-- `sidebar_stacked_row` takes a **`Tone`, not a `Dot`**: the shape is derived
-  by `Tone::dot` (see `ui/core.rs`), so no caller picks solid-versus-hollow any
-  more. It is one shape for both lists: status lane + title on the first line,
-  an optional inline `note` (transient status, e.g. "opening…") after the
-  title, and an optional `detail` second line (the row's context — provider, or
-  folder · machine). Both secondary texts are `text_sm` and resolve their color
-  through `Tone::Muted` rather than `cx.theme().muted_foreground` directly,
-  so `ui` keeps its rule that a component asks for a meaning, never a theme
-  field (SPEC C11).
-- `status_lane` is a private builder rather than a bare dot because the dot has
-  to *say* something: it carries `Tone::label` as both its `aria_label` and its
-  tooltip. A color alone is not a status for a screen reader, and it is not one
-  for a sighted user who has not memorized six shades either.
-  `STATUS_LANE_ELEMENT_ID` is the bare string `"status"` for every row, which is
-  correct rather than lazy: gpui element ids are paths, and every row already
-  carries a unique id, so a leaf only has to be unique among its siblings.
-- `sidebar_empty_note` is the "no sessions yet" line. It is a plain note, not
-  a row: an empty list has nothing to select, so it must not look clickable.
 
 ## crates/harvester/src/ui/theme.rs
 
@@ -1902,98 +1935,14 @@ is the same hue-240/5%-saturation gray at a different lightness) replacing
   the platform text system substitutes, so a machine without these installed
   degrades instead of failing.
 
-## crates/harvester/src/ui/tool_block.rs
-
-Reusable visual primitives (frame, typography, status treatment) for one
-transcript tool-call block; tool-specific labeling and body policy live in
-`transcript.rs` instead, keeping this module purely presentational.
-
-- `block` renders on the `popover` slot with a hairline border, rounded through
-  `theme.radius_lg`: in the graphite elevation ladder a tool card is a raised
-  surface over the canvas (it was previously the `sidebar` slot, which the
-  graphite ladder repurposed as the *darkest* tier — keeping it would have
-  sunk the cards below their page). It carries **no** shadow. A transcript can
-  hold a dozen of these in a row, and a dozen stacked `shadow_sm` cards read as
-  clutter rather than depth; the fill and the hairline already place the card
-  on the ladder, which is what a shadow was there to do. The header chevron is
-  `core::disclosure_chevron`, tinted `faint` like every disclosure marker.
-- The header is `py_2` (up from a bare `px(6.)`, i.e. the compact tier), takes
-  a `tab_index`, and carries `Role::Button` with `aria_expanded` and an
-  `aria_label` the caller supplies (see `tool_label` / `tool_accessible_name`
-  in `transcript.rs`). It takes its `index` rather than an `ElementId` and
-  builds `(HEADER_ELEMENT_ID, index)` itself, so the id scheme lives in one
-  place with the status slot's matching `(STATUS_ELEMENT_ID, index)` — the row
-  needs a stateful id for focus and click, the indicator needs its own for the
-  tooltip, and letting the caller invent either one invites a collision.
-  `HEADER_TAB_INDEX` (0) makes every tool header an ordinary tab stop in
-  document order, and that single call is the whole keyboard story: the
-  existing `on_click` toggle answers Enter and Space with no key handling
-  written here (see `ui/shell.rs` for the gpui mechanics).
-- Focus on the header is a transparent 1px border that turns `theme.ring`,
-  not the shared `keyboard_focus_ring` shadow. The card clips its children
-  (`overflow_hidden`), so a shadow drawn outside the header's box would be cut
-  off; reserving the border at `transparent_black()` means gaining focus
-  changes a color and never a layout.
-- The header has both a hover fill (`list_hover`) and a press fill (`muted`):
-  press feedback lands on pointer-down, matching every other clickable
-  surface in the app.
-- `status` is the dot in a fixed `size_4` slot carrying the caller's status
-  word as its tooltip — same rule as the sidebar's status lane: a color is not
-  a status unless something says what it means. The word is *not* `Tone::label`
-  here; it is `transcript::tool_status_label`, because the tones speak the
-  machine- and session-liveness vocabulary and a finished tool call is
-  "Completed", not "Neutral". The slot is `size_4` rather than hugging the 6px
-  dot for two reasons: a 6px tooltip target is not something a pointer can
-  reliably hit, and a fixed-width indicator gives a stack of repeated rows one
-  stable icon column, which is what keeps every header's label starting on the
-  same x.
-- `stats` is one faint run (`+3 −1`), not a green `+` beside a red `−`. Diff
-  counts are metadata about an edit, not a verdict on it, and spending the
-  success/danger colors on them made a routine edit look like a test result —
-  the two colors that mean "it worked" and "it failed" have to stay scarce.
-  Semantic color is legitimate where it *is* the data, which in this module is
-  the diff lines in the body and nowhere else. `stats` also gave up its own
-  smaller size, which is what lets the `items_baseline` label row line up
-  exactly instead of nearly.
-- The card's emphasis budget is three text tiers and no more: full foreground
-  for the subject (the file name or the command), `dim` for the verb and the
-  output body, `faint` for the stats, the context line, the chevron and the
-  truncation notice. Together with `tool_tone` mapping a settled call to
-  `Tone::Muted`, that leaves a finished tool block with exactly one focal point
-  and, in the header, exactly one colored element — the dot. Color in the
-  transcript means "running" or "broken" and nothing else.
-- Header and body deliberately sit at the same `text_sm` size. They are two
-  halves of one secondary-tier card, told apart by a hairline and a font
-  change, not by size; the body used to be smaller than its own header, which
-  inverted the label/content relationship. One step below the message prose is
-  the right place for the whole card: prose is the content, tool rows are the
-  scannable log of how it was produced, and under the old two-scale mismatch
-  the log rendered *larger* than the work it described.
-- `body` is `text_sm` on the mono family with an explicit
-  `line_height(relative(CODE_LINE_HEIGHT))` (1.45). Code needs tighter leading
-  than the 1.7 prose uses — it is the *ratio* between the two that carries the
-  meaning (code reads as one block, prose wants air), not either number on its
-  own — and `TextViewStyle` has no line-height field, so the
-  wrapper is where it is set — the same technique `transcript.rs` uses for
-  messages. `code_lines` is a bare unpadded column so a run of diff or written
-  lines stacks with no gap between them; the `gap_1` on `body` separates the
-  *sections* of a body (context line, content, output), not the lines inside a
-  section. Equal gaps claim equal relationships, and consecutive lines of one
-  file are not siblings with space between them — their leading is what should
-  separate them, which is exactly what `CODE_LINE_HEIGHT` is for.
-- `truncation_notice` says "Output truncated" as a sentence, not "… output
-  truncated": it is chrome stating a fact about the block, and the leading
-  ellipsis made it read like part of the output it is describing. No final
-  period either — a short state is a label, not a sentence to be closed.
-
 ## crates/harvester/src/ui/transcript.rs
 
-Transcript presentation: messages, markdown, tool labeling/bodies, and
-expansion state, layered on top of `harvester-client-core`'s `Transcript`
-(the verbatim-derived conversation replica). This module adds *only* visual
-policy and keys all of it by stable Pi tool-call ids, so a history repair can
-replace transcript items wholesale without moving expansion state onto the
-wrong block.
+Transcript presentation: messages, markdown, the tool card's chrome, tool
+labeling/bodies, and expansion state, layered on top of
+`harvester-client-core`'s `Transcript` (the verbatim-derived conversation
+replica). This module adds *only* visual policy and keys all of it by stable Pi
+tool-call ids, so a history repair can replace transcript items wholesale
+without moving expansion state onto the wrong block.
 
 - `TranscriptPresentation` owns exactly the state that belongs to rendering:
   which stable `toolCallId`s the user expanded. Session lifecycle, Pi events,
@@ -2015,6 +1964,98 @@ wrong block.
   outright: neither the chat pane that hosts it nor the gallery's
   `transcript_panel` (explicitly `p_0`) adds any of its own, so there is one
   place to change it and no chance of doubling it.
+
+The `tool_block_*` builders are the tool card's reusable visual primitives —
+frame, typography, status treatment. They all carry the `tool_block_` prefix,
+which they did not need while they lived behind a `tool_block::` module path.
+They were merged in from a separate `ui/tool_block.rs` because this module was
+their only consumer and already held half the render (`render_tool_body`,
+`render_diff`, `render_written_content`, `diff_line_kind`); the prefix is what
+keeps `tool_block_body` from reading as "the body" and `tool_block_header` from
+colliding with the chat pane's header in a reader's head. Nothing outside `ui`
+draws a tool block — the gallery reaches one only through
+`TranscriptPresentation::render` — so every one of them is module-private, as
+is `DiffLineKind`.
+
+- `tool_block_frame` renders on the `popover` slot with a hairline border,
+  rounded through `theme.radius_lg`: in the graphite elevation ladder a tool
+  card is a raised surface over the canvas (it was previously the `sidebar`
+  slot, which the graphite ladder repurposed as the *darkest* tier — keeping it
+  would have sunk the cards below their page). It carries **no** shadow. A
+  transcript can hold a dozen of these in a row, and a dozen stacked
+  `shadow_sm` cards read as clutter rather than depth; the fill and the
+  hairline already place the card on the ladder, which is what a shadow was
+  there to do. The header chevron is `core::disclosure_chevron`, tinted `faint`
+  like every disclosure marker.
+- `tool_block_header` is `py_2` (up from a bare `px(6.)`, i.e. the compact
+  tier), takes a `tab_index`, and carries `Role::Button` with `aria_expanded`
+  and an `aria_label` the caller supplies (see `tool_label` /
+  `tool_accessible_name` below). It takes its `index` rather than an
+  `ElementId` and builds `(TOOL_BLOCK_HEADER_ELEMENT_ID, index)` itself, so the
+  id scheme lives in one place with the status slot's matching
+  `(TOOL_BLOCK_STATUS_ELEMENT_ID, index)` — the row needs a stateful id for
+  focus and click, the indicator needs its own for the tooltip, and letting the
+  caller invent either one invites a collision. `TOOL_BLOCK_HEADER_TAB_INDEX`
+  (0) makes every tool header an ordinary tab stop in document order, and that
+  single call is the whole keyboard story: the existing `on_click` toggle
+  answers Enter and Space with no key handling written here (see `ui/shell.rs`
+  for the gpui mechanics).
+- Focus on `tool_block_header` is a transparent 1px border that turns
+  `theme.ring`, not the shared `keyboard_focus_ring` shadow. The card clips its
+  children (`overflow_hidden`), so a shadow drawn outside the header's box
+  would be cut off; reserving the border at `transparent_black()` means gaining
+  focus changes a color and never a layout.
+- `tool_block_header` has both a hover fill (`list_hover`) and a press fill
+  (`muted`): press feedback lands on pointer-down, matching every other
+  clickable surface in the app.
+- `tool_block_status_indicator` is the dot in a fixed `size_4` slot carrying
+  the caller's status word as its tooltip — same rule as the sidebar's status
+  lane: a color is not a status unless something says what it means. The word
+  is *not* `Tone::label` here; it is `tool_status_label`, because the tones
+  speak the machine- and session-liveness vocabulary and a finished tool call
+  is "Completed", not "Neutral". The slot is `size_4` rather than hugging the
+  6px dot for two reasons: a 6px tooltip target is not something a pointer can
+  reliably hit, and a fixed-width indicator gives a stack of repeated rows one
+  stable icon column, which is what keeps every header's label starting on the
+  same x.
+- `tool_block_stats` is one faint run (`+3 −1`), not a green `+` beside a red
+  `−`. Diff counts are metadata about an edit, not a verdict on it, and
+  spending the success/danger colors on them made a routine edit look like a
+  test result — the two colors that mean "it worked" and "it failed" have to
+  stay scarce. Semantic color is legitimate where it *is* the data, which in
+  the tool card is the diff lines in the body and nowhere else.
+  `tool_block_stats` also gave up its own smaller size, which is what lets the
+  `items_baseline` label row line up exactly instead of nearly.
+- The card's emphasis budget is three text tiers and no more: full foreground
+  for the subject (the file name or the command), `dim` for the verb and the
+  output body, `faint` for the stats, the context line, the chevron and the
+  truncation notice. Together with `tool_tone` mapping a settled call to
+  `Tone::Muted`, that leaves a finished tool block with exactly one focal point
+  and, in the header, exactly one colored element — the dot. Color in the
+  transcript means "running" or "broken" and nothing else.
+- Header and body deliberately sit at the same `text_sm` size. They are two
+  halves of one secondary-tier card, told apart by a hairline and a font
+  change, not by size; the body used to be smaller than its own header, which
+  inverted the label/content relationship. One step below the message prose is
+  the right place for the whole card: prose is the content, tool rows are the
+  scannable log of how it was produced, and under the old two-scale mismatch
+  the log rendered *larger* than the work it described.
+- `tool_block_body` is `text_sm` on the mono family with an explicit
+  `line_height(relative(CODE_LINE_HEIGHT))` (1.45). Code needs tighter leading
+  than the 1.7 prose uses — it is the *ratio* between the two that carries the
+  meaning (code reads as one block, prose wants air), not either number on its
+  own — and `TextViewStyle` has no line-height field, so the wrapper is where
+  it is set — the same technique `message_frame` uses for prose.
+  `tool_block_code_lines` is a bare unpadded column so a run of diff or written
+  lines stacks with no gap between them; the `gap_1` on `tool_block_body`
+  separates the *sections* of a body (context line, content, output), not the
+  lines inside a section. Equal gaps claim equal relationships, and consecutive
+  lines of one file are not siblings with space between them — their leading is
+  what should separate them, which is exactly what `CODE_LINE_HEIGHT` is for.
+- `tool_block_truncation_notice` says "Output truncated" as a sentence, not "…
+  output truncated": it is chrome stating a fact about the block, and the
+  leading ellipsis made it read like part of the output it is describing. No
+  final period either — a short state is a label, not a sentence to be closed.
 - `tool_tone`: `ToolStatus::Running` maps to `Tone::Active` rather than
   `Tone::Pending` — a running tool is the live thing the user is watching on
   screen right now, not a "just working, outcome unknown" state. `Ok` maps to
@@ -2050,7 +2091,10 @@ wrong block.
 - `output_text` centralizes the empty-output case: "Running…" while the call is
   in flight, "No output" once it has settled. It was `"(no output)"` —
   parenthesised asides are how a UI mumbles, and a tool that genuinely printed
-  nothing is a fact worth stating plainly. Pinned by a test.
+  nothing is a fact worth stating plainly. Pinned by a test. Its match spells
+  `ToolStatus::Ok | ToolStatus::Error` rather than a `_` arm, so adding a fourth
+  status makes the compiler ask what the placeholder should say instead of
+  silently answering "No output".
 - `render_tool_body` is now a router over named builders (`render_tool_content`
   over `render_diff` / `render_written_content` / `render_written_line`, and
   `output_text`) rather than a chain of early returns; the behavior is
@@ -2563,7 +2607,7 @@ that turns out to matter, the honest way back is a `ui::sidebar_row` carrying
 `Role::Button`, not a style the library will keep ignoring.
 
 Row chrome is not here: `ui::sidebar_row`, `ui::sidebar_stacked_row` and
-`ui::sidebar_empty_note` own how a row *looks* (see `ui/sidebar.rs`), and
+`ui::sidebar_empty_note` own how a row *looks* (see `ui/shell.rs`), and
 `ui::collapsible_section` owns the two section headers, so this module is
 store data → row content → intent and nothing else. The two collapse booleans
 stay here because they are this screen's state; the header component is told
@@ -2600,7 +2644,7 @@ Constants:
   transient status fragment trailing a title, not a heading.
 
 Keyboard and accessibility, which is screen policy and therefore lives here
-rather than in `ui/sidebar.rs`:
+rather than in `ui/shell.rs`:
 - Session rows are `Role::ListItem` with `aria_label` (the row title) and
   `aria_selected`, and they take the shared `keyboard_focus_ring`. They are the
   sidebar's only clickable rows, so they are its only tab stops.

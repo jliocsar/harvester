@@ -3,29 +3,44 @@ use std::rc::Rc;
 use std::sync::OnceLock;
 
 use gpui::{
-    div, prelude::*, relative, AnyElement, App, Div, ElementId, ScrollHandle, SharedString, Window,
+    div, prelude::*, relative, transparent_black, AnyElement, App, Div, ElementId, ScrollHandle,
+    SharedString, Stateful, Window,
 };
 use gpui_component::highlighter::HighlightTheme;
 use gpui_component::text::{TextView, TextViewStyle};
+use gpui_component::tooltip::Tooltip;
 use gpui_component::ActiveTheme as _;
 use harvester_client_core::transcript::{Item, Message, Role, ToolBlock, ToolStatus, Transcript};
 use serde_json::Value;
 
-use super::core::Tone;
-use super::tool_block::{self, DiffLineKind};
+use super::core::{dim, disclosure_chevron, faint, mono_font_family, status_dot_for_tone, Tone};
 
 const ARGS_SUMMARY_MAX_CHARS: usize = 80;
 const MESSAGE_LINE_HEIGHT: f32 = 1.7;
+const CODE_LINE_HEIGHT: f32 = 1.45;
 const USER_BUBBLE_MAX_WIDTH: f32 = 0.7;
 
 const RUNNING_PLACEHOLDER: &str = "Running…";
 const NO_OUTPUT_PLACEHOLDER: &str = "No output";
+const TRUNCATION_NOTICE: &str = "Output truncated";
 
 const RUNNING_STATUS_LABEL: &str = "Running";
 const COMPLETED_STATUS_LABEL: &str = "Completed";
 const FAILED_STATUS_LABEL: &str = "Failed";
 
+const TOOL_BLOCK_HEADER_ELEMENT_ID: &str = "tool-block-header";
+const TOOL_BLOCK_STATUS_ELEMENT_ID: &str = "tool-block-status";
+
+const TOOL_BLOCK_HEADER_TAB_INDEX: isize = 0;
+
 type ToggleToolBlock = Rc<dyn Fn(String, &mut Window, &mut App)>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffLineKind {
+    Context,
+    Added,
+    Removed,
+}
 
 #[derive(Default)]
 pub struct TranscriptPresentation {
@@ -96,7 +111,7 @@ impl TranscriptPresentation {
         let summary = tool_summary(block);
         let expanded = self.expanded_tool_calls.contains(&block.tool_call_id);
         let tool_call_id = block.tool_call_id.clone();
-        let header = tool_block::header(
+        let header = tool_block_header(
             index,
             tone,
             status_label.into(),
@@ -109,7 +124,7 @@ impl TranscriptPresentation {
             toggle_tool_block(tool_call_id.clone(), window, cx);
         });
 
-        tool_block::block(cx)
+        tool_block_frame(cx)
             .child(header)
             .when(expanded, |container| {
                 container.child(render_tool_body(block, cx))
@@ -187,6 +202,137 @@ fn render_streaming(transcript: &Transcript, cx: &App) -> Option<Div> {
         (None, true) => Some(message_frame("…", false, cx)),
         (None, false) => None,
     }
+}
+
+fn tool_block_frame(cx: &App) -> Div {
+    div()
+        .rounded(cx.theme().radius_lg)
+        .bg(cx.theme().popover)
+        .border_1()
+        .border_color(cx.theme().border)
+        .flex()
+        .flex_col()
+        .overflow_hidden()
+}
+
+fn tool_block_header(
+    index: usize,
+    tone: Tone,
+    status_label: SharedString,
+    accessible_name: SharedString,
+    label: Div,
+    expanded: bool,
+    cx: &App,
+) -> Stateful<Div> {
+    div()
+        .id((TOOL_BLOCK_HEADER_ELEMENT_ID, index))
+        .role(gpui::Role::Button)
+        .aria_label(accessible_name)
+        .aria_expanded(expanded)
+        .px_3()
+        .py_2()
+        .border_1()
+        .border_color(transparent_black())
+        .tab_index(TOOL_BLOCK_HEADER_TAB_INDEX)
+        .focus_visible(|style| style.border_color(cx.theme().ring))
+        .flex()
+        .items_center()
+        .gap_2()
+        .hover(|style| style.bg(cx.theme().list_hover))
+        .active(|style| style.bg(cx.theme().muted))
+        .child(tool_block_status_indicator(index, tone, status_label, cx))
+        .child(label.flex_1().min_w_0())
+        .child(
+            div()
+                .flex_none()
+                .text_color(faint(cx))
+                .child(disclosure_chevron(expanded)),
+        )
+}
+
+fn tool_block_status_indicator(
+    index: usize,
+    tone: Tone,
+    status_label: SharedString,
+    cx: &App,
+) -> Stateful<Div> {
+    div()
+        .id((TOOL_BLOCK_STATUS_ELEMENT_ID, index))
+        .flex_none()
+        .size_4()
+        .flex()
+        .items_center()
+        .justify_center()
+        .tooltip(move |window, cx| Tooltip::new(status_label.clone()).build(window, cx))
+        .child(status_dot_for_tone(tone, cx))
+}
+
+fn tool_block_label_row() -> Div {
+    div()
+        .flex()
+        .items_baseline()
+        .gap_2()
+        .overflow_hidden()
+        .text_sm()
+}
+
+fn tool_block_verb(text: impl Into<SharedString>, cx: &App) -> Div {
+    div().flex_none().text_color(dim(cx)).child(text.into())
+}
+
+fn tool_block_subject(text: SharedString, mono: bool, cx: &App) -> Div {
+    div()
+        .overflow_hidden()
+        .text_ellipsis()
+        .when(mono, |subject| subject.font_family(mono_font_family(cx)))
+        .child(text)
+}
+
+fn tool_block_stats(added: usize, removed: usize, cx: &App) -> Div {
+    div()
+        .flex_none()
+        .text_color(faint(cx))
+        .child(format!("+{added} −{removed}"))
+}
+
+fn tool_block_body(cx: &App) -> Div {
+    div()
+        .border_t_1()
+        .border_color(cx.theme().border)
+        .px_3()
+        .py_2()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .text_sm()
+        .line_height(relative(CODE_LINE_HEIGHT))
+        .font_family(mono_font_family(cx))
+}
+
+fn tool_block_code_lines() -> Div {
+    div().flex().flex_col()
+}
+
+fn tool_block_context(text: SharedString, cx: &App) -> Div {
+    div().text_color(faint(cx)).child(text)
+}
+
+fn tool_block_output(text: SharedString, cx: &App) -> Div {
+    div().text_color(dim(cx)).child(text)
+}
+
+fn tool_block_diff_line(kind: DiffLineKind, text: SharedString, cx: &App) -> Div {
+    let color = match kind {
+        DiffLineKind::Context => dim(cx),
+        DiffLineKind::Added => cx.theme().success,
+        DiffLineKind::Removed => cx.theme().danger,
+    };
+
+    div().text_color(color).child(text)
+}
+
+fn tool_block_truncation_notice(cx: &App) -> Div {
+    div().text_color(faint(cx)).child(TRUNCATION_NOTICE)
 }
 
 fn tool_tone(status: ToolStatus) -> Tone {
@@ -295,16 +441,16 @@ fn unknown_tool_summary(block: &ToolBlock) -> ToolSummary {
 }
 
 fn tool_label(summary: &ToolSummary, cx: &App) -> Div {
-    let label = tool_block::label()
-        .child(tool_block::verb(summary.verb.clone(), cx))
-        .child(tool_block::subject(
+    let label = tool_block_label_row()
+        .child(tool_block_verb(summary.verb.clone(), cx))
+        .child(tool_block_subject(
             summary.subject.clone(),
             summary.subject_is_monospace,
             cx,
         ));
 
     match summary.line_stats {
-        Some((added, removed)) => label.child(tool_block::stats(added, removed, cx)),
+        Some((added, removed)) => label.child(tool_block_stats(added, removed, cx)),
         None => label,
     }
 }
@@ -318,16 +464,16 @@ fn tool_accessible_name(summary: &ToolSummary, status_label: &'static str) -> Sh
 }
 
 fn render_tool_body(block: &ToolBlock, cx: &App) -> Div {
-    let body = tool_block::body(cx).child(tool_block::context(context_line(block).into(), cx));
+    let body = tool_block_body(cx).child(tool_block_context(context_line(block).into(), cx));
 
     if let Some(content) = render_tool_content(block, cx) {
         return body.child(content);
     }
 
-    let body = body.child(tool_block::output(output_text(block), cx));
+    let body = body.child(tool_block_output(output_text(block), cx));
 
     if block.output_truncated {
-        return body.child(tool_block::truncation_notice(cx));
+        return body.child(tool_block_truncation_notice(cx));
     }
 
     body
@@ -346,7 +492,7 @@ fn render_tool_content(block: &ToolBlock, cx: &App) -> Option<Div> {
 }
 
 fn render_diff(diff: &str, cx: &App) -> Div {
-    tool_block::code_lines().children(diff.lines().map(|line| render_diff_line(line, cx)))
+    tool_block_code_lines().children(diff.lines().map(|line| render_diff_line(line, cx)))
 }
 
 fn render_written_content(block: &ToolBlock, cx: &App) -> Option<Div> {
@@ -357,7 +503,7 @@ fn render_written_content(block: &ToolBlock, cx: &App) -> Option<Div> {
     let content = block.arg("content")?;
 
     Some(
-        tool_block::code_lines().children(
+        tool_block_code_lines().children(
             content
                 .lines()
                 .enumerate()
@@ -367,7 +513,7 @@ fn render_written_content(block: &ToolBlock, cx: &App) -> Option<Div> {
 }
 
 fn render_written_line(index: usize, line: &str, cx: &App) -> Div {
-    tool_block::diff_line(
+    tool_block_diff_line(
         DiffLineKind::Added,
         format!("+{} {line}", index + 1).into(),
         cx,
@@ -381,7 +527,7 @@ fn output_text(block: &ToolBlock) -> SharedString {
 
     match block.status {
         ToolStatus::Running => RUNNING_PLACEHOLDER.into(),
-        _ => NO_OUTPUT_PLACEHOLDER.into(),
+        ToolStatus::Ok | ToolStatus::Error => NO_OUTPUT_PLACEHOLDER.into(),
     }
 }
 
@@ -402,7 +548,7 @@ fn diff_line_kind(line: &str) -> DiffLineKind {
 }
 
 fn render_diff_line(line: &str, cx: &App) -> Div {
-    tool_block::diff_line(diff_line_kind(line), line.to_string().into(), cx)
+    tool_block_diff_line(diff_line_kind(line), line.to_string().into(), cx)
 }
 
 fn basename(path: &str) -> &str {

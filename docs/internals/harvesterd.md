@@ -30,59 +30,6 @@ That directory name is load-bearing in three places — `crates/harvester/build.
 fallback) and `harvester-cli`'s `--daemon` default — so a profile rename is a
 four-file change, not a one-line one.
 
-## crates/harvesterd/src/daemon.rs
-
-Shared daemon state: the pid table, and nothing else. Per docs/DAEMON.md,
-harvesterd is stateless — pi's own session `.jsonl` files are the only source
-of truth. This module is the in-memory exception: pids, not persisted state.
-
-- `PASSTHROUGH_ID_PREFIX` (`"hv-"`) namespaces request ids the daemon injects
-  into pi commands so the stdout pump can route a response back to its waiter
-  by prefix match. The mint (`Daemon::next_passthrough_id`) and the match
-  (in `session.rs`) must agree on the exact string, hence one shared const
-  rather than a literal duplicated at each site.
-- `SpawnOutcome::AlreadyRunning` vs `::Spawned`: both arms return the live
-  session so callers never need to reconstruct the sid they just moved in.
-  "AlreadyRunning" exists because the pid table is the per-sid single-instance
-  guard — a second `create_session` for a live sid loses at the lock, and this
-  is a domain outcome, not an error. It is deliberately *not* smuggled through
-  `io::ErrorKind::AlreadyExists` for the caller to sniff; `io::Result::Err` is
-  reserved for genuine spawn failures.
-- `RunningSession` carries `cwd` and `spawned_at_ms` because the pid table is
-  the *only* record of a session pi hasn't written a file for yet — a listing
-  built from disk alone cannot see it at all (see fslist.rs).
-- `DaemonInner.build_fingerprint`: this process's own build fingerprint,
-  computed once at startup and reported in `ping` (docs/DAEMON.md §ping). Not
-  persisted — it's the identity of the running image and dies with the
-  process.
-- `DaemonInner.sessions` uses `std::sync::Mutex` deliberately (not tokio's):
-  no guard is ever held across an `.await`, and lookups happen on every
-  passthrough, so a blocking mutex is fine and simpler.
-- `Daemon::running_sessions()` copies every live pi child out from under the
-  lock because no guard may cross the `spawn_blocking` boundary the caller
-  (fslist) is headed for. Keyed by sid because `list_sessions` asks "is this
-  sid running?" once per file on disk, and `Sid: Borrow<str>` makes that a
-  borrowed lookup.
-- `Daemon::spawn_session`: check-and-spawn under one lock. The table itself is
-  the single-instance guard for a sid — this is what makes "one pi process =
-  one session file, always" (CLAUDE.md) actually hold.
-- **Generation identity**: a session's identity is its `Arc` pointer, not its
-  sid. Stopping and resuming a sid spawns a *new generation* — a different pi
-  child, a different `Arc<Session>` — under the same key. A sid match alone
-  only proves "some pi for this sid is alive," which is the wrong question for
-  a caller holding an older handle. `Daemon::is_current_generation` uses
-  `Arc::ptr_eq` to ask the right question, and every "is my session still the
-  live one?" check should go through it so the rule is stated once. It takes
-  the sid *from* the session (not as a separate argument) because a
-  caller-supplied sid could disagree with the handle — that pairing is exactly
-  the invariant being enforced.
-- `Daemon::remove_session_if_same`: vacates a session's table entry only if it
-  is still the current generation; a resumed successor is never evicted.
-  Called by the stdout pump *before* it broadcasts Exit. Tests-and-removes
-  under one lock (rather than calling `is_current_generation` then
-  re-locking) because a resume landing between the two calls would otherwise
-  make this evict the successor it just checked was different.
-
 ## crates/harvesterd/src/fslist.rs
 
 Implements `list_sessions`: a readdir-based scan of pi's session directories.
@@ -146,6 +93,27 @@ async-runtime thread never waits on disk.
 
 harvesterd is the per-machine daemon owning `pi --mode rpc` children. Contract
 is docs/DAEMON.md (protocol v1). Stateless by design.
+
+**Path policy**: every filesystem path the daemon touches is derived from
+`$HOME` in exactly one place — the contiguous block of path functions at the
+top of this file (single source of truth for path construction; keep them
+adjacent). Other modules call them as `crate::log_dir()` /
+`crate::pi_sessions_root()`.
+
+- `socket()`: the client-daemon rendezvous point, spelled using the same
+  constant (`harvester_proto::DAEMON_SOCKET_PATH`) the client itself reads, so
+  the two sides structurally cannot disagree about where to meet.
+- `harvester_dir()` (`~/.harvester`): the socket's parent directory. Its
+  `0700` permission mode (enforced in `main`) is the daemon's *entire*
+  authentication story (docs/DAEMON.md §Transport) — anyone who can open the
+  socket is trusted.
+- `log_dir()`: where each session's `<sid>.stderr.log` lands. This is the only
+  exit-diagnosis channel the client-daemon contract provides.
+- `pi_sessions_root()` (`~/.pi/agent/sessions`): pi's own per-cwd session
+  directories. Read-only from harvesterd's perspective — they are the actual
+  source of truth (see fslist.rs and CLAUDE.md's disk-is-truth invariant).
+
+**Startup and the CLI surface**:
 
 - `LOCK_FILE_NAME` (`harvesterd.lock`): the single-instance lock lives next to
   the socket in `~/.harvester`, as its own file rather than locking the socket
@@ -452,24 +420,6 @@ Implements verbatim pi RPC passthrough (docs/DAEMON.md §The `pi` passthrough).
   drops its waiter map on exit, named because it is the only pi "answer" the
   daemon authors for a command it did successfully write.
 
-## crates/harvesterd/src/paths.rs
-
-Every filesystem path the daemon touches is derived from `$HOME` in exactly
-one place in this file (single source of truth for path construction).
-
-- `socket()`: the client-daemon rendezvous point, spelled using the same
-  constant (`harvester_proto::DAEMON_SOCKET_PATH`) the client itself reads, so
-  the two sides structurally cannot disagree about where to meet.
-- `harvester_dir()` (`~/.harvester`): the socket's parent directory. Its
-  `0700` permission mode (enforced in `main.rs`) is the daemon's *entire*
-  authentication story (docs/DAEMON.md §Transport) — anyone who can open the
-  socket is trusted.
-- `log_dir()`: where each session's `<sid>.stderr.log` lands. This is the only
-  exit-diagnosis channel the client-daemon contract provides.
-- `pi_sessions_root()` (`~/.pi/agent/sessions`): pi's own per-cwd session
-  directories. Read-only from harvesterd's perspective — they are the actual
-  source of truth (see fslist.rs and CLAUDE.md's disk-is-truth invariant).
-
 ## crates/harvesterd/src/server.rs
 
 The controller layer: this module only frames, decodes, routes, and encodes
@@ -518,8 +468,91 @@ logic itself lives in `ops.rs` (harvester-native commands) and
 
 ## crates/harvesterd/src/session.rs
 
-One pi child process per `Session`: owns spawn, stdin ownership, and the
-stdout pump.
+One pi child process per `Session`: owns spawn (including the pi launch
+line), stdin ownership, and the stdout pump — plus `Daemon`, the pid table
+that owns every live `Session`. `Daemon` and `Session` were once separate
+modules with a mutual import; merging them here removed that cycle and put
+the passthrough id's mint and its match in one file.
+
+**The `Daemon` pid table** — shared daemon state: the pid table, and nothing
+else. Per docs/DAEMON.md, harvesterd is stateless — pi's own session `.jsonl`
+files are the only source of truth. The pid table is the in-memory exception:
+pids, not persisted state.
+
+- `PASSTHROUGH_ID_PREFIX` (`"hv-"`) namespaces request ids the daemon injects
+  into pi commands so the stdout pump can route a response back to its waiter
+  by prefix match. The mint (`Daemon::next_passthrough_id`) and the match
+  (`passthrough_response_key`) must agree on the exact string, hence one
+  shared const rather than a literal duplicated at each site. It is private
+  now that both sites live in this module.
+- `SpawnOutcome::AlreadyRunning` vs `::Spawned`: both arms return the live
+  session so callers never need to reconstruct the sid they just moved in.
+  "AlreadyRunning" exists because the pid table is the per-sid single-instance
+  guard — a second `create_session` for a live sid loses at the lock, and this
+  is a domain outcome, not an error. It is deliberately *not* smuggled through
+  `io::ErrorKind::AlreadyExists` for the caller to sniff; `io::Result::Err` is
+  reserved for genuine spawn failures.
+- `RunningSession` carries `cwd` and `spawned_at_ms` because the pid table is
+  the *only* record of a session pi hasn't written a file for yet — a listing
+  built from disk alone cannot see it at all (see fslist.rs).
+- `DaemonInner.build_fingerprint`: this process's own build fingerprint,
+  computed once at startup and reported in `ping` (docs/DAEMON.md §ping). Not
+  persisted — it's the identity of the running image and dies with the
+  process.
+- `DaemonInner.sessions` uses `std::sync::Mutex` deliberately (not tokio's):
+  no guard is ever held across an `.await`, and lookups happen on every
+  passthrough, so a blocking mutex is fine and simpler.
+- `Daemon::running_sessions()` copies every live pi child out from under the
+  lock because no guard may cross the `spawn_blocking` boundary the caller
+  (fslist) is headed for. Keyed by sid because `list_sessions` asks "is this
+  sid running?" once per file on disk, and `Sid: Borrow<str>` makes that a
+  borrowed lookup.
+- `Daemon::spawn_session`: check-and-spawn under one lock. The table itself is
+  the single-instance guard for a sid — this is what makes "one pi process =
+  one session file, always" (CLAUDE.md) actually hold. `Session::spawn` is
+  private and this is its only caller, so no path can spawn a pi without
+  going through the table's lock.
+- **Generation identity**: a session's identity is its `Arc` pointer, not its
+  sid. Stopping and resuming a sid spawns a *new generation* — a different pi
+  child, a different `Arc<Session>` — under the same key. A sid match alone
+  only proves "some pi for this sid is alive," which is the wrong question for
+  a caller holding an older handle. `Daemon::is_current_generation` uses
+  `Arc::ptr_eq` to ask the right question, and every "is my session still the
+  live one?" check should go through it so the rule is stated once. It takes
+  the sid *from* the session (not as a separate argument) because a
+  caller-supplied sid could disagree with the handle — that pairing is exactly
+  the invariant being enforced.
+- `Daemon::remove_session_if_same` (private — the stdout pump is its only
+  caller): vacates a session's table entry only if it is still the current
+  generation; a resumed successor is never evicted. Called by the stdout pump
+  *before* it broadcasts Exit. Tests-and-removes under one lock (rather than
+  calling `is_current_generation` then re-locking) because a resume landing
+  between the two calls would otherwise make this evict the successor it just
+  checked was different.
+
+**The pi launch line** (`create_pi_command` / `open_stderr_log`, docs/DAEMON.md
+§The pi launch line):
+
+- **Re-verify on every pi upgrade** (CLAUDE.md §Pi version discipline):
+  `--session-id` (resume-or-create) is source-verified against pi 0.83.0 but
+  *undocumented* API, so `create_pi_command` is a mandatory stop on every pi
+  upgrade check.
+- `create_pi_command` sets `PI_OFFLINE=1` to disable update checks and
+  telemetry, plus two git guards (`GIT_TERMINAL_PROMPT=0` and a
+  `BatchMode=yes` `GIT_SSH_COMMAND`) so a package install that wants
+  credentials fails fast instead of hanging the spawn — this is the risk that
+  passing `--approve` buys back.
+- `open_stderr_log` **appends, never truncates**: since spawn is also resume,
+  truncating would destroy the record of why the previous run died — exactly
+  what a user is looking for when they click resume, and the sole
+  exit-diagnosis channel the contract gives clients (docs/DAEMON.md §Events).
+  The banner line written at open time is what makes appended runs separable
+  when tailing the log.
+- `MILLIS_PER_SECOND`: the spawn banner is stamped in whole seconds — the
+  unit a `tail` of the log is read in, and the unit the contract names
+  (docs/DAEMON.md §The pi launch line).
+
+**The `Session` and its pumps**:
 
 - **`SessionOutput::Event`** carries the complete pre-serialized wire envelope
   (`{"type":"event","sid":…,"event":…}`, no trailing LF) built once in the
@@ -696,28 +729,6 @@ nobody can answer.
     dialog may publish a timeout of hours, and the timer must not keep the
     `Session` (and with it the broadcast channel every subscriber holds)
     alive past the lifetime of the pi process it belongs to.
-
-## crates/harvesterd/src/session/launch.rs
-
-Builds the one pi launch line (docs/DAEMON.md §The pi launch line). Pinned to
-pi 0.83.0 — `--session-id` (resume-or-create) is source-verified but
-*undocumented* API, so re-verify this module on every pi upgrade (CLAUDE.md
-§Pi version discipline).
-
-- `create_pi_command` sets `PI_OFFLINE=1` to disable update checks and
-  telemetry, plus two git guards (`GIT_TERMINAL_PROMPT=0` and a
-  `BatchMode=yes` `GIT_SSH_COMMAND`) so a package install that wants
-  credentials fails fast instead of hanging the spawn — this is the risk that
-  passing `--approve` buys back.
-- `open_stderr_log` **appends, never truncates**: since spawn is also resume,
-  truncating would destroy the record of why the previous run died — exactly
-  what a user is looking for when they click resume, and the sole
-  exit-diagnosis channel the contract gives clients (docs/DAEMON.md §Events).
-  The banner line written at open time is what makes appended runs separable
-  when tailing the log.
-- `MILLIS_PER_SECOND`: the spawn banner is stamped in whole seconds — the
-  unit a `tail` of the log is read in, and the unit the contract names
-  (docs/DAEMON.md §The pi launch line).
 
 ## crates/harvesterd/src/sid.rs
 

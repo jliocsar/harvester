@@ -5,8 +5,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::host;
-use crate::ssh::SshTarget;
+use crate::host::{self, SshTarget};
 use crate::{Error, Result};
 
 pub const SUPPORTED_PROVIDER_PROTOCOL: u64 = 1;

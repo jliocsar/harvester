@@ -1,39 +1,30 @@
 mod bootstrap;
 pub mod bridge;
-mod client;
 mod connection;
-pub mod dialog;
-mod dialog_obligation;
+mod dialog;
 mod fleet;
 mod host;
-mod machine;
 pub mod machines;
 mod provider;
-mod ssh;
 mod token;
-mod tokio_thread;
 pub mod transcript;
-mod workspace;
 
 pub use bootstrap::{bootstrap_and_connect, BootstrapOutcome, Connected};
-pub use client::{DaemonClient, SessionEvent};
 #[cfg(feature = "raw-protocol")]
 pub use connection::raw;
-pub use connection::{DaemonConnection, DaemonReader, DaemonWriter};
-pub use dialog::{DialogAnswer, DialogKind, DialogRequest};
-pub use dialog_obligation::{
-    AnsweredDialog, DialogKey, DialogObligation, DialogObligations, DialogRoom, EnqueueResult,
+pub use connection::{DaemonClient, DaemonConnection, DaemonReader, DaemonWriter, SessionEvent};
+pub use dialog::{
+    AnsweredDialog, DialogAnswer, DialogKey, DialogKind, DialogObligation, DialogObligations,
+    DialogRequest, DialogRoom, EnqueueResult,
 };
 pub use fleet::{
     BridgeEvents, Fleet, FleetError, FleetEvents, MachineCandidate, MachineState, MachinesEvents,
-    Unapplied,
+    Unapplied, LOCAL_MACHINE,
 };
-pub use host::Host;
-pub use machine::LOCAL_MACHINE;
-pub use ssh::SshTarget;
+pub use host::{Host, SshTarget};
+pub use machines::RemoteDirEntry;
 pub use token::{Pending, RequestToken, RequestTokens};
 pub use transcript::Transcript;
-pub use workspace::RemoteDirEntry;
 
 pub type Result<T> = std::result::Result<T, Error>;
 

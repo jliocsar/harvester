@@ -10,11 +10,10 @@ use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
-use crate::daemon::{Daemon, SpawnOutcome};
 use crate::fslist;
 use crate::models;
 use crate::server::{answer_later, Outbound};
-use crate::session::{self, Session, SessionOutput, SpawnArgs};
+use crate::session::{self, Daemon, Session, SessionOutput, SpawnArgs, SpawnOutcome};
 use crate::sid::Sid;
 
 const STOP_KILL_BACKSTOP: Duration = Duration::from_secs(30);

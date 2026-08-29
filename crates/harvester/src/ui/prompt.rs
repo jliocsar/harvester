@@ -12,8 +12,7 @@ use gpui_component::{ActiveTheme as _, Disableable as _, Icon, IconName, Sizable
 
 use crate::assets::GIT_BRANCH_ICON_PATH;
 
-use super::core::Tone;
-use super::note::inline_note;
+use super::core::{inline_note, Tone};
 
 const MODEL_CONTROL_ID: &str = "chat-model";
 const MACHINE_CONTROL_ID: &str = "chat-machine";

@@ -2,10 +2,9 @@ use harvester_proto::Outgoing;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-use crate::daemon::Daemon;
 use crate::ops::no_such_session_message;
 use crate::server::{answer_later, Outbound};
-use crate::session::Session;
+use crate::session::{Daemon, Session};
 use crate::sid::Sid;
 
 const SESSION_SWAPPING_COMMANDS: &[&str] = &["new_session", "switch_session", "fork", "clone"];

@@ -1,18 +1,34 @@
-use crate::host::Host;
+use crate::host::{parse_home, shell_quote, ExecOutput, Host, SshTarget, HOME_SCRIPT};
 use crate::provider::{
     discover_providers, install_bundled_providers, MachineKey, Provider, ProviderMachine,
 };
-use crate::ssh::SshTarget;
 use crate::token::RequestToken;
-use crate::tokio_thread::run_on_tokio_thread;
-use crate::workspace::{
-    list_directory, resolve_git_branch, resolve_home, validate_git_workspace, RemoteDirEntry,
-};
+use crate::Error;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 const PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const LIST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+const WORKSPACE_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+pub(crate) fn run_on_tokio_thread(
+    main: impl std::future::Future<Output = ()>,
+    on_runtime_error: impl FnOnce(String),
+) {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            on_runtime_error(format!("tokio runtime: {error}"));
+
+            return;
+        }
+    };
+
+    runtime.block_on(main);
+}
 
 #[derive(Debug)]
 pub enum Command {
@@ -76,6 +92,12 @@ pub struct MachineRow {
     pub label: String,
     pub provider: String,
     pub target: Option<SshTarget>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteDirEntry {
+    pub name: String,
+    pub is_dir: bool,
 }
 
 pub(crate) struct MachinesWorker {
@@ -246,6 +268,79 @@ fn spawn_host_op(
     });
 }
 
+async fn exec_workspace_script(
+    host: &Host,
+    script: &str,
+    context: &'static str,
+) -> crate::Result<ExecOutput> {
+    let output = host.exec(script, None, WORKSPACE_EXEC_TIMEOUT).await?;
+
+    output.require_success(context)?;
+
+    Ok(output)
+}
+
+async fn resolve_home(host: &Host) -> crate::Result<String> {
+    let output = exec_workspace_script(host, HOME_SCRIPT, "resolve home").await?;
+
+    parse_home(&output.stdout)
+        .map(str::to_string)
+        .ok_or_else(|| Error::Exec {
+            context: "resolve home",
+            detail: output.describe_failure(),
+        })
+}
+
+async fn list_directory(host: &Host, path: &str) -> crate::Result<Vec<RemoteDirEntry>> {
+    let script = format!("ls -1Ap -- {}", shell_quote(path));
+    let output = exec_workspace_script(host, &script, "list directory").await?;
+
+    Ok(parse_ls_entries(&output.stdout))
+}
+
+fn parse_ls_entries(stdout: &str) -> Vec<RemoteDirEntry> {
+    stdout.lines().filter_map(parse_ls_entry).collect()
+}
+
+fn parse_ls_entry(line: &str) -> Option<RemoteDirEntry> {
+    let (name, is_dir) = line
+        .strip_suffix('/')
+        .map_or((line, false), |directory| (directory, true));
+
+    if name.is_empty() || name.chars().any(char::is_control) {
+        return None;
+    }
+
+    Some(RemoteDirEntry {
+        name: name.to_string(),
+        is_dir,
+    })
+}
+
+async fn validate_git_workspace(host: &Host, path: &str) -> crate::Result<()> {
+    let script = format!("git -C {} rev-parse --git-dir", shell_quote(path));
+
+    exec_workspace_script(host, &script, "validate workspace").await?;
+
+    Ok(())
+}
+
+async fn resolve_git_branch(host: &Host, path: &str) -> crate::Result<String> {
+    let script = format!("git -C {} rev-parse --abbrev-ref HEAD", shell_quote(path));
+    let output = exec_workspace_script(host, &script, "resolve branch").await?;
+
+    let branch = output.stdout.trim();
+
+    if branch.is_empty() {
+        return Err(Error::Exec {
+            context: "resolve branch",
+            detail: output.describe_failure(),
+        });
+    }
+
+    Ok(branch.to_string())
+}
+
 fn spawn_list_cycle(
     previous: ProviderRows,
     events: UnboundedSender<Event>,
@@ -371,5 +466,53 @@ fn probe_ad_hoc(machines: &[String], events: &UnboundedSender<Event>) {
         };
 
         probe_machine(machine.clone(), target, events);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(stdout: &str) -> Vec<(String, bool)> {
+        parse_ls_entries(stdout)
+            .into_iter()
+            .map(|entry| (entry.name, entry.is_dir))
+            .collect()
+    }
+
+    #[test]
+    fn a_trailing_slash_is_what_marks_a_directory() {
+        assert_eq!(
+            names("src/\nCargo.toml\ntarget/\n"),
+            vec![
+                ("src".to_string(), true),
+                ("Cargo.toml".to_string(), false),
+                ("target".to_string(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_name_carrying_control_characters_is_dropped_rather_than_rendered() {
+        assert_eq!(
+            names("good.txt\nbell\u{7}name\nescape\u{1b}[31m\n"),
+            vec![("good.txt".to_string(), false)],
+            "`ls -1` cannot escape these, and a picker row is a path we later quote into a shell"
+        );
+    }
+
+    #[test]
+    fn a_blank_line_is_not_a_file() {
+        assert_eq!(names("\n\nreal\n\n"), vec![("real".to_string(), false)]);
+    }
+
+    #[test]
+    fn a_carriage_return_inside_a_name_is_dropped_but_a_crlf_line_ending_is_not() {
+        assert_eq!(names("win\rdows.txt\n"), Vec::new());
+        assert_eq!(
+            names("windows.txt\r\n"),
+            vec![("windows.txt".to_string(), false)],
+            "a CRLF transport must not cost the listing every entry"
+        );
     }
 }

@@ -1,5 +1,3 @@
-mod prompt_presentation;
-
 use gpui::{
     div, prelude::*, px, App, Context, Entity, EventEmitter, Focusable, ScrollHandle, SharedString,
     Subscription, Window,
@@ -7,16 +5,15 @@ use gpui::{
 use gpui_component::input::{InputEvent, InputState};
 use serde_json::Value;
 
-use crate::models::ModelChoice;
+use crate::models::{
+    machine_control_label, model_control_state, model_row_label, repo_control_label, ModelChoice,
+};
 use crate::session_state::{self, ModelSelection, ModelsState, SessionPhase, SessionState};
 use crate::store::{FleetStore, StoreEvent};
 use crate::ui::{self, Tone};
 use crate::workspaces::folder_name;
 use harvester_client_core::bridge::{Command, Event as BridgeEvent};
 use harvester_client_core::{machines, MachineCandidate, RequestToken};
-use prompt_presentation::{
-    machine_control_label, model_control_state, model_row_label, repo_control_label,
-};
 
 pub use session_state::ChatTarget;
 

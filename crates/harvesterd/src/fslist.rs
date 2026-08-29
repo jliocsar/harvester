@@ -6,14 +6,13 @@ use std::time::UNIX_EPOCH;
 use harvester_proto::{SessionInfo, SessionStatus, LF};
 use serde_json::Value;
 
-use crate::daemon::RunningSession;
-use crate::paths;
+use crate::session::RunningSession;
 use crate::sid::Sid;
 
 const SESSION_INFO_MARKER: &[u8] = br#""session_info""#;
 
 pub fn list_sessions(running: &HashMap<Sid, RunningSession>) -> Vec<SessionInfo> {
-    let Ok(dirs) = std::fs::read_dir(paths::pi_sessions_root()) else {
+    let Ok(dirs) = std::fs::read_dir(crate::pi_sessions_root()) else {
         return Vec::new();
     };
 

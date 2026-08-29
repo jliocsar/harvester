@@ -1,30 +1,34 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use harvester_proto::{
-    encode_frame, read_frame, HarvesterCmd, Outgoing, PingData, Request, PROTOCOL_VERSION,
+    encode_frame, read_frame, HarvesterCmd, HarvesterResponse, Outgoing, PingData, Request,
+    PROTOCOL_VERSION,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::Child;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::{oneshot, Mutex as AsyncMutex};
 use tokio::time::Instant;
 
-use crate::host::Host;
-use crate::ssh::SshTarget;
+use crate::host::{Host, SshTarget};
 use crate::{Error, Result};
 
 pub(crate) use harvester_proto::DAEMON_SOCKET_PATH as DAEMON_SOCKET;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(250);
-pub(crate) const HANDSHAKE_PING_ID: u64 = 0;
+const HANDSHAKE_PING_ID: u64 = 0;
 const FORWARD_SOCKET_PREFIX: &str = "harvester-";
 const FORWARD_SOCKET_SUFFIX: &str = ".sock";
 
 pub(crate) struct Forward {
-    child: std::sync::Mutex<Child>,
+    child: Mutex<Child>,
     local_socket: PathBuf,
 }
 
@@ -63,11 +67,6 @@ impl DaemonReader {
 
         Ok(Some(serde_json::from_slice(line)?))
     }
-
-    #[cfg(feature = "raw-protocol")]
-    async fn next_raw(&mut self) -> std::io::Result<Option<&[u8]>> {
-        read_frame(&mut self.reader, &mut self.line_buffer).await
-    }
 }
 
 pub struct DaemonWriter {
@@ -78,14 +77,6 @@ pub struct DaemonWriter {
 impl DaemonWriter {
     pub async fn send(&mut self, request: &Request) -> std::io::Result<()> {
         self.write_all_flushed(&encode_frame(request)?).await
-    }
-
-    #[cfg(feature = "raw-protocol")]
-    async fn send_raw_line(&mut self, line: &[u8]) -> std::io::Result<()> {
-        let mut frame = line.to_vec();
-        frame.push(harvester_proto::LF);
-
-        self.write_all_flushed(&frame).await
     }
 
     async fn write_all_flushed(&mut self, frame: &[u8]) -> std::io::Result<()> {
@@ -122,15 +113,185 @@ impl DaemonConnection {
 
 #[cfg(feature = "raw-protocol")]
 pub mod raw {
+    use harvester_proto::{read_frame, LF};
+
     use super::{DaemonReader, DaemonWriter};
 
     pub async fn next_line(reader: &mut DaemonReader) -> std::io::Result<Option<&[u8]>> {
-        reader.next_raw().await
+        read_frame(&mut reader.reader, &mut reader.line_buffer).await
     }
 
     pub async fn send_line(writer: &mut DaemonWriter, line: &[u8]) -> std::io::Result<()> {
-        writer.send_raw_line(line).await
+        let mut frame = line.to_vec();
+        frame.push(LF);
+
+        writer.write_all_flushed(&frame).await
     }
+}
+
+#[derive(Debug)]
+pub enum SessionEvent {
+    Pi { sid: String, event: Value },
+    SessionExit { sid: String, exit_code: Option<i32> },
+    EventGap { sid: String, skipped: u64 },
+}
+
+#[derive(Clone)]
+pub struct DaemonClient {
+    inner: Arc<ClientInner>,
+}
+
+struct ClientInner {
+    writer: AsyncMutex<DaemonWriter>,
+    pending: Mutex<HashMap<u64, oneshot::Sender<Outgoing>>>,
+    last_request_id: AtomicU64,
+}
+
+impl DaemonClient {
+    pub fn start(connection: DaemonConnection) -> (DaemonClient, UnboundedReceiver<SessionEvent>) {
+        let DaemonConnection { mut reader, writer } = connection;
+        let (event_sender, event_receiver) = unbounded_channel();
+        let client = DaemonClient {
+            inner: Arc::new(ClientInner {
+                writer: AsyncMutex::new(writer),
+                pending: Mutex::new(HashMap::new()),
+                last_request_id: AtomicU64::new(HANDSHAKE_PING_ID),
+            }),
+        };
+
+        let routing_client = client.clone();
+
+        tokio::spawn(async move {
+            loop {
+                match reader.next().await {
+                    Ok(Some(line)) => routing_client.route_line(line, &event_sender),
+                    Ok(None) => break,
+                    Err(error) => {
+                        eprintln!("daemon client: read failed: {error}");
+
+                        break;
+                    }
+                }
+            }
+
+            routing_client.fail_all_pending();
+        });
+
+        (client, event_receiver)
+    }
+
+    pub async fn harvester(&self, cmd: HarvesterCmd) -> std::io::Result<HarvesterResponse> {
+        match self.request(|id| Request::Harvester { id, cmd }).await? {
+            Outgoing::HarvesterResponse { response, .. } => Ok(response),
+            mismatched => Err(envelope_mismatch(&mismatched)),
+        }
+    }
+
+    pub async fn pi(&self, sid: &str, cmd: Value) -> std::io::Result<Value> {
+        let sid = sid.to_string();
+
+        match self.request(|id| Request::Pi { id, sid, cmd }).await? {
+            Outgoing::PiResponse { response, .. } => Ok(response),
+            mismatched => Err(envelope_mismatch(&mismatched)),
+        }
+    }
+
+    async fn request(
+        &self,
+        build: impl FnOnce(Option<Value>) -> Request,
+    ) -> std::io::Result<Outgoing> {
+        let id = self.inner.last_request_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let (sender, receiver) = oneshot::channel();
+        let _pending = PendingRequestGuard::register(self, id, sender);
+        let request = build(Some(json!(id)));
+
+        self.inner.writer.lock().await.send(&request).await?;
+
+        receiver.await.map_err(|_closed| {
+            std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "connection closed before the response",
+            )
+        })
+    }
+
+    fn route_line(&self, line: Outgoing, events: &UnboundedSender<SessionEvent>) {
+        match line {
+            Outgoing::Event { sid, event } => {
+                let _ = events.send(SessionEvent::Pi { sid, event });
+            }
+            Outgoing::SessionExit { sid, exit_code } => {
+                let _ = events.send(SessionEvent::SessionExit { sid, exit_code });
+            }
+            Outgoing::EventGap { sid, skipped } => {
+                let _ = events.send(SessionEvent::EventGap { sid, skipped });
+            }
+            response @ (Outgoing::HarvesterResponse { .. } | Outgoing::PiResponse { .. }) => {
+                self.resolve(response);
+            }
+        }
+    }
+
+    fn resolve(&self, response: Outgoing) {
+        let id = match &response {
+            Outgoing::HarvesterResponse { id, .. } | Outgoing::PiResponse { id, .. } => id.as_ref(),
+            _ => None,
+        };
+        let Some(id) = id.and_then(Value::as_u64) else {
+            eprintln!("daemon client: response without a usable id");
+
+            return;
+        };
+
+        let Some(waiter) = self.lock_pending().remove(&id) else {
+            eprintln!("daemon client: dropped response for request {id}");
+
+            return;
+        };
+
+        let _ = waiter.send(response);
+    }
+
+    fn fail_all_pending(&self) {
+        self.lock_pending().clear();
+    }
+
+    fn lock_pending(&self) -> MutexGuard<'_, HashMap<u64, oneshot::Sender<Outgoing>>> {
+        self.inner.pending.lock().expect("pending mutex")
+    }
+}
+
+struct PendingRequestGuard {
+    client: DaemonClient,
+    id: u64,
+}
+
+impl PendingRequestGuard {
+    fn register(
+        client: &DaemonClient,
+        id: u64,
+        sender: oneshot::Sender<Outgoing>,
+    ) -> PendingRequestGuard {
+        client.lock_pending().insert(id, sender);
+
+        PendingRequestGuard {
+            client: client.clone(),
+            id,
+        }
+    }
+}
+
+impl Drop for PendingRequestGuard {
+    fn drop(&mut self) {
+        self.client.lock_pending().remove(&self.id);
+    }
+}
+
+fn envelope_mismatch(response: &Outgoing) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("response arrived in the wrong envelope: {response:?}"),
+    )
 }
 
 pub(crate) async fn connect_host(host: &Host, home: &str) -> Result<(DaemonConnection, PingData)> {
@@ -253,7 +414,7 @@ fn start_forward(target: &SshTarget, remote_home: &str) -> Result<Forward> {
         .spawn()?;
 
     Ok(Forward {
-        child: std::sync::Mutex::new(child),
+        child: Mutex::new(child),
         local_socket,
     })
 }
@@ -264,7 +425,7 @@ fn local_socket_path(dest: &str) -> PathBuf {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     dest.hash(&mut hasher);
 
-    crate::ssh::client_socket_dir().join(forward_socket_name(std::process::id(), hasher.finish()))
+    crate::host::client_socket_dir().join(forward_socket_name(std::process::id(), hasher.finish()))
 }
 
 fn forward_socket_name(client_pid: u32, destination_hash: u64) -> String {
@@ -272,7 +433,7 @@ fn forward_socket_name(client_pid: u32, destination_hash: u64) -> String {
 }
 
 pub(crate) async fn sweep_leaked_forward_sockets() {
-    let dir = crate::ssh::client_socket_dir();
+    let dir = crate::host::client_socket_dir();
 
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -485,6 +646,40 @@ mod tests {
 
         assert_eq!(sid, "01H");
         assert_eq!(event, json!({"type": "agent_settled"}));
+    }
+
+    #[tokio::test]
+    async fn a_client_request_resolves_when_the_daemon_echoes_its_id() {
+        let (client_side, daemon_side) = tokio::io::duplex(4096);
+        let (client, _session_events) =
+            DaemonClient::start(DaemonConnection::over(client_side, None));
+        let mut daemon = DaemonConnection::over(daemon_side, None);
+
+        let request_task =
+            tokio::spawn(async move { client.harvester(HarvesterCmd::ListSessions).await });
+        let request = daemon.reader.next_line_for_test().await;
+
+        assert_eq!(
+            request["id"],
+            json!(HANDSHAKE_PING_ID + 1),
+            "request ids continue the handshake's own sequence"
+        );
+
+        daemon
+            .writer
+            .send_json_for_test(json!({
+                "id": request["id"],
+                "type": "harvester_response",
+                "response": {"success": true, "data": {"sessions": []}},
+            }))
+            .await;
+
+        let response = request_task
+            .await
+            .expect("request task")
+            .expect("the response resolves at the await point");
+
+        assert_eq!(response.into_result(), Ok(json!({"sessions": []})));
     }
 
     #[tokio::test]

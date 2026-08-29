@@ -46,7 +46,7 @@ The exceptions are physical boundaries, not layout, and each is named:
 | --- | --- | --- |
 | `FOCUS_RING_SPREAD` 1.5px, `FOCUS_RING_OFFSET` 0 | `ui/shell.rs` | A focus ring is a hairline, in the same class as a 1px border. It must stay one crisp ring at any base font size. |
 | `STATUS_DOT_DIAMETER` 6px | `ui/core.rs` | A raster boundary: 6px is the smallest disc that still antialiases into a circle, and the rem steps on either side land it mushy or off the half-pixel grid. The dot should keep its physical size when the type grows; the lane it sits in scales instead. |
-| `MAIN_WINDOW_WIDTH/HEIGHT` 1100×720 | `desktop_shell.rs`, mirrored by the gallery | The OS window's physical bounds, not layout. |
+| `MAIN_WINDOW_WIDTH/HEIGHT` 1100×720 | `main.rs`, mirrored by the gallery | The OS window's physical bounds, not layout. |
 | Flexbox `min_w(px(0.))` / `min_h(px(0.))` | `workbench.rs`, `chat.rs` | A shrink constraint, not a measurement. |
 
 Two dev-and-dialog surfaces outside `ui/` still carry a pixel height because

@@ -1,5 +1,6 @@
-use gpui::{div, prelude::*, px, App, Div, Hsla, SharedString};
-use gpui_component::{ActiveTheme as _, Icon, IconName};
+use gpui::{div, prelude::*, px, App, Div, ElementId, Hsla, SharedString};
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::{v_flex, ActiveTheme as _, Icon, IconName, Sizable as _};
 
 const FAINT_TEXT_OPACITY: f32 = 0.6;
 
@@ -100,6 +101,29 @@ pub fn status_dot(dot: Dot, cx: &App) -> Div {
         Dot::Solid(tone) => base.bg(tone.color(cx)),
         Dot::Hollow(tone) => base.border_1().border_color(tone.color(cx)),
     }
+}
+
+pub fn inline_note(tone: Tone, text: impl Into<SharedString>, cx: &App) -> Div {
+    div()
+        .text_sm()
+        .text_color(tone.color(cx))
+        .child(text.into())
+}
+
+pub fn empty_pane_hint(tone: Tone, text: impl Into<SharedString>, cx: &App) -> Div {
+    v_flex()
+        .size_full()
+        .items_center()
+        .justify_center()
+        .gap_4()
+        .p_8()
+        .text_center()
+        .text_color(tone.color(cx))
+        .child(text.into())
+}
+
+pub fn empty_pane_action(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
+    Button::new(id).label(label).primary().small()
 }
 
 pub(super) fn disclosure_chevron(expanded: bool) -> Icon {

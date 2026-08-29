@@ -11,9 +11,9 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::daemon::Daemon;
 use crate::ops::{self, AttachedMap};
 use crate::passthrough;
+use crate::session::Daemon;
 
 const OUTGOING_QUEUE_DEPTH: usize = 256;
 

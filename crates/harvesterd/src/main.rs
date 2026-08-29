@@ -1,15 +1,13 @@
-mod daemon;
 mod fslist;
 mod models;
 mod ops;
 mod passthrough;
-mod paths;
 mod server;
 mod session;
 mod sid;
 
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tokio::net::UnixListener;
 
@@ -18,6 +16,29 @@ const LOCK_FILE_NAME: &str = "harvesterd.lock";
 const RUNNING_EXECUTABLE: &str = "/proc/self/exe";
 
 const UNAVAILABLE_FINGERPRINT: &str = "unavailable";
+
+fn home() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").expect("HOME must be set"))
+}
+
+fn socket() -> PathBuf {
+    home().join(harvester_proto::DAEMON_SOCKET_PATH)
+}
+
+fn harvester_dir() -> PathBuf {
+    socket()
+        .parent()
+        .expect("socket path has a parent")
+        .to_path_buf()
+}
+
+fn log_dir() -> PathBuf {
+    harvester_dir().join("log")
+}
+
+fn pi_sessions_root() -> PathBuf {
+    home().join(".pi/agent/sessions")
+}
 
 fn fingerprint_running_executable() -> std::io::Result<String> {
     harvester_proto::fingerprint_reader(&mut std::fs::File::open(RUNNING_EXECUTABLE)?)
@@ -97,9 +118,9 @@ async fn main() {
         }
     }
 
-    let sock_path = paths::socket();
-    let dir = paths::harvester_dir();
-    std::fs::create_dir_all(paths::log_dir()).expect("create ~/.harvester/log");
+    let sock_path = socket();
+    let dir = harvester_dir();
+    std::fs::create_dir_all(log_dir()).expect("create ~/.harvester/log");
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
         .expect("chmod 700 ~/.harvester");
 
@@ -113,7 +134,7 @@ async fn main() {
         sock_path.display()
     );
 
-    let daemon = daemon::Daemon::new(startup_build_fingerprint());
+    let daemon = session::Daemon::new(startup_build_fingerprint());
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {

@@ -141,102 +141,178 @@ runtime), and that the guards that must be present in the `&&` chain actually
 are, in the right order (e.g. the size assertion strictly precedes `chmod +x`
 and `mv`, so a truncated upload is never made executable or installed).
 
-## crates/harvester-client-core/src/bridge/attach_window.rs
+## crates/harvester-client-core/src/bridge.rs
 
-**Purpose.** Buffers the live events a session emits between its `attach`
-landing daemon-side and its history reaching the frontend. The daemon starts
-streaming a session's events the instant `attach` lands (docs/DAEMON.md
-§attach — deliberate daemon behavior, not something this client can or should
-reorder), but the frontend has nowhere to put those events until
-`Event::Attached` publishes the `get_entries` snapshot one round trip later.
-An event arriving in that window is missing from the snapshot *and* would be
-dropped by the frontend if delivered live — concretely, a lost
-`tool_execution_end` leaves a tool card spinning for the life of that chat,
-because streaming text self-repairs (on pi 0.83 every `message_update`
-carries the whole partial; on every version `message_end` is authoritative)
-but tool-end events do not. Hence the bridge holds that window back and
-flushes it right after the snapshot.
+**Module shape and threading model.** The bridge is one background thread per
+machine, running a current-thread tokio runtime that owns that machine's
+daemon connection — this crate is tokio-based, but gpui's own executor has no
+tokio reactor, so the daemon connection has to live on a dedicated thread.
+Frontends talk to a bridge over tokio mpsc channels (reactor-independent, so
+awaitable straight from gpui tasks): commands go down each bridge's own
+sender, and events from every bridge come back tagged with the machine key on
+one shared channel. The module is deliberately gpui-free.
 
-Everything in this file is pure and synchronous by design — no daemon, no pi,
-no async runtime — specifically so it is the one piece of the whole fix that
-can be unit-tested in isolation (see the test module).
+`bridge.rs` is the whole of the bridge: the `Command`/`Event` contract a
+frontend codes against, the thread and its `tokio::select!` loop, the router
+(`dispatch`) that turns one command into one spawned flow, and the flows
+themselves (see Flows below) — one straight-line async future per command, so
+responses resolve at their await points and there is no response-routing state
+machine anywhere in the crate. That is *why* the select loop can stay a pure
+router — see `dispatch`'s note below. One piece stays deliberately factored
+out as the module's one submodule:
+- `attach_window` — the live events held back between `attach` landing and
+  `Event::Attached` publishing; pure, synchronous, and tested standalone. Its
+  purity and isolation are a documented design property, which is why it
+  survives as a separate file while the former `bridge/mod.rs` and
+  `bridge/flows.rs` were folded into `bridge.rs`.
 
-**`ATTACH_EVENT_BUFFER_CAP = 1024`.** How many live events one session may
-hold back while its history fetch is in flight. Chosen as generous headroom,
-not a tuned limit: a `get_entries` round trip is on the order of
-milliseconds, and pi emits only a few events per second, so 1024 is orders of
-magnitude more than should ever be needed. The cap exists purely so a wedged
-fetch can't grow an unbounded `Vec`.
+**`Command` (UI → bridge).** A command answered by exactly one event carries
+a `RequestToken` that the answering event echoes (docs/SPEC.md §Decisions,
+C2). `Open`, `StartSession`, and `Prompt` carry no token: they have no single
+reply — what they produce is the session's own event stream, keyed by sid,
+which outlives the request that started it.
+- `Open`: `create_session` (resume-or-create, idempotent for an
+  already-running sid) then attach. Deliberately carries no "is it running"
+  flag — the daemon owns that truth, and any client-cached copy goes stale
+  the instant a session exits while the client is detached. Ends in
+  `Event::Attached` or a failure event.
+- `StartSession`: turns an unstarted chat into a real session (SPEC §Flows
+  "Start session"): `create_session` → `attach` → first prompt, all riding
+  pi's in-order stdin queue, no readiness probe needed. Ends in
+  `Event::Attached` with empty entries (session is brand new) or a failure
+  event.
+- `ListModels`: daemon `list_models`, uncached — costs a real pi startup.
+  Answered by `Event::ModelsListed`. Deliberately *not* folded into
+  `PiRequest`: it is a harvester command to the daemon's throwaway
+  `--no-session` pi, not a passthrough scoped to a running session, so it has
+  no sid to carry. Use `PiRequest` instead for a session that is already
+  running — `get_available_models` works against a live pi and costs
+  milliseconds instead of a process start.
+- `PiRequest { sid, cmd, token }`: the one session-scoped round trip. `cmd` is
+  a pi command verbatim (`get_available_models`, `get_state`, `set_model`,
+  `get_session_stats`, `set_session_name`, `set_thinking_level`, `compact`, …)
+  and the bridge neither reads nor rewrites it beyond echoing its `type` back
+  as `method`. Answered by `Event::PiAnswered`. This replaced three typed
+  commands (`ListSessionModels`/`GetSessionState`/`SetModel`) that were each a
+  variant, an identically shaped event and a one-line flow over
+  `pi_flow_result` — a typed shadow of an untyped thing, in a crate whose
+  whole rule is that the client speaks Pi. Every further pi command is now
+  zero bridge code.
+- `Stop`: runs the daemon's stop ladder (pi `abort`, then stdin EOF, then a
+  SIGKILL backstop). The session file survives, and the same sid resumes
+  through `Open` — this is a reap, not a delete. Carries no token because the
+  reply is not the outcome: `stop` answers `{"stopping": true}` the instant
+  the ladder starts, and the authoritative completion signal is
+  `Event::SessionExit`, which the daemon may deliver *before* that reply
+  since events and responses travel independent paths (docs/DAEMON.md
+  §stop).
+- `AnswerDialog`: passthrough `extension_ui_response`. Carries no token
+  because there is nothing to correlate: pi resolves an
+  `extension_ui_response` with `null`, and the daemon replies the same way
+  for a dialog id it has already retired — success and "answered too late"
+  are indistinguishable by design (docs/DAEMON.md §Dialogs).
 
-**`PushOutcome`** — what the select loop should do with a live event it just
-offered to the buffers: `Deliver` (no flow is holding this session back —
-send it live), `Buffered`, `Overflowed` (the cap was just hit on this event —
-the held events are dropped and the session is marked for resync; this is the
-one outcome worth a stderr line), `Discarded` (already overflowed —
-everything after the trip point is dropped on the floor because the
-resulting resync is authoritative anyway, so re-holding events is pointless).
+**`Event` (bridge → UI).** Pi payloads stay verbatim `Value` — the client
+speaks Pi. An event answering a command echoes that command's `RequestToken`;
+where a session-scoped answer also carries `sid`, that `sid` is routing (which
+chat renders it), not correlation. Everything else is unsolicited (connection
+lifecycle, the session event stream) and carries no token.
+- `Attached`: a session was opened — attach completed and history was
+  replayed via passthrough `get_entries`, with `entries` being pi's list
+  verbatim. This is the frontend's cue to *create* the chat for `sid`.
+- `AttachmentLeft`: this bridge successfully detached from its previous
+  session. Emitted before the flow creates or attaches its replacement, so
+  frontend state tied to that exact attachment room can retire immediately.
+- `HistoryReplaced`: the same `get_entries` snapshot as `Attached`, but as a
+  repair after events were lost (a daemon `event_gap`, or the attach window
+  itself overflowing) for a session the frontend already has a chat for.
+  Split from `Attached` because the two mean different things and conflating
+  them was a real bug: rebuilding the chat entity on a repair is what let a
+  late resync clobber the chat on screen. A `HistoryReplaced` should replace
+  the existing chat's entries; if there's no chat for `sid`, ignore it — the
+  bridge only ever repairs the session it is attached to.
+- `HistoryExtended`: the cheap repair variant — `entries` are only those
+  *after* the cursor the last fetch left (docs/SPEC.md C6), so they extend
+  the frontend's replica rather than replacing it. Same "ignore if no chat"
+  rule as `HistoryReplaced`. The frontend must drop whatever it built from
+  live events before applying these: live events carry no entry ids, so the
+  delta is the authoritative account of the very span the frontend was
+  guessing at while attached. `Transcript::extend_history` encodes this rule
+  once.
+- `Pi`: one live pi event for an attached session, verbatim.
+- `RequestFailed`: a request failed daemon- or pi-side. Statusbar material —
+  the connection itself is still healthy.
+- `PromptFailed`: the prompt for `sid` never reached pi (the daemon or pi
+  refused it, or the connection broke under it). Sid-scoped rather than
+  machine-scoped because the damage is sid-scoped: the frontend already
+  rendered that prompt and raised its busy indicator, and only the chat
+  showing `sid` can end that turn and say why. The machine-wide
+  `RequestFailed` it used to ride mapped to a start-phase reset, which is a
+  no-op on a live session — the prompt sat there forever with a spinner. The
+  flow also logs the detail to stderr, since the only UI for it is one chat
+  that may no longer exist.
+- `ModelsListed`: answers `ListModels`; pi's `data` verbatim (the client
+  speaks Pi — the workbench extracts what its picker renders). Errors render
+  inside the unstarted chat, not the statusbar.
+- `PiAnswered { sid, token, method, result }`: answers `PiRequest`. `result`
+  is pi's `data` verbatim on success and pi's own error string on failure.
+  `token` is the correlation (the asking control's slot rejects anything
+  else); `sid` is routing (which chat renders it). `method` is the `type`
+  field of the `cmd` that was sent, echoed by the one generic flow, and it
+  exists for the consumer that is *not* the asking control: the statusbar
+  reports a failed `set_model` no matter which chat asked, and re-deriving
+  that from the token alone would mean re-typing the command the frontend
+  just erased. Empty when the command carried no `type` — a malformed request
+  nobody can build from the app today.
 
-**`FlushOutcome`** — what an attach flow finds waiting once `Attached` is
-about to be published: `Events` (deliver these, in arrival order, before
-anything else) or `Overflowed` (events were lost, so the snapshot just about
-to be published is already stale).
+**`BridgeContext` fields and their invariants.**
+- `attached: Arc<AsyncMutex<Option<String>>>` — the one session this bridge
+  is attached to (single chat pane per bridge). The *async* mutex also
+  *serializes* attachment changes: a second `Open` waits out the first flow
+  rather than interleaving with it.
+- `attach_buffers` — live events held back while an attach flow is still
+  fetching history (see `attach_window.rs`).
+- `resyncing: Arc<Mutex<HashSet<String>>>` — sessions with a repair already
+  in flight, so a burst of gaps costs one `get_entries` rather than one per
+  gap.
+- `cursor: Arc<Mutex<Option<SessionCursor>>>` — the attached session's replay
+  cursor from the last `get_entries` (docs/SPEC.md C6). One slot only,
+  because one bridge holds exactly one attachment.
 
-**`AttachEventBuffers::register`.** Idempotent by design: a resync racing an
-already-in-flight open joins the window that flow already registered rather
-than resetting it — resetting would discard everything held so far for that
-race loser's benefit, silently reintroducing the exact gap the mechanism
-exists to close.
+`SessionCursor` pairs pi's `leafId` with the sid it was fetched for. The sid
+half is not optional convenience: a cursor is only ever valid for the session
+it came from, and pairing them makes spending it on the wrong session
+structurally impossible rather than merely unlikely (e.g. after a
+same-bridge session swap).
 
-**`AttachEventBuffers::flush` returning `Events(vec![])` for an absent
-session** is not an error path: it means another flow for the same sid
-already flushed first, its events are already out, and its own `Attached`/
-repair event already seeded the chat — so there's nothing left owed to this
-caller.
+**Bridge main loop notes.**
+- The sidebar renders from `sessions_flow`, so it's fired immediately on
+  connect.
+- In the `tokio::select!` loop: a `None` from the command channel means the
+  UI dropped the bridge — dropping the `client` tears down the connection and
+  any ssh forward. A `None` from `session_events` means the client itself
+  stopped, so this bridge is done; there's no attachment left to explicitly
+  forget because this whole context (and its daemon client) dies with the
+  loop.
+- `EventGap` is recovered in the backbone, not the UI: refetch the history
+  that was just lost and republish it through the same events every frontend
+  already knows how to render (`HistoryReplaced`/`HistoryExtended`).
+- `dispatch`: every command is its own spawned straight-line flow so the
+  select loop above never itself awaits on the daemon — event forwarding
+  therefore cannot stall behind a slow command.
+- `handle_pi_event`: dialog requests ride this same path as any other pi
+  event — answering a dialog is the frontend's obligation now (docs/SPEC.md
+  C5), and the bridge's only job is to put the question in front of it
+  unaltered.
+- `pi_event_type` is the crate's one reader of a pi payload's `type` field
+  (`get("type").and_then(as_str)`). The same three-line shape had grown
+  copies in `pi_request_flow` and `Transcript::apply` (and a third in the
+  gpui crate's `is_turn_settled`); this is the one home, so the next place
+  that needs a pi event's type does not write a fourth copy. It went private
+  in the `bridge.rs` merge — no caller outside the bridge exists today, and
+  re-widening it is a one-word change the day one appears.
 
-**`AttachRegistration`.** RAII guard owning one session's registration for
-the length of an attach flow. RAII specifically because the ways a flow can
-exit early outnumber the way it completes normally — a failed attach and a
-failed `get_entries` both return early — and a registration that outlived its
-owning flow would silently swallow that session's live events for the rest of
-the bridge's life, which is strictly worse than the buffering gap this whole
-mechanism exists to close. Same defensive shape as `Pending` in `client.rs`
-and `ForwardGuard` in `connection.rs` elsewhere in this crate — a recurring
-pattern worth recognizing.
-- Must be constructed *before* the `attach` request is sent, not after: the
-  daemon's event stream starts the moment `attach` lands, not when its
-  response comes back to the client.
-- `flushed: bool` field exists because `flush()` already removed the buffer
-  entry from the map; without tracking that, a `Drop` running after a
-  same-sid *re-registration* (e.g. a resync racing right behind a flush)
-  would wipe a window it no longer owns, belonging to someone else's
-  in-progress registration.
-
-**Test coverage worth knowing about (regression intent, not just assertions):**
-- Order of flushed events is asserted explicitly because a `tool_execution_end`
-  only mutates an already-existing block rather than being self-contained —
-  delivering it out of order relative to `tool_execution_start` breaks
-  rendering, so arrival order is a real invariant, not incidental.
-- A dropped (never flushed) registration must reopen the live stream — this
-  is the concrete failure mode a failed attach or failed `get_entries` must
-  not trigger: an early return must not leave the session's events
-  permanently buffered.
-- Overflow test: the event that trips the cap is the only one that logs
-  `Overflowed`; everything after is `Discarded` silently, and the eventual
-  flush reports `Overflowed` — mirroring the daemon's own `event_gap`
-  semantics rather than inventing a parallel concept.
-- A flushed registration's `Drop` must not wipe a subsequent same-sid
-  registration's window (the `flushed` flag's whole reason to exist).
-- A second registration joining a window already in flight (open racing a
-  resync) means the "loser" of the race owes nothing on its own flush — the
-  winner already delivered everything.
-
-### Recorded follow-up
-
-None — no unresolved TODOs or deferred decisions were embedded as comments in
-these three files; every comment either explained current, intentional
-behavior or documented a past bug being guarded against by a test.
-
-## crates/harvester-client-core/src/bridge/flows.rs
+### Flows
 
 One straight-line async flow per command, plus two the bridge starts on its
 own (the initial `sessions_flow` list_sessions, and `resync_flow` after
@@ -453,7 +529,7 @@ that is reported.
 **`pi_request_flow`.** The whole implementation of `Command::PiRequest`: run
 the verbatim `cmd` through `pi_flow_result` and publish `Event::PiAnswered`
 with the same sid, the same token, and the command's own `type` string (read
-via the shared `pi_event_type` helper in `bridge/mod.rs`), so no other layer
+via the shared `pi_event_type` helper), so no other layer
 has to re-type the command it just sent. It is the only place in the bridge
 that inspects a pi payload's contents at all, and it inspects exactly one
 field it then copies verbatim.
@@ -462,173 +538,9 @@ field it then copies verbatim.
 that picker/statusbar-facing events carry: `data` verbatim on success, pi's
 error string otherwise.
 
-## crates/harvester-client-core/src/bridge/mod.rs
+### Test harness
 
-**Module shape and threading model.** The bridge is one background thread per
-machine, running a current-thread tokio runtime that owns that machine's
-daemon connection — this crate is tokio-based, but gpui's own executor has no
-tokio reactor, so the daemon connection has to live on a dedicated thread.
-Frontends talk to a bridge over tokio mpsc channels (reactor-independent, so
-awaitable straight from gpui tasks): commands go down each bridge's own
-sender, and events from every bridge come back tagged with the machine key on
-one shared channel. The module is deliberately gpui-free.
-
-`mod.rs` is the whole of the bridge's *shape*: the `Command`/`Event` contract
-a frontend codes against, the thread and its `tokio::select!` loop, and the
-router (`dispatch`) that turns one command into one spawned flow. Two things
-are deliberately factored out:
-- `flows` — one straight-line async flow per command; responses resolve at
-  their await points, so there is no response-routing state machine anywhere
-  in the crate. This is *why* the select loop in `mod.rs` can stay a pure
-  router — see `dispatch`'s note below.
-- `attach_window` — the live events held back between `attach` landing and
-  `Event::Attached` publishing; pure, synchronous, and tested standalone.
-
-**`Command` (UI → bridge).** A command answered by exactly one event carries
-a `RequestToken` that the answering event echoes (docs/SPEC.md §Decisions,
-C2). `Open`, `StartSession`, and `Prompt` carry no token: they have no single
-reply — what they produce is the session's own event stream, keyed by sid,
-which outlives the request that started it.
-- `Open`: `create_session` (resume-or-create, idempotent for an
-  already-running sid) then attach. Deliberately carries no "is it running"
-  flag — the daemon owns that truth, and any client-cached copy goes stale
-  the instant a session exits while the client is detached. Ends in
-  `Event::Attached` or a failure event.
-- `StartSession`: turns an unstarted chat into a real session (SPEC §Flows
-  "Start session"): `create_session` → `attach` → first prompt, all riding
-  pi's in-order stdin queue, no readiness probe needed. Ends in
-  `Event::Attached` with empty entries (session is brand new) or a failure
-  event.
-- `ListModels`: daemon `list_models`, uncached — costs a real pi startup.
-  Answered by `Event::ModelsListed`. Deliberately *not* folded into
-  `PiRequest`: it is a harvester command to the daemon's throwaway
-  `--no-session` pi, not a passthrough scoped to a running session, so it has
-  no sid to carry. Use `PiRequest` instead for a session that is already
-  running — `get_available_models` works against a live pi and costs
-  milliseconds instead of a process start.
-- `PiRequest { sid, cmd, token }`: the one session-scoped round trip. `cmd` is
-  a pi command verbatim (`get_available_models`, `get_state`, `set_model`,
-  `get_session_stats`, `set_session_name`, `set_thinking_level`, `compact`, …)
-  and the bridge neither reads nor rewrites it beyond echoing its `type` back
-  as `method`. Answered by `Event::PiAnswered`. This replaced three typed
-  commands (`ListSessionModels`/`GetSessionState`/`SetModel`) that were each a
-  variant, an identically shaped event and a one-line flow over
-  `pi_flow_result` — a typed shadow of an untyped thing, in a crate whose
-  whole rule is that the client speaks Pi. Every further pi command is now
-  zero bridge code.
-- `Stop`: runs the daemon's stop ladder (pi `abort`, then stdin EOF, then a
-  SIGKILL backstop). The session file survives, and the same sid resumes
-  through `Open` — this is a reap, not a delete. Carries no token because the
-  reply is not the outcome: `stop` answers `{"stopping": true}` the instant
-  the ladder starts, and the authoritative completion signal is
-  `Event::SessionExit`, which the daemon may deliver *before* that reply
-  since events and responses travel independent paths (docs/DAEMON.md
-  §stop).
-- `AnswerDialog`: passthrough `extension_ui_response`. Carries no token
-  because there is nothing to correlate: pi resolves an
-  `extension_ui_response` with `null`, and the daemon replies the same way
-  for a dialog id it has already retired — success and "answered too late"
-  are indistinguishable by design (docs/DAEMON.md §Dialogs).
-
-**`Event` (bridge → UI).** Pi payloads stay verbatim `Value` — the client
-speaks Pi. An event answering a command echoes that command's `RequestToken`;
-where a session-scoped answer also carries `sid`, that `sid` is routing (which
-chat renders it), not correlation. Everything else is unsolicited (connection
-lifecycle, the session event stream) and carries no token.
-- `Attached`: a session was opened — attach completed and history was
-  replayed via passthrough `get_entries`, with `entries` being pi's list
-  verbatim. This is the frontend's cue to *create* the chat for `sid`.
-- `AttachmentLeft`: this bridge successfully detached from its previous
-  session. Emitted before the flow creates or attaches its replacement, so
-  frontend state tied to that exact attachment room can retire immediately.
-- `HistoryReplaced`: the same `get_entries` snapshot as `Attached`, but as a
-  repair after events were lost (a daemon `event_gap`, or the attach window
-  itself overflowing) for a session the frontend already has a chat for.
-  Split from `Attached` because the two mean different things and conflating
-  them was a real bug: rebuilding the chat entity on a repair is what let a
-  late resync clobber the chat on screen. A `HistoryReplaced` should replace
-  the existing chat's entries; if there's no chat for `sid`, ignore it — the
-  bridge only ever repairs the session it is attached to.
-- `HistoryExtended`: the cheap repair variant — `entries` are only those
-  *after* the cursor the last fetch left (docs/SPEC.md C6), so they extend
-  the frontend's replica rather than replacing it. Same "ignore if no chat"
-  rule as `HistoryReplaced`. The frontend must drop whatever it built from
-  live events before applying these: live events carry no entry ids, so the
-  delta is the authoritative account of the very span the frontend was
-  guessing at while attached. `Transcript::extend_history` encodes this rule
-  once.
-- `Pi`: one live pi event for an attached session, verbatim.
-- `RequestFailed`: a request failed daemon- or pi-side. Statusbar material —
-  the connection itself is still healthy.
-- `PromptFailed`: the prompt for `sid` never reached pi (the daemon or pi
-  refused it, or the connection broke under it). Sid-scoped rather than
-  machine-scoped because the damage is sid-scoped: the frontend already
-  rendered that prompt and raised its busy indicator, and only the chat
-  showing `sid` can end that turn and say why. The machine-wide
-  `RequestFailed` it used to ride mapped to a start-phase reset, which is a
-  no-op on a live session — the prompt sat there forever with a spinner. The
-  flow also logs the detail to stderr, since the only UI for it is one chat
-  that may no longer exist.
-- `ModelsListed`: answers `ListModels`; pi's `data` verbatim (the client
-  speaks Pi — the workbench extracts what its picker renders). Errors render
-  inside the unstarted chat, not the statusbar.
-- `PiAnswered { sid, token, method, result }`: answers `PiRequest`. `result`
-  is pi's `data` verbatim on success and pi's own error string on failure.
-  `token` is the correlation (the asking control's slot rejects anything
-  else); `sid` is routing (which chat renders it). `method` is the `type`
-  field of the `cmd` that was sent, echoed by the one generic flow, and it
-  exists for the consumer that is *not* the asking control: the statusbar
-  reports a failed `set_model` no matter which chat asked, and re-deriving
-  that from the token alone would mean re-typing the command the frontend
-  just erased. Empty when the command carried no `type` — a malformed request
-  nobody can build from the app today.
-
-**`BridgeContext` fields and their invariants.**
-- `attached: Arc<AsyncMutex<Option<String>>>` — the one session this bridge
-  is attached to (single chat pane per bridge). The *async* mutex also
-  *serializes* attachment changes: a second `Open` waits out the first flow
-  rather than interleaving with it.
-- `attach_buffers` — live events held back while an attach flow is still
-  fetching history (see `attach_window.rs`).
-- `resyncing: Arc<Mutex<HashSet<String>>>` — sessions with a repair already
-  in flight, so a burst of gaps costs one `get_entries` rather than one per
-  gap.
-- `cursor: Arc<Mutex<Option<SessionCursor>>>` — the attached session's replay
-  cursor from the last `get_entries` (docs/SPEC.md C6). One slot only,
-  because one bridge holds exactly one attachment.
-
-`SessionCursor` pairs pi's `leafId` with the sid it was fetched for. The sid
-half is not optional convenience: a cursor is only ever valid for the session
-it came from, and pairing them makes spending it on the wrong session
-structurally impossible rather than merely unlikely (e.g. after a
-same-bridge session swap).
-
-**Bridge main loop notes.**
-- The sidebar renders from `sessions_flow`, so it's fired immediately on
-  connect.
-- In the `tokio::select!` loop: a `None` from the command channel means the
-  UI dropped the bridge — dropping the `client` tears down the connection and
-  any ssh forward. A `None` from `session_events` means the client itself
-  stopped, so this bridge is done; there's no attachment left to explicitly
-  forget because this whole context (and its daemon client) dies with the
-  loop.
-- `EventGap` is recovered in the backbone, not the UI: refetch the history
-  that was just lost and republish it through the same events every frontend
-  already knows how to render (`HistoryReplaced`/`HistoryExtended`).
-- `dispatch`: every command is its own spawned straight-line flow so the
-  select loop above never itself awaits on the daemon — event forwarding
-  therefore cannot stall behind a slow command.
-- `handle_pi_event`: dialog requests ride this same path as any other pi
-  event — answering a dialog is the frontend's obligation now (docs/SPEC.md
-  C5), and the bridge's only job is to put the question in front of it
-  unaltered.
-- `pi_event_type` is the crate's one reader of a pi payload's `type` field
-  (`get("type").and_then(as_str)`). The same three-line shape had grown
-  copies in `pi_request_flow` and `Transcript::apply` (and a third in the
-  gpui crate's `is_turn_settled`); this is the crate-level home, so the next
-  place that needs a pi event's type does not write a fourth copy.
-
-**Test harness note.** `Harness` wires a `BridgeContext` to a fake daemon over
+`Harness` wires a `BridgeContext` to a fake daemon over
 an in-memory `tokio::io::duplex` pair — this is the whole reason
 `DaemonConnection` stopped being hardwired to `UnixStream`.
 
@@ -651,60 +563,101 @@ assert):
   `Attached` — `Attached` means "create the chat", conflating the two let a
   late-landing resync clobber the chat already on screen.
 
-## crates/harvester-client-core/src/client.rs
+## crates/harvester-client-core/src/bridge/attach_window.rs
 
-Request/response correlation for one daemon connection. Per docs/DAEMON.md:
-requests carry an `id`, the response echoes it, and arrival order on the wire
-is not guaranteed. `DaemonClient` resolves requests at their `await` point via
-a pending map — the same shape pi's own RPC client uses internally — so every
-command flow in the client reads as straight-line async/await rather than a
-hand-rolled continuation state machine. Unsolicited daemon lines (pi events,
-`session_exit`, gap notices) flow out on a separate channel (`SessionEvent`)
-instead of through the pending map, since nothing is awaiting them.
+**Purpose.** Buffers the live events a session emits between its `attach`
+landing daemon-side and its history reaching the frontend. The daemon starts
+streaming a session's events the instant `attach` lands (docs/DAEMON.md
+§attach — deliberate daemon behavior, not something this client can or should
+reorder), but the frontend has nowhere to put those events until
+`Event::Attached` publishes the `get_entries` snapshot one round trip later.
+An event arriving in that window is missing from the snapshot *and* would be
+dropped by the frontend if delivered live — concretely, a lost
+`tool_execution_end` leaves a tool card spinning for the life of that chat,
+because streaming text self-repairs (on pi 0.83 every `message_update`
+carries the whole partial; on every version `message_end` is authoritative)
+but tool-end events do not. Hence the bridge holds that window back and
+flushes it right after the snapshot.
 
-`SessionEvent::EventGap`: the daemon dropped events for this connection
-because the client read too slowly. Whatever state the client holds for that
-`sid` is now incomplete and must be refetched rather than trusted as
-continuous.
+Everything in this file is pure and synchronous by design — no daemon, no pi,
+no async runtime — specifically so it is the one piece of the whole fix that
+can be unit-tested in isolation (see the test module).
 
-`ClientInner.writer` is guarded by an **async** mutex because the guard is
-held across the socket write itself (a sync mutex cannot be held across an
-`.await`).
+**`ATTACH_EVENT_BUFFER_CAP = 1024`.** How many live events one session may
+hold back while its history fetch is in flight. Chosen as generous headroom,
+not a tuned limit: a `get_entries` round trip is on the order of
+milliseconds, and pi emits only a few events per second, so 1024 is orders of
+magnitude more than should ever be needed. The cap exists purely so a wedged
+fetch can't grow an unbounded `Vec`.
 
-`ClientInner.pending` is a **std** (sync) mutex, deliberately never held
-across an await — it's only touched for quick insert/remove operations. The
-value stored is the whole daemon line/envelope, not a pre-classified payload:
-the router only knows the request id, and the original requester already
-knows which envelope shape it sent, so no double-parsing is needed.
+**`PushOutcome`** — what the select loop should do with a live event it just
+offered to the buffers: `Deliver` (no flow is holding this session back —
+send it live), `Buffered`, `Overflowed` (the cap was just hit on this event —
+the held events are dropped and the session is marked for resync; this is the
+one outcome worth a stderr line), `Discarded` (already overflowed —
+everything after the trip point is dropped on the floor because the
+resulting resync is authoritative anyway, so re-holding events is pointless).
 
-`last_request_id` starts at the handshake ping's id (`HANDSHAKE_PING_ID`), so
-the first real request issued is the one immediately after it — request ids
-share one monotonic sequence with the handshake instead of restarting.
+**`FlushOutcome`** — what an attach flow finds waiting once `Attached` is
+about to be published: `Events` (deliver these, in arrival order, before
+anything else) or `Overflowed` (events were lost, so the snapshot just about
+to be published is already stale).
 
-`DaemonClient::start` splits a `DaemonConnection` into a background routing
-task (owns the reader) and a client handle (writer + pending map). Dropping
-both the client handle and the event receiver is what tears the connection
-(and any ssh port forward backing it) down — there's no separate explicit
-teardown call.
+**`AttachEventBuffers::register`.** Idempotent by design: a resync racing an
+already-in-flight open joins the window that flow already registered rather
+than resetting it — resetting would discard everything held so far for that
+race loser's benefit, silently reintroducing the exact gap the mechanism
+exists to close.
 
-`resolve`: when a pending waiter for a response id can't be found, that means
-the requester's task already gave up (e.g. it was dropped mid-await) — this is
-logged as noteworthy but is not treated as fatal, since the daemon did nothing
-wrong.
+**`AttachEventBuffers::flush` returning `Events(vec![])` for an absent
+session** is not an error path: it means another flow for the same sid
+already flushed first, its events are already out, and its own `Attached`/
+repair event already seeded the chat — so there's nothing left owed to this
+caller.
 
-The `Pending` RAII guard (inner helper type, not `token::Pending`) exists
-because the ways a request's pending-map entry needs cleaning up outnumber the
-ways it resolves normally: a failed write, a cancelled future (the caller's
-task dropping mid-await — which the UI does routinely whenever a flow is
-abandoned), or ordinary resolution. Without RAII, a leaked entry means a
-waiter that can never be woken and a `HashMap` that only grows — so removal
-cannot safely live at a single call site and must be tied to the guard's drop.
+**`AttachRegistration`.** RAII guard owning one session's registration for
+the length of an attach flow. RAII specifically because the ways a flow can
+exit early outnumber the way it completes normally — a failed attach and a
+failed `get_entries` both return early — and a registration that outlived its
+owning flow would silently swallow that session's live events for the rest of
+the bridge's life, which is strictly worse than the buffering gap this whole
+mechanism exists to close. Same defensive shape as `PendingRequestGuard`
+and `Forward` in `connection.rs` elsewhere in this crate — a recurring
+pattern worth recognizing.
+- Must be constructed *before* the `attach` request is sent, not after: the
+  daemon's event stream starts the moment `attach` lands, not when its
+  response comes back to the client.
+- `flushed: bool` field exists because `flush()` already removed the buffer
+  entry from the map; without tracking that, a `Drop` running after a
+  same-sid *re-registration* (e.g. a resync racing right behind a flush)
+  would wipe a window it no longer owns, belonging to someone else's
+  in-progress registration.
 
-`envelope_mismatch`: the daemon echoing a request's id back on the *wrong*
-envelope type (e.g. a `Harvester` request id showing up on a `PiResponse`) is
-a daemon-contract violation — impossible under docs/DAEMON.md's contract, so
-it's surfaced as an error to report rather than something the client tries to
-recover from.
+**Test coverage worth knowing about (regression intent, not just assertions):**
+- Order of flushed events is asserted explicitly because a `tool_execution_end`
+  only mutates an already-existing block rather than being self-contained —
+  delivering it out of order relative to `tool_execution_start` breaks
+  rendering, so arrival order is a real invariant, not incidental.
+- A dropped (never flushed) registration must reopen the live stream — this
+  is the concrete failure mode a failed attach or failed `get_entries` must
+  not trigger: an early return must not leave the session's events
+  permanently buffered.
+- Overflow test: the event that trips the cap is the only one that logs
+  `Overflowed`; everything after is `Discarded` silently, and the eventual
+  flush reports `Overflowed` — mirroring the daemon's own `event_gap`
+  semantics rather than inventing a parallel concept.
+- A flushed registration's `Drop` must not wipe a subsequent same-sid
+  registration's window (the `flushed` flag's whole reason to exist).
+- A second registration joining a window already in flight (open racing a
+  resync) means the "loser" of the race owes nothing on its own flush — the
+  winner already delivered everything.
+
+### Recorded follow-up
+
+None — no unresolved TODOs or deferred decisions were embedded as comments in
+the bridge's sources (now `bridge.rs` plus this file); every comment either
+explained current, intentional behavior or documented a past bug being guarded
+against by a test.
 
 ## crates/harvester-client-core/src/connection.rs
 
@@ -721,8 +674,9 @@ LF-terminated JSONL (docs/DAEMON.md §Protocol).
   often to retry connect+ping while a freshly started daemon is still binding
   its socket. Covers slow VMs; the normal case succeeds on the first try.
 - `HANDSHAKE_PING_ID = 0`: the handshake ping is always the first request on a
-  connection, so id 0 is unambiguous; `client.rs` starts its own request ids
-  above it.
+  connection, so id 0 is unambiguous; `DaemonClient` (below, same file) seeds
+  its request counter from it, so handshake and requests share one monotonic
+  id space. Private since the merge — no other module reads it.
 - `FORWARD_SOCKET_PREFIX`/`FORWARD_SOCKET_SUFFIX` (`harvester-` / `.sock`):
   forward socket files are named `harvester-<pid>-<hash>.sock`, built by
   `forward_socket_name` and read back by `forward_socket_owner_pid` — one
@@ -789,7 +743,7 @@ path: the socket file is bound the instant ssh comes up, so building the
 guard any later would orphan one socket file per expired connect attempt. It
 removes a stale local socket file first (ssh refuses to bind over one).
 Keepalive and `StreamLocalBindUnlink` options live in `SSH_BASE_ARGS`
-(ssh.rs) rather than on this invocation: the *master* connection owns the
+(host.rs) rather than on this invocation: the *master* connection owns the
 transport and the forward's listener, so passing mux-client-only options here
 would have no effect — this bit the project once when both landed on the
 forward invocation and silently never fired.
@@ -837,9 +791,75 @@ makes elsewhere, and `kill` is a shell builtin so nothing has to be
 installed. A probe that fails to run at all is read as *alive*, because
 "cannot tell" must not become "delete it".
 
+**`DaemonClient` and `SessionEvent`** (merged in from the former
+`client.rs` — one socket, one file).
+
+Request/response correlation for one daemon connection. Per docs/DAEMON.md:
+requests carry an `id`, the response echoes it, and arrival order on the wire
+is not guaranteed. `DaemonClient` resolves requests at their `await` point via
+a pending map — the same shape pi's own RPC client uses internally — so every
+command flow in the client reads as straight-line async/await rather than a
+hand-rolled continuation state machine. Unsolicited daemon lines (pi events,
+`session_exit`, gap notices) flow out on a separate channel (`SessionEvent`)
+instead of through the pending map, since nothing is awaiting them.
+
+`SessionEvent::EventGap`: the daemon dropped events for this connection
+because the client read too slowly. Whatever state the client holds for that
+`sid` is now incomplete and must be refetched rather than trusted as
+continuous.
+
+`ClientInner.writer` is guarded by an **async** mutex because the guard is
+held across the socket write itself (a sync mutex cannot be held across an
+`.await`).
+
+`ClientInner.pending` is a **std** (sync) mutex, deliberately never held
+across an await — it's only touched for quick insert/remove operations. The
+value stored is the whole daemon line/envelope, not a pre-classified payload:
+the router only knows the request id, and the original requester already
+knows which envelope shape it sent, so no double-parsing is needed.
+
+`last_request_id` starts at the handshake ping's id (`HANDSHAKE_PING_ID`,
+defined above), so the first real request issued is the one immediately after
+it — request ids share one monotonic sequence with the handshake instead of
+restarting. `a_client_request_resolves_when_the_daemon_echoes_its_id` pins
+both halves: the sequencing and the resolve-at-the-await-point round trip.
+
+`DaemonClient::start` splits a `DaemonConnection` into a background routing
+task (owns the reader) and a client handle (writer + pending map). Dropping
+both the client handle and the event receiver is what tears the connection
+(and any ssh port forward backing it) down — there's no separate explicit
+teardown call.
+
+`resolve`: when a pending waiter for a response id can't be found, that means
+the requester's task already gave up (e.g. it was dropped mid-await) — this is
+logged as noteworthy but is not treated as fatal, since the daemon did nothing
+wrong.
+
+The `PendingRequestGuard` RAII guard (renamed from `Pending` in the merge,
+because the crate publicly exports the unrelated `token::Pending<T>` and two
+meanings of one name in one crate was a review finding waiting to happen)
+exists because the ways a request's pending-map entry needs cleaning up outnumber the
+ways it resolves normally: a failed write, a cancelled future (the caller's
+task dropping mid-await — which the UI does routinely whenever a flow is
+abandoned), or ordinary resolution. Without RAII, a leaked entry means a
+waiter that can never be woken and a `HashMap` that only grows — so removal
+cannot safely live at a single call site and must be tied to the guard's drop.
+
+`envelope_mismatch`: the daemon echoing a request's id back on the *wrong*
+envelope type (e.g. a `Harvester` request id showing up on a `PiResponse`) is
+a daemon-contract violation — impossible under docs/DAEMON.md's contract, so
+it's surfaced as an error to report rather than something the client tries to
+recover from.
+
+The `#[cfg(test)]` helpers `next_line_for_test`/`send_json_for_test` stay
+`pub(crate)`: they are the fake-daemon vocabulary `bridge.rs`'s `Harness`
+drives its tests with, so they cannot narrow to private.
+
 **Cross-reference**: docs/DAEMON.md §Protocol, §ping.
 
 ## crates/harvester-client-core/src/dialog.rs
+
+### The pi wire shape (pinned to pi 0.83.0)
 
 Pi's dialog vocabulary: the four blocking questions an extension can raise, and
 the three answer shapes. This is the one place in the client that reads a
@@ -892,7 +912,10 @@ cancelled confirm resolves to `false`, the same outcome as `confirmed: false`
 "No" for confirm dialogs — the one dialog kind where dismissing counts as a
 real answer rather than a refusal to answer.
 
-## crates/harvester-client-core/src/dialog_obligation.rs
+### The obligation room and its FIFO
+
+This was `dialog_obligation.rs` until it folded in here — the dialog
+vocabulary and the obligation state machine over it are one file now.
 
 Client-side state machine for dialogs forwarded by the daemon while a client
 is attached (pi stays suspended until answered). This module is deliberately
@@ -1191,6 +1214,37 @@ documented rule.
 None beyond what's captured above — the module's doc comments recorded
 design rationale, not open TODOs.
 
+### Machine identity
+
+This was `machine.rs` until it folded in here — `MachineRef` never had a
+caller outside the fleet, so it now lives beside its one consumer and is
+private to this file.
+
+Machine identity (docs/SPEC.md §Machine): the trichotomy that decides what a
+stored machine string refers to, and therefore which host the client execs
+on. This is decided in exactly one place because `Host::Local` is already a
+client-core concept, and a frontend re-deriving these semantics from
+`MachineKey` alone would drift from them.
+
+- `LOCAL_MACHINE = "local"` is the hardcoded local machine's key. It is not a
+  provider machine and is never deletable: harvesterd runs as a detached
+  child on the local machine, with no SSH involved.
+- `MachineRef` is what a stored machine string (workspaces.json, or the argv
+  launch destination) refers to — total by construction. Every string is one
+  of three kinds; an unresolvable *reference* is still well-formed, and
+  whether it resolves to an actual host is the caller's separate concern:
+  - `Local` — the hardcoded local machine.
+  - `Provider(MachineKey)` — a `<provider>/<id>` key. Connection info comes
+    from that provider's `list`, so such a machine is only resolvable once
+    its provider has been listed. Parsing splits on the *first* `/`, so an
+    id may itself contain slashes — the provider name is the one part
+    Harvester owns the format of.
+  - `AdHoc(String)` — a plain SSH destination used verbatim: the argv launch
+    form and legacy keyless workspaces.json entries.
+- Gotcha: a provider literally named `local` (`local/vm`) still parses as
+  `Provider`, not `Local` — only the bare string `"local"` matches the
+  local-machine case. `"localhost"` is `AdHoc`, not `Local`.
+
 ## crates/harvester-client-core/src/host.rs
 
 The one exec boundary for both machine kinds — local and SSH
@@ -1257,6 +1311,71 @@ enforcement on a script that never terminates.
 shutdown discipline, referenced by analogy in `run`'s EOF-via-drop
 comment).
 
+### SSH targets
+
+This was `ssh.rs` until it folded in here — addressing and the exec boundary
+that uses it are one module now.
+
+Plain-SSH plumbing shared by this module's own one-shot execs and the
+long-lived socket forward (`connection.rs`): target addressing plus the base
+ssh invocation.
+
+`SshTarget.dest` is handed to ssh verbatim, so both `user@host` forms and
+ssh-config aliases work unmodified.
+
+`SSH_BASE_ARGS` is non-interactive by contract — the client must fail fast,
+never hang on a password or host-key prompt (`BatchMode=yes`).
+`StrictHostKeyChecking=accept-new` trusts a first-seen host key without
+prompting (otherwise fresh VMs would be unreachable under `BatchMode`) but
+still hard-fails if a *known* key changes.
+
+Multiplexing (`ControlMaster=auto` + `ControlPath`): the first connection to
+a machine becomes the mux master and every later exec rides it, skipping the
+SSH handshake — measured on exe.dev, a listing costs ~1.7s cold vs. ~0.35s
+multiplexed, which is what makes the folder picker's per-click `ls` calls
+affordable. `auto` degrades to a plain (non-muxed) connection whenever the
+master is unusable, so multiplexing is pure speedup, never a new failure
+mode. `ControlPersist=60`: the master lingers 60s past its last client, then
+exits on its own — nothing for Harvester to manage or clean up.
+`StreamLocalBindUnlink=yes`: unlinks a leftover forward socket file before
+binding, so a respawn racing a dying forward's teardown doesn't fail with
+"Address already in use."
+
+`ServerAliveInterval=15` / `ServerAliveCountMax=3`: a dropped link that never
+sends a TCP RST (laptop sleep, wifi switch, VM migration) is otherwise
+invisible — requests carry no deadline of their own, so a pending one would
+hang until TCP itself gave up, with the machine still showing as connected.
+Three missed 15s keepalive probes end the connection, EOF-ing the socket and
+surfacing as a real disconnect within ~45s.
+
+Everything transport-level (keepalives, `StreamLocalBindUnlink`) belongs on
+`SSH_BASE_ARGS` rather than on an individual invocation, because whichever
+process becomes the mux *master* owns the connection — options about the
+transport or about a forward's listener are the master's to apply and are
+silently ignored on a mux client. (Both options landed on the forward
+invocation once, where — since the forward is usually the client, not the
+master — they could never fire; this is the reasoning that fixed that bug.)
+
+`CONTROL_SOCKET_TEMPLATE = "harvester-ssh-%C"`: `%C` is ssh's own short hash
+of (local host, remote host, port, user), giving one control socket per
+distinct target, well under the ~108-byte `sun_path` limit.
+
+`client_socket_dir` resolves and memoizes (`OnceLock`) `~/.harvester/run`
+(mode 0700) once per process. Control sockets and forward sockets must never
+live in world-writable `/tmp`: a predictable path there could be squatted
+before Harvester binds it, and ssh's mux protocol is itself unauthenticated
+— a squatted/fake mux server would MITM every exec. This mirrors the
+daemon-side policy of using filesystem permissions for socket auth
+(docs/DAEMON.md). Falls back to the OS temp dir (with a loud stderr note)
+only when `$HOME` is unusable. It's memoized because it sits on the path of
+every ssh invocation the client builds (every machine probe, every
+folder-picker click), and re-resolving meant a `create_dir_all` +
+`set_permissions` pair on each one.
+
+`SshTarget::command` builds the actual ssh invocation; `extra_args` are
+inserted before the destination because ssh requires options before the
+target argument.
+
 ## crates/harvester-client-core/src/lib.rs
 
 Crate-level docs describe `harvester-client-core` as the client backbone:
@@ -1270,9 +1389,9 @@ Three layers, bottom-up:
    command flows, event fan-in) and `machines` (provider listing, reachability
    probes, and the daemon-free host ops the folder picker runs directly).
 2. **Machine identity**: `MachineRef` is the one place that decides what a
-   stored machine string actually means. It is crate-internal: every question
-   a frontend asks about a machine string (`host_for`, `label`, `state`) is
-   answered by `Fleet`, which is the only caller.
+   stored machine string actually means. It is private to `fleet.rs`: every
+   question a frontend asks about a machine string (`host_for`, `label`,
+   `state`) is answered by `Fleet`, which is the only caller.
 3. **Across machines**: `Fleet` owns the bridge pool, the machine table, probe
    verdicts, and the connect policy — modeling a machine's reachability as one
    `MachineState` specifically so a probe verdict and an actual daemon link
@@ -1301,13 +1420,17 @@ dev tool does).
 
 The exported surface is deliberately no wider than those two doors. Names
 that only this crate's own layers call — `bridge::start`/`BridgeHandle`,
-`machines::start`/`MachinesWorker`, `MachineRef`, the four `workspace` host
-ops (`resolve_home`, `list_directory`, `validate_git_workspace`,
-`resolve_git_branch`, all reached through `machines::Command`),
+`machines::start`/`MachinesWorker`, `machines::run_on_tokio_thread`,
 `RequestTokens::mint` and `DialogAnswer::to_response` — are `pub(crate)`.
 Publishing them was speculative: each was offered as "a frontend that wants
 less could use this", none ever had a caller outside the crate, and every
-published name is a promise that constrains refactors. Re-widening any of
+published name is a promise that constrains refactors. Two former entries on
+this list have since narrowed past `pub(crate)` entirely, for the same
+reason: `MachineRef` is private to `fleet.rs`, and the four host ops
+(`resolve_home`, `list_directory`, `validate_git_workspace`,
+`resolve_git_branch`, all reached through `machines::Command`) are private to
+`machines.rs` — only `RemoteDirEntry`, the shape a listing answer carries,
+is still re-exported here. Re-widening any of
 them is a one-word change the day a second frontend actually asks; the
 vocabulary those workers speak (`bridge::Command`/`Event`,
 `machines::Command`/`Event`) stays public, so nothing about the design is
@@ -1329,33 +1452,6 @@ hidden.
 - `Provider`: a machine provider executable misbehaved — contract violation,
   timeout, or its own `{"error"}` object surfaced verbatim (docs/PROVIDERS.md
   defines the provider contract this maps to).
-
-## crates/harvester-client-core/src/machine.rs
-
-Machine identity (docs/SPEC.md §Machine): the trichotomy that decides what a
-stored machine string refers to, and therefore which host the client execs
-on. This is decided in exactly one place because `Host::Local` is already a
-client-core concept, and a frontend re-deriving these semantics from
-`MachineKey` alone would drift from them.
-
-- `LOCAL_MACHINE = "local"` is the hardcoded local machine's key. It is not a
-  provider machine and is never deletable: harvesterd runs as a detached
-  child on the local machine, with no SSH involved.
-- `MachineRef` is what a stored machine string (workspaces.json, or the argv
-  launch destination) refers to — total by construction. Every string is one
-  of three kinds; an unresolvable *reference* is still well-formed, and
-  whether it resolves to an actual host is the caller's separate concern:
-  - `Local` — the hardcoded local machine.
-  - `Provider(MachineKey)` — a `<provider>/<id>` key. Connection info comes
-    from that provider's `list`, so such a machine is only resolvable once
-    its provider has been listed. Parsing splits on the *first* `/`, so an
-    id may itself contain slashes — the provider name is the one part
-    Harvester owns the format of.
-  - `AdHoc(String)` — a plain SSH destination used verbatim: the argv launch
-    form and legacy keyless workspaces.json entries.
-- Gotcha: a provider literally named `local` (`local/vm`) still parses as
-  `Provider`, not `Local` — only the bare string `"local"` matches the
-  local-machine case. `"localhost"` is `AdHoc`, not `Local`.
 
 ## crates/harvester-client-core/src/machines.rs
 
@@ -1467,15 +1563,102 @@ idempotent (the dot just updates twice).
 §Machine): a plain `ssh <machine> true`, reachable iff it round-trips with
 exit 0. It rides the multiplexed SSH master when one is up, so a warm probe
 is one round trip. Errors collapse to unreachable — that is the only answer
-the sidebar dot renders. This logic lives here (not in the `ssh` transport
-module) because a probe is a *machine* question answered with an exec:
-`ssh` owns addressing, `host` owns execs, and having `ssh` reach back through
-`host` to `ssh` would be a dependency cycle with exactly one caller (this
+the sidebar dot renders. This logic lives here (not in `host`) because a
+probe is a *machine* question answered with an exec: `host` owns SSH
+addressing and the exec boundary, and having it reach back up into
+machine-level policy would invert the dependency for exactly one caller (this
 file).
 
 `probe_provider_machines` skips machines with no `target` (the argv ssh
 form) — no target means no probe, and the dot stays unknown rather than
 being reported unreachable.
+
+### The runtime thread
+
+This was `tokio_thread.rs` until it folded in here — `run_on_tokio_thread` is
+`pub(crate)` on this module now, and `bridge.rs` reaches it as
+`machines::run_on_tokio_thread`.
+
+The one way this crate gets a tokio reactor. gpui drives its own executor and
+never installs a tokio reactor, so no async work in this crate can run on the
+caller's thread — every I/O-owning worker (a bridge's daemon connection, the
+machines worker) instead lives on a dedicated std thread that builds its own
+runtime and blocks on one future for its whole life. The runtime is
+current-thread on purpose: one worker is one logical actor, so a work-stealing
+pool would buy nothing and would cost extra threads.
+
+This was factored out of the call sites because the *failure* case is the
+interesting half: building a runtime fails only when the OS refuses a
+resource, and at that point the worker cannot start at all, so its owner must
+be told in whatever way that particular worker reports failure — which is the
+only thing the two call sites actually disagree about (one sends a
+`ConnectFailed` event, one logs to stderr).
+
+`run_on_tokio_thread`: if the runtime fails to build, `on_runtime_error` gets
+the formatted error and `main` is dropped un-polled — safe here because every
+worker's main future does all of its real work only after its first poll (no
+worker relies on drop-without-polling side effects).
+
+### Daemon-free host ops
+
+This was `workspace.rs` until it folded in here — the four ops are private to
+this module now, reached only through `machines::Command`, and only
+`RemoteDirEntry` is still re-exported from `lib.rs`.
+
+Workspace browsing (docs/SPEC.md §Workspace): directory listings for the
+folder picker, and git validation. This is explicitly **client** business,
+never the daemon's — docs/DAEMON.md keeps path/filesystem work out of the
+envelope on purpose. Implemented as one-shot execs against `Host`, so the
+local machine and SSH machines get identical semantics; remote execs
+multiplex over the existing SSH ControlMaster connection, so a per-click
+listing costs roughly one network round trip, not a new connection.
+
+`WORKSPACE_EXEC_TIMEOUT` (30s) is a ceiling on one picker exec: multiplexed
+listings normally take tens of milliseconds, so this exists purely so a
+wedged transport can't hang the picker forever.
+
+`exec_workspace_script` is the one exec-and-require-success step all four
+ops share (run under `WORKSPACE_EXEC_TIMEOUT`, fail through
+`require_success` with the op's own context word), leaving each op as its
+script plus its parse.
+
+`resolve_home`: finds the machine's `$HOME`, which is where the folder picker
+starts its walk (SPEC §Workspace). Deliberately one plain exec, never a
+daemon round trip/bootstrap — path work being client business means the
+picker must not block on a daemon it doesn't otherwise need.
+
+`list_directory` shells out to `ls -1Ap`: one name per line, hidden entries
+included (dotdirs are legitimate workspace parents — must not be filtered
+out), with directories marked by a trailing `/`. Known limitation: symlinked
+directories are listed *un*dereferenced by `-p`, so they render as plain file
+entries in the picker — considered acceptable for a picker's purposes.
+
+`parse_ls_entry` drops any line carrying a control character, and any empty
+one. Quoting a path *into* the remote shell is sound (`shell_quote`); parsing
+`ls -1` output back *out* is not, because the format has no escaping — a
+filename may legally contain anything but `/` and NUL. A name with an
+embedded `\r`, tab or escape sequence would otherwise become a picker row
+whose text is a lie and whose value is later quoted back into a shell
+command. Dropping such an entry is the honest outcome: no such row appears,
+rather than a row that points somewhere else. The one case this cannot
+repair is a filename containing a literal newline — `lines()` has already
+split it into two clean-looking halves by the time we see it, and `ls -1`
+gives us nothing to tell that apart from two files. Both halves are dropped
+only if they happen to carry other control characters; otherwise they render
+as two entries that lead nowhere (validation fails when they are opened).
+Fixing that class for real needs a NUL-delimited listing (`find -print0`),
+which is a bigger change than the picker has earned.
+
+`validate_git_workspace`: a workspace is defined as "a path that is a git
+repository" (SPEC §Workspace) — validated via `git rev-parse --git-dir`. Git's
+own failure text is threaded through to the UI as the error detail.
+
+`resolve_git_branch`: powers the chat prompt strip's read-only branch
+indicator (SPEC §Flows "Start session"). Uses the same client-side exec path
+as the picker's listing/validation, since the daemon has no concept of git
+branches and is deliberately never asked for one. A detached HEAD reports the
+literal string `HEAD` verbatim — whatever git itself says the checkout is on,
+unmassaged.
 
 ## crates/harvester-client-core/src/provider.rs
 
@@ -1590,68 +1773,6 @@ hard error.
 **Cross-references**: docs/PROVIDERS.md §info, §list, §Discovery,
 §Transport, §Reference implementation; docs/SPEC.md §Machine.
 
-## crates/harvester-client-core/src/ssh.rs
-
-Plain-SSH plumbing shared by one-shot execs (`host.rs`) and the long-lived
-socket forward (`connection.rs`): target addressing plus the base ssh
-invocation.
-
-`SshTarget.dest` is handed to ssh verbatim, so both `user@host` forms and
-ssh-config aliases work unmodified.
-
-`SSH_BASE_ARGS` is non-interactive by contract — the client must fail fast,
-never hang on a password or host-key prompt (`BatchMode=yes`).
-`StrictHostKeyChecking=accept-new` trusts a first-seen host key without
-prompting (otherwise fresh VMs would be unreachable under `BatchMode`) but
-still hard-fails if a *known* key changes.
-
-Multiplexing (`ControlMaster=auto` + `ControlPath`): the first connection to
-a machine becomes the mux master and every later exec rides it, skipping the
-SSH handshake — measured on exe.dev, a listing costs ~1.7s cold vs. ~0.35s
-multiplexed, which is what makes the folder picker's per-click `ls` calls
-affordable. `auto` degrades to a plain (non-muxed) connection whenever the
-master is unusable, so multiplexing is pure speedup, never a new failure
-mode. `ControlPersist=60`: the master lingers 60s past its last client, then
-exits on its own — nothing for Harvester to manage or clean up.
-`StreamLocalBindUnlink=yes`: unlinks a leftover forward socket file before
-binding, so a respawn racing a dying forward's teardown doesn't fail with
-"Address already in use."
-
-`ServerAliveInterval=15` / `ServerAliveCountMax=3`: a dropped link that never
-sends a TCP RST (laptop sleep, wifi switch, VM migration) is otherwise
-invisible — requests carry no deadline of their own, so a pending one would
-hang until TCP itself gave up, with the machine still showing as connected.
-Three missed 15s keepalive probes end the connection, EOF-ing the socket and
-surfacing as a real disconnect within ~45s.
-
-Everything transport-level (keepalives, `StreamLocalBindUnlink`) belongs on
-`SSH_BASE_ARGS` rather than on an individual invocation, because whichever
-process becomes the mux *master* owns the connection — options about the
-transport or about a forward's listener are the master's to apply and are
-silently ignored on a mux client. (Both options landed on the forward
-invocation once, where — since the forward is usually the client, not the
-master — they could never fire; this is the reasoning that fixed that bug.)
-
-`CONTROL_SOCKET_TEMPLATE = "harvester-ssh-%C"`: `%C` is ssh's own short hash
-of (local host, remote host, port, user), giving one control socket per
-distinct target, well under the ~108-byte `sun_path` limit.
-
-`client_socket_dir` resolves and memoizes (`OnceLock`) `~/.harvester/run`
-(mode 0700) once per process. Control sockets and forward sockets must never
-live in world-writable `/tmp`: a predictable path there could be squatted
-before Harvester binds it, and ssh's mux protocol is itself unauthenticated
-— a squatted/fake mux server would MITM every exec. This mirrors the
-daemon-side policy of using filesystem permissions for socket auth
-(docs/DAEMON.md). Falls back to the OS temp dir (with a loud stderr note)
-only when `$HOME` is unusable. It's memoized because it sits on the path of
-every ssh invocation the client builds (every machine probe, every
-folder-picker click), and re-resolving meant a `create_dir_all` +
-`set_permissions` pair on each one.
-
-`SshTarget::command` builds the actual ssh invocation; `extra_args` are
-inserted before the destination because ssh requires options before the
-target argument.
-
 ## crates/harvester-client-core/src/token.rs
 
 Reply correlation for the client's workers — see docs/SPEC.md §Decisions, C2.
@@ -1711,28 +1832,6 @@ token nothing is waiting on.
 `Pending::is_waiting` answers "is any answer still wanted" without needing to
 hold the specific token — for a surface (like a modal) that just wants to gate
 its input while a request is in flight.
-
-## crates/harvester-client-core/src/tokio_thread.rs
-
-The one way this crate gets a tokio reactor. gpui drives its own executor and
-never installs a tokio reactor, so no async work in this crate can run on the
-caller's thread — every I/O-owning worker (a bridge's daemon connection, the
-machines worker) instead lives on a dedicated std thread that builds its own
-runtime and blocks on one future for its whole life. The runtime is
-current-thread on purpose: one worker is one logical actor, so a work-stealing
-pool would buy nothing and would cost extra threads.
-
-This was factored out of the call sites because the *failure* case is the
-interesting half: building a runtime fails only when the OS refuses a
-resource, and at that point the worker cannot start at all, so its owner must
-be told in whatever way that particular worker reports failure — which is the
-only thing the two call sites actually disagree about (one sends a
-`ConnectFailed` event, one logs to stderr).
-
-`run_on_tokio_thread`: if the runtime fails to build, `on_runtime_error` gets
-the formatted error and `main` is dropped un-polled — safe here because every
-worker's main future does all of its real work only after its first poll (no
-worker relies on drop-without-polling side effects).
 
 ## crates/harvester-client-core/src/transcript.rs
 
@@ -1905,60 +2004,3 @@ The test module docstring: pi 0.83.0's wire shapes are pinned here — every
 fixture is the shape the client actually receives, and the point of this
 module living outside the gpui crate is that these tests run without a
 window.
-
-## crates/harvester-client-core/src/workspace.rs
-
-Workspace browsing (docs/SPEC.md §Workspace): directory listings for the
-folder picker, and git validation. This is explicitly **client** business,
-never the daemon's — docs/DAEMON.md keeps path/filesystem work out of the
-envelope on purpose. Implemented as one-shot execs against `Host`, so the
-local machine and SSH machines get identical semantics; remote execs
-multiplex over the existing SSH ControlMaster connection, so a per-click
-listing costs roughly one network round trip, not a new connection.
-
-`WORKSPACE_EXEC_TIMEOUT` (30s) is a ceiling on one picker exec: multiplexed
-listings normally take tens of milliseconds, so this exists purely so a
-wedged transport can't hang the picker forever.
-
-`exec_workspace_script` is the one exec-and-require-success step all four
-ops share (run under `WORKSPACE_EXEC_TIMEOUT`, fail through
-`require_success` with the op's own context word), leaving each op as its
-script plus its parse.
-
-`resolve_home`: finds the machine's `$HOME`, which is where the folder picker
-starts its walk (SPEC §Workspace). Deliberately one plain exec, never a
-daemon round trip/bootstrap — path work being client business means the
-picker must not block on a daemon it doesn't otherwise need.
-
-`list_directory` shells out to `ls -1Ap`: one name per line, hidden entries
-included (dotdirs are legitimate workspace parents — must not be filtered
-out), with directories marked by a trailing `/`. Known limitation: symlinked
-directories are listed *un*dereferenced by `-p`, so they render as plain file
-entries in the picker — considered acceptable for a picker's purposes.
-
-`parse_ls_entry` drops any line carrying a control character, and any empty
-one. Quoting a path *into* the remote shell is sound (`shell_quote`); parsing
-`ls -1` output back *out* is not, because the format has no escaping — a
-filename may legally contain anything but `/` and NUL. A name with an
-embedded `\r`, tab or escape sequence would otherwise become a picker row
-whose text is a lie and whose value is later quoted back into a shell
-command. Dropping such an entry is the honest outcome: no such row appears,
-rather than a row that points somewhere else. The one case this cannot
-repair is a filename containing a literal newline — `lines()` has already
-split it into two clean-looking halves by the time we see it, and `ls -1`
-gives us nothing to tell that apart from two files. Both halves are dropped
-only if they happen to carry other control characters; otherwise they render
-as two entries that lead nowhere (validation fails when they are opened).
-Fixing that class for real needs a NUL-delimited listing (`find -print0`),
-which is a bigger change than the picker has earned.
-
-`validate_git_workspace`: a workspace is defined as "a path that is a git
-repository" (SPEC §Workspace) — validated via `git rev-parse --git-dir`. Git's
-own failure text is threaded through to the UI as the error detail.
-
-`resolve_git_branch`: powers the chat prompt strip's read-only branch
-indicator (SPEC §Flows "Start session"). Uses the same client-side exec path
-as the picker's listing/validation, since the daemon has no concept of git
-branches and is deliberately never asked for one. A detached HEAD reports the
-literal string `HEAD` verbatim — whatever git itself says the checkout is on,
-unmassaged.
