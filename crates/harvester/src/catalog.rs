@@ -5,19 +5,19 @@ use crate::session_state::ChatTarget;
 use crate::workspaces::{self, Workspace};
 
 #[derive(Debug, Clone)]
-pub struct MachineSession {
+pub(crate) struct MachineSession {
     pub machine: String,
     pub info: SessionInfo,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionOpen {
+pub(crate) struct SessionOpen {
     pub machine: String,
     pub sid: String,
     pub cwd: String,
 }
 
-pub struct Catalog {
+pub(crate) struct Catalog {
     sessions: Vec<MachineSession>,
     workspaces: Vec<Workspace>,
     opening: Option<OpeningSession>,
@@ -30,11 +30,11 @@ struct OpeningSession {
 }
 
 impl Catalog {
-    pub fn load() -> Self {
+    pub(crate) fn load() -> Self {
         Self::from_workspaces(workspaces::load())
     }
 
-    pub fn from_workspaces(workspaces: Vec<Workspace>) -> Self {
+    pub(crate) const fn from_workspaces(workspaces: Vec<Workspace>) -> Self {
         Self {
             sessions: Vec::new(),
             workspaces,
@@ -43,7 +43,7 @@ impl Catalog {
         }
     }
 
-    pub fn record_sessions(&mut self, machine: &str, sessions: Vec<SessionInfo>) {
+    pub(crate) fn record_sessions(&mut self, machine: &str, sessions: Vec<SessionInfo>) {
         self.sessions.retain(|session| session.machine != machine);
         self.sessions
             .extend(sessions.into_iter().map(|info| MachineSession {
@@ -53,7 +53,7 @@ impl Catalog {
         self.sort_sessions();
     }
 
-    pub fn set_session_status(&mut self, sid: &str, status: SessionStatus) -> bool {
+    pub(crate) fn set_session_status(&mut self, sid: &str, status: SessionStatus) -> bool {
         let mut changed = false;
 
         for session in &mut self.sessions {
@@ -66,7 +66,7 @@ impl Catalog {
         changed
     }
 
-    pub fn session_attached(&mut self, machine: &str, sid: &str) -> bool {
+    pub(crate) fn session_attached(&mut self, machine: &str, sid: &str) -> bool {
         let changed = self.set_session_status(sid, SessionStatus::Running);
 
         self.selected_sid = Some(sid.to_string());
@@ -74,11 +74,11 @@ impl Catalog {
         self.abandon_open_on(machine) || changed
     }
 
-    pub fn clear_selected_session(&mut self) {
+    pub(crate) fn clear_selected_session(&mut self) {
         self.selected_sid = None;
     }
 
-    pub fn is_selected_session(&self, sid: &str) -> bool {
+    pub(crate) fn is_selected_session(&self, sid: &str) -> bool {
         self.selected_sid.as_deref() == Some(sid)
     }
 
@@ -96,11 +96,11 @@ impl Catalog {
         self.selected_sid = None;
     }
 
-    pub fn session_exited(&mut self, sid: &str) -> bool {
+    pub(crate) fn session_exited(&mut self, sid: &str) -> bool {
         self.set_session_status(sid, SessionStatus::Exited)
     }
 
-    pub fn add_workspace(&mut self, workspace: Workspace) -> std::io::Result<bool> {
+    pub(crate) fn add_workspace(&mut self, workspace: Workspace) -> std::io::Result<bool> {
         if self.workspaces.contains(&workspace) {
             return Ok(false);
         }
@@ -113,7 +113,7 @@ impl Catalog {
         Ok(true)
     }
 
-    pub fn forget_machine(&mut self, machine: &str) -> std::io::Result<()> {
+    pub(crate) fn forget_machine(&mut self, machine: &str) -> std::io::Result<()> {
         let kept = self.workspaces_without(machine);
 
         if kept.len() != self.workspaces.len() {
@@ -136,11 +136,11 @@ impl Catalog {
             .collect()
     }
 
-    pub fn begin_open(&mut self, machine: String, sid: String) {
+    pub(crate) fn begin_open(&mut self, machine: String, sid: String) {
         self.opening = Some(OpeningSession { machine, sid });
     }
 
-    pub fn may_open_session(&mut self, sid: &str) -> bool {
+    pub(crate) fn may_open_session(&mut self, sid: &str) -> bool {
         let Some(opening) = &self.opening else {
             return true;
         };
@@ -154,7 +154,7 @@ impl Catalog {
         true
     }
 
-    pub fn open_session(&mut self, sid: &str) -> Option<SessionOpen> {
+    pub(crate) fn open_session(&mut self, sid: &str) -> Option<SessionOpen> {
         let session = self
             .sessions
             .iter()
@@ -170,7 +170,7 @@ impl Catalog {
         Some(open)
     }
 
-    pub fn insert_started_session(
+    pub(crate) fn insert_started_session(
         &mut self,
         machine: String,
         sid: String,
@@ -203,21 +203,21 @@ impl Catalog {
         self.sort_sessions();
     }
 
-    pub fn visible_sessions(&self) -> Vec<&MachineSession> {
+    pub(crate) fn visible_sessions(&self) -> Vec<&MachineSession> {
         self.sessions
             .iter()
             .filter(|session| self.session_visible(session))
             .collect()
     }
 
-    pub fn visible_session_count_on(&self, machine: &str) -> usize {
+    pub(crate) fn visible_session_count_on(&self, machine: &str) -> usize {
         self.visible_sessions()
             .iter()
             .filter(|session| session.machine == machine)
             .count()
     }
 
-    pub fn session_cwd(&self, sid: &str) -> Option<&str> {
+    pub(crate) fn session_cwd(&self, sid: &str) -> Option<&str> {
         self.sessions
             .iter()
             .find(|session| session.info.sid == sid)
@@ -229,11 +229,11 @@ impl Catalog {
         &self.sessions
     }
 
-    pub fn workspaces(&self) -> &[Workspace] {
+    pub(crate) fn workspaces(&self) -> &[Workspace] {
         &self.workspaces
     }
 
-    pub fn repos_on(&self, machine: &str) -> Vec<String> {
+    pub(crate) fn repos_on(&self, machine: &str) -> Vec<String> {
         self.workspaces
             .iter()
             .filter(|workspace| workspace.machine == machine)
@@ -241,7 +241,7 @@ impl Catalog {
             .collect()
     }
 
-    pub fn default_new_session_target(&self, machines: &[String]) -> ChatTarget {
+    pub(crate) fn default_new_session_target(&self, machines: &[String]) -> ChatTarget {
         let reachable = |machine: &str| machines.iter().any(|candidate| candidate == machine);
         let recent = self.sessions.iter().find(|session| {
             reachable(&session.machine) && self.is_stored(&session.machine, &session.info.cwd)
@@ -281,11 +281,11 @@ impl Catalog {
             .any(|workspace| workspace.machine == machine && workspace.path == path)
     }
 
-    pub fn opening_sid(&self) -> Option<&str> {
+    pub(crate) fn opening_sid(&self) -> Option<&str> {
         self.opening.as_ref().map(|opening| opening.sid.as_str())
     }
 
-    pub fn abandon_open_on(&mut self, machine: &str) -> bool {
+    pub(crate) fn abandon_open_on(&mut self, machine: &str) -> bool {
         if self
             .opening
             .as_ref()
@@ -414,7 +414,7 @@ mod tests {
     }
 
     fn machines(machines: &[&str]) -> Vec<String> {
-        machines.iter().map(|machine| machine.to_string()).collect()
+        machines.iter().map(ToString::to_string).collect()
     }
 
     #[test]

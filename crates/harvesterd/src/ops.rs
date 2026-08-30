@@ -18,12 +18,12 @@ use crate::sid::Sid;
 
 const STOP_KILL_BACKSTOP: Duration = Duration::from_secs(30);
 
-pub struct Attachment {
+pub(crate) struct Attachment {
     session: Arc<Session>,
     forwarder: JoinHandle<()>,
 }
 
-pub type AttachedMap = HashMap<Sid, Attachment>;
+pub(crate) type AttachedMap = HashMap<Sid, Attachment>;
 
 impl Drop for Attachment {
     fn drop(&mut self) {
@@ -35,7 +35,7 @@ impl Drop for Attachment {
     }
 }
 
-pub fn dispatch(
+pub(crate) fn dispatch(
     daemon: &Daemon,
     id: Option<Value>,
     cmd: HarvesterCmd,
@@ -106,7 +106,7 @@ fn ping(daemon: &Daemon, client_version: u32) -> HarvesterResponse {
     })
 }
 
-pub fn no_such_session_message(sid: &Sid) -> String {
+pub(crate) fn no_such_session_message(sid: &Sid) -> String {
     format!("no running session '{sid}'")
 }
 
@@ -242,7 +242,7 @@ async fn forward_session_exit(
         exit_code,
     };
 
-    let _ = out_tx.send(Outbound::Typed(outgoing)).await;
+    drop(out_tx.send(Outbound::Typed(outgoing)).await);
 
     false
 }

@@ -19,7 +19,7 @@ const PI_STDERR_SUMMARY_CHARS: usize = 200;
 const PI_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const PI_EXITED_EARLY: &str = "pi exited before answering";
 
-pub async fn list_models(cwd: String) -> HarvesterResponse {
+pub(crate) async fn list_models(cwd: String) -> HarvesterResponse {
     match tokio::time::timeout(LIST_MODELS_TIMEOUT, query_available_models(&cwd)).await {
         Ok(Ok(data)) => HarvesterResponse::ok(data),
         Ok(Err(detail)) => HarvesterResponse::err(format!("list_models: {detail}")),
@@ -90,7 +90,7 @@ async fn settle_models_success(
     value: Value,
 ) -> Value {
     drop(stdin);
-    let _ = child.wait().await;
+    drop(child.wait().await);
 
     value.get("data").cloned().unwrap_or(json!({}))
 }

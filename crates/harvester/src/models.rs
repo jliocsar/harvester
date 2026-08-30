@@ -14,13 +14,13 @@ const PENDING_MODEL_LABEL: &str = "Model";
 const UNAVAILABLE_MODEL_LABEL: &str = "Model unavailable";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModelChoice {
+pub(crate) struct ModelChoice {
     pub name: String,
     pub provider: String,
     pub id: String,
 }
 
-pub fn model_choice_from_value(model: &Value) -> Option<ModelChoice> {
+pub(crate) fn model_choice_from_value(model: &Value) -> Option<ModelChoice> {
     let id = model.get("id").and_then(Value::as_str)?;
     let provider = model.get("provider").and_then(Value::as_str)?;
     let name = model.get("name").and_then(Value::as_str).unwrap_or(id);
@@ -32,7 +32,7 @@ pub fn model_choice_from_value(model: &Value) -> Option<ModelChoice> {
     })
 }
 
-pub fn extract_model_choices(data: &Value) -> Vec<ModelChoice> {
+pub(crate) fn extract_model_choices(data: &Value) -> Vec<ModelChoice> {
     let Some(models) = data.get("models").and_then(Value::as_array) else {
         return Vec::new();
     };
@@ -40,7 +40,7 @@ pub fn extract_model_choices(data: &Value) -> Vec<ModelChoice> {
     models.iter().filter_map(model_choice_from_value).collect()
 }
 
-pub fn present_prompt_strip(
+pub(crate) fn present_prompt_strip(
     state: &SessionState,
     model_picks: &[Option<ModelChoice>],
     machine_candidates: &[MachineCandidate],
@@ -60,7 +60,7 @@ pub fn present_prompt_strip(
     }
 }
 
-pub fn model_picks(state: &SessionState) -> Vec<Option<ModelChoice>> {
+pub(crate) fn model_picks(state: &SessionState) -> Vec<Option<ModelChoice>> {
     if matches!(state.phase(), SessionPhase::Starting { .. }) {
         return Vec::new();
     }
@@ -84,11 +84,11 @@ fn prompt_strip_notice(state: &SessionState) -> Option<ui::PromptStripNotice> {
     }
 }
 
-fn is_unstarted(state: &SessionState) -> bool {
+const fn is_unstarted(state: &SessionState) -> bool {
     matches!(state.phase(), SessionPhase::Unstarted)
 }
 
-fn can_send(state: &SessionState) -> bool {
+const fn can_send(state: &SessionState) -> bool {
     !is_unstarted(state) || state.target().is_resolved()
 }
 
@@ -314,7 +314,7 @@ mod tests {
     #[test]
     fn a_starting_session_says_so_and_offers_no_model_to_pick() {
         let mut state = unstarted_state(target());
-        let _ = state.submit_prompt("fix it".to_string());
+        drop(state.submit_prompt("fix it".to_string()));
         let starting = strip(&state, &[], &[]);
 
         assert!(matches!(

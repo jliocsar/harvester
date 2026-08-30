@@ -205,9 +205,9 @@ struct ErrorResult {
 #[derive(Deserialize)]
 struct InfoResult {
     protocol: u64,
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     name: String,
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     capabilities: Vec<String>,
 }
 
@@ -220,7 +220,7 @@ struct ListResult {
 struct MachineEntry {
     id: String,
     label: String,
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     status: String,
     ssh: Value,
 }
@@ -261,7 +261,7 @@ fn parse_machine_list(provider: &str, result: Value) -> Result<Vec<ProviderMachi
         match parse_machine(entry) {
             Ok(machine) => machines.push(machine),
             Err(error) => {
-                eprintln!("harvester: provider {provider}: skipping machine entry: {error}")
+                eprintln!("harvester: provider {provider}: skipping machine entry: {error}");
             }
         }
     }

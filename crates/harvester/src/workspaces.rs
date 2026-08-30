@@ -2,7 +2,7 @@ use harvester_proto::replace_atomically;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Workspace {
+pub(crate) struct Workspace {
     pub machine: String,
     pub path: String,
 }
@@ -18,7 +18,7 @@ fn store_path() -> std::io::Result<std::path::PathBuf> {
     Ok(std::path::PathBuf::from(home).join(".harvester/workspaces.json"))
 }
 
-pub fn load() -> Vec<Workspace> {
+pub(crate) fn load() -> Vec<Workspace> {
     let path = match store_path() {
         Ok(path) => path,
         Err(error) => {
@@ -51,7 +51,7 @@ pub fn load() -> Vec<Workspace> {
     }
 }
 
-pub fn save(workspaces: &[Workspace]) -> std::io::Result<()> {
+pub(crate) fn save(workspaces: &[Workspace]) -> std::io::Result<()> {
     let path = store_path()?;
 
     if let Some(parent) = path.parent() {

@@ -218,13 +218,13 @@ impl DaemonClient {
     fn route_line(&self, line: Outgoing, events: &UnboundedSender<SessionEvent>) {
         match line {
             Outgoing::Event { sid, event } => {
-                let _ = events.send(SessionEvent::Pi { sid, event });
+                drop(events.send(SessionEvent::Pi { sid, event }));
             }
             Outgoing::SessionExit { sid, exit_code } => {
-                let _ = events.send(SessionEvent::SessionExit { sid, exit_code });
+                drop(events.send(SessionEvent::SessionExit { sid, exit_code }));
             }
             Outgoing::EventGap { sid, skipped } => {
-                let _ = events.send(SessionEvent::EventGap { sid, skipped });
+                drop(events.send(SessionEvent::EventGap { sid, skipped }));
             }
             response @ (Outgoing::HarvesterResponse { .. } | Outgoing::PiResponse { .. }) => {
                 self.resolve(response);
@@ -249,7 +249,7 @@ impl DaemonClient {
             return;
         };
 
-        let _ = waiter.send(response);
+        drop(waiter.send(response));
     }
 
     fn fail_all_pending(&self) {
@@ -518,7 +518,7 @@ async fn remove_if_refused(path: &Path) {
 
 #[cfg(test)]
 impl DaemonReader {
-    pub(crate) async fn next_line_for_test(&mut self) -> serde_json::Value {
+    pub(crate) async fn next_line_for_test(&mut self) -> Value {
         let line = read_frame(&mut self.reader, &mut self.line_buffer)
             .await
             .expect("read")
@@ -530,7 +530,7 @@ impl DaemonReader {
 
 #[cfg(test)]
 impl DaemonWriter {
-    pub(crate) async fn send_json_for_test(&mut self, value: serde_json::Value) {
+    pub(crate) async fn send_json_for_test(&mut self, value: Value) {
         let frame = encode_frame(&value).expect("serializes");
 
         self.write_all_flushed(&frame).await.expect("write");
@@ -615,7 +615,7 @@ mod tests {
             .expect("one frame");
 
         assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(request).expect("json"),
+            serde_json::from_slice::<Value>(request).expect("json"),
             json!({"id": 7, "type": "harvester", "cmd": {"type": "detach", "sid": "01H"}})
         );
 

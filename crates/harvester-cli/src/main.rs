@@ -101,7 +101,7 @@ async fn raw(connection: DaemonConnection) -> Result<(), Box<dyn std::error::Err
     }
 
     drop(writer);
-    let _ = printer.await;
+    drop(printer.await);
 
     Ok(())
 }

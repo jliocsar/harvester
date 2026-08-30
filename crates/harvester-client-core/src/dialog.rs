@@ -95,24 +95,24 @@ fn parse_kind(event: &Value, method: &str) -> Option<DialogKind> {
 impl DialogAnswer {
     pub(crate) fn to_response(&self, dialog_id: &str) -> Value {
         match self {
-            DialogAnswer::Value(value) => {
+            Self::Value(value) => {
                 json!({"type": PI_EXTENSION_UI_RESPONSE, "id": dialog_id, "value": value})
             }
-            DialogAnswer::Confirmed(confirmed) => {
+            Self::Confirmed(confirmed) => {
                 json!({"type": PI_EXTENSION_UI_RESPONSE, "id": dialog_id,
                        "confirmed": confirmed})
             }
-            DialogAnswer::Cancelled => {
+            Self::Cancelled => {
                 json!({"type": PI_EXTENSION_UI_RESPONSE, "id": dialog_id, "cancelled": true})
             }
         }
     }
 
-    pub fn dismissal_for(request: &DialogRequest) -> Self {
+    pub const fn dismissal_for(request: &DialogRequest) -> Self {
         match &request.kind {
-            DialogKind::Confirm { .. } => DialogAnswer::Confirmed(false),
+            DialogKind::Confirm { .. } => Self::Confirmed(false),
             DialogKind::Select { .. } | DialogKind::Input { .. } | DialogKind::Editor { .. } => {
-                DialogAnswer::Cancelled
+                Self::Cancelled
             }
         }
     }
@@ -162,7 +162,7 @@ pub enum EnqueueResult {
 impl EnqueueResult {
     #[must_use]
     pub fn accepted(self) -> bool {
-        self == EnqueueResult::Accepted
+        self == Self::Accepted
     }
 }
 

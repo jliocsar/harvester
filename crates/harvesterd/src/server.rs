@@ -17,7 +17,7 @@ use crate::session::Daemon;
 
 const OUTGOING_QUEUE_DEPTH: usize = 256;
 
-pub enum Outbound {
+pub(crate) enum Outbound {
     Typed(Outgoing),
     Raw(Arc<[u8]>),
 }
@@ -27,10 +27,10 @@ impl Outbound {
         line.clear();
 
         match self {
-            Outbound::Typed(outgoing) => {
-                serde_json::to_writer(&mut *line, outgoing).expect("serializable")
+            Self::Typed(outgoing) => {
+                serde_json::to_writer(&mut *line, outgoing).expect("serializable");
             }
-            Outbound::Raw(bytes) => line.extend_from_slice(bytes),
+            Self::Raw(bytes) => line.extend_from_slice(bytes),
         }
 
         line.push(LF);
@@ -43,7 +43,7 @@ struct RequestIdProbe {
     id: Option<Value>,
 }
 
-pub async fn serve_connection(daemon: Daemon, stream: UnixStream) {
+pub(crate) async fn serve_connection(daemon: Daemon, stream: UnixStream) {
     let (read_half, write_half) = stream.into_split();
 
     let (out_tx, out_rx) = mpsc::channel::<Outbound>(OUTGOING_QUEUE_DEPTH);
@@ -63,13 +63,13 @@ pub async fn serve_connection(daemon: Daemon, stream: UnixStream) {
         };
 
         if let Some(outgoing) = handle_request(&daemon, request, &out_tx, &mut attached) {
-            let _ = out_tx.send(Outbound::Typed(outgoing)).await;
+            drop(out_tx.send(Outbound::Typed(outgoing)).await);
         }
     }
 
     attached.clear();
     drop(out_tx);
-    let _ = writer.await;
+    drop(writer.await);
 }
 
 fn spawn_writer(
@@ -89,14 +89,14 @@ fn spawn_writer(
     })
 }
 
-pub fn answer_later(
+pub(crate) fn answer_later(
     out_tx: &mpsc::Sender<Outbound>,
     answer: impl Future<Output = Outgoing> + Send + 'static,
 ) {
     let out_tx = out_tx.clone();
 
     tokio::spawn(async move {
-        let _ = out_tx.send(Outbound::Typed(answer.await)).await;
+        drop(out_tx.send(Outbound::Typed(answer.await)).await);
     });
 }
 
@@ -112,7 +112,7 @@ async fn decode_line(line: &[u8], out_tx: &mpsc::Sender<Outbound>) -> Option<Req
                 id: request_id_from_raw_line(line),
                 response: HarvesterResponse::err(format!("parse error: {error}")),
             };
-            let _ = out_tx.send(Outbound::Typed(outgoing)).await;
+            drop(out_tx.send(Outbound::Typed(outgoing)).await);
 
             None
         }

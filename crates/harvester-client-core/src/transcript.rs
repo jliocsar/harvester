@@ -36,7 +36,7 @@ pub struct ToolBlock {
 }
 
 impl ToolBlock {
-    pub fn running(tool_call_id: String, tool_name: String, args: Value) -> Self {
+    pub const fn running(tool_call_id: String, tool_name: String, args: Value) -> Self {
         Self {
             tool_call_id,
             tool_name,
@@ -102,7 +102,7 @@ impl Transcript {
         self.streaming.as_deref()
     }
 
-    pub fn is_busy(&self) -> bool {
+    pub const fn is_busy(&self) -> bool {
         self.busy
     }
 

@@ -120,7 +120,7 @@ struct EventSender {
 
 impl EventSender {
     fn send(&self, event: Event) {
-        let _ = self.sender.send((self.machine.clone(), event));
+        drop(self.sender.send((self.machine.clone(), event)));
     }
 }
 
@@ -209,13 +209,10 @@ async fn bridge_main(
                 None => break,
                 Some(command) => dispatch(command, &context),
             },
-            event = session_events.recv() => match event {
-                Some(event) => handle_session_event(&context, event),
-                None => {
-                    context.events.send(Event::Disconnected);
+            event = session_events.recv() => if let Some(event) = event { handle_session_event(&context, event) } else {
+                context.events.send(Event::Disconnected);
 
-                    break;
-                }
+                break;
             },
         }
     }
@@ -259,7 +256,7 @@ fn dispatch(command: Command, context: &BridgeContext) {
         Command::Prompt { sid, text } => spawn_flow(prompt_flow(context, sid, text)),
         Command::ListModels { cwd, token } => spawn_flow(list_models_flow(context, cwd, token)),
         Command::PiRequest { sid, cmd, token } => {
-            spawn_flow(pi_request_flow(context, sid, cmd, token))
+            spawn_flow(pi_request_flow(context, sid, cmd, token));
         }
         Command::Stop { sid } => spawn_flow(stop_flow(context, sid)),
         Command::AnswerDialog {
@@ -342,7 +339,10 @@ async fn open_flow(context: BridgeContext, sid: String, cwd: String) {
         return;
     };
 
-    if let WindowFlush::Overflowed = replay_history(&context, sid.clone(), registration).await {
+    if matches!(
+        replay_history(&context, sid.clone(), registration).await,
+        WindowFlush::Overflowed
+    ) {
         spawn_flow(resync_flow(context, sid));
     }
 }
@@ -541,7 +541,10 @@ async fn start_session_flow(
         entries: Vec::new(),
     });
 
-    if let WindowFlush::Overflowed = deliver_buffered_events(&context, sid.clone(), registration) {
+    if matches!(
+        deliver_buffered_events(&context, sid.clone(), registration),
+        WindowFlush::Overflowed
+    ) {
         spawn_flow(resync_flow(context.clone(), sid.clone()));
     }
 
@@ -757,13 +760,13 @@ mod tests {
     }
 
     impl Harness {
-        fn new() -> Harness {
+        fn new() -> Self {
             let (client_side, daemon_side) = tokio::io::duplex(64 * 1024);
             let (client, _session_events) =
                 DaemonClient::start(DaemonConnection::over(client_side, None));
             let (event_sender, events) = unbounded_channel();
 
-            Harness {
+            Self {
                 context: BridgeContext {
                     client,
                     events: EventSender {

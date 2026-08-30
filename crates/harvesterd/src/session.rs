@@ -17,7 +17,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, Notify};
 
 use crate::sid::Sid;
 
-pub use dialog::cancel as cancel_dialog;
+pub(crate) use dialog::cancel as cancel_dialog;
 
 const SESSION_EVENT_BUFFER: usize = 1024;
 
@@ -25,12 +25,12 @@ const STDIN_QUEUE_DEPTH: usize = 64;
 
 const MILLIS_PER_SECOND: u64 = 1_000;
 
-pub const PASSTHROUGH_ID_PREFIX: &str = "hv-";
+pub(crate) const PASSTHROUGH_ID_PREFIX: &str = "hv-";
 
 const EVENT_ENVELOPE_END: u8 = b'}';
 
 #[derive(Debug, Clone)]
-pub enum SessionOutput {
+pub(crate) enum SessionOutput {
     Event(Arc<[u8]>),
     Exit { exit_code: Option<i32> },
 }
@@ -47,7 +47,7 @@ struct LineProbe<'line> {
     timeout: Option<u64>,
 }
 
-pub struct Session {
+pub(crate) struct Session {
     pub sid: Sid,
     pub cwd: String,
     pub spawned_at_ms: u64,
@@ -59,7 +59,7 @@ pub struct Session {
     pending_responses: Mutex<HashMap<String, oneshot::Sender<Value>>>,
 }
 
-pub struct SpawnArgs {
+pub(crate) struct SpawnArgs {
     pub sid: Sid,
     pub cwd: String,
     pub provider: Option<String>,
@@ -67,18 +67,18 @@ pub struct SpawnArgs {
     pub name: Option<String>,
 }
 
-pub enum SpawnOutcome {
+pub(crate) enum SpawnOutcome {
     Spawned(Arc<Session>),
     AlreadyRunning(Arc<Session>),
 }
 
-pub struct RunningSession {
+pub(crate) struct RunningSession {
     pub cwd: String,
     pub spawned_at_ms: u64,
 }
 
 #[derive(Clone)]
-pub struct Daemon {
+pub(crate) struct Daemon {
     inner: Arc<DaemonInner>,
 }
 
@@ -89,7 +89,7 @@ struct DaemonInner {
 }
 
 impl Daemon {
-    pub fn new(build_fingerprint: String) -> Self {
+    pub(crate) fn new(build_fingerprint: String) -> Self {
         Self {
             inner: Arc::new(DaemonInner {
                 build_fingerprint,
@@ -99,21 +99,21 @@ impl Daemon {
         }
     }
 
-    pub fn build_fingerprint(&self) -> &str {
+    pub(crate) fn build_fingerprint(&self) -> &str {
         &self.inner.build_fingerprint
     }
 
-    pub fn next_passthrough_id(&self) -> String {
+    pub(crate) fn next_passthrough_id(&self) -> String {
         let request_number = self.inner.request_counter.fetch_add(1, Ordering::Relaxed);
 
         format!("{PASSTHROUGH_ID_PREFIX}{request_number}")
     }
 
-    pub fn session(&self, sid: &Sid) -> Option<Arc<Session>> {
+    pub(crate) fn session(&self, sid: &Sid) -> Option<Arc<Session>> {
         lock(&self.inner.sessions, "sessions").get(sid).cloned()
     }
 
-    pub fn running_sessions(&self) -> HashMap<Sid, RunningSession> {
+    pub(crate) fn running_sessions(&self) -> HashMap<Sid, RunningSession> {
         lock(&self.inner.sessions, "sessions")
             .iter()
             .map(|(sid, session)| {
@@ -127,7 +127,7 @@ impl Daemon {
             .collect()
     }
 
-    pub fn spawn_session(&self, args: SpawnArgs) -> std::io::Result<SpawnOutcome> {
+    pub(crate) fn spawn_session(&self, args: SpawnArgs) -> std::io::Result<SpawnOutcome> {
         let mut sessions = lock(&self.inner.sessions, "sessions");
 
         if let Some(running) = sessions.get(&args.sid) {
@@ -140,7 +140,7 @@ impl Daemon {
         Ok(SpawnOutcome::Spawned(session))
     }
 
-    pub fn is_current_generation(&self, session: &Arc<Session>) -> bool {
+    pub(crate) fn is_current_generation(&self, session: &Arc<Session>) -> bool {
         is_current_generation_in(&lock(&self.inner.sessions, "sessions"), session)
     }
 
@@ -189,7 +189,7 @@ impl Session {
         Ok(session)
     }
 
-    pub fn write_line(&self, value: &Value) -> Result<(), &'static str> {
+    pub(crate) fn write_line(&self, value: &Value) -> Result<(), &'static str> {
         let line = encode_frame(value).expect("serializable");
         let guard = lock(&self.stdin_queue, "stdin_queue");
 
@@ -203,15 +203,15 @@ impl Session {
         })
     }
 
-    pub fn close_stdin(&self) {
+    pub(crate) fn close_stdin(&self) {
         drop(lock(&self.stdin_queue, "stdin_queue").take());
     }
 
-    pub fn kill(&self) {
+    pub(crate) fn kill(&self) {
         self.kill_switch.notify_one();
     }
 
-    pub fn register_response_waiter(&self, request_key: String) -> oneshot::Receiver<Value> {
+    pub(crate) fn register_response_waiter(&self, request_key: String) -> oneshot::Receiver<Value> {
         let (sender, receiver) = oneshot::channel();
 
         lock(&self.pending_responses, "pending_responses").insert(request_key, sender);
@@ -228,7 +228,7 @@ impl Session {
             return;
         };
 
-        let _ = waiter.send(response);
+        drop(waiter.send(response));
     }
 
     fn fail_pending_responses(&self) {
@@ -309,10 +309,10 @@ async fn pump_stdin(sid: Sid, mut stdin: ChildStdin, mut frames: mpsc::Receiver<
 async fn reap_child(session: Arc<Session>, mut child: Child) -> Option<i32> {
     tokio::select! {
         status = child.wait() => return status.ok().and_then(|status| status.code()),
-        _ = session.kill_switch.notified() => {}
+        () = session.kill_switch.notified() => {}
     }
 
-    let _ = child.start_kill();
+    drop(child.start_kill());
 
     child.wait().await.ok().and_then(|status| status.code())
 }
@@ -346,7 +346,7 @@ async fn pump_stdout(
 
     daemon.remove_session_if_same(&session);
     session.fail_pending_responses();
-    let _ = session.output.send(SessionOutput::Exit { exit_code });
+    drop(session.output.send(SessionOutput::Exit { exit_code }));
 }
 
 fn probe_line<'line>(sid: &Sid, line: &'line [u8]) -> Option<LineProbe<'line>> {
@@ -382,7 +382,7 @@ fn route_line(session: &Arc<Session>, line: &[u8], probe: LineProbe<'_>) {
     let event = encode_event(&session.event_prefix, line);
 
     if dialog::apply_policy(session, &probe, &event) {
-        let _ = session.output.send(SessionOutput::Event(event));
+        drop(session.output.send(SessionOutput::Event(event)));
     }
 }
 

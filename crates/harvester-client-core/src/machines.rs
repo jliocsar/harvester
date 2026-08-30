@@ -187,15 +187,15 @@ fn handle_command(
 ) {
     match command {
         Command::SetAdHocMachines(machines) => {
-            set_ad_hoc_machines(machines, ad_hoc_machines, events)
+            set_ad_hoc_machines(machines, ad_hoc_machines, events);
         }
         Command::ResolveHome { host, token } => spawn_resolve_home(host, token, events),
         Command::ListDir { host, path, token } => spawn_list_dir(host, path, token, events),
         Command::ValidateWorkspace { host, path, token } => {
-            spawn_validate_workspace(host, path, token, events)
+            spawn_validate_workspace(host, path, token, events);
         }
         Command::ResolveBranch { host, path, token } => {
-            spawn_resolve_branch(host, path, token, events)
+            spawn_resolve_branch(host, path, token, events);
         }
     }
 }
@@ -214,7 +214,7 @@ fn spawn_resolve_home(host: Host, token: RequestToken, events: &UnboundedSender<
         let result = resolve_home(&host).await.map_err(|error| error.to_string());
 
         Event::HomeResolved { token, result }
-    })
+    });
 }
 
 fn spawn_list_dir(host: Host, path: String, token: RequestToken, events: &UnboundedSender<Event>) {
@@ -224,7 +224,7 @@ fn spawn_list_dir(host: Host, path: String, token: RequestToken, events: &Unboun
             .map_err(|error| error.to_string());
 
         Event::DirListed { token, result }
-    })
+    });
 }
 
 fn spawn_validate_workspace(
@@ -239,7 +239,7 @@ fn spawn_validate_workspace(
             .map_err(|error| error.to_string());
 
         Event::WorkspaceValidated { token, result }
-    })
+    });
 }
 
 fn spawn_resolve_branch(
@@ -254,7 +254,7 @@ fn spawn_resolve_branch(
             .map_err(|error| error.to_string());
 
         Event::BranchResolved { token, result }
-    })
+    });
 }
 
 fn spawn_host_op(
@@ -264,7 +264,7 @@ fn spawn_host_op(
     let events = events.clone();
 
     tokio::spawn(async move {
-        let _ = events.send(op.await);
+        drop(events.send(op.await));
     });
 }
 
@@ -349,7 +349,7 @@ fn spawn_list_cycle(
 ) {
     tokio::spawn(async move {
         if let Some(rows) = list_provider_machines(&previous, &events).await {
-            let _ = listed.send(rows);
+            drop(listed.send(rows));
         }
     });
 }
@@ -391,10 +391,10 @@ async fn list_provider_machines(
                 rows.insert(provider.name.clone(), machine_rows(&provider, machines));
             }
             Err(error) => {
-                let _ = events.send(Event::ProviderFailed {
+                drop(events.send(Event::ProviderFailed {
                     provider: provider.name.clone(),
                     detail: error.to_string(),
-                });
+                }));
 
                 if let Some(last_good) = previous.get(&provider.name) {
                     rows.insert(provider.name.clone(), last_good.clone());
@@ -432,10 +432,10 @@ fn probe_machine(key: String, target: SshTarget, events: &UnboundedSender<Event>
     let events = events.clone();
 
     tokio::spawn(async move {
-        let _ = events.send(Event::Probed {
+        drop(events.send(Event::Probed {
             key,
             reachable: probe_reachable(&target).await,
-        });
+        }));
     });
 }
 

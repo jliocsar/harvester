@@ -8,15 +8,15 @@ use harvester_client_core::{
     BridgeEvents, Fleet, Host, MachineCandidate, MachineState, MachinesEvents, RequestTokens,
 };
 
-pub use crate::catalog::MachineSession;
+pub(crate) use crate::catalog::MachineSession;
 
-pub enum StoreEvent {
+pub(crate) enum StoreEvent {
     Bridge { machine: String, event: BridgeEvent },
     Machines(machines::Event),
     Failed(String),
 }
 
-pub struct FleetStore {
+pub(crate) struct FleetStore {
     argv_machine: Option<String>,
     fleet: Fleet,
     tokens: RequestTokens,
@@ -26,10 +26,10 @@ pub struct FleetStore {
 impl EventEmitter<StoreEvent> for FleetStore {}
 
 impl FleetStore {
-    pub fn new(
+    pub(crate) fn new(
         argv_machine: Option<String>,
         daemon_binary: Vec<u8>,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) -> Self {
         let (fleet, events) = Fleet::start(daemon_binary);
 
@@ -55,14 +55,14 @@ impl FleetStore {
         store
     }
 
-    fn pump_bridge_events(mut events: BridgeEvents, cx: &mut Context<Self>) {
+    fn pump_bridge_events(mut events: BridgeEvents, cx: &mut Context<'_, Self>) {
         cx.spawn(async move |this, cx| {
             while let Some(unapplied) = events.next().await {
                 if this
                     .update(cx, |store, cx| {
                         let (machine, event) = store.fleet.observe_bridge_event(unapplied);
 
-                        store.handle_bridge_event(machine, event, cx)
+                        store.handle_bridge_event(machine, event, cx);
                     })
                     .is_err()
                 {
@@ -73,14 +73,14 @@ impl FleetStore {
         .detach();
     }
 
-    fn pump_machines_events(mut events: MachinesEvents, cx: &mut Context<Self>) {
+    fn pump_machines_events(mut events: MachinesEvents, cx: &mut Context<'_, Self>) {
         cx.spawn(async move |this, cx| {
             while let Some(unapplied) = events.next().await {
                 if this
                     .update(cx, |store, cx| {
                         let event = store.fleet.observe_machines_event(unapplied);
 
-                        store.handle_machines_event(event, cx)
+                        store.handle_machines_event(event, cx);
                     })
                     .is_err()
                 {
@@ -91,7 +91,12 @@ impl FleetStore {
         .detach();
     }
 
-    fn handle_bridge_event(&mut self, machine: String, event: BridgeEvent, cx: &mut Context<Self>) {
+    fn handle_bridge_event(
+        &mut self,
+        machine: String,
+        event: BridgeEvent,
+        cx: &mut Context<'_, Self>,
+    ) {
         if let BridgeEvent::Sessions(sessions) = event {
             self.catalog.record_sessions(&machine, sessions);
             cx.notify();
@@ -103,14 +108,19 @@ impl FleetStore {
         cx.emit(StoreEvent::Bridge { machine, event });
     }
 
-    fn apply_bridge_event(&mut self, machine: &str, event: &BridgeEvent, cx: &mut Context<Self>) {
+    fn apply_bridge_event(
+        &mut self,
+        machine: &str,
+        event: &BridgeEvent,
+        cx: &mut Context<'_, Self>,
+    ) {
         match event {
             BridgeEvent::Connected => cx.notify(),
             BridgeEvent::ConnectFailed { .. } | BridgeEvent::Disconnected => {
-                self.handle_link_lost(machine, cx)
+                self.handle_link_lost(machine, cx);
             }
             BridgeEvent::RequestFailed { detail } => {
-                self.handle_request_failed(machine, detail, cx)
+                self.handle_request_failed(machine, detail, cx);
             }
             BridgeEvent::Attached { sid, .. } => self.handle_session_attached(machine, sid, cx),
             BridgeEvent::SessionExit { sid, .. } => self.handle_session_exited(sid, cx),
@@ -130,38 +140,38 @@ impl FleetStore {
         }
     }
 
-    fn handle_link_lost(&mut self, machine: &str, cx: &mut Context<Self>) {
+    fn handle_link_lost(&mut self, machine: &str, cx: &mut Context<'_, Self>) {
         self.catalog.abandon_open_on(machine);
         cx.notify();
     }
 
-    fn handle_request_failed(&mut self, machine: &str, detail: &str, cx: &mut Context<Self>) {
+    fn handle_request_failed(&mut self, machine: &str, detail: &str, cx: &mut Context<'_, Self>) {
         self.catalog.abandon_open_on(machine);
         self.fail(format!("{machine}: {detail}"), cx);
         cx.notify();
     }
 
-    fn handle_session_attached(&mut self, machine: &str, sid: &str, cx: &mut Context<Self>) {
+    fn handle_session_attached(&mut self, machine: &str, sid: &str, cx: &mut Context<'_, Self>) {
         self.catalog.session_attached(machine, sid);
         cx.notify();
     }
 
-    fn handle_session_exited(&mut self, sid: &str, cx: &mut Context<Self>) {
+    fn handle_session_exited(&mut self, sid: &str, cx: &mut Context<'_, Self>) {
         self.catalog.session_exited(sid);
         cx.notify();
     }
 
-    fn handle_machines_event(&mut self, event: machines::Event, cx: &mut Context<Self>) {
+    fn handle_machines_event(&mut self, event: machines::Event, cx: &mut Context<'_, Self>) {
         match event {
             machines::Event::Listed { .. } | machines::Event::Probed { .. } => cx.notify(),
             machines::Event::ProviderFailed { provider, detail } => {
-                self.fail(format!("provider {provider}: {detail}"), cx)
+                self.fail(format!("provider {provider}: {detail}"), cx);
             }
             answer => cx.emit(StoreEvent::Machines(answer)),
         }
     }
 
-    fn fail(&mut self, detail: String, cx: &mut Context<Self>) {
+    fn fail(&mut self, detail: String, cx: &mut Context<'_, Self>) {
         cx.emit(StoreEvent::Failed(detail));
     }
 
@@ -181,7 +191,7 @@ impl FleetStore {
         self.fleet.track_machines(machines);
     }
 
-    pub fn ensure_connection(&mut self, machine: &str, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn ensure_connection(&mut self, machine: &str, cx: &mut Context<'_, Self>) -> bool {
         match self.fleet.ensure_connection(machine) {
             Ok(()) => true,
             Err(error) => {
@@ -192,11 +202,16 @@ impl FleetStore {
         }
     }
 
-    pub fn send(&self, machine: &str, command: Command) {
+    pub(crate) fn send(&self, machine: &str, command: Command) {
         self.fleet.send(machine, command);
     }
 
-    pub fn send_gated(&mut self, machine: &str, command: Command, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn send_gated(
+        &mut self,
+        machine: &str,
+        command: Command,
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
         if let Some(detail) = self.gate_failure(machine, &command) {
             self.fail(detail, cx);
 
@@ -226,7 +241,12 @@ impl FleetStore {
         Some(format!("{label}: not connected — nothing was sent"))
     }
 
-    fn raise_open_guard_for(&mut self, machine: &str, command: &Command, cx: &mut Context<Self>) {
+    fn raise_open_guard_for(
+        &mut self,
+        machine: &str,
+        command: &Command,
+        cx: &mut Context<'_, Self>,
+    ) {
         let Command::StartSession { sid, .. } = command else {
             return;
         };
@@ -234,10 +254,10 @@ impl FleetStore {
         self.begin_start(machine.to_string(), sid.clone(), cx);
     }
 
-    pub fn send_host_command(
+    pub(crate) fn send_host_command(
         &mut self,
         command: machines::Command,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) -> bool {
         match self.fleet.send_host_command(command) {
             Ok(()) => true,
@@ -249,7 +269,12 @@ impl FleetStore {
         }
     }
 
-    pub fn add_workspace(&mut self, machine: String, path: String, cx: &mut Context<Self>) {
+    pub(crate) fn add_workspace(
+        &mut self,
+        machine: String,
+        path: String,
+        cx: &mut Context<'_, Self>,
+    ) {
         let workspace = Workspace { machine, path };
 
         let added = match self.catalog.add_workspace(workspace) {
@@ -269,7 +294,7 @@ impl FleetStore {
         cx.notify();
     }
 
-    pub fn forget_machine(&mut self, machine: &str, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn forget_machine(&mut self, machine: &str, cx: &mut Context<'_, Self>) -> bool {
         if let Err(error) = self.catalog.forget_machine(machine) {
             self.fail(format!("save workspaces: {error}"), cx);
 
@@ -286,16 +311,16 @@ impl FleetStore {
         true
     }
 
-    pub fn begin_start(&mut self, machine: String, sid: String, cx: &mut Context<Self>) {
+    pub(crate) fn begin_start(&mut self, machine: String, sid: String, cx: &mut Context<'_, Self>) {
         self.catalog.begin_open(machine, sid);
         cx.notify();
     }
 
-    pub fn may_open_session(&mut self, sid: &str) -> bool {
+    pub(crate) fn may_open_session(&mut self, sid: &str) -> bool {
         self.catalog.may_open_session(sid)
     }
 
-    pub fn open_session(&mut self, sid: &str, cx: &mut Context<Self>) {
+    pub(crate) fn open_session(&mut self, sid: &str, cx: &mut Context<'_, Self>) {
         let Some(open) = self.catalog.open_session(sid) else {
             return;
         };
@@ -316,71 +341,71 @@ impl FleetStore {
         cx.notify();
     }
 
-    pub fn insert_started_session(
+    pub(crate) fn insert_started_session(
         &mut self,
         machine: String,
         sid: String,
         name: String,
         cwd: String,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         self.catalog.insert_started_session(machine, sid, name, cwd);
         cx.notify();
     }
 
-    pub fn argv_machine(&self) -> Option<&str> {
+    pub(crate) fn argv_machine(&self) -> Option<&str> {
         self.argv_machine.as_deref()
     }
 
-    pub fn catalog(&self) -> &Catalog {
+    pub(crate) const fn catalog(&self) -> &Catalog {
         &self.catalog
     }
 
-    pub fn tokens(&self) -> RequestTokens {
+    pub(crate) fn tokens(&self) -> RequestTokens {
         self.tokens.clone()
     }
 
-    pub fn label(&self, machine: &str) -> String {
+    pub(crate) fn label(&self, machine: &str) -> String {
         self.fleet.label(machine)
     }
 
-    pub fn state(&self, machine: &str) -> MachineState<'_> {
+    pub(crate) fn state(&self, machine: &str) -> MachineState<'_> {
         self.fleet.state(machine)
     }
 
-    pub fn is_live(&self, machine: &str) -> bool {
+    pub(crate) fn is_live(&self, machine: &str) -> bool {
         self.fleet.state(machine).is_live()
     }
 
-    pub fn host_for(&self, machine: &str) -> harvester_client_core::Result<Host> {
+    pub(crate) fn host_for(&self, machine: &str) -> harvester_client_core::Result<Host> {
         self.fleet.host_for(machine)
     }
 
-    pub fn provider_machines(&self) -> &[machines::MachineRow] {
+    pub(crate) fn provider_machines(&self) -> &[machines::MachineRow] {
         self.fleet.provider_machines()
     }
 
-    pub fn missing_tracked_machines(&self) -> Vec<String> {
+    pub(crate) fn missing_tracked_machines(&self) -> Vec<String> {
         self.fleet.missing_tracked_machines()
     }
 
-    pub fn ad_hoc_machines(&self) -> Vec<String> {
+    pub(crate) fn ad_hoc_machines(&self) -> Vec<String> {
         self.fleet.ad_hoc_machines()
     }
 
-    pub fn machine_candidates(&self) -> Vec<MachineCandidate> {
+    pub(crate) fn machine_candidates(&self) -> Vec<MachineCandidate> {
         self.fleet.machine_candidates()
     }
 
-    pub fn connected_machine_count(&self) -> usize {
+    pub(crate) fn connected_machine_count(&self) -> usize {
         self.fleet.connected_machine_count()
     }
 
-    pub fn linked_machine_count(&self) -> usize {
+    pub(crate) fn linked_machine_count(&self) -> usize {
         self.fleet.linked_machine_count()
     }
 
-    pub fn new_session_target(&self) -> ChatTarget {
+    pub(crate) fn new_session_target(&self) -> ChatTarget {
         let machines: Vec<String> = self
             .fleet
             .machine_candidates()
@@ -391,13 +416,13 @@ impl FleetStore {
         self.catalog.default_new_session_target(&machines)
     }
 
-    pub fn clear_selected_session(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn clear_selected_session(&mut self, cx: &mut Context<'_, Self>) {
         self.catalog.clear_selected_session();
         cx.notify();
     }
 }
 
-fn is_pre_session_command(command: &Command) -> bool {
+const fn is_pre_session_command(command: &Command) -> bool {
     matches!(
         command,
         Command::ListModels { .. } | Command::StartSession { .. }

@@ -25,7 +25,7 @@ struct OpenChat {
     _flow_requests: Subscription,
 }
 
-pub struct Workbench {
+pub(crate) struct Workbench {
     store: Entity<FleetStore>,
     sidebar: Entity<Sidebar>,
     modal: Entity<ModalCoordinator>,
@@ -37,11 +37,11 @@ pub struct Workbench {
 }
 
 impl Workbench {
-    pub fn new(
+    pub(crate) fn new(
         argv_machine: Option<String>,
         daemon_binary: Vec<u8>,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) -> Self {
         let store = cx.new(|cx| FleetStore::new(argv_machine, daemon_binary, cx));
         let sidebar = cx.new(|cx| Sidebar::new(store.clone(), cx));
@@ -68,7 +68,7 @@ impl Workbench {
         _store: &Entity<FleetStore>,
         event: &StoreEvent,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         match event {
             StoreEvent::Bridge {
@@ -85,13 +85,13 @@ impl Workbench {
         _sidebar: &Entity<Sidebar>,
         intent: &SidebarIntent,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         match intent {
             SidebarIntent::NewSession => self.open_new_session_chat(window, cx),
             SidebarIntent::OpenSession { sid } => self.open_session(sid, cx),
             SidebarIntent::ForgetMachine { machine } => {
-                self.open_forget_machine(machine.clone(), window, cx)
+                self.open_forget_machine(machine.clone(), window, cx);
             }
         }
     }
@@ -100,10 +100,10 @@ impl Workbench {
         &mut self,
         machine: String,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         self.modal.update(cx, |modal, cx| {
-            modal.open_forget_machine(machine, window, cx)
+            modal.open_forget_machine(machine, window, cx);
         });
     }
 
@@ -112,17 +112,17 @@ impl Workbench {
         _modal: &Entity<ModalCoordinator>,
         outcome: &ModalOutcome,
         _window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         match outcome {
             ModalOutcome::RepoAdded { machine, path } => self.handle_repo_added(machine, path, cx),
             ModalOutcome::MachineForgotten { machine } => {
-                self.handle_machine_forgotten(machine, cx)
+                self.handle_machine_forgotten(machine, cx);
             }
         }
     }
 
-    fn handle_machine_forgotten(&mut self, machine: &str, cx: &mut Context<Self>) {
+    fn handle_machine_forgotten(&mut self, machine: &str, cx: &mut Context<'_, Self>) {
         let targets_machine = self
             .chat
             .as_ref()
@@ -136,7 +136,7 @@ impl Workbench {
         cx.notify();
     }
 
-    fn handle_repo_added(&mut self, machine: &str, path: &str, cx: &mut Context<Self>) {
+    fn handle_repo_added(&mut self, machine: &str, path: &str, cx: &mut Context<'_, Self>) {
         let Some(chat) = self.chat.as_ref().map(|open| open.chat.clone()) else {
             return;
         };
@@ -150,7 +150,7 @@ impl Workbench {
         chat.update(cx, |chat, cx| chat.select_repo(path, cx));
     }
 
-    fn report(&self, detail: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn report(&self, detail: String, window: &mut Window, cx: &mut Context<'_, Self>) {
         window.push_notification((NotificationType::Error, detail), cx);
     }
 
@@ -160,7 +160,7 @@ impl Workbench {
         sid: &str,
         entries: &[Value],
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         if let Some(chat) = self.take_starting_chat(sid, cx) {
             chat.update(cx, |chat, cx| {
@@ -181,10 +181,15 @@ impl Workbench {
         self.install_chat(chat, window, cx);
     }
 
-    fn install_chat(&mut self, chat: Entity<Chat>, window: &mut Window, cx: &mut Context<Self>) {
+    fn install_chat(
+        &mut self,
+        chat: Entity<Chat>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
         let flow_requests = cx.subscribe_in(&chat, window, Self::handle_chat_flow_request);
 
-        chat.update(cx, |chat, cx| chat.request_prompt_controls(cx));
+        chat.update(cx, Chat::request_prompt_controls);
 
         self.chat = Some(OpenChat {
             chat,
@@ -193,7 +198,7 @@ impl Workbench {
         cx.notify();
     }
 
-    fn workspace_path_of(&self, sid: &str, cx: &Context<Self>) -> String {
+    fn workspace_path_of(&self, sid: &str, cx: &Context<'_, Self>) -> String {
         self.store
             .read(cx)
             .catalog()
@@ -202,7 +207,7 @@ impl Workbench {
             .to_string()
     }
 
-    fn open_session(&mut self, sid: &str, cx: &mut Context<Self>) {
+    fn open_session(&mut self, sid: &str, cx: &mut Context<'_, Self>) {
         if !self
             .store
             .update(cx, |store, _| store.may_open_session(sid))
@@ -226,7 +231,7 @@ impl Workbench {
         cx.notify();
     }
 
-    fn discard_unstarted_chat(&mut self, cx: &mut Context<Self>) {
+    fn discard_unstarted_chat(&mut self, cx: &mut Context<'_, Self>) {
         let unstarted = self
             .chat
             .as_ref()
@@ -239,7 +244,11 @@ impl Workbench {
         self.chat = None;
     }
 
-    fn take_starting_chat(&mut self, sid: &str, cx: &mut Context<Self>) -> Option<Entity<Chat>> {
+    fn take_starting_chat(
+        &mut self,
+        sid: &str,
+        cx: &mut Context<'_, Self>,
+    ) -> Option<Entity<Chat>> {
         let chat = self.chat.as_ref()?.chat.clone();
         let (machine, cwd, name) = {
             let chat = chat.read(cx);
@@ -257,13 +266,13 @@ impl Workbench {
         };
 
         self.store.update(cx, |store, cx| {
-            store.insert_started_session(machine, sid.to_string(), name, cwd, cx)
+            store.insert_started_session(machine, sid.to_string(), name, cwd, cx);
         });
 
         Some(chat)
     }
 
-    fn open_new_session_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_new_session_chat(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         let already_unstarted = self.chat.as_ref().is_some_and(|open| {
             let chat = open.chat.read(cx);
 
@@ -278,8 +287,7 @@ impl Workbench {
         let store = self.store.clone();
         let chat = cx.new(|cx| Chat::unstarted(target, store, window, cx));
 
-        self.store
-            .update(cx, |store, cx| store.clear_selected_session(cx));
+        self.store.update(cx, FleetStore::clear_selected_session);
         self.install_chat(chat, window, cx);
     }
 
@@ -288,19 +296,19 @@ impl Workbench {
         _chat: &Entity<Chat>,
         request: &ChatFlowRequest,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         match request {
             ChatFlowRequest::AddRepo { machine } => self.open_add_repo(machine.clone(), window, cx),
         }
     }
 
-    fn open_add_repo(&mut self, machine: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_add_repo(&mut self, machine: String, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.modal
             .update(cx, |modal, cx| modal.open_add_repo(machine, window, cx));
     }
 
-    fn render_content(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn render_content(&self, cx: &Context<'_, Self>) -> impl IntoElement {
         let content = div().flex_1().min_w_0().h_full();
 
         if let Some(open) = &self.chat {
@@ -313,7 +321,7 @@ impl Workbench {
         content.child(ui::empty_pane_hint(hint.tone, hint.text, cx))
     }
 
-    fn render_statusbar(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn render_statusbar(&self, cx: &Context<'_, Self>) -> impl IntoElement {
         let store = self.store.read(cx);
         let link = present_statusbar_link(
             argv_machine_state(store),
@@ -381,7 +389,7 @@ fn present_statusbar_link(
 }
 
 impl Render for Workbench {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         div()
             .size_full()
             .flex()

@@ -19,9 +19,9 @@ const CONFIRM_ACTION_LABEL: &str = "Confirm";
 
 pub(crate) fn open_pi_dialog<T: 'static>(
     obligation: &DialogObligation,
-    answered: impl Fn(&mut T, DialogAnswer, &mut Window, &mut Context<T>) -> bool + 'static,
+    answered: impl Fn(&mut T, DialogAnswer, &mut Window, &mut Context<'_, T>) -> bool + 'static,
     window: &mut Window,
-    cx: &mut Context<T>,
+    cx: &mut Context<'_, T>,
 ) {
     let owner = cx.entity();
     let answer: AnswerCallback = Rc::new(
@@ -42,7 +42,7 @@ pub(crate) fn open_pi_dialog<T: 'static>(
             cx,
         ),
         DialogKind::Confirm { message } => {
-            open_question(title, message, dismissal, answer, window, cx)
+            open_question(title, message, dismissal, answer, window, cx);
         }
         DialogKind::Input { placeholder } => open_entry(
             title_or_named_condition(title, UNTITLED_INPUT_CONDITION),
@@ -71,7 +71,7 @@ fn open_option_list<T: 'static>(
     dismissal: DialogAnswer,
     answer: AnswerCallback,
     window: &mut Window,
-    cx: &mut Context<T>,
+    cx: &mut Context<'_, T>,
 ) {
     let chosen = answer.clone();
 
@@ -91,7 +91,7 @@ fn open_question<T: 'static>(
     dismissal: DialogAnswer,
     answer: AnswerCallback,
     window: &mut Window,
-    cx: &mut Context<T>,
+    cx: &mut Context<'_, T>,
 ) {
     let confirmed = answer.clone();
     let question = confirmation_copy(title, message);
@@ -142,7 +142,7 @@ fn open_entry<T: 'static>(
     dismissal: DialogAnswer,
     answer: AnswerCallback,
     window: &mut Window,
-    cx: &mut Context<T>,
+    cx: &mut Context<'_, T>,
 ) {
     let input = create_input(seed, window, cx);
     let submitted = answer.clone();

@@ -189,11 +189,11 @@ impl Walk {
         Some(self.ask(PickerRequest::Validation { path }))
     }
 
-    fn busy(&self) -> bool {
+    const fn busy(&self) -> bool {
         self.pending.is_waiting()
     }
 
-    fn can_submit(&self) -> bool {
+    const fn can_submit(&self) -> bool {
         !self.busy() && !self.path.is_empty()
     }
 
@@ -201,7 +201,7 @@ impl Walk {
         !self.path.is_empty() && self.path != "/"
     }
 
-    fn waiting_note(&self) -> Option<&'static str> {
+    const fn waiting_note(&self) -> Option<&'static str> {
         if !self.busy() {
             return None;
         }
@@ -223,9 +223,9 @@ enum EntryRow {
 impl EntryRow {
     fn label(&self) -> SharedString {
         match self {
-            EntryRow::Parent => "../".into(),
-            EntryRow::Directory(name) => format!("{name}/").into(),
-            EntryRow::File(name) => name.clone(),
+            Self::Parent => "../".into(),
+            Self::Directory(name) => format!("{name}/").into(),
+            Self::File(name) => name.clone(),
         }
     }
 }
@@ -236,7 +236,7 @@ struct EntriesDelegate {
 }
 
 impl EntriesDelegate {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             rows: Vec::new(),
             matches: Vec::new(),
@@ -283,7 +283,7 @@ impl ListDelegate for EntriesDelegate {
         &mut self,
         ix: IndexPath,
         _window: &mut Window,
-        _cx: &mut Context<ListState<Self>>,
+        _cx: &mut Context<'_, ListState<Self>>,
     ) -> Option<Self::Item> {
         let row = self.row(ix.row)?;
 
@@ -298,7 +298,7 @@ impl ListDelegate for EntriesDelegate {
         &mut self,
         query: &str,
         _window: &mut Window,
-        _cx: &mut Context<ListState<Self>>,
+        _cx: &mut Context<'_, ListState<Self>>,
     ) -> Task<()> {
         let query = query.trim().to_lowercase();
 
@@ -317,7 +317,7 @@ impl ListDelegate for EntriesDelegate {
         &mut self,
         _ix: Option<IndexPath>,
         _window: &mut Window,
-        _cx: &mut Context<ListState<Self>>,
+        _cx: &mut Context<'_, ListState<Self>>,
     ) {
     }
 }
@@ -335,7 +335,7 @@ impl FolderPicker {
         machine: String,
         store: Entity<FleetStore>,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) -> Self {
         let label = store.read(cx).label(&machine);
         let tokens = store.read(cx).tokens();
@@ -354,13 +354,13 @@ impl FolderPicker {
         }
     }
 
-    pub(super) fn start(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn start(&mut self, cx: &mut Context<'_, Self>) {
         let home = self.walk.ask(PickerRequest::Home);
 
         self.send_request(home, cx);
     }
 
-    pub(super) fn cancel(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn cancel(&mut self, cx: &mut Context<'_, Self>) {
         self.walk.stop_waiting();
         cx.notify();
     }
@@ -370,7 +370,7 @@ impl FolderPicker {
         entries: &Entity<ListState<EntriesDelegate>>,
         event: &ListEvent,
         _window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         let ListEvent::Confirm(ix) = event else {
             return;
@@ -388,7 +388,7 @@ impl FolderPicker {
         self.dispatch(command, cx);
     }
 
-    fn dispatch(&mut self, command: Option<PickerCommand>, cx: &mut Context<Self>) {
+    fn dispatch(&mut self, command: Option<PickerCommand>, cx: &mut Context<'_, Self>) {
         if let Some(command) = command {
             self.send_request(command, cx);
         }
@@ -396,7 +396,7 @@ impl FolderPicker {
         cx.notify();
     }
 
-    fn send_request(&mut self, command: PickerCommand, cx: &mut Context<Self>) {
+    fn send_request(&mut self, command: PickerCommand, cx: &mut Context<'_, Self>) {
         let host = match self.store.read(cx).host_for(&self.walk.machine) {
             Ok(host) => host,
             Err(error) => {
@@ -421,17 +421,17 @@ impl FolderPicker {
         _store: &Entity<FleetStore>,
         event: &StoreEvent,
         _window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         match event {
             StoreEvent::Machines(machines::Event::HomeResolved { token, result }) => {
-                self.handle_home_resolved(*token, result.clone(), cx)
+                self.handle_home_resolved(*token, result.clone(), cx);
             }
             StoreEvent::Machines(machines::Event::DirListed { token, result }) => {
-                self.handle_dir_listed(*token, result.clone(), cx)
+                self.handle_dir_listed(*token, result.clone(), cx);
             }
             StoreEvent::Machines(machines::Event::WorkspaceValidated { token, result }) => {
-                self.handle_workspace_validated(*token, result.clone(), cx)
+                self.handle_workspace_validated(*token, result.clone(), cx);
             }
             StoreEvent::Bridge { .. }
             | StoreEvent::Machines(
@@ -448,7 +448,7 @@ impl FolderPicker {
         &mut self,
         token: RequestToken,
         result: Result<String, String>,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         let command = self.walk.accept_home(token, result);
 
@@ -459,7 +459,7 @@ impl FolderPicker {
         &mut self,
         token: RequestToken,
         result: Result<Vec<RemoteDirEntry>, String>,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         let Some(entries) = self.walk.accept_listing(token, result) else {
             cx.notify();
@@ -479,7 +479,7 @@ impl FolderPicker {
         &mut self,
         token: RequestToken,
         result: Result<(), String>,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         let Some(path) = self.walk.accept_validation(token, result) else {
             cx.notify();
@@ -492,9 +492,9 @@ impl FolderPicker {
 
     pub(super) fn open_dialog<T: 'static>(
         picker: &Entity<Self>,
-        dismissed: impl Fn(&mut T, &mut Window, &mut Context<T>) -> bool + 'static,
+        dismissed: impl Fn(&mut T, &mut Window, &mut Context<'_, T>) -> bool + 'static,
         window: &mut Window,
-        cx: &mut Context<T>,
+        cx: &mut Context<'_, T>,
     ) {
         let owner = cx.entity();
         let picker = picker.clone();
@@ -515,7 +515,7 @@ impl FolderPicker {
         });
     }
 
-    fn render_location(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn render_location(&self, cx: &Context<'_, Self>) -> impl IntoElement {
         div()
             .flex()
             .gap_2()
@@ -538,7 +538,7 @@ impl FolderPicker {
             )
     }
 
-    fn render_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_buttons(&self, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let can_submit = self.walk.can_submit();
 
         button_row(
@@ -559,7 +559,7 @@ impl FolderPicker {
 }
 
 impl Render for FolderPicker {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         div()
             .flex()
             .flex_col()

@@ -64,7 +64,7 @@ struct Scanner {
 
 impl Scanner {
     fn new(source: &str) -> Self {
-        Scanner {
+        Self {
             characters: source.chars().collect(),
             index: 0,
             line: 1,

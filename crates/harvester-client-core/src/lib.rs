@@ -59,23 +59,23 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Io(error) => write!(f, "{error}"),
-            Error::Exec { context, detail } => write!(f, "{context}: {detail}"),
-            Error::DaemonConnect(detail) => write!(f, "daemon connect: {detail}"),
-            Error::VersionMismatch { expected, actual } => write!(
+            Self::Io(error) => write!(f, "{error}"),
+            Self::Exec { context, detail } => write!(f, "{context}: {detail}"),
+            Self::DaemonConnect(detail) => write!(f, "daemon connect: {detail}"),
+            Self::VersionMismatch { expected, actual } => write!(
                 f,
                 "daemon reports version {actual} after reinstall (expected {expected}) — \
                  is the daemon binary you are shipping stale?"
             ),
-            Error::Provider { provider, detail } => write!(f, "provider {provider}: {detail}"),
-            Error::NotConnectable { machine } => {
+            Self::Provider { provider, detail } => write!(f, "provider {provider}: {detail}"),
+            Self::NotConnectable { machine } => {
                 write!(f, "machine {machine} is not connectable")
             }
-            Error::BridgeStart { machine, detail } => {
+            Self::BridgeStart { machine, detail } => {
                 write!(f, "start bridge for {machine}: {detail}")
             }
-            Error::HostWorkerMissing => write!(f, "machines worker is not running"),
-            Error::HostWorkerStopped => write!(f, "machines worker stopped"),
+            Self::HostWorkerMissing => write!(f, "machines worker is not running"),
+            Self::HostWorkerStopped => write!(f, "machines worker stopped"),
         }
     }
 }
@@ -84,7 +84,7 @@ impl std::error::Error for Error {}
 
 impl From<std::io::Error> for Error {
     fn from(error: std::io::Error) -> Self {
-        Error::Io(error)
+        Self::Io(error)
     }
 }
 

@@ -27,43 +27,43 @@ pub enum Tone {
 }
 
 impl Tone {
-    pub const ALL: &'static [Tone] = &[
-        Tone::Muted,
-        Tone::Idle,
-        Tone::Active,
-        Tone::Pending,
-        Tone::Live,
-        Tone::Failed,
+    pub const ALL: &'static [Self] = &[
+        Self::Muted,
+        Self::Idle,
+        Self::Active,
+        Self::Pending,
+        Self::Live,
+        Self::Failed,
     ];
 
     pub fn color(self, cx: &App) -> Hsla {
         let theme = cx.theme();
 
         match self {
-            Tone::Muted => theme.muted_foreground,
-            Tone::Idle => faint(cx),
-            Tone::Active => theme.info,
-            Tone::Pending => theme.warning,
-            Tone::Live => theme.success,
-            Tone::Failed => theme.danger,
+            Self::Muted => theme.muted_foreground,
+            Self::Idle => faint(cx),
+            Self::Active => theme.info,
+            Self::Pending => theme.warning,
+            Self::Live => theme.success,
+            Self::Failed => theme.danger,
         }
     }
 
     pub const fn label(self) -> &'static str {
         match self {
-            Tone::Muted => MUTED_LABEL,
-            Tone::Idle => IDLE_LABEL,
-            Tone::Active => ACTIVE_LABEL,
-            Tone::Pending => PENDING_LABEL,
-            Tone::Live => LIVE_LABEL,
-            Tone::Failed => FAILED_LABEL,
+            Self::Muted => MUTED_LABEL,
+            Self::Idle => IDLE_LABEL,
+            Self::Active => ACTIVE_LABEL,
+            Self::Pending => PENDING_LABEL,
+            Self::Live => LIVE_LABEL,
+            Self::Failed => FAILED_LABEL,
         }
     }
 
-    pub fn is_hollow(self) -> bool {
+    pub const fn is_hollow(self) -> bool {
         match self {
-            Tone::Idle | Tone::Pending => true,
-            Tone::Muted | Tone::Active | Tone::Live | Tone::Failed => false,
+            Self::Idle | Self::Pending => true,
+            Self::Muted | Self::Active | Self::Live | Self::Failed => false,
         }
     }
 }

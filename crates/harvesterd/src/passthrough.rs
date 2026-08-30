@@ -11,7 +11,7 @@ const SESSION_SWAPPING_COMMANDS: &[&str] = &["new_session", "switch_session", "f
 
 const SESSION_EXITED_BEFORE_RESPONDING: &str = "session exited before responding";
 
-pub fn pi_passthrough(
+pub(crate) fn pi_passthrough(
     daemon: &Daemon,
     id: Option<Value>,
     sid: String,

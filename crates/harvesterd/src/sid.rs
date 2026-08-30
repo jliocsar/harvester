@@ -15,10 +15,10 @@ fn is_valid_session_id(candidate: &str) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
-pub struct Sid(String);
+pub(crate) struct Sid(String);
 
 impl Sid {
-    pub fn parse(raw: &str) -> Result<Self, String> {
+    pub(crate) fn parse(raw: &str) -> Result<Self, String> {
         if !is_valid_session_id(raw) {
             return Err(format!(
                 "invalid sid '{raw}': must be non-empty, contain only \
@@ -30,7 +30,7 @@ impl Sid {
         Ok(Self(raw.to_string()))
     }
 
-    pub fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 }

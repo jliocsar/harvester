@@ -39,10 +39,10 @@ pub async fn bootstrap_and_connect(host: &Host, daemon_binary: &[u8]) -> Result<
     match outcome {
         BootstrapOutcome::AlreadyCurrent => start(host).await?,
         BootstrapOutcome::Upgraded => {
-            install_and_start(host, daemon_binary, KillRunningDaemon::Yes).await?
+            install_and_start(host, daemon_binary, KillRunningDaemon::Yes).await?;
         }
         BootstrapOutcome::Installed => {
-            install_and_start(host, daemon_binary, KillRunningDaemon::No).await?
+            install_and_start(host, daemon_binary, KillRunningDaemon::No).await?;
         }
     }
 

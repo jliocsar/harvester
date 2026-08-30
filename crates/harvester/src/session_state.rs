@@ -10,44 +10,44 @@ const SESSION_NAME_MAX_CHARS: usize = 48;
 
 const PI_GET_STATE: &str = "get_state";
 
-pub const PI_SET_MODEL: &str = "set_model";
+pub(crate) const PI_SET_MODEL: &str = "set_model";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ChatTarget {
+pub(crate) struct ChatTarget {
     pub machine: String,
     pub workspace_path: String,
 }
 
 impl ChatTarget {
-    pub fn unresolved() -> Self {
+    pub(crate) fn unresolved() -> Self {
         Self::default()
     }
 
-    pub fn is_resolved(&self) -> bool {
+    pub(crate) const fn is_resolved(&self) -> bool {
         !self.machine.is_empty() && !self.workspace_path.is_empty()
     }
 }
 
-pub fn is_turn_settled(event: &Value) -> bool {
+pub(crate) fn is_turn_settled(event: &Value) -> bool {
     event.get("type").and_then(Value::as_str) == Some(PI_AGENT_SETTLED)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SessionPhase {
+pub(crate) enum SessionPhase {
     Unstarted,
     Starting { sid: String, name: String },
     Live { sid: String },
 }
 
 impl SessionPhase {
-    pub fn sid(&self) -> Option<&str> {
+    pub(crate) fn sid(&self) -> Option<&str> {
         match self {
             Self::Unstarted => None,
             Self::Starting { sid, .. } | Self::Live { sid } => Some(sid),
         }
     }
 
-    pub fn starting_session(&self) -> Option<(&str, &str)> {
+    pub(crate) fn starting_session(&self) -> Option<(&str, &str)> {
         match self {
             Self::Starting { sid, name } => Some((sid, name)),
             _ => None,
@@ -56,7 +56,7 @@ impl SessionPhase {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum ModelsState {
+pub(crate) enum ModelsState {
     #[default]
     NotRequested,
     Loading,
@@ -65,7 +65,7 @@ pub enum ModelsState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ModelSelection {
+pub(crate) enum ModelSelection {
     LaunchDefault,
     Launch(ModelChoice),
     LivePending,
@@ -73,7 +73,7 @@ pub enum ModelSelection {
     LiveUnavailable,
 }
 
-pub struct SessionState {
+pub(crate) struct SessionState {
     phase: SessionPhase,
     target: ChatTarget,
     transcript: Transcript,
@@ -89,7 +89,7 @@ pub struct SessionState {
 }
 
 impl SessionState {
-    pub fn unstarted(target: ChatTarget, tokens: RequestTokens) -> Self {
+    pub(crate) fn unstarted(target: ChatTarget, tokens: RequestTokens) -> Self {
         Self::new(
             SessionPhase::Unstarted,
             Transcript::new(&[]),
@@ -99,7 +99,12 @@ impl SessionState {
         )
     }
 
-    pub fn live(sid: String, target: ChatTarget, entries: &[Value], tokens: RequestTokens) -> Self {
+    pub(crate) fn live(
+        sid: String,
+        target: ChatTarget,
+        entries: &[Value],
+        tokens: RequestTokens,
+    ) -> Self {
         Self::new(
             SessionPhase::Live { sid },
             Transcript::new(entries),
@@ -132,19 +137,19 @@ impl SessionState {
         }
     }
 
-    pub fn phase(&self) -> &SessionPhase {
+    pub(crate) const fn phase(&self) -> &SessionPhase {
         &self.phase
     }
 
-    pub fn sid(&self) -> Option<&str> {
+    pub(crate) fn sid(&self) -> Option<&str> {
         self.phase.sid()
     }
 
-    pub fn target(&self) -> &ChatTarget {
+    pub(crate) const fn target(&self) -> &ChatTarget {
         &self.target
     }
 
-    pub fn retarget(&mut self, machine: String) -> bool {
+    pub(crate) fn retarget(&mut self, machine: String) -> bool {
         if !matches!(self.phase, SessionPhase::Unstarted) || self.target.machine == machine {
             return false;
         }
@@ -157,7 +162,7 @@ impl SessionState {
         true
     }
 
-    pub fn pick_repo(&mut self, path: String) -> bool {
+    pub(crate) fn pick_repo(&mut self, path: String) -> bool {
         if !matches!(self.phase, SessionPhase::Unstarted) || self.target.workspace_path == path {
             return false;
         }
@@ -170,11 +175,11 @@ impl SessionState {
         true
     }
 
-    pub fn branch(&self) -> Option<&str> {
+    pub(crate) fn branch(&self) -> Option<&str> {
         self.branch.as_deref()
     }
 
-    pub fn request_branch(&mut self) -> Option<RequestToken> {
+    pub(crate) fn request_branch(&mut self) -> Option<RequestToken> {
         if !self.target.is_resolved() {
             return None;
         }
@@ -182,11 +187,15 @@ impl SessionState {
         Some(self.branch_request.ask(&self.tokens, ()))
     }
 
-    pub fn cancel_branch(&mut self) {
+    pub(crate) fn cancel_branch(&mut self) {
         self.branch_request.cancel();
     }
 
-    pub fn accept_branch(&mut self, token: RequestToken, result: Result<String, String>) -> bool {
+    pub(crate) fn accept_branch(
+        &mut self,
+        token: RequestToken,
+        result: Result<String, String>,
+    ) -> bool {
         if self.branch_request.accept(token).is_none() {
             return false;
         }
@@ -201,34 +210,34 @@ impl SessionState {
         self.branch = None;
     }
 
-    pub fn transcript(&self) -> &Transcript {
+    pub(crate) const fn transcript(&self) -> &Transcript {
         &self.transcript
     }
 
-    pub fn models(&self) -> &ModelsState {
+    pub(crate) const fn models(&self) -> &ModelsState {
         &self.models
     }
 
-    pub fn model_choices(&self) -> &[ModelChoice] {
+    pub(crate) fn model_choices(&self) -> &[ModelChoice] {
         match &self.models {
             ModelsState::Loaded(choices) => choices,
             _ => &[],
         }
     }
 
-    pub fn selection(&self) -> &ModelSelection {
+    pub(crate) const fn selection(&self) -> &ModelSelection {
         &self.selection
     }
 
-    pub fn exited_notice(&self) -> Option<&str> {
+    pub(crate) fn exited_notice(&self) -> Option<&str> {
         self.exited.as_deref()
     }
 
-    pub fn is_live(&self) -> bool {
+    pub(crate) const fn is_live(&self) -> bool {
         matches!(self.phase, SessionPhase::Live { .. }) && self.exited.is_none()
     }
 
-    pub fn request_model_list(&mut self) -> Option<Command> {
+    pub(crate) fn request_model_list(&mut self) -> Option<Command> {
         if !self.target.is_resolved() {
             return None;
         }
@@ -244,7 +253,7 @@ impl SessionState {
         self.model_request.ask(&self.tokens, ())
     }
 
-    pub fn request_model_controls(&mut self) -> Option<[Command; 2]> {
+    pub(crate) fn request_model_controls(&mut self) -> Option<[Command; 2]> {
         let SessionPhase::Live { sid } = &self.phase else {
             return None;
         };
@@ -269,7 +278,7 @@ impl SessionState {
         ])
     }
 
-    pub fn accept_pi_answer(
+    pub(crate) fn accept_pi_answer(
         &mut self,
         method: &str,
         token: RequestToken,
@@ -283,7 +292,11 @@ impl SessionState {
         }
     }
 
-    pub fn accept_models(&mut self, token: RequestToken, result: Result<Value, String>) -> bool {
+    pub(crate) fn accept_models(
+        &mut self,
+        token: RequestToken,
+        result: Result<Value, String>,
+    ) -> bool {
         if self.model_request.accept(token).is_none() {
             return false;
         }
@@ -296,7 +309,7 @@ impl SessionState {
         true
     }
 
-    pub fn fail_pending(&mut self, detail: String) -> bool {
+    pub(crate) fn fail_pending(&mut self, detail: String) -> bool {
         let mut changed = false;
 
         if matches!(self.phase, SessionPhase::Starting { .. }) {
@@ -319,7 +332,7 @@ impl SessionState {
         changed
     }
 
-    pub fn cancel_model_fetch(&mut self, detail: String) -> bool {
+    pub(crate) fn cancel_model_fetch(&mut self, detail: String) -> bool {
         if !matches!(self.models, ModelsState::Loading) {
             return false;
         }
@@ -330,7 +343,7 @@ impl SessionState {
         true
     }
 
-    pub fn fail_prompt(&mut self, detail: String) -> bool {
+    pub(crate) fn fail_prompt(&mut self, detail: String) -> bool {
         if !matches!(self.phase, SessionPhase::Live { .. }) {
             return false;
         }
@@ -340,7 +353,7 @@ impl SessionState {
         true
     }
 
-    pub fn fail_start(&mut self) -> bool {
+    pub(crate) fn fail_start(&mut self) -> bool {
         if !matches!(self.phase, SessionPhase::Starting { .. }) {
             return false;
         }
@@ -352,7 +365,7 @@ impl SessionState {
         true
     }
 
-    pub fn promote_to_live(&mut self, sid: String, entries: &[Value]) -> bool {
+    pub(crate) fn promote_to_live(&mut self, sid: String, entries: &[Value]) -> bool {
         if !matches!(&self.phase, SessionPhase::Starting { sid: expected, .. } if expected == &sid)
         {
             return false;
@@ -369,7 +382,7 @@ impl SessionState {
         true
     }
 
-    pub fn replace_history(&mut self, entries: &[Value]) -> bool {
+    pub(crate) fn replace_history(&mut self, entries: &[Value]) -> bool {
         if self.sid().is_none() {
             return false;
         }
@@ -379,7 +392,7 @@ impl SessionState {
         true
     }
 
-    pub fn extend_history(&mut self, entries: &[Value]) -> bool {
+    pub(crate) fn extend_history(&mut self, entries: &[Value]) -> bool {
         if self.sid().is_none() {
             return false;
         }
@@ -389,11 +402,11 @@ impl SessionState {
         true
     }
 
-    pub fn apply_pi_event(&mut self, event: &Value) -> bool {
+    pub(crate) fn apply_pi_event(&mut self, event: &Value) -> bool {
         self.transcript.apply(event)
     }
 
-    pub fn exit(&mut self, exit_code: Option<i32>) -> bool {
+    pub(crate) fn exit(&mut self, exit_code: Option<i32>) -> bool {
         if self.sid().is_none() || self.exited.is_some() {
             return false;
         }
@@ -409,7 +422,7 @@ impl SessionState {
         true
     }
 
-    pub fn pick_model(&mut self, picked: Option<ModelChoice>) -> Option<Command> {
+    pub(crate) fn pick_model(&mut self, picked: Option<ModelChoice>) -> Option<Command> {
         match &self.phase {
             SessionPhase::Unstarted => {
                 self.selection = match picked {
@@ -438,7 +451,11 @@ impl SessionState {
         }
     }
 
-    pub fn accept_model_set(&mut self, token: RequestToken, result: Result<Value, String>) -> bool {
+    pub(crate) fn accept_model_set(
+        &mut self,
+        token: RequestToken,
+        result: Result<Value, String>,
+    ) -> bool {
         let Some(displaced) = self.set_model_request.accept(token) else {
             return false;
         };
@@ -453,7 +470,7 @@ impl SessionState {
         true
     }
 
-    pub fn accept_session_state(
+    pub(crate) fn accept_session_state(
         &mut self,
         token: RequestToken,
         result: Result<Value, String>,
@@ -474,13 +491,13 @@ impl SessionState {
         true
     }
 
-    pub fn can_stop(&self) -> bool {
+    pub(crate) const fn can_stop(&self) -> bool {
         matches!(self.phase, SessionPhase::Live { .. })
             && self.exited.is_none()
             && self.transcript.is_busy()
     }
 
-    pub fn stop_command(&self) -> Option<Command> {
+    pub(crate) fn stop_command(&self) -> Option<Command> {
         if !self.can_stop() {
             return None;
         }
@@ -490,7 +507,7 @@ impl SessionState {
         })
     }
 
-    pub fn submit_prompt(&mut self, text: String) -> Option<Command> {
+    pub(crate) fn submit_prompt(&mut self, text: String) -> Option<Command> {
         if text.trim().is_empty() || self.exited.is_some() {
             return None;
         }
@@ -541,7 +558,7 @@ impl SessionState {
     }
 }
 
-pub fn session_name_from_prompt(prompt: &str) -> String {
+pub(crate) fn session_name_from_prompt(prompt: &str) -> String {
     prompt
         .trim()
         .lines()
@@ -594,7 +611,7 @@ mod tests {
     #[test]
     fn failed_start_returns_to_unstarted_without_a_ghost_session() {
         let mut state = SessionState::unstarted(target(), RequestTokens::default());
-        let _ = state.submit_prompt("fix it".to_string());
+        drop(state.submit_prompt("fix it".to_string()));
 
         assert!(state.fail_start());
         assert!(matches!(state.phase(), SessionPhase::Unstarted));
@@ -606,7 +623,7 @@ mod tests {
     fn exit_ends_the_turn_and_rejects_more_prompts() {
         let mut state =
             SessionState::live("sid".to_string(), target(), &[], RequestTokens::default());
-        let _ = state.submit_prompt("running".to_string());
+        drop(state.submit_prompt("running".to_string()));
 
         assert!(state.exit(Some(17)));
         assert!(!state.is_live());
@@ -776,7 +793,7 @@ mod tests {
     fn a_prompt_that_never_left_the_client_ends_its_turn_with_a_reason() {
         let mut state =
             SessionState::live("sid".to_string(), target(), &[], RequestTokens::default());
-        let _ = state.submit_prompt("run it".to_string());
+        drop(state.submit_prompt("run it".to_string()));
 
         assert!(state.transcript().is_busy());
         assert!(state.fail_prompt("Not connected".to_string()));
@@ -802,7 +819,7 @@ mod tests {
             "an idle session has no turn to interrupt"
         );
 
-        let _ = state.submit_prompt("run it".to_string());
+        drop(state.submit_prompt("run it".to_string()));
 
         assert!(state.can_stop());
         assert!(

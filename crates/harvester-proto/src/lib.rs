@@ -47,7 +47,7 @@ pub fn fingerprint_reader<R: std::io::Read>(reader: &mut R) -> std::io::Result<S
 
         byte_count += filled as u64;
 
-        for byte in &buf[..filled] {
+        for byte in buf.iter().take(filled) {
             hash = (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME);
         }
     }
@@ -73,12 +73,12 @@ pub async fn read_frame<'buf, R: AsyncBufRead + Unpin>(
 
     let mut frame = buf.as_slice();
 
-    if frame.last() == Some(&LF) {
-        frame = &frame[..frame.len() - 1];
+    if let Some(stripped) = frame.strip_suffix(&[LF]) {
+        frame = stripped;
     }
 
-    if frame.last() == Some(&CR) {
-        frame = &frame[..frame.len() - 1];
+    if let Some(stripped) = frame.strip_suffix(&[CR]) {
+        frame = stripped;
     }
 
     Ok(Some(frame))
@@ -193,7 +193,7 @@ pub enum HarvesterCmd {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Outgoing {
     HarvesterResponse {
@@ -222,7 +222,7 @@ pub enum Outgoing {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HarvesterResponse {
     pub success: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -232,7 +232,7 @@ pub struct HarvesterResponse {
 }
 
 impl HarvesterResponse {
-    pub fn ok(data: Value) -> Self {
+    pub const fn ok(data: Value) -> Self {
         Self {
             success: true,
             data: Some(data),
@@ -1088,7 +1088,7 @@ mod tests {
             let path = std::env::temp_dir()
                 .join(format!("harvester-proto-{label}-{}", std::process::id()));
 
-            let _ = std::fs::remove_dir_all(&path);
+            drop(std::fs::remove_dir_all(&path));
             std::fs::create_dir_all(&path).expect("a scratch dir must be creatable");
 
             Self { path }
@@ -1101,7 +1101,7 @@ mod tests {
 
     impl Drop for ScratchDir {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
+            drop(std::fs::remove_dir_all(&self.path));
         }
     }
 

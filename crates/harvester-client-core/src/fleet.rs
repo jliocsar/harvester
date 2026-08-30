@@ -21,12 +21,12 @@ enum MachineRef {
 impl MachineRef {
     fn parse(stored: &str) -> Self {
         if stored == LOCAL_MACHINE {
-            return MachineRef::Local;
+            return Self::Local;
         }
 
         match MachineKey::parse(stored) {
-            Some(key) => MachineRef::Provider(key),
-            None => MachineRef::AdHoc(stored.to_string()),
+            Some(key) => Self::Provider(key),
+            None => Self::AdHoc(stored.to_string()),
         }
     }
 }
@@ -45,17 +45,17 @@ enum Link {
 
 impl Machine {
     fn record_probe(&mut self, reachable: bool) {
-        if let Machine::Probed { .. } = self {
-            *self = Machine::Probed { reachable };
+        if let Self::Probed { .. } = self {
+            *self = Self::Probed { reachable };
         }
     }
 
     fn state(&self) -> MachineState<'_> {
         match self {
-            Machine::Probed { reachable: true } => MachineState::Reachable,
-            Machine::Probed { reachable: false } => MachineState::Unreachable,
+            Self::Probed { reachable: true } => MachineState::Reachable,
+            Self::Probed { reachable: false } => MachineState::Unreachable,
 
-            Machine::Linked { link, .. } => match link {
+            Self::Linked { link, .. } => match link {
                 Link::Connecting => MachineState::Connecting,
                 Link::Connected => MachineState::Connected,
                 Link::Failed { detail } => MachineState::ConnectFailed { detail },
@@ -78,7 +78,7 @@ pub enum MachineState<'a> {
 }
 
 impl MachineState<'_> {
-    pub fn is_live(&self) -> bool {
+    pub const fn is_live(&self) -> bool {
         matches!(self, MachineState::Connecting | MachineState::Connected)
     }
 }
@@ -168,12 +168,12 @@ impl Fleet {
 
     fn publish_ad_hoc_machines(&self) {
         if let Some(commands) = &self.host_commands {
-            let _ = commands.send(machines::Command::SetAdHocMachines(self.ad_hoc_machines()));
+            drop(commands.send(machines::Command::SetAdHocMachines(self.ad_hoc_machines())));
         }
     }
 
     fn forget_unknown_machines(&mut self) {
-        let Fleet {
+        let Self {
             machines,
             tracked,
             provider_rows,

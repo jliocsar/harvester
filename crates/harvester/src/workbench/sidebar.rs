@@ -34,7 +34,7 @@ pub(super) struct Sidebar {
 impl EventEmitter<SidebarIntent> for Sidebar {}
 
 impl Sidebar {
-    pub(super) fn new(store: Entity<FleetStore>, cx: &mut Context<Self>) -> Self {
+    pub(super) fn new(store: Entity<FleetStore>, cx: &mut Context<'_, Self>) -> Self {
         let store_repaint = cx.observe(&store, |_, _, cx| cx.notify());
 
         Self {
@@ -45,7 +45,7 @@ impl Sidebar {
         }
     }
 
-    fn render_session_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_session_list(&self, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let rows: Vec<SessionRow> = self
             .store
             .read(cx)
@@ -73,7 +73,7 @@ impl Sidebar {
             })
     }
 
-    fn render_new_session_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_new_session_button(&self, cx: &mut Context<'_, Self>) -> impl IntoElement {
         div().px(ui::SIDEBAR_EDGE_GUTTER).py_2().child(
             Button::new("new-session")
                 .icon(IconName::Plus)
@@ -84,7 +84,7 @@ impl Sidebar {
         )
     }
 
-    fn render_machine_list(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn render_machine_list(&self, cx: &Context<'_, Self>) -> impl IntoElement {
         let store = self.store.read(cx);
         let provider_rows: Vec<_> = store
             .provider_machines()
@@ -142,7 +142,7 @@ impl Sidebar {
         label: SharedString,
         detail: Option<SharedString>,
         key: &str,
-        cx: &Context<Self>,
+        cx: &Context<'_, Self>,
     ) -> ListItem {
         let tone = present_machine(self.store.read(cx).state(key), key).tone;
 
@@ -158,7 +158,7 @@ impl Sidebar {
         &self,
         index: usize,
         machine: String,
-        cx: &Context<Self>,
+        cx: &Context<'_, Self>,
     ) -> ListItem {
         let label = self.store.read(cx).label(&machine);
         let sidebar = cx.entity();
@@ -182,13 +182,13 @@ impl Sidebar {
                     let machine = machine.clone();
 
                     sidebar.update(cx, |_, cx| {
-                        cx.emit(SidebarIntent::ForgetMachine { machine })
+                        cx.emit(SidebarIntent::ForgetMachine { machine });
                     });
                 })
         })
     }
 
-    fn session_row(&self, session: &MachineSession, cx: &Context<Self>) -> SessionRow {
+    fn session_row(&self, session: &MachineSession, cx: &Context<'_, Self>) -> SessionRow {
         let store = self.store.read(cx);
         let info = &session.info;
 
@@ -217,7 +217,7 @@ impl Sidebar {
         &self,
         index: usize,
         row: SessionRow,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) -> impl IntoElement {
         let sid = row.sid;
         let title = row.title.clone();
@@ -237,13 +237,17 @@ impl Sidebar {
             .keyboard_focus_ring(cx)
             .child(body)
             .on_click(cx.listener(move |_, _, _, cx| {
-                cx.emit(SidebarIntent::OpenSession { sid: sid.clone() })
+                cx.emit(SidebarIntent::OpenSession { sid: sid.clone() });
             }))
     }
 }
 
 impl Render for Sidebar {
-    fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(
+        &mut self,
+        _window: &mut gpui::Window,
+        cx: &mut Context<'_, Self>,
+    ) -> impl IntoElement {
         div()
             .w_64()
             .h_full()

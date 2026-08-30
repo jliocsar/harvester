@@ -12,9 +12,9 @@ use crate::ui::{self, Tone};
 use harvester_client_core::bridge::{Command, Event as BridgeEvent};
 use harvester_client_core::{folder_name, machines, MachineCandidate, RequestToken};
 
-pub use session_state::ChatTarget;
+pub(crate) use session_state::ChatTarget;
 
-pub const NEW_SESSION_LABEL: &str = "New session";
+pub(crate) const NEW_SESSION_LABEL: &str = "New session";
 
 const UNSENT_REQUEST_DETAIL: &str = "Not connected";
 const CONNECTION_LOST_DETAIL: &str = "Connection lost";
@@ -22,13 +22,13 @@ const MACHINE_CHANGED_DETAIL: &str = "machine changed";
 const MODEL_FALLBACK_SUFFIX: &str = " — pi will use its default model";
 const UNRESOLVED_TARGET_SUBTITLE: &str = "Pick a machine and a repository below";
 
-pub enum ChatFlowRequest {
+pub(crate) enum ChatFlowRequest {
     AddRepo { machine: String },
 }
 
 impl EventEmitter<ChatFlowRequest> for Chat {}
 
-pub struct Chat {
+pub(crate) struct Chat {
     state: SessionState,
     store: Entity<FleetStore>,
     transcript_presentation: ui::TranscriptPresentation,
@@ -41,24 +41,24 @@ pub struct Chat {
 }
 
 impl Chat {
-    pub fn unstarted(
+    pub(crate) fn unstarted(
         target: ChatTarget,
         store: Entity<FleetStore>,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) -> Self {
         let tokens = store.read(cx).tokens();
 
         Self::new(SessionState::unstarted(target, tokens), store, window, cx)
     }
 
-    pub fn live(
+    pub(crate) fn live(
         sid: String,
         target: ChatTarget,
         entries: &[Value],
         store: Entity<FleetStore>,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) -> Self {
         let tokens = store.read(cx).tokens();
         Self::new(
@@ -73,7 +73,7 @@ impl Chat {
         state: SessionState,
         store: Entity<FleetStore>,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) -> Self {
         let input = ui::create_prompt_input(window, cx);
         let prompt_submitted = cx.subscribe_in(&input, window, Self::handle_prompt_submitted);
@@ -98,24 +98,29 @@ impl Chat {
         _store: &Entity<FleetStore>,
         event: &StoreEvent,
         _window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         match event {
             StoreEvent::Bridge { machine, event } => self.handle_bridge_event(machine, event, cx),
             StoreEvent::Machines(machines::Event::BranchResolved { token, result }) => {
-                self.handle_branch_resolved(*token, result.clone(), cx)
+                self.handle_branch_resolved(*token, result.clone(), cx);
             }
             StoreEvent::Machines(_) | StoreEvent::Failed(_) => {}
         }
     }
 
-    fn handle_bridge_event(&mut self, machine: &str, event: &BridgeEvent, cx: &mut Context<Self>) {
+    fn handle_bridge_event(
+        &mut self,
+        machine: &str,
+        event: &BridgeEvent,
+        cx: &mut Context<'_, Self>,
+    ) {
         match event {
             BridgeEvent::ConnectFailed { detail } if self.runs_on(machine) => {
-                self.fail_pending_requests(detail.clone(), cx)
+                self.fail_pending_requests(detail.clone(), cx);
             }
             BridgeEvent::Disconnected if self.runs_on(machine) => {
-                self.fail_pending_requests(CONNECTION_LOST_DETAIL.to_string(), cx)
+                self.fail_pending_requests(CONNECTION_LOST_DETAIL.to_string(), cx);
             }
             BridgeEvent::RequestFailed { .. } if self.runs_on(machine) => {
                 if self.state.fail_start() {
@@ -123,20 +128,20 @@ impl Chat {
                 }
             }
             BridgeEvent::ModelsListed { token, result } if self.runs_on(machine) => {
-                self.handle_models_listed(*token, result.clone(), cx)
+                self.handle_models_listed(*token, result.clone(), cx);
             }
             BridgeEvent::HistoryReplaced { sid, entries } if self.renders(sid) => {
-                self.replace_history(entries, cx)
+                self.replace_history(entries, cx);
             }
             BridgeEvent::HistoryExtended { sid, entries } if self.renders(sid) => {
-                self.extend_history(entries, cx)
+                self.extend_history(entries, cx);
             }
             BridgeEvent::Pi { sid, event } if self.renders(sid) => self.handle_pi_event(event, cx),
             BridgeEvent::SessionExit { sid, exit_code } if self.renders(sid) => {
-                self.handle_session_exit(*exit_code, cx)
+                self.handle_session_exit(*exit_code, cx);
             }
             BridgeEvent::PromptFailed { sid, detail } if self.renders(sid) => {
-                self.handle_prompt_failed(detail.clone(), cx)
+                self.handle_prompt_failed(detail.clone(), cx);
             }
             BridgeEvent::PiAnswered {
                 sid,
@@ -156,46 +161,46 @@ impl Chat {
         self.state.sid() == Some(sid)
     }
 
-    fn machine_label(&self, cx: &Context<Self>) -> SharedString {
+    fn machine_label(&self, cx: &Context<'_, Self>) -> SharedString {
         self.store
             .read(cx)
             .label(&self.state.target().machine)
             .into()
     }
 
-    fn machine_candidates(&self, cx: &Context<Self>) -> Vec<MachineCandidate> {
+    fn machine_candidates(&self, cx: &Context<'_, Self>) -> Vec<MachineCandidate> {
         self.store.read(cx).machine_candidates()
     }
 
-    fn repo_candidates(&self, cx: &Context<Self>) -> Vec<String> {
+    fn repo_candidates(&self, cx: &Context<'_, Self>) -> Vec<String> {
         self.store
             .read(cx)
             .catalog()
             .repos_on(&self.state.target().machine)
     }
 
-    pub fn sid(&self) -> Option<&str> {
+    pub(crate) fn sid(&self) -> Option<&str> {
         self.state.sid()
     }
 
-    pub fn machine(&self) -> &str {
+    pub(crate) fn machine(&self) -> &str {
         &self.state.target().machine
     }
 
-    pub fn starting_session(&self) -> Option<(&str, &str)> {
+    pub(crate) fn starting_session(&self) -> Option<(&str, &str)> {
         self.state.phase().starting_session()
     }
 
-    pub fn workspace_path(&self) -> &str {
+    pub(crate) fn workspace_path(&self) -> &str {
         &self.state.target().workspace_path
     }
 
-    pub fn request_prompt_controls(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn request_prompt_controls(&mut self, cx: &mut Context<'_, Self>) {
         self.request_models(cx);
         self.request_branch(cx);
     }
 
-    fn request_models(&mut self, cx: &mut Context<Self>) {
+    fn request_models(&mut self, cx: &mut Context<'_, Self>) {
         match self.state.phase() {
             SessionPhase::Unstarted => self.request_model_list(cx),
             SessionPhase::Live { .. } => self.request_model_controls(cx),
@@ -203,7 +208,7 @@ impl Chat {
         }
     }
 
-    fn request_model_controls(&mut self, cx: &mut Context<Self>) {
+    fn request_model_controls(&mut self, cx: &mut Context<'_, Self>) {
         let Some(commands) = self.state.request_model_controls() else {
             return;
         };
@@ -213,7 +218,7 @@ impl Chat {
         }
     }
 
-    fn request_model_list(&mut self, cx: &mut Context<Self>) {
+    fn request_model_list(&mut self, cx: &mut Context<'_, Self>) {
         let Some(command) = self.state.request_model_list() else {
             return;
         };
@@ -221,7 +226,7 @@ impl Chat {
         self.send(command, cx);
     }
 
-    fn send(&mut self, command: Command, cx: &mut Context<Self>) {
+    fn send(&mut self, command: Command, cx: &mut Context<'_, Self>) {
         let machine = self.state.target().machine.clone();
         let ends_the_turn = matches!(command, Command::Prompt { .. });
         let sent = self
@@ -235,7 +240,7 @@ impl Chat {
         self.fail_unsent(ends_the_turn, cx);
     }
 
-    fn fail_unsent(&mut self, ends_the_turn: bool, cx: &mut Context<Self>) {
+    fn fail_unsent(&mut self, ends_the_turn: bool, cx: &mut Context<'_, Self>) {
         let mut changed = self.state.fail_pending(UNSENT_REQUEST_DETAIL.to_string());
 
         if ends_the_turn {
@@ -247,7 +252,7 @@ impl Chat {
         }
     }
 
-    fn request_branch(&mut self, cx: &mut Context<Self>) {
+    fn request_branch(&mut self, cx: &mut Context<'_, Self>) {
         let Some(token) = self.state.request_branch() else {
             return;
         };
@@ -279,7 +284,7 @@ impl Chat {
         &mut self,
         token: RequestToken,
         result: Result<String, String>,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         if let Err(detail) = &result {
             eprintln!("harvester: branch indicator: {detail}");
@@ -290,28 +295,33 @@ impl Chat {
         }
     }
 
-    pub fn promote_to_live(&mut self, sid: String, entries: &[Value], cx: &mut Context<Self>) {
+    pub(crate) fn promote_to_live(
+        &mut self,
+        sid: String,
+        entries: &[Value],
+        cx: &mut Context<'_, Self>,
+    ) {
         if self.state.promote_to_live(sid, entries) {
             self.scroll.scroll_to_bottom();
             cx.notify();
         }
     }
 
-    fn replace_history(&mut self, entries: &[Value], cx: &mut Context<Self>) {
+    fn replace_history(&mut self, entries: &[Value], cx: &mut Context<'_, Self>) {
         if self.state.replace_history(entries) {
             self.scroll.scroll_to_bottom();
             cx.notify();
         }
     }
 
-    fn extend_history(&mut self, entries: &[Value], cx: &mut Context<Self>) {
+    fn extend_history(&mut self, entries: &[Value], cx: &mut Context<'_, Self>) {
         if self.state.extend_history(entries) {
             self.scroll.scroll_to_bottom();
             cx.notify();
         }
     }
 
-    fn fail_pending_requests(&mut self, detail: String, cx: &mut Context<Self>) {
+    fn fail_pending_requests(&mut self, detail: String, cx: &mut Context<'_, Self>) {
         if self.state.fail_pending(detail) {
             cx.notify();
         }
@@ -321,7 +331,7 @@ impl Chat {
         &mut self,
         token: RequestToken,
         result: Result<Value, String>,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         if self.state.accept_models(token, result) {
             cx.notify();
@@ -333,20 +343,20 @@ impl Chat {
         method: &str,
         token: RequestToken,
         result: Result<Value, String>,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         if self.state.accept_pi_answer(method, token, result) {
             cx.notify();
         }
     }
 
-    fn handle_prompt_failed(&mut self, detail: String, cx: &mut Context<Self>) {
+    fn handle_prompt_failed(&mut self, detail: String, cx: &mut Context<'_, Self>) {
         if self.state.fail_prompt(detail) {
             cx.notify();
         }
     }
 
-    fn pick_model(&mut self, picked: Option<ModelChoice>, cx: &mut Context<Self>) {
+    fn pick_model(&mut self, picked: Option<ModelChoice>, cx: &mut Context<'_, Self>) {
         if let Some(command) = self.state.pick_model(picked) {
             self.send(command, cx);
         }
@@ -354,7 +364,7 @@ impl Chat {
         cx.notify();
     }
 
-    fn pick_machine(&mut self, machine: String, cx: &mut Context<Self>) {
+    fn pick_machine(&mut self, machine: String, cx: &mut Context<'_, Self>) {
         if self.state.target().machine == machine {
             cx.notify();
 
@@ -374,7 +384,7 @@ impl Chat {
         cx.notify();
     }
 
-    pub fn select_repo(&mut self, path: String, cx: &mut Context<Self>) {
+    pub(crate) fn select_repo(&mut self, path: String, cx: &mut Context<'_, Self>) {
         if self.state.pick_repo(path) {
             self.request_prompt_controls(cx);
         }
@@ -382,7 +392,7 @@ impl Chat {
         cx.notify();
     }
 
-    fn add_repo(&mut self, cx: &mut Context<Self>) {
+    fn add_repo(&mut self, cx: &mut Context<'_, Self>) {
         let machine = self.state.target().machine.clone();
 
         if machine.is_empty() {
@@ -392,17 +402,17 @@ impl Chat {
         cx.emit(ChatFlowRequest::AddRepo { machine });
     }
 
-    pub fn is_live(&self) -> bool {
+    pub(crate) const fn is_live(&self) -> bool {
         self.state.is_live()
     }
 
-    fn handle_session_exit(&mut self, exit_code: Option<i32>, cx: &mut Context<Self>) {
+    fn handle_session_exit(&mut self, exit_code: Option<i32>, cx: &mut Context<'_, Self>) {
         if self.state.exit(exit_code) {
             cx.notify();
         }
     }
 
-    fn handle_pi_event(&mut self, event: &Value, cx: &mut Context<Self>) {
+    fn handle_pi_event(&mut self, event: &Value, cx: &mut Context<'_, Self>) {
         if session_state::is_turn_settled(event) {
             self.request_branch(cx);
         }
@@ -420,7 +430,7 @@ impl Chat {
         _input: &Entity<InputState>,
         event: &InputEvent,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         if !matches!(event, InputEvent::PressEnter { .. }) {
             return;
@@ -429,7 +439,7 @@ impl Chat {
         self.submit_prompt(window, cx);
     }
 
-    fn submit_text(&mut self, text: String, cx: &mut Context<Self>) {
+    fn submit_text(&mut self, text: String, cx: &mut Context<'_, Self>) {
         let Some(command) = self.state.submit_prompt(text) else {
             return;
         };
@@ -439,7 +449,7 @@ impl Chat {
         self.send(command, cx);
     }
 
-    fn submit_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn submit_prompt(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         let input = self.input.clone();
         let text = input.read(cx).value().to_string();
 
@@ -451,7 +461,7 @@ impl Chat {
         self.submit_text(text, cx);
     }
 
-    fn unstarted_subtitle(&self, cx: &Context<Self>) -> SharedString {
+    fn unstarted_subtitle(&self, cx: &Context<'_, Self>) -> SharedString {
         if !self.state.target().is_resolved() {
             return UNRESOLVED_TARGET_SUBTITLE.into();
         }
@@ -464,7 +474,7 @@ impl Chat {
         .into()
     }
 
-    fn render_transcript(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_transcript(&self, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let chat = cx.entity();
 
         self.transcript_presentation.render(
@@ -480,7 +490,7 @@ impl Chat {
         )
     }
 
-    fn render_bottom_row(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_bottom_row(&self, window: &Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let model_picks = models::model_picks(&self.state);
         let machine_candidates = self.machine_candidates(cx);
         let repo_candidates = self.repo_candidates(cx);
@@ -499,13 +509,13 @@ impl Chat {
             chat_for_send.update(cx, |chat, cx| chat.submit_prompt(window, cx));
         };
         let stop = move |_window: &mut Window, cx: &mut App| {
-            chat_for_stop.update(cx, |chat, cx| chat.stop_session(cx));
+            chat_for_stop.update(cx, Self::stop_session);
         };
 
         ui::prompt_strip(strip, send, stop, &self.input, cx)
     }
 
-    fn stop_session(&mut self, cx: &mut Context<Self>) {
+    fn stop_session(&mut self, cx: &mut Context<'_, Self>) {
         let Some(command) = self.state.stop_command() else {
             return;
         };
@@ -517,7 +527,7 @@ impl Chat {
         &mut self,
         action: &ui::PickModel,
         _window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         let Some(pick) = models::model_picks(&self.state).get(action.index).cloned() else {
             return;
@@ -530,7 +540,7 @@ impl Chat {
         &mut self,
         action: &ui::PickMachine,
         _window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         let Some(candidate) = self.machine_candidates(cx).get(action.index).cloned() else {
             return;
@@ -543,7 +553,7 @@ impl Chat {
         &mut self,
         action: &ui::PickRepo,
         _window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         let Some(repo) = self.repo_candidates(cx).get(action.index).cloned() else {
             self.add_repo(cx);
@@ -571,7 +581,7 @@ impl Chat {
 }
 
 impl Render for Chat {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let accepts_input = self.state.exited_notice().is_none()
             && !matches!(self.state.phase(), SessionPhase::Starting { .. });
 

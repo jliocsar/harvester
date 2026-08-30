@@ -10,7 +10,7 @@ use super::{LineProbe, Session};
 const TIMEOUT_EVICTION_SLACK: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
-pub struct DialogRoom {
+pub(super) struct DialogRoom {
     attached: usize,
     pending: HashMap<String, Arc<[u8]>>,
 }
@@ -51,15 +51,15 @@ impl DialogRoom {
 }
 
 impl Session {
-    pub fn attach(&self) -> Vec<Arc<[u8]>> {
+    pub(crate) fn attach(&self) -> Vec<Arc<[u8]>> {
         lock(&self.room, "dialog room").attach()
     }
 
-    pub fn detach(&self) -> Vec<String> {
+    pub(crate) fn detach(&self) -> Vec<String> {
         lock(&self.room, "dialog room").detach()
     }
 
-    pub fn remove_pending_dialog(&self, dialog_id: &str) -> bool {
+    pub(crate) fn remove_pending_dialog(&self, dialog_id: &str) -> bool {
         lock(&self.room, "dialog room").remove_pending(dialog_id)
     }
 
@@ -90,7 +90,7 @@ pub(super) fn apply_policy(
     true
 }
 
-pub fn cancel(session: &Session, dialog_id: &str) {
+pub(crate) fn cancel(session: &Session, dialog_id: &str) {
     let cancel = json!({"type": PI_EXTENSION_UI_RESPONSE, "id": dialog_id, "cancelled": true});
 
     if let Err(error) = session.write_line(&cancel) {

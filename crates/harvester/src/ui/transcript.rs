@@ -339,7 +339,7 @@ fn tool_block_truncation_notice(cx: &App) -> Div {
     div().text_color(faint(cx)).child(TRUNCATION_NOTICE)
 }
 
-fn tool_tone(status: ToolStatus) -> Tone {
+const fn tool_tone(status: ToolStatus) -> Tone {
     match status {
         ToolStatus::Running => Tone::Active,
         ToolStatus::Ok => Tone::Muted,
@@ -347,7 +347,7 @@ fn tool_tone(status: ToolStatus) -> Tone {
     }
 }
 
-fn tool_status_label(status: ToolStatus) -> &'static str {
+const fn tool_status_label(status: ToolStatus) -> &'static str {
     match status {
         ToolStatus::Running => RUNNING_STATUS_LABEL,
         ToolStatus::Ok => COMPLETED_STATUS_LABEL,
@@ -543,7 +543,7 @@ fn context_line(block: &ToolBlock) -> String {
     }
 }
 
-fn diff_line_kind(line: &str) -> DiffLineKind {
+const fn diff_line_kind(line: &str) -> DiffLineKind {
     match line.as_bytes().first() {
         Some(b'+') => DiffLineKind::Added,
         Some(b'-') => DiffLineKind::Removed,

@@ -17,7 +17,7 @@ struct Spike {
 }
 
 impl Spike {
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
         let focus_handle = cx.focus_handle();
 
         window.focus(&focus_handle, cx);
@@ -29,7 +29,7 @@ impl Spike {
     }
 
     /// Print what the app can see of itself, to stdout.
-    fn dump(&mut self, _: &Dump, window: &mut Window, _cx: &mut Context<Self>) {
+    fn dump(&mut self, _: &Dump, window: &mut Window, _cx: &mut Context<'_, Self>) {
         let tree = window.debug_a11y_tree_json();
 
         println!("=== a11y_active={} ===", window.is_a11y_active());
@@ -42,7 +42,7 @@ impl Spike {
 }
 
 impl Render for Spike {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let rows = ["alpha", "beta", "gamma"];
 
         div()

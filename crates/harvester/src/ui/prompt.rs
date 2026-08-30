@@ -192,8 +192,8 @@ pub enum PromptStripNotice {
 impl PromptStripNotice {
     fn text(self) -> SharedString {
         match self {
-            PromptStripNotice::SessionStarting => SESSION_STARTING_NOTICE.into(),
-            PromptStripNotice::SessionExited(detail) => detail,
+            Self::SessionStarting => SESSION_STARTING_NOTICE.into(),
+            Self::SessionExited(detail) => detail,
         }
     }
 }

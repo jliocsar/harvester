@@ -30,7 +30,7 @@ struct SessionInfoEntry<'line> {
     name: Option<Cow<'line, str>>,
 }
 
-pub fn list_sessions(running: &HashMap<Sid, RunningSession>) -> Vec<SessionInfo> {
+pub(crate) fn list_sessions(running: &HashMap<Sid, RunningSession>) -> Vec<SessionInfo> {
     let Ok(dirs) = std::fs::read_dir(crate::pi_sessions_root()) else {
         return Vec::new();
     };
@@ -39,7 +39,7 @@ pub fn list_sessions(running: &HashMap<Sid, RunningSession>) -> Vec<SessionInfo>
     let mut sessions: Vec<SessionInfo> = dirs
         .flatten()
         .filter_map(|dir| std::fs::read_dir(dir.path()).ok())
-        .flat_map(|files| files.flatten())
+        .flat_map(Iterator::flatten)
         .filter_map(|file| {
             let path = file.path();
 

@@ -45,7 +45,7 @@ impl ModalCoordinator {
     pub(super) fn new(
         store: Entity<FleetStore>,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) -> Self {
         let store_events = cx.subscribe_in(&store, window, Self::handle_store_event);
 
@@ -61,7 +61,7 @@ impl ModalCoordinator {
         &mut self,
         machine: String,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         if self.active.is_some() {
             return;
@@ -77,14 +77,14 @@ impl ModalCoordinator {
             _picker_events: picker_events,
         });
         FolderPicker::open_dialog(&picker, Self::cancel_add_repo, window, cx);
-        picker.update(cx, |picker, cx| picker.start(cx));
+        picker.update(cx, FolderPicker::start);
     }
 
     pub(super) fn open_forget_machine(
         &mut self,
         machine: String,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         if self.active.is_some() {
             return;
@@ -107,7 +107,7 @@ impl ModalCoordinator {
         &mut self,
         removal: Confirmation,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         let confirmed = cx.entity();
         let declined = cx.entity();
@@ -123,7 +123,7 @@ impl ModalCoordinator {
         );
     }
 
-    fn forget_machine(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    fn forget_machine(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> bool {
         let Some(ActiveModal::ForgetMachine { machine }) = &self.active else {
             return false;
         };
@@ -141,7 +141,7 @@ impl ModalCoordinator {
         true
     }
 
-    fn decline_forget_machine(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    fn decline_forget_machine(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> bool {
         if !matches!(self.active, Some(ActiveModal::ForgetMachine { .. })) {
             return false;
         }
@@ -156,7 +156,7 @@ impl ModalCoordinator {
         _picker: &Entity<FolderPicker>,
         picked: &WorkspacePicked,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         let Some(ActiveModal::AddRepo { machine, .. }) = &self.active else {
             return;
@@ -167,18 +167,18 @@ impl ModalCoordinator {
         self.active = None;
         window.close_dialog(cx);
         self.store.update(cx, |store, cx| {
-            store.add_workspace(machine.clone(), path.clone(), cx)
+            store.add_workspace(machine.clone(), path.clone(), cx);
         });
         cx.emit(ModalOutcome::RepoAdded { machine, path });
         self.defer_advance(window, cx);
     }
 
-    fn cancel_add_repo(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    fn cancel_add_repo(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> bool {
         let Some(ActiveModal::AddRepo { picker, .. }) = &self.active else {
             return false;
         };
 
-        picker.update(cx, |picker, cx| picker.cancel(cx));
+        picker.update(cx, FolderPicker::cancel);
 
         self.release(window, cx);
 
@@ -190,7 +190,7 @@ impl ModalCoordinator {
         _store: &Entity<FleetStore>,
         event: &StoreEvent,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         match event {
             StoreEvent::Bridge {
@@ -223,7 +223,7 @@ impl ModalCoordinator {
         sid: &str,
         event: &serde_json::Value,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         let Some(request) = DialogRequest::parse(event) else {
             return;
@@ -238,7 +238,7 @@ impl ModalCoordinator {
         sid: &str,
         request: DialogRequest,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         let obligation = DialogObligation {
             machine: machine.to_string(),
@@ -253,7 +253,7 @@ impl ModalCoordinator {
         self.advance(window, cx);
     }
 
-    fn advance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn advance(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         if self.active.is_some() {
             return;
         }
@@ -278,7 +278,7 @@ impl ModalCoordinator {
         key: &DialogKey,
         answer: DialogAnswer,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) -> bool {
         if !self.displays(key) {
             return false;
@@ -308,7 +308,7 @@ impl ModalCoordinator {
         machine: &str,
         sid: &str,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         let retired = self.obligations.enter_room(DialogRoom {
             machine: machine.to_string(),
@@ -323,14 +323,14 @@ impl ModalCoordinator {
         machine: &str,
         sid: &str,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         let retired = self.obligations.retire_room(machine, sid);
 
         self.apply_retirement(retired, window, cx);
     }
 
-    fn leave_machine(&mut self, machine: &str, window: &mut Window, cx: &mut Context<Self>) {
+    fn leave_machine(&mut self, machine: &str, window: &mut Window, cx: &mut Context<'_, Self>) {
         let retired = self.obligations.leave_machine(machine);
 
         self.apply_retirement(retired, window, cx);
@@ -340,7 +340,7 @@ impl ModalCoordinator {
         &mut self,
         retired: Vec<DialogObligation>,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         let displayed_retired = retired
             .iter()
@@ -359,12 +359,12 @@ impl ModalCoordinator {
         matches!(&self.active, Some(ActiveModal::PiQuestion { key: displayed }) if displayed == key)
     }
 
-    fn release(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn release(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.active = None;
         self.defer_advance(window, cx);
     }
 
-    fn defer_advance(&self, window: &mut Window, cx: &mut Context<Self>) {
+    fn defer_advance(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
         let coordinator = cx.entity();
 
         window.defer(cx, move |window, cx| {

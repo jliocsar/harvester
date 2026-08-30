@@ -124,12 +124,12 @@ pub fn open_select<T: 'static>(
     chosen: impl Fn(String, &mut Window, &mut App) -> bool + 'static,
     cancelled: impl Fn(&mut Window, &mut App) -> bool + 'static,
     window: &mut Window,
-    cx: &mut Context<T>,
+    cx: &mut Context<'_, T>,
 ) {
     let cancelled = Rc::new(cancelled);
     let option_count = options.len();
     let delegate = OptionListDelegate {
-        options: options.into_iter().map(|option| option.into()).collect(),
+        options: options.into_iter().map(Into::into).collect(),
         selected: None,
         chosen: Rc::new(chosen),
     };
@@ -159,7 +159,7 @@ pub fn open_confirmation<T: 'static>(
     confirmed: impl Fn(&mut Window, &mut App) -> bool + 'static,
     declined: impl Fn(&mut Window, &mut App) -> bool + 'static,
     window: &mut Window,
-    cx: &mut Context<T>,
+    cx: &mut Context<'_, T>,
 ) {
     let confirmed = Rc::new(confirmed);
     let declined = Rc::new(declined);
@@ -196,7 +196,7 @@ pub fn open_text<T: 'static>(
     submitted: impl Fn(String, &mut Window, &mut App) -> bool + 'static,
     cancelled: impl Fn(&mut Window, &mut App) -> bool + 'static,
     window: &mut Window,
-    cx: &mut Context<T>,
+    cx: &mut Context<'_, T>,
 ) {
     let submitted = Rc::new(submitted);
     let cancelled = Rc::new(cancelled);
@@ -256,7 +256,7 @@ impl ListDelegate for OptionListDelegate {
         &mut self,
         ix: IndexPath,
         _window: &mut Window,
-        _cx: &mut Context<ListState<Self>>,
+        _cx: &mut Context<'_, ListState<Self>>,
     ) -> Option<Self::Item> {
         let option = self.options.get(ix.row)?;
 
@@ -267,7 +267,7 @@ impl ListDelegate for OptionListDelegate {
         &mut self,
         ix: Option<IndexPath>,
         _window: &mut Window,
-        _cx: &mut Context<ListState<Self>>,
+        _cx: &mut Context<'_, ListState<Self>>,
     ) {
         self.selected = ix;
     }
@@ -276,7 +276,7 @@ impl ListDelegate for OptionListDelegate {
         &mut self,
         _secondary: bool,
         window: &mut Window,
-        cx: &mut Context<ListState<Self>>,
+        cx: &mut Context<'_, ListState<Self>>,
     ) {
         let Some(option) = self.chosen_option() else {
             return;

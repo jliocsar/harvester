@@ -22,7 +22,7 @@ pub struct Pending<T> {
 
 impl<T> Default for Pending<T> {
     fn default() -> Self {
-        Pending { outstanding: None }
+        Self { outstanding: None }
     }
 }
 
@@ -46,7 +46,7 @@ impl<T> Pending<T> {
         matches!(&self.outstanding, Some((outstanding, _)) if *outstanding == token)
     }
 
-    pub fn is_waiting(&self) -> bool {
+    pub const fn is_waiting(&self) -> bool {
         self.outstanding.is_some()
     }
 

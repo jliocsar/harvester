@@ -91,13 +91,13 @@ impl Host {
         timeout: Duration,
     ) -> std::io::Result<ExecOutput> {
         let command = match self {
-            Host::Local => {
+            Self::Local => {
                 let mut command = Command::new("sh");
                 command.args(["-c", script]);
 
                 command
             }
-            Host::Ssh(target) => {
+            Self::Ssh(target) => {
                 let mut command = target.command(&[]);
                 command.arg(format!("exec sh -c {}", shell_quote(script)));
 
@@ -196,7 +196,7 @@ async fn run(mut command: Command, stdin_data: Option<&[u8]>) -> std::io::Result
     let output = child.wait_with_output().await?;
 
     if let Some(feed) = feed {
-        let _ = feed.await;
+        drop(feed.await);
     }
 
     Ok(ExecOutput {
