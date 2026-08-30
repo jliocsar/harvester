@@ -46,3 +46,40 @@ opt-level = "z"
 lto = true
 strip = true
 panic = "abort"
+
+# Lint policy. Rationale and the per-lint verdicts live in docs/internals/lints.md.
+# Member crates opt in with `lints.workspace = true`; harvester-gallery is its own
+# workspace and carries its own copy.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unreachable_pub = "warn"
+elided_lifetimes_in_paths = "warn"
+let_underscore_drop = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
+# Deliberately rejected: 42 sites use `.map(f).unwrap_or(d)`, and test helpers
+# return `Option<T>` on purpose to compare against the function under test.
+map_unwrap_or = "allow"
+unnecessary_wraps = "allow"
+
+# Directly contradicts `unreachable_pub`, which is the rule this codebase wants.
+redundant_pub_crate = "allow"
+
+# For library authors publishing an API; harvester ships binaries.
+must_use_candidate = "allow"
+
+# House rules that already had a lint.
+use_self = "warn"
+
+# Restriction lints are a menu, not a group — never enable the group.
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+indexing_slicing = "warn"
+mod_module_files = "warn"
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"

@@ -1,0 +1,16 @@
+id: theme-outside-ui-is-structural-only
+language: rust
+severity: error
+message: >-
+  Outside ui/, cx.theme() is for structural slots only; every text colour comes
+  from a Tone. See CLAUDE.md one-way rules and DESIGN.md.
+files:
+  - "crates/**/*.rs"
+ignores:
+  - "crates/*/src/ui/**"
+rule:
+  pattern: cx.theme().$FIELD
+constraints:
+  FIELD:
+    not:
+      regex: "^(sidebar|sidebar_border|background|foreground|popover|border|radius|font_size)$"

@@ -183,8 +183,16 @@ against the function under test).
 
 ```sh
 cargo fmt && cargo check --workspace     # gate before handing anything over
+cargo clippy --workspace --all-targets   # lint policy: docs/internals/lints.md
+ast-grep scan                            # house rules clippy cannot express
 cargo build --profile daemon-release --target x86_64-unknown-linux-musl -p harvesterd  # the shippable daemon
 ```
+
+Lint config lives in `[workspace.lints]` (Cargo.toml), `clippy.toml` and
+`.ast-grep/rules/`; every verdict and every deliberate `allow` is recorded in
+`docs/internals/lints.md`. Two of the one-way rules below are now compiler-
+enforced rather than grep-checked: `unreachable_pub` is the `pub`/`pub(crate)`
+rule and `clippy::use_self` is the `Self` rule.
 
 Protocol smoke test: run `./target/debug/harvesterd`, connect to
 `~/.harvester/harvesterd.sock` with a short python/socat script, drive

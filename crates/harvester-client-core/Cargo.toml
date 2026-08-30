@@ -13,3 +13,6 @@ tokio.workspace = true
 # The framing bypass `harvester-cli`'s protocol debugger needs. Off for the
 # shipped client, so the production types carry no way around `read_frame`.
 raw-protocol = []
+
+[lints]
+workspace = true

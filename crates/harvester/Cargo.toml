@@ -40,3 +40,6 @@ tokio = { workspace = true }
 # Uuidv7 sids minted client-side for ghost-chat starts (time-sortable — the
 # sidebar's newest-first order keys on the sid). Client crate only.
 uuid = { version = "1", features = ["v7"] }
+
+[lints]
+workspace = true

@@ -12,3 +12,6 @@ harvester-proto = { path = "../harvester-proto" }
 serde_json.workspace = true
 # io-std feeds raw mode's stdin JSONL pump.
 tokio = { workspace = true, features = ["io-std"] }
+
+[lints]
+workspace = true

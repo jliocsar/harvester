@@ -1,0 +1,18 @@
+# Thresholds and bans for the lints enabled in Cargo.toml's [workspace.lints].
+# See docs/internals/lints.md.
+cognitive-complexity-threshold = 25
+excessive-nesting-threshold = 5
+too-many-lines-threshold = 120
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+
+# "One implementation per computation": ban the primitive so the second
+# implementation cannot be written by accident. The canonical helper carries an
+# `#[expect]` with a reason.
+disallowed-methods = [
+    { path = "std::time::SystemTime::now", reason = "use harvester_proto::unix_millis_now" },
+]
+
+# All 79 indexing_slicing sites were assertions in test targets; indexing a
+# known-shape fixture is clearer there than `.get().unwrap()`.
+allow-indexing-slicing-in-tests = true
