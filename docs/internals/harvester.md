@@ -1144,12 +1144,13 @@ sentence case like every other heading.
   place its horizontal edges are written down. `SIDEBAR_EDGE_GUTTER`
   (`rems(0.25)`) keeps section-header and New-session hit areas off the window
   edge; `SIDEBAR_ROW_PADDING` (`rems(0.75)`) keeps content off a control's own
-  edge. `SIDEBAR_CONTENT_INSET` is their computed 1rem sum and has two jobs:
-  it is where a section's title starts and chevron ends, and it is the outer
-  margin of every `sidebar_row`. A selected row's left and right borders
-  therefore align with the title and chevron above it, while the row's own
-  padding indents its contents one level further so rows still read as children
-  of the section. `sidebar_empty_note` starts at the same 1rem section spine.
+  edge. `SIDEBAR_CONTENT_INSET` is their computed 1rem sum: the spine
+  where a section's title starts, where its chevron ends, and where a row's
+  status dot starts. `sidebar_row` takes the same `mx(SIDEBAR_EDGE_GUTTER)` +
+  `px(SIDEBAR_ROW_PADDING)` pair as `section_header`, so a row's contents
+  resolve onto that spine instead of one padding step past it, and a selected
+  pill's borders sit at the edge gutter alongside the header's own hover box.
+  `sidebar_empty_note` starts at the same 1rem section spine.
   The inset is computed (`rems(EDGE_GUTTER.0 + PADDING.0)`) rather than typed a
   second time; `Rems` is a tuple struct and `rems` is a `const fn`, so the sum
   costs nothing at runtime and cannot drift. `SIDEBAR_EDGE_GUTTER` is the one
@@ -1176,9 +1177,9 @@ sentence case like every other heading.
   not clickable) opts out with `tab_stop(false)` — still focusable
   programmatically, just skipped by Tab, because a row with no click handler is
   a dead end to land on — and a caller that is opts into the ring with
-  `keyboard_focus_ring`. Its `mx(SIDEBAR_CONTENT_INSET)` applies to every row,
+  `keyboard_focus_ring`. Its `mx(SIDEBAR_EDGE_GUTTER)` applies to every row,
   not only a selected one, so selection never changes layout and the selected
-  border always lands on the section's title/chevron spine. The ring cannot
+  border always lands on the same edge as the section header's hover box. The ring cannot
   live inside `sidebar_row` itself: it needs `cx` for the theme's ring color and
   this builder takes only an id, so the split is deliberate — the row owns
   reachability, the call site owns the ring. It no longer restates a text size
@@ -1239,10 +1240,9 @@ sentence case like every other heading.
   color from the ambient text style.
 - `section_header`'s content defines the selectable-row boundary: its
   `mx(SIDEBAR_EDGE_GUTTER)` + `px(SIDEBAR_ROW_PADDING)` place the title and
-  chevron at `SIDEBAR_CONTENT_INSET`, and `sidebar_row` uses that computed inset
-  as its own outer margin. A sidebar-shaped header that the gallery happens to
-  reuse and an app row therefore cannot disagree about where a selected border
-  belongs.
+  chevron at `SIDEBAR_CONTENT_INSET`, and `sidebar_row` repeats that exact pair.
+  A sidebar-shaped header that the gallery happens to reuse and an app row
+  therefore cannot disagree about where a border or a status dot belongs.
   Its padding doubled with the rest of the chrome, `pt_2`/`pb_1` →
   `pt_4`/`pb_2`, which keeps the deliberate 2:1 asymmetry (more air above a
   heading than below it, so the heading binds downward to the rows it labels)

@@ -346,10 +346,10 @@ one owner rather than each inventing a literal:
   icon-only send button's trailing edge resolves directly from `pr_3`.
 - The sidebar resolves from one pair: `SIDEBAR_EDGE_GUTTER` (0.25rem) and
   `SIDEBAR_ROW_PADDING` (0.75rem). Their computed sum,
-  `SIDEBAR_CONTENT_INSET` (1rem), is the section title/chevron spine and the
-  outer margin of every selectable row, so a selected pill's two borders land
-  on those content edges. Rows keep their own inner padding and therefore read
-  as children of the section rather than competing with its title. The New
+  `SIDEBAR_CONTENT_INSET` (1rem), is the spine every piece of sidebar content
+  starts on: a section's title, and a row's status dot. Rows take the same
+  `mx`/`px` pair as the section header, so a selected pill's borders sit at the
+  edge gutter and its contents still land on the shared spine. The New
   session wrapper reads the edge gutter while its medium button supplies
   `px_3`; together they complete the same 1rem inset exactly.
 - `SIDEBAR_STATUS_LANE` (1rem) is a fixed functional lane. The status dot sits

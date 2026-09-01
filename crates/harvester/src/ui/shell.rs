@@ -40,7 +40,7 @@ fn secondary_text() -> Div {
 
 pub fn sidebar_row(id: impl Into<ElementId>) -> ListItem {
     ListItem::new(id)
-        .mx(SIDEBAR_CONTENT_INSET)
+        .mx(SIDEBAR_EDGE_GUTTER)
         .px(SIDEBAR_ROW_PADDING)
         .py_2()
         .rounded_md()
