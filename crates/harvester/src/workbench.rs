@@ -3,19 +3,21 @@ mod modal;
 mod picker;
 mod sidebar;
 
+use std::collections::HashMap;
+
 use gpui::{div, prelude::*, Context, Entity, Subscription, Window};
 use gpui_component::notification::NotificationType;
 use gpui_component::{ActiveTheme as _, Root, WindowExt as _};
-use harvester_client_core::bridge::Event as BridgeEvent;
-use harvester_client_core::MachineState;
-use serde_json::Value;
+use harvester_client_core::{
+    ChatId, ClientRuntime, ClientSnapshot, MachineId, MachineStatus, RuntimeEvent, SessionKey,
+};
 
 use machine_presentation::present_machine;
 use modal::{ModalCoordinator, ModalOutcome};
 use sidebar::{Sidebar, SidebarIntent};
 
-use crate::chat::{Chat, ChatFlowRequest, ChatTarget};
-use crate::store::{FleetStore, StoreEvent};
+use crate::chat::{Chat, ChatFlowRequest};
+use crate::store::FleetStore;
 use crate::ui::{self, Tone};
 
 const NO_CHAT_HINT: &str = "start a new session to begin";
@@ -29,7 +31,8 @@ pub(crate) struct Workbench {
     store: Entity<FleetStore>,
     sidebar: Entity<Sidebar>,
     modal: Entity<ModalCoordinator>,
-    chat: Option<OpenChat>,
+    chats: HashMap<ChatId, OpenChat>,
+    selected: Option<ChatId>,
     _store_repaint: Subscription,
     _store_events: Subscription,
     _sidebar_intents: Subscription,
@@ -38,12 +41,12 @@ pub(crate) struct Workbench {
 
 impl Workbench {
     pub(crate) fn new(
-        argv_machine: Option<String>,
-        daemon_binary: Vec<u8>,
+        runtime: ClientRuntime,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
-        let store = cx.new(|cx| FleetStore::new(argv_machine, daemon_binary, cx));
+        let events = runtime.subscribe();
+        let store = cx.new(|cx| FleetStore::new(runtime, events, cx));
         let sidebar = cx.new(|cx| Sidebar::new(store.clone(), cx));
         let modal = cx.new(|cx| ModalCoordinator::new(store.clone(), window, cx));
         let store_repaint = cx.observe(&store, |_, _, cx| cx.notify());
@@ -55,7 +58,8 @@ impl Workbench {
             store,
             sidebar,
             modal,
-            chat: None,
+            chats: HashMap::new(),
+            selected: None,
             _store_repaint: store_repaint,
             _store_events: store_events,
             _sidebar_intents: sidebar_intents,
@@ -66,17 +70,28 @@ impl Workbench {
     fn handle_store_event(
         &mut self,
         _store: &Entity<FleetStore>,
-        event: &StoreEvent,
+        event: &RuntimeEvent,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
         match event {
-            StoreEvent::Bridge {
-                machine,
-                event: BridgeEvent::Attached { sid, entries },
-            } => self.handle_attached(machine, sid, entries, window, cx),
-            StoreEvent::Failed(detail) => self.report(detail.clone(), window, cx),
-            StoreEvent::Bridge { .. } | StoreEvent::Machines(_) => {}
+            RuntimeEvent::Changed
+            | RuntimeEvent::PromptAccepted { .. }
+            | RuntimeEvent::PromptCompleted { .. }
+            | RuntimeEvent::WorkspaceAdded { .. } => {}
+            RuntimeEvent::Failed(detail)
+            | RuntimeEvent::Rejected(detail)
+            | RuntimeEvent::PromptRejected { detail, .. }
+            | RuntimeEvent::DialogAnswerFailed { detail, .. } => {
+                self.report(detail.clone(), window, cx);
+            }
+            RuntimeEvent::DraftPromoted { draft, session } => {
+                self.promote_draft(*draft, session.clone(), cx);
+            }
+            RuntimeEvent::MachineForgotten(machine) => self.machine_forgotten(machine, cx),
+            RuntimeEvent::MachineForgetFailed { detail, .. } => {
+                self.report(detail.clone(), window, cx);
+            }
         }
     }
 
@@ -89,22 +104,13 @@ impl Workbench {
     ) {
         match intent {
             SidebarIntent::NewSession => self.open_new_session_chat(window, cx),
-            SidebarIntent::OpenSession { sid } => self.open_session(sid, cx),
+            SidebarIntent::OpenSession { session } => {
+                self.open_session(session.clone(), window, cx);
+            }
             SidebarIntent::ForgetMachine { machine } => {
                 self.open_forget_machine(machine.clone(), window, cx);
             }
         }
-    }
-
-    fn open_forget_machine(
-        &mut self,
-        machine: String,
-        window: &mut Window,
-        cx: &mut Context<'_, Self>,
-    ) {
-        self.modal.update(cx, |modal, cx| {
-            modal.open_forget_machine(machine, window, cx);
-        });
     }
 
     fn handle_modal_outcome(
@@ -115,180 +121,133 @@ impl Workbench {
         cx: &mut Context<'_, Self>,
     ) {
         match outcome {
-            ModalOutcome::RepoAdded { machine, path } => self.handle_repo_added(machine, path, cx),
-            ModalOutcome::MachineForgotten { machine } => {
-                self.handle_machine_forgotten(machine, cx);
+            ModalOutcome::RepoAdded { draft, workspace } => {
+                self.store
+                    .read(cx)
+                    .select_workspace(*draft, workspace.clone());
+                self.store.read(cx).request_controls(ChatId::Draft(*draft));
             }
         }
     }
 
-    fn handle_machine_forgotten(&mut self, machine: &str, cx: &mut Context<'_, Self>) {
-        let targets_machine = self
-            .chat
-            .as_ref()
-            .is_some_and(|open| open.chat.read(cx).machine() == machine);
-
-        if !targets_machine {
-            return;
-        }
-
-        self.chat = None;
-        cx.notify();
-    }
-
-    fn handle_repo_added(&mut self, machine: &str, path: &str, cx: &mut Context<'_, Self>) {
-        let Some(chat) = self.chat.as_ref().map(|open| open.chat.clone()) else {
-            return;
-        };
-
-        if chat.read(cx).machine() != machine {
-            return;
-        }
-
-        let path = path.to_string();
-
-        chat.update(cx, |chat, cx| chat.select_repo(path, cx));
+    fn open_forget_machine(
+        &mut self,
+        machine: MachineId,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.modal.update(cx, |modal, cx| {
+            modal.open_forget_machine(machine, window, cx);
+        });
     }
 
     fn report(&self, detail: String, window: &mut Window, cx: &mut Context<'_, Self>) {
         window.push_notification((NotificationType::Error, detail), cx);
     }
 
-    fn handle_attached(
-        &mut self,
-        machine: &str,
-        sid: &str,
-        entries: &[Value],
-        window: &mut Window,
-        cx: &mut Context<'_, Self>,
-    ) {
-        if let Some(chat) = self.take_starting_chat(sid, cx) {
-            chat.update(cx, |chat, cx| {
-                chat.promote_to_live(sid.to_string(), entries, cx);
-                chat.request_prompt_controls(cx);
-            });
-
-            return;
-        }
-
-        let target = ChatTarget {
-            machine: machine.to_string(),
-            workspace_path: self.workspace_path_of(sid, cx),
-        };
+    fn install_chat(&mut self, id: ChatId, window: &mut Window, cx: &mut Context<'_, Self>) {
         let store = self.store.clone();
-        let chat = cx.new(|cx| Chat::live(sid.to_string(), target, entries, store, window, cx));
-
-        self.install_chat(chat, window, cx);
-    }
-
-    fn install_chat(
-        &mut self,
-        chat: Entity<Chat>,
-        window: &mut Window,
-        cx: &mut Context<'_, Self>,
-    ) {
+        let chat_id = id.clone();
+        let chat = cx.new(|cx| Chat::new(chat_id, store, window, cx));
         let flow_requests = cx.subscribe_in(&chat, window, Self::handle_chat_flow_request);
 
-        chat.update(cx, Chat::request_prompt_controls);
+        self.chats.insert(
+            id.clone(),
+            OpenChat {
+                chat,
+                _flow_requests: flow_requests,
+            },
+        );
+        self.select(Some(id), cx);
+    }
 
-        self.chat = Some(OpenChat {
-            chat,
-            _flow_requests: flow_requests,
-        });
+    fn select(&mut self, selected: Option<ChatId>, cx: &mut Context<'_, Self>) {
+        self.selected = selected.clone();
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.select(selected, cx));
         cx.notify();
     }
 
-    fn workspace_path_of(&self, sid: &str, cx: &Context<'_, Self>) -> String {
-        self.store
-            .read(cx)
-            .catalog()
-            .session_cwd(sid)
-            .unwrap_or_default()
-            .to_string()
-    }
-
-    fn open_session(&mut self, sid: &str, cx: &mut Context<'_, Self>) {
-        if !self
-            .store
-            .update(cx, |store, _| store.may_open_session(sid))
-        {
-            return;
-        }
-
-        self.discard_unstarted_chat(cx);
-
-        let already_open = self.chat.as_ref().is_some_and(|open| {
-            let chat = open.chat.read(cx);
-
-            chat.sid() == Some(sid) && chat.is_live()
-        });
-
-        if !already_open {
-            self.store
-                .update(cx, |store, cx| store.open_session(sid, cx));
-        }
-
-        cx.notify();
-    }
-
-    fn discard_unstarted_chat(&mut self, cx: &mut Context<'_, Self>) {
-        let unstarted = self
-            .chat
-            .as_ref()
-            .is_some_and(|open| open.chat.read(cx).sid().is_none());
-
-        if !unstarted {
-            return;
-        }
-
-        self.chat = None;
-    }
-
-    fn take_starting_chat(
+    fn open_session(
         &mut self,
-        sid: &str,
+        session: SessionKey,
+        window: &mut Window,
         cx: &mut Context<'_, Self>,
-    ) -> Option<Entity<Chat>> {
-        let chat = self.chat.as_ref()?.chat.clone();
-        let (machine, cwd, name) = {
-            let chat = chat.read(cx);
-            let (starting_sid, name) = chat.starting_session()?;
+    ) {
+        let id = ChatId::Session(session.clone());
 
-            if starting_sid != sid {
-                return None;
-            }
+        self.store.read(cx).open_session(session);
 
-            (
-                chat.machine().to_string(),
-                chat.workspace_path().to_string(),
-                name.to_string(),
-            )
-        };
+        if self.chats.contains_key(&id) {
+            self.select(Some(id), cx);
 
-        self.store.update(cx, |store, cx| {
-            store.insert_started_session(machine, sid.to_string(), name, cwd, cx);
-        });
+            return;
+        }
 
-        Some(chat)
+        self.install_chat(id, window, cx);
     }
 
     fn open_new_session_chat(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let already_unstarted = self.chat.as_ref().is_some_and(|open| {
-            let chat = open.chat.read(cx);
+        let draft = self.store.read(cx).create_draft();
+        let id = ChatId::Draft(draft);
 
-            chat.starting_session().is_none() && chat.sid().is_none()
-        });
+        self.install_chat(id.clone(), window, cx);
 
-        if self.store.read(cx).catalog().opening_sid().is_some() || already_unstarted {
+        if let Some(open) = self.chats.get(&id) {
+            open.chat.read(cx).request_controls(cx);
+        }
+    }
+
+    fn promote_draft(
+        &mut self,
+        draft: harvester_client_core::DraftId,
+        session: SessionKey,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let draft_id = ChatId::Draft(draft);
+        let session_id = ChatId::Session(session);
+        let Some(open) = self.chats.remove(&draft_id) else {
             return;
+        };
+        let promoted_was_selected = self.selected.as_ref() == Some(&draft_id);
+        let session_was_selected = self.selected.as_ref() == Some(&session_id);
+
+        open.chat
+            .update(cx, |chat, cx| chat.set_id(session_id.clone(), cx));
+        self.chats.insert(session_id.clone(), open);
+
+        if promoted_was_selected || session_was_selected {
+            self.select(Some(session_id), cx);
+        }
+    }
+
+    fn machine_forgotten(&mut self, machine: &MachineId, cx: &mut Context<'_, Self>) {
+        let store = self.store.read(cx);
+        let snapshot = store.snapshot();
+        let removed: Vec<ChatId> = self
+            .chats
+            .keys()
+            .filter(|id| match id {
+                ChatId::Session(key) => key.machine() == machine,
+                ChatId::Draft(id) => match snapshot.draft(*id) {
+                    Some(draft) => draft.target.machine.as_ref() == Some(machine),
+                    None => true,
+                },
+            })
+            .cloned()
+            .collect();
+
+        for id in &removed {
+            self.chats.remove(id);
         }
 
-        let target = self.store.read(cx).new_session_target();
-        let store = self.store.clone();
-        let chat = cx.new(|cx| Chat::unstarted(target, store, window, cx));
-
-        self.store.update(cx, FleetStore::clear_selected_session);
-        self.install_chat(chat, window, cx);
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|selected| removed.contains(selected))
+        {
+            self.select(None, cx);
+        }
     }
 
     fn handle_chat_flow_request(
@@ -299,35 +258,45 @@ impl Workbench {
         cx: &mut Context<'_, Self>,
     ) {
         match request {
-            ChatFlowRequest::AddRepo { machine } => self.open_add_repo(machine.clone(), window, cx),
+            ChatFlowRequest::AddRepo { draft, machine } => {
+                self.open_add_repo(*draft, machine.clone(), window, cx);
+            }
         }
     }
 
-    fn open_add_repo(&mut self, machine: String, window: &mut Window, cx: &mut Context<'_, Self>) {
-        self.modal
-            .update(cx, |modal, cx| modal.open_add_repo(machine, window, cx));
+    fn open_add_repo(
+        &mut self,
+        draft: harvester_client_core::DraftId,
+        machine: MachineId,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.modal.update(cx, |modal, cx| {
+            modal.open_add_repo(draft, machine, window, cx);
+        });
     }
 
     fn render_content(&self, cx: &Context<'_, Self>) -> impl IntoElement {
         let content = div().flex_1().min_w_0().h_full();
 
-        if let Some(open) = &self.chat {
+        if let Some(open) = self
+            .selected
+            .as_ref()
+            .and_then(|selected| self.chats.get(selected))
+        {
             return content.child(open.chat.clone());
         }
 
         let store = self.store.read(cx);
-        let hint = present_empty_pane(argv_machine_state(store));
+        let hint = present_empty_pane(store.snapshot());
 
         content.child(ui::empty_pane_hint(hint.tone, hint.text, cx))
     }
 
     fn render_statusbar(&self, cx: &Context<'_, Self>) -> impl IntoElement {
         let store = self.store.read(cx);
-        let link = present_statusbar_link(
-            argv_machine_state(store),
-            store.connected_machine_count(),
-            store.linked_machine_count(),
-        );
+        let snapshot = store.snapshot();
+        let link = present_statusbar_link(snapshot);
 
         ui::statusbar_frame(cx).child(div().text_color(link.tone.color(cx)).child(link.text))
     }
@@ -338,14 +307,22 @@ struct ShellMessage {
     tone: Tone,
 }
 
-fn argv_machine_state(store: &FleetStore) -> Option<(&str, MachineState<'_>)> {
-    let machine = store.argv_machine()?;
+fn startup_machine_state(snapshot: &ClientSnapshot) -> Option<(&str, &MachineStatus)> {
+    let machine = snapshot.startup_machine()?;
+    let state = &snapshot.machine(machine)?.status;
 
-    Some((machine, store.state(machine)))
+    Some((machine.as_str(), state))
 }
 
-fn present_empty_pane(argv_machine: Option<(&str, MachineState<'_>)>) -> ShellMessage {
-    let Some((machine, state)) = argv_machine else {
+fn present_empty_pane(snapshot: &ClientSnapshot) -> ShellMessage {
+    if let Some(detail) = snapshot.fatal_error() {
+        return ShellMessage {
+            text: detail.to_string(),
+            tone: Tone::Failed,
+        };
+    }
+
+    let Some((machine, state)) = startup_machine_state(snapshot) else {
         return no_chat_hint();
     };
     let display = present_machine(state, machine);
@@ -366,12 +343,15 @@ fn no_chat_hint() -> ShellMessage {
     }
 }
 
-fn present_statusbar_link(
-    argv_machine: Option<(&str, MachineState<'_>)>,
-    connected_machine_count: usize,
-    linked_machine_count: usize,
-) -> ShellMessage {
-    if let Some((machine, state)) = argv_machine {
+fn present_statusbar_link(snapshot: &ClientSnapshot) -> ShellMessage {
+    if let Some(detail) = snapshot.fatal_error() {
+        return ShellMessage {
+            text: detail.to_string(),
+            tone: Tone::Failed,
+        };
+    }
+
+    if let Some((machine, state)) = startup_machine_state(snapshot) {
         let display = present_machine(state, machine);
 
         if let Some(link) = display.statusbar_link {
@@ -383,7 +363,11 @@ fn present_statusbar_link(
     }
 
     ShellMessage {
-        text: format!("{connected_machine_count} of {linked_machine_count} machines connected"),
+        text: format!(
+            "{} of {} machines connected",
+            snapshot.connected_machine_count(),
+            snapshot.linked_machine_count()
+        ),
         tone: Tone::Idle,
     }
 }

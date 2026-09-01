@@ -1,21 +1,23 @@
 use gpui::{AppContext as _, Context, Entity, EventEmitter, Subscription, Window};
 use gpui_component::WindowExt as _;
-use harvester_client_core::bridge::{Command, Event as BridgeEvent};
 use harvester_client_core::{
-    DialogAnswer, DialogKey, DialogObligation, DialogObligations, DialogRequest, DialogRoom,
+    DialogAnswer, DialogKey, DialogObligation, DraftId, MachineId, RuntimeEvent,
+    WorkspaceBrowserId, WorkspaceId,
 };
 
-use super::picker::{FolderPicker, WorkspacePicked};
+use super::picker::FolderPicker;
 use crate::dialogs::open_pi_dialog;
-use crate::store::{FleetStore, StoreEvent};
+use crate::store::FleetStore;
 use crate::ui::dialog::{open_confirmation, ActionAccent, Confirmation, CANCEL_LABEL};
 
 const NOTHING_IS_DELETED: &str = "Nothing on the machine itself is deleted.";
 const FORGET_ACTION_LABEL: &str = "Remove";
 
 pub(super) enum ModalOutcome {
-    RepoAdded { machine: String, path: String },
-    MachineForgotten { machine: String },
+    RepoAdded {
+        draft: DraftId,
+        workspace: WorkspaceId,
+    },
 }
 
 enum ActiveModal {
@@ -23,19 +25,20 @@ enum ActiveModal {
         key: DialogKey,
     },
     AddRepo {
-        machine: String,
+        draft: DraftId,
+        browser: WorkspaceBrowserId,
         picker: Entity<FolderPicker>,
-        _picker_events: Subscription,
     },
     ForgetMachine {
-        machine: String,
+        machine: MachineId,
+        requested: bool,
     },
 }
 
 pub(super) struct ModalCoordinator {
     store: Entity<FleetStore>,
-    obligations: DialogObligations,
     active: Option<ActiveModal>,
+    awaiting_dialog: Option<DialogKey>,
     _store_events: Subscription,
 }
 
@@ -51,55 +54,64 @@ impl ModalCoordinator {
 
         Self {
             store,
-            obligations: DialogObligations::default(),
             active: None,
+            awaiting_dialog: None,
             _store_events: store_events,
         }
     }
 
     pub(super) fn open_add_repo(
         &mut self,
-        machine: String,
+        draft: DraftId,
+        machine: MachineId,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.active.is_some() {
+        if self.active.is_some() || self.awaiting_dialog.is_some() {
             return;
         }
 
+        let browser = self.store.read(cx).begin_workspace_browser(machine.clone());
         let store = self.store.clone();
-        let picker = cx.new(|cx| FolderPicker::new(machine.clone(), store, window, cx));
-        let picker_events = cx.subscribe_in(&picker, window, Self::handle_workspace_picked);
+        let picker = cx.new(|cx| FolderPicker::new(browser, store, window, cx));
 
         self.active = Some(ActiveModal::AddRepo {
-            machine,
+            draft,
+            browser,
             picker: picker.clone(),
-            _picker_events: picker_events,
         });
         FolderPicker::open_dialog(&picker, Self::cancel_add_repo, window, cx);
-        picker.update(cx, FolderPicker::start);
     }
 
     pub(super) fn open_forget_machine(
         &mut self,
-        machine: String,
+        machine: MachineId,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.active.is_some() {
+        if self.active.is_some() || self.awaiting_dialog.is_some() {
             return;
         }
 
         let store = self.store.read(cx);
+        let snapshot = store.snapshot();
+        let sessions = snapshot
+            .sessions()
+            .iter()
+            .filter(|session| session.key.machine() == &machine)
+            .count();
         let removal = Confirmation {
-            title: format!("Remove machine {}?", store.label(&machine)).into(),
-            message: removal_message(store.catalog().visible_session_count_on(&machine)).into(),
+            title: format!("Remove machine {}?", snapshot.machine_label(&machine)).into(),
+            message: removal_message(sessions).into(),
             cancel_label: CANCEL_LABEL.into(),
             action_label: FORGET_ACTION_LABEL.into(),
             action_accent: ActionAccent::Danger,
         };
 
-        self.active = Some(ActiveModal::ForgetMachine { machine });
+        self.active = Some(ActiveModal::ForgetMachine {
+            machine,
+            requested: false,
+        });
         self.open_removal_confirmation(removal, window, cx);
     }
 
@@ -123,22 +135,19 @@ impl ModalCoordinator {
         );
     }
 
-    fn forget_machine(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> bool {
-        let Some(ActiveModal::ForgetMachine { machine }) = &self.active else {
+    fn forget_machine(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> bool {
+        let Some(ActiveModal::ForgetMachine { machine, requested }) = &mut self.active else {
             return false;
         };
-        let machine = machine.clone();
-        let forgotten = self
-            .store
-            .update(cx, |store, cx| store.forget_machine(&machine, cx));
 
-        self.release(window, cx);
-
-        if forgotten {
-            cx.emit(ModalOutcome::MachineForgotten { machine });
+        if *requested {
+            return false;
         }
 
-        true
+        *requested = true;
+        self.store.read(cx).forget_machine(machine.clone());
+
+        false
     }
 
     fn decline_forget_machine(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> bool {
@@ -151,35 +160,12 @@ impl ModalCoordinator {
         true
     }
 
-    fn handle_workspace_picked(
-        &mut self,
-        _picker: &Entity<FolderPicker>,
-        picked: &WorkspacePicked,
-        window: &mut Window,
-        cx: &mut Context<'_, Self>,
-    ) {
-        let Some(ActiveModal::AddRepo { machine, .. }) = &self.active else {
-            return;
-        };
-        let machine = machine.clone();
-        let path = picked.path.clone();
-
-        self.active = None;
-        window.close_dialog(cx);
-        self.store.update(cx, |store, cx| {
-            store.add_workspace(machine.clone(), path.clone(), cx);
-        });
-        cx.emit(ModalOutcome::RepoAdded { machine, path });
-        self.defer_advance(window, cx);
-    }
-
     fn cancel_add_repo(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> bool {
         let Some(ActiveModal::AddRepo { picker, .. }) = &self.active else {
             return false;
         };
 
-        picker.update(cx, FolderPicker::cancel);
-
+        picker.read(cx).cancel(cx);
         self.release(window, cx);
 
         true
@@ -188,165 +174,77 @@ impl ModalCoordinator {
     fn handle_store_event(
         &mut self,
         _store: &Entity<FleetStore>,
-        event: &StoreEvent,
+        event: &RuntimeEvent,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
         match event {
-            StoreEvent::Bridge {
-                machine,
-                event: BridgeEvent::AttachmentLeft { sid },
-            } => self.retire_room(machine, sid, window, cx),
-            StoreEvent::Bridge {
-                machine,
-                event: BridgeEvent::Attached { sid, .. },
-            } => self.enter_room(machine, sid, window, cx),
-            StoreEvent::Bridge {
-                machine,
-                event: BridgeEvent::Pi { sid, event },
-            } => self.handle_pi_event(machine, sid, event, window, cx),
-            StoreEvent::Bridge {
-                machine,
-                event: BridgeEvent::SessionExit { sid, .. },
-            } => self.retire_room(machine, sid, window, cx),
-            StoreEvent::Bridge {
-                machine,
-                event: BridgeEvent::Disconnected,
-            } => self.leave_machine(machine, window, cx),
-            StoreEvent::Bridge { .. } | StoreEvent::Machines(_) | StoreEvent::Failed(_) => {}
+            RuntimeEvent::Changed => self.sync_dialog(window, cx),
+            RuntimeEvent::WorkspaceAdded { browser, workspace } => {
+                self.handle_workspace_added(*browser, workspace, window, cx);
+            }
+            RuntimeEvent::MachineForgotten(machine) => {
+                self.handle_machine_forgotten(machine, window, cx);
+            }
+            RuntimeEvent::MachineForgetFailed { machine, .. } => {
+                self.handle_machine_forget_failed(machine);
+            }
+            RuntimeEvent::DialogAnswerFailed { dialog, .. } => {
+                self.handle_dialog_answer_failed(dialog, window, cx);
+            }
+            RuntimeEvent::Failed(_)
+            | RuntimeEvent::Rejected(_)
+            | RuntimeEvent::PromptAccepted { .. }
+            | RuntimeEvent::PromptRejected { .. }
+            | RuntimeEvent::PromptCompleted { .. }
+            | RuntimeEvent::DraftPromoted { .. } => {}
         }
     }
 
-    fn handle_pi_event(
+    fn handle_workspace_added(
         &mut self,
-        machine: &str,
-        sid: &str,
-        event: &serde_json::Value,
+        browser: WorkspaceBrowserId,
+        workspace: &WorkspaceId,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some(request) = DialogRequest::parse(event) else {
+        let Some(ActiveModal::AddRepo {
+            draft,
+            browser: active,
+            ..
+        }) = &self.active
+        else {
             return;
         };
 
-        self.enqueue(machine, sid, request, window, cx);
-    }
-
-    fn enqueue(
-        &mut self,
-        machine: &str,
-        sid: &str,
-        request: DialogRequest,
-        window: &mut Window,
-        cx: &mut Context<'_, Self>,
-    ) {
-        let obligation = DialogObligation {
-            machine: machine.to_string(),
-            sid: sid.to_string(),
-            request,
-        };
-
-        if !self.obligations.enqueue(obligation).accepted() {
+        if *active != browser {
             return;
         }
 
-        self.advance(window, cx);
-    }
-
-    fn advance(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if self.active.is_some() {
-            return;
-        }
-
-        let Some(obligation) = self.obligations.front().cloned() else {
-            return;
-        };
-        let key = obligation.key();
-        let answered_key = key.clone();
-
-        self.active = Some(ActiveModal::PiQuestion { key });
-        open_pi_dialog(
-            &obligation,
-            move |modal, answer, window, cx| modal.answer_front(&answered_key, answer, window, cx),
-            window,
-            cx,
-        );
-    }
-
-    fn answer_front(
-        &mut self,
-        key: &DialogKey,
-        answer: DialogAnswer,
-        window: &mut Window,
-        cx: &mut Context<'_, Self>,
-    ) -> bool {
-        if !self.displays(key) {
-            return false;
-        }
-
-        let Some(answered) = self.obligations.answer_front(key, answer) else {
-            return false;
-        };
-        let obligation = answered.obligation;
+        let draft = *draft;
+        let workspace = workspace.clone();
 
         self.active = None;
-        self.store.read(cx).send(
-            &obligation.machine,
-            Command::AnswerDialog {
-                sid: obligation.sid,
-                dialog_id: obligation.request.id,
-                answer: answered.answer,
-            },
-        );
+        window.close_dialog(cx);
+        cx.emit(ModalOutcome::RepoAdded { draft, workspace });
         self.defer_advance(window, cx);
-
-        true
     }
 
-    fn enter_room(
+    fn handle_machine_forgotten(
         &mut self,
-        machine: &str,
-        sid: &str,
+        machine: &MachineId,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let retired = self.obligations.enter_room(DialogRoom {
-            machine: machine.to_string(),
-            sid: sid.to_string(),
-        });
+        let active = matches!(
+            &self.active,
+            Some(ActiveModal::ForgetMachine {
+                machine: active,
+                ..
+            }) if active == machine
+        );
 
-        self.apply_retirement(retired, window, cx);
-    }
-
-    fn retire_room(
-        &mut self,
-        machine: &str,
-        sid: &str,
-        window: &mut Window,
-        cx: &mut Context<'_, Self>,
-    ) {
-        let retired = self.obligations.retire_room(machine, sid);
-
-        self.apply_retirement(retired, window, cx);
-    }
-
-    fn leave_machine(&mut self, machine: &str, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let retired = self.obligations.leave_machine(machine);
-
-        self.apply_retirement(retired, window, cx);
-    }
-
-    fn apply_retirement(
-        &mut self,
-        retired: Vec<DialogObligation>,
-        window: &mut Window,
-        cx: &mut Context<'_, Self>,
-    ) {
-        let displayed_retired = retired
-            .iter()
-            .any(|obligation| self.displays(&obligation.key()));
-
-        if !displayed_retired {
+        if !active {
             return;
         }
 
@@ -355,8 +253,100 @@ impl ModalCoordinator {
         self.defer_advance(window, cx);
     }
 
-    fn displays(&self, key: &DialogKey) -> bool {
-        matches!(&self.active, Some(ActiveModal::PiQuestion { key: displayed }) if displayed == key)
+    fn handle_machine_forget_failed(&mut self, machine: &MachineId) {
+        let Some(ActiveModal::ForgetMachine {
+            machine: active,
+            requested,
+        }) = &mut self.active
+        else {
+            return;
+        };
+
+        if active == machine {
+            *requested = false;
+        }
+    }
+
+    fn handle_dialog_answer_failed(
+        &mut self,
+        dialog: &DialogKey,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.awaiting_dialog.as_ref() != Some(dialog) {
+            return;
+        }
+
+        self.awaiting_dialog = None;
+        self.defer_advance(window, cx);
+    }
+
+    fn sync_dialog(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let pending = self.store.read(cx).snapshot().pending_dialog().cloned();
+        let pending_key = pending.as_ref().map(DialogObligation::key);
+
+        if let Some(awaiting) = &self.awaiting_dialog {
+            if pending_key.as_ref() == Some(awaiting) {
+                return;
+            }
+
+            self.awaiting_dialog = None;
+        }
+
+        if let Some(ActiveModal::PiQuestion { key }) = &self.active {
+            if pending_key.as_ref() == Some(key) {
+                return;
+            }
+
+            self.active = None;
+            window.close_dialog(cx);
+            self.defer_advance(window, cx);
+
+            return;
+        }
+
+        self.advance(window, cx);
+    }
+
+    fn advance(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.active.is_some() || self.awaiting_dialog.is_some() {
+            return;
+        }
+
+        let Some(obligation) = self.store.read(cx).snapshot().pending_dialog().cloned() else {
+            return;
+        };
+        let key = obligation.key();
+        let answered_key = key.clone();
+
+        self.active = Some(ActiveModal::PiQuestion { key });
+        open_pi_dialog(
+            &obligation,
+            move |modal, answer, window, cx| modal.answer(&answered_key, answer, window, cx),
+            window,
+            cx,
+        );
+    }
+
+    fn answer(
+        &mut self,
+        key: &DialogKey,
+        answer: DialogAnswer,
+        _window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
+        if !matches!(
+            &self.active,
+            Some(ActiveModal::PiQuestion { key: displayed }) if displayed == key
+        ) {
+            return false;
+        }
+
+        self.active = None;
+        self.awaiting_dialog = Some(key.clone());
+        self.store.read(cx).answer_dialog(key.clone(), answer);
+
+        true
     }
 
     fn release(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {

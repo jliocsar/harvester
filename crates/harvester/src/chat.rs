@@ -1,76 +1,55 @@
+use std::collections::HashMap;
+
 use gpui::{
     div, prelude::*, App, Context, Entity, EventEmitter, Focusable, ScrollHandle, SharedString,
     Subscription, Window,
 };
 use gpui_component::input::{InputEvent, InputState};
-use serde_json::Value;
+use harvester_client_core::{
+    folder_name, ChatId, ClientSnapshot, DraftId, MachineId, ModelsState, RuntimeEvent,
+    SubmissionId,
+};
 
-use crate::models::{self, ModelChoice};
-use crate::session_state::{self, ModelsState, SessionPhase, SessionState};
-use crate::store::{FleetStore, StoreEvent};
+use crate::models;
+use crate::store::FleetStore;
 use crate::ui::{self, Tone};
-use harvester_client_core::bridge::{Command, Event as BridgeEvent};
-use harvester_client_core::{folder_name, machines, MachineCandidate, RequestToken};
-
-pub(crate) use session_state::ChatTarget;
 
 pub(crate) const NEW_SESSION_LABEL: &str = "New session";
 
-const UNSENT_REQUEST_DETAIL: &str = "Not connected";
-const CONNECTION_LOST_DETAIL: &str = "Connection lost";
-const MACHINE_CHANGED_DETAIL: &str = "machine changed";
 const MODEL_FALLBACK_SUFFIX: &str = " — pi will use its default model";
 const UNRESOLVED_TARGET_SUBTITLE: &str = "Pick a machine and a repository below";
+const OPENING_SESSION_HINT: &str = "Opening session…";
+
+type TranscriptSignature = u64;
 
 pub(crate) enum ChatFlowRequest {
-    AddRepo { machine: String },
+    AddRepo { draft: DraftId, machine: MachineId },
 }
 
 impl EventEmitter<ChatFlowRequest> for Chat {}
 
+struct SubmittedInput {
+    text: String,
+    accepted: bool,
+}
+
 pub(crate) struct Chat {
-    state: SessionState,
+    id: ChatId,
     store: Entity<FleetStore>,
     transcript_presentation: ui::TranscriptPresentation,
+    transcript_signature: Option<TranscriptSignature>,
     focus_input: bool,
     input: Entity<InputState>,
     scroll: ScrollHandle,
+    submissions: HashMap<SubmissionId, SubmittedInput>,
     _prompt_submitted: Subscription,
     _store_repaint: Subscription,
     _store_events: Subscription,
 }
 
 impl Chat {
-    pub(crate) fn unstarted(
-        target: ChatTarget,
-        store: Entity<FleetStore>,
-        window: &mut Window,
-        cx: &mut Context<'_, Self>,
-    ) -> Self {
-        let tokens = store.read(cx).tokens();
-
-        Self::new(SessionState::unstarted(target, tokens), store, window, cx)
-    }
-
-    pub(crate) fn live(
-        sid: String,
-        target: ChatTarget,
-        entries: &[Value],
-        store: Entity<FleetStore>,
-        window: &mut Window,
-        cx: &mut Context<'_, Self>,
-    ) -> Self {
-        let tokens = store.read(cx).tokens();
-        Self::new(
-            SessionState::live(sid, target, entries, tokens),
-            store,
-            window,
-            cx,
-        )
-    }
-
-    fn new(
-        state: SessionState,
+    pub(crate) fn new(
+        id: ChatId,
         store: Entity<FleetStore>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
@@ -79,350 +58,113 @@ impl Chat {
         let prompt_submitted = cx.subscribe_in(&input, window, Self::handle_prompt_submitted);
         let store_repaint = cx.observe(&store, |_, _, cx| cx.notify());
         let store_events = cx.subscribe_in(&store, window, Self::handle_store_event);
+        let transcript_signature = transcript_signature(store.read(cx).snapshot(), &id);
 
         Self {
-            state,
+            id,
             store,
             transcript_presentation: ui::TranscriptPresentation::default(),
+            transcript_signature,
             focus_input: true,
             input,
             scroll: ScrollHandle::new(),
+            submissions: HashMap::new(),
             _prompt_submitted: prompt_submitted,
             _store_repaint: store_repaint,
             _store_events: store_events,
         }
     }
 
+    pub(crate) fn set_id(&mut self, id: ChatId, cx: &mut Context<'_, Self>) {
+        self.id = id;
+        self.transcript_signature = transcript_signature(self.store.read(cx).snapshot(), &self.id);
+        self.scroll.scroll_to_bottom();
+        cx.notify();
+    }
+
     fn handle_store_event(
         &mut self,
         _store: &Entity<FleetStore>,
-        event: &StoreEvent,
-        _window: &mut Window,
+        event: &RuntimeEvent,
+        window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
         match event {
-            StoreEvent::Bridge { machine, event } => self.handle_bridge_event(machine, event, cx),
-            StoreEvent::Machines(machines::Event::BranchResolved { token, result }) => {
-                self.handle_branch_resolved(*token, result.clone(), cx);
+            RuntimeEvent::Changed => self.handle_snapshot_changed(cx),
+            RuntimeEvent::PromptAccepted { submission, .. } => {
+                self.handle_prompt_accepted(*submission, window, cx);
             }
-            StoreEvent::Machines(_) | StoreEvent::Failed(_) => {}
+            RuntimeEvent::PromptRejected {
+                submission, text, ..
+            } => self.handle_prompt_rejected(*submission, text, window, cx),
+            RuntimeEvent::PromptCompleted { submission } => {
+                self.submissions.remove(submission);
+            }
+            RuntimeEvent::Failed(_)
+            | RuntimeEvent::Rejected(_)
+            | RuntimeEvent::DialogAnswerFailed { .. }
+            | RuntimeEvent::DraftPromoted { .. }
+            | RuntimeEvent::WorkspaceAdded { .. }
+            | RuntimeEvent::MachineForgotten(_)
+            | RuntimeEvent::MachineForgetFailed { .. } => {}
         }
     }
 
-    fn handle_bridge_event(
-        &mut self,
-        machine: &str,
-        event: &BridgeEvent,
-        cx: &mut Context<'_, Self>,
-    ) {
-        match event {
-            BridgeEvent::ConnectFailed { detail } if self.runs_on(machine) => {
-                self.fail_pending_requests(detail.clone(), cx);
-            }
-            BridgeEvent::Disconnected if self.runs_on(machine) => {
-                self.fail_pending_requests(CONNECTION_LOST_DETAIL.to_string(), cx);
-            }
-            BridgeEvent::RequestFailed { .. } if self.runs_on(machine) => {
-                if self.state.fail_start() {
-                    cx.notify();
-                }
-            }
-            BridgeEvent::ModelsListed { token, result } if self.runs_on(machine) => {
-                self.handle_models_listed(*token, result.clone(), cx);
-            }
-            BridgeEvent::HistoryReplaced { sid, entries } if self.renders(sid) => {
-                self.replace_history(entries, cx);
-            }
-            BridgeEvent::HistoryExtended { sid, entries } if self.renders(sid) => {
-                self.extend_history(entries, cx);
-            }
-            BridgeEvent::Pi { sid, event } if self.renders(sid) => self.handle_pi_event(event, cx),
-            BridgeEvent::SessionExit { sid, exit_code } if self.renders(sid) => {
-                self.handle_session_exit(*exit_code, cx);
-            }
-            BridgeEvent::PromptFailed { sid, detail } if self.renders(sid) => {
-                self.handle_prompt_failed(detail.clone(), cx);
-            }
-            BridgeEvent::PiAnswered {
-                sid,
-                token,
-                method,
-                result,
-            } if self.renders(sid) => self.handle_pi_answered(method, *token, result.clone(), cx),
-            _ => {}
-        }
-    }
+    fn handle_snapshot_changed(&mut self, cx: &mut Context<'_, Self>) {
+        let signature = transcript_signature(self.store.read(cx).snapshot(), &self.id);
 
-    fn runs_on(&self, machine: &str) -> bool {
-        self.state.target().machine == machine
-    }
-
-    fn renders(&self, sid: &str) -> bool {
-        self.state.sid() == Some(sid)
-    }
-
-    fn machine_label(&self, cx: &Context<'_, Self>) -> SharedString {
-        self.store
-            .read(cx)
-            .label(&self.state.target().machine)
-            .into()
-    }
-
-    fn machine_candidates(&self, cx: &Context<'_, Self>) -> Vec<MachineCandidate> {
-        self.store.read(cx).machine_candidates()
-    }
-
-    fn repo_candidates(&self, cx: &Context<'_, Self>) -> Vec<String> {
-        self.store
-            .read(cx)
-            .catalog()
-            .repos_on(&self.state.target().machine)
-    }
-
-    pub(crate) fn sid(&self) -> Option<&str> {
-        self.state.sid()
-    }
-
-    pub(crate) fn machine(&self) -> &str {
-        &self.state.target().machine
-    }
-
-    pub(crate) fn starting_session(&self) -> Option<(&str, &str)> {
-        self.state.phase().starting_session()
-    }
-
-    pub(crate) fn workspace_path(&self) -> &str {
-        &self.state.target().workspace_path
-    }
-
-    pub(crate) fn request_prompt_controls(&mut self, cx: &mut Context<'_, Self>) {
-        self.request_models(cx);
-        self.request_branch(cx);
-    }
-
-    fn request_models(&mut self, cx: &mut Context<'_, Self>) {
-        match self.state.phase() {
-            SessionPhase::Unstarted => self.request_model_list(cx),
-            SessionPhase::Live { .. } => self.request_model_controls(cx),
-            SessionPhase::Starting { .. } => {}
-        }
-    }
-
-    fn request_model_controls(&mut self, cx: &mut Context<'_, Self>) {
-        let Some(commands) = self.state.request_model_controls() else {
-            return;
-        };
-
-        for command in commands {
-            self.send(command, cx);
-        }
-    }
-
-    fn request_model_list(&mut self, cx: &mut Context<'_, Self>) {
-        let Some(command) = self.state.request_model_list() else {
-            return;
-        };
-
-        self.send(command, cx);
-    }
-
-    fn send(&mut self, command: Command, cx: &mut Context<'_, Self>) {
-        let machine = self.state.target().machine.clone();
-        let ends_the_turn = matches!(command, Command::Prompt { .. });
-        let sent = self
-            .store
-            .update(cx, |store, cx| store.send_gated(&machine, command, cx));
-
-        if sent {
-            return;
-        }
-
-        self.fail_unsent(ends_the_turn, cx);
-    }
-
-    fn fail_unsent(&mut self, ends_the_turn: bool, cx: &mut Context<'_, Self>) {
-        let mut changed = self.state.fail_pending(UNSENT_REQUEST_DETAIL.to_string());
-
-        if ends_the_turn {
-            changed |= self.state.fail_prompt(UNSENT_REQUEST_DETAIL.to_string());
-        }
-
-        if changed {
-            cx.notify();
-        }
-    }
-
-    fn request_branch(&mut self, cx: &mut Context<'_, Self>) {
-        let Some(token) = self.state.request_branch() else {
-            return;
-        };
-        let target = self.state.target().clone();
-        let host = match self.store.read(cx).host_for(&target.machine) {
-            Ok(host) => host,
-            Err(error) => {
-                eprintln!("harvester: branch indicator: {error}");
-                self.state.cancel_branch();
-
-                return;
-            }
-        };
-        let command = machines::Command::ResolveBranch {
-            host,
-            path: target.workspace_path,
-            token,
-        };
-        let sent = self
-            .store
-            .update(cx, |store, cx| store.send_host_command(command, cx));
-
-        if !sent {
-            self.state.cancel_branch();
-        }
-    }
-
-    fn handle_branch_resolved(
-        &mut self,
-        token: RequestToken,
-        result: Result<String, String>,
-        cx: &mut Context<'_, Self>,
-    ) {
-        if let Err(detail) = &result {
-            eprintln!("harvester: branch indicator: {detail}");
-        }
-
-        if self.state.accept_branch(token, result) {
-            cx.notify();
-        }
-    }
-
-    pub(crate) fn promote_to_live(
-        &mut self,
-        sid: String,
-        entries: &[Value],
-        cx: &mut Context<'_, Self>,
-    ) {
-        if self.state.promote_to_live(sid, entries) {
+        if signature != self.transcript_signature {
+            self.transcript_signature = signature;
             self.scroll.scroll_to_bottom();
-            cx.notify();
         }
     }
 
-    fn replace_history(&mut self, entries: &[Value], cx: &mut Context<'_, Self>) {
-        if self.state.replace_history(entries) {
-            self.scroll.scroll_to_bottom();
-            cx.notify();
-        }
-    }
-
-    fn extend_history(&mut self, entries: &[Value], cx: &mut Context<'_, Self>) {
-        if self.state.extend_history(entries) {
-            self.scroll.scroll_to_bottom();
-            cx.notify();
-        }
-    }
-
-    fn fail_pending_requests(&mut self, detail: String, cx: &mut Context<'_, Self>) {
-        if self.state.fail_pending(detail) {
-            cx.notify();
-        }
-    }
-
-    fn handle_models_listed(
+    fn handle_prompt_accepted(
         &mut self,
-        token: RequestToken,
-        result: Result<Value, String>,
+        submission: SubmissionId,
+        window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.state.accept_models(token, result) {
-            cx.notify();
-        }
-    }
-
-    fn handle_pi_answered(
-        &mut self,
-        method: &str,
-        token: RequestToken,
-        result: Result<Value, String>,
-        cx: &mut Context<'_, Self>,
-    ) {
-        if self.state.accept_pi_answer(method, token, result) {
-            cx.notify();
-        }
-    }
-
-    fn handle_prompt_failed(&mut self, detail: String, cx: &mut Context<'_, Self>) {
-        if self.state.fail_prompt(detail) {
-            cx.notify();
-        }
-    }
-
-    fn pick_model(&mut self, picked: Option<ModelChoice>, cx: &mut Context<'_, Self>) {
-        if let Some(command) = self.state.pick_model(picked) {
-            self.send(command, cx);
-        }
-
-        cx.notify();
-    }
-
-    fn pick_machine(&mut self, machine: String, cx: &mut Context<'_, Self>) {
-        if self.state.target().machine == machine {
-            cx.notify();
-
+        let Some(submitted) = self.submissions.get_mut(&submission) else {
             return;
-        }
+        };
+        let current = self.input.read(cx).value().to_string();
 
-        self.state
-            .cancel_model_fetch(MACHINE_CHANGED_DETAIL.to_string());
+        submitted.accepted = true;
 
-        if self.state.retarget(machine) {
-            let first_repo = self.repo_candidates(cx).first().cloned();
-
-            self.state.pick_repo(first_repo.unwrap_or_default());
-            self.request_prompt_controls(cx);
-        }
-
-        cx.notify();
-    }
-
-    pub(crate) fn select_repo(&mut self, path: String, cx: &mut Context<'_, Self>) {
-        if self.state.pick_repo(path) {
-            self.request_prompt_controls(cx);
-        }
-
-        cx.notify();
-    }
-
-    fn add_repo(&mut self, cx: &mut Context<'_, Self>) {
-        let machine = self.state.target().machine.clone();
-
-        if machine.is_empty() {
-            return;
-        }
-
-        cx.emit(ChatFlowRequest::AddRepo { machine });
-    }
-
-    pub(crate) const fn is_live(&self) -> bool {
-        self.state.is_live()
-    }
-
-    fn handle_session_exit(&mut self, exit_code: Option<i32>, cx: &mut Context<'_, Self>) {
-        if self.state.exit(exit_code) {
-            cx.notify();
-        }
-    }
-
-    fn handle_pi_event(&mut self, event: &Value, cx: &mut Context<'_, Self>) {
-        if session_state::is_turn_settled(event) {
-            self.request_branch(cx);
-        }
-
-        if !self.state.apply_pi_event(event) {
-            return;
+        if current == submitted.text {
+            self.input
+                .update(cx, |state, cx| state.set_value("", window, cx));
         }
 
         self.scroll.scroll_to_bottom();
-        cx.notify();
+    }
+
+    fn handle_prompt_rejected(
+        &mut self,
+        submission: SubmissionId,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(submitted) = self.submissions.remove(&submission) else {
+            return;
+        };
+        let current = self.input.read(cx).value().to_string();
+
+        if current.is_empty() {
+            self.input.update(cx, |state, cx| {
+                state.set_value(submitted.text, window, cx);
+            });
+        } else if current == text {
+            self.focus_input = true;
+        }
+
+        self.scroll.scroll_to_bottom();
+    }
+
+    pub(crate) fn request_controls(&self, cx: &App) {
+        self.store.read(cx).request_controls(self.id.clone());
     }
 
     fn handle_prompt_submitted(
@@ -439,69 +181,111 @@ impl Chat {
         self.submit_prompt(window, cx);
     }
 
-    fn submit_text(&mut self, text: String, cx: &mut Context<'_, Self>) {
-        let Some(command) = self.state.submit_prompt(text) else {
+    fn submit_prompt(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) {
+        let input = self.input.clone();
+        let text = input.read(cx).value().to_string();
+        let can_send = models::can_send(self.store.read(cx).snapshot(), &self.id);
+
+        if text.trim().is_empty() || !can_send || self.awaiting_prompt_acceptance() {
+            return;
+        }
+
+        let submission = self.store.read(cx).reserve_prompt_submission();
+
+        self.submissions.insert(
+            submission,
+            SubmittedInput {
+                text: text.clone(),
+                accepted: false,
+            },
+        );
+        self.store
+            .read(cx)
+            .submit_prompt(submission, self.id.clone(), text);
+        self.scroll.scroll_to_bottom();
+    }
+
+    fn awaiting_prompt_acceptance(&self) -> bool {
+        self.submissions
+            .values()
+            .any(|submission| !submission.accepted)
+    }
+
+    fn add_repo(&self, cx: &mut Context<'_, Self>) {
+        let ChatId::Draft(draft) = &self.id else {
+            return;
+        };
+        let draft = *draft;
+        let Some(machine) = self
+            .store
+            .read(cx)
+            .snapshot()
+            .draft(draft)
+            .and_then(|draft| draft.target.machine.clone())
+        else {
             return;
         };
 
-        self.scroll.scroll_to_bottom();
-        cx.notify();
-        self.send(command, cx);
-    }
-
-    fn submit_prompt(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let input = self.input.clone();
-        let text = input.read(cx).value().to_string();
-
-        if text.trim().is_empty() {
-            return;
-        }
-
-        input.update(cx, |state, cx| state.set_value("", window, cx));
-        self.submit_text(text, cx);
+        cx.emit(ChatFlowRequest::AddRepo { draft, machine });
     }
 
     fn unstarted_subtitle(&self, cx: &Context<'_, Self>) -> SharedString {
-        if !self.state.target().is_resolved() {
+        let ChatId::Draft(id) = &self.id else {
+            return SharedString::default();
+        };
+        let id = *id;
+        let store = self.store.read(cx);
+        let snapshot = store.snapshot();
+        let Some(draft) = snapshot.draft(id) else {
             return UNRESOLVED_TARGET_SUBTITLE.into();
-        }
+        };
+        let (Some(machine), Some(workspace)) = (
+            draft.target.machine.as_ref(),
+            draft.target.workspace.as_ref(),
+        ) else {
+            return UNRESOLVED_TARGET_SUBTITLE.into();
+        };
 
         format!(
             "{} on {}",
-            folder_name(&self.state.target().workspace_path),
-            self.machine_label(cx)
+            folder_name(workspace.path()),
+            snapshot.machine_label(machine)
         )
         .into()
     }
 
     fn render_transcript(&self, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let chat = cx.entity();
+        let ChatId::Session(key) = &self.id else {
+            return div().into_any_element();
+        };
+        let store = self.store.read(cx);
+        let Some(session) = store.snapshot().live_session(key) else {
+            return ui::empty_pane_hint(Tone::Pending, OPENING_SESSION_HINT, cx).into_any_element();
+        };
 
-        self.transcript_presentation.render(
-            self.state.transcript(),
-            &self.scroll,
-            move |tool_call_id, _, cx| {
-                chat.update(cx, |chat, cx| {
-                    chat.transcript_presentation.toggle_tool_block(tool_call_id);
-                    cx.notify();
-                });
-            },
-            cx,
-        )
+        self.transcript_presentation
+            .render(
+                session.replica.transcript(),
+                &self.scroll,
+                move |tool_call_id, _, cx| {
+                    chat.update(cx, |chat, cx| {
+                        chat.transcript_presentation.toggle_tool_block(tool_call_id);
+                        cx.notify();
+                    });
+                },
+                cx,
+            )
+            .into_any_element()
     }
 
     fn render_bottom_row(&self, window: &Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        let model_picks = models::model_picks(&self.state);
-        let machine_candidates = self.machine_candidates(cx);
-        let repo_candidates = self.repo_candidates(cx);
         let focused = self.input.read(cx).focus_handle(cx).is_focused(window);
         let strip = models::present_prompt_strip(
-            &self.state,
-            &model_picks,
-            &machine_candidates,
-            &self.machine_label(cx),
-            &repo_candidates,
+            self.store.read(cx).snapshot(),
+            &self.id,
             focused,
+            !self.awaiting_prompt_acceptance(),
         );
         let chat_for_send = cx.entity();
         let chat_for_stop = chat_for_send.clone();
@@ -516,11 +300,11 @@ impl Chat {
     }
 
     fn stop_session(&mut self, cx: &mut Context<'_, Self>) {
-        let Some(command) = self.state.stop_command() else {
+        let ChatId::Session(key) = &self.id else {
             return;
         };
 
-        self.send(command, cx);
+        self.store.read(cx).stop_session(key.clone());
     }
 
     fn handle_pick_model(
@@ -529,11 +313,14 @@ impl Chat {
         _window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some(pick) = models::model_picks(&self.state).get(action.index).cloned() else {
+        let picked = models::model_picks(self.store.read(cx).snapshot(), &self.id)
+            .get(action.index)
+            .cloned();
+        let Some(picked) = picked else {
             return;
         };
 
-        self.pick_model(pick, cx);
+        self.store.read(cx).pick_model(self.id.clone(), picked);
     }
 
     fn handle_pick_machine(
@@ -542,11 +329,19 @@ impl Chat {
         _window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some(candidate) = self.machine_candidates(cx).get(action.index).cloned() else {
+        let ChatId::Draft(draft) = &self.id else {
+            return;
+        };
+        let draft = *draft;
+        let machine = models::machine_candidates(self.store.read(cx).snapshot())
+            .get(action.index)
+            .map(|candidate| candidate.id.clone());
+        let Some(machine) = machine else {
             return;
         };
 
-        self.pick_machine(candidate.key, cx);
+        self.store.read(cx).retarget_draft(draft, machine);
+        self.store.read(cx).request_controls(self.id.clone());
     }
 
     fn handle_pick_repo(
@@ -555,37 +350,51 @@ impl Chat {
         _window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some(repo) = self.repo_candidates(cx).get(action.index).cloned() else {
+        let ChatId::Draft(draft) = &self.id else {
+            return;
+        };
+        let draft = *draft;
+        let repo = models::repo_candidates(self.store.read(cx).snapshot(), &self.id)
+            .get(action.index)
+            .map(|repo| (*repo).clone());
+        let Some(repo) = repo else {
             self.add_repo(cx);
 
             return;
         };
 
-        self.select_repo(repo, cx);
+        self.store.read(cx).select_workspace(draft, repo);
+        self.store.read(cx).request_controls(self.id.clone());
     }
 
     fn render_unstarted_body(&self, cx: &App) -> impl IntoElement {
+        let ChatId::Draft(id) = &self.id else {
+            return div().flex_1().min_h_0();
+        };
+        let id = *id;
+        let failure =
+            self.store
+                .read(cx)
+                .snapshot()
+                .draft(id)
+                .and_then(|draft| match &draft.models {
+                    ModelsState::Failed(detail) => Some(format!("{detail}{MODEL_FALLBACK_SUFFIX}")),
+                    ModelsState::NotRequested | ModelsState::Loading | ModelsState::Loaded(_) => {
+                        None
+                    }
+                });
+
         div()
             .flex_1()
             .min_h_0()
             .p_3()
-            .children(match self.state.models() {
-                ModelsState::Failed(detail) => Some(ui::inline_note(
-                    Tone::Failed,
-                    format!("{detail}{MODEL_FALLBACK_SUFFIX}"),
-                    cx,
-                )),
-                _ => None,
-            })
+            .children(failure.map(|detail| ui::inline_note(Tone::Failed, detail, cx)))
     }
 }
 
 impl Render for Chat {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        let accepts_input = self.state.exited_notice().is_none()
-            && !matches!(self.state.phase(), SessionPhase::Starting { .. });
-
-        if self.focus_input && accepts_input {
+        if self.focus_input {
             window.focus(&self.input.read(cx).focus_handle(cx), cx);
             self.focus_input = false;
         }
@@ -597,17 +406,24 @@ impl Render for Chat {
             .on_action(cx.listener(Self::handle_pick_model))
             .on_action(cx.listener(Self::handle_pick_machine))
             .on_action(cx.listener(Self::handle_pick_repo));
-        let pane = match self.state.phase() {
-            SessionPhase::Unstarted | SessionPhase::Starting { .. } => pane
+        let pane = match &self.id {
+            ChatId::Draft(_) => pane
                 .child(ui::chat_header(
                     NEW_SESSION_LABEL.into(),
                     self.unstarted_subtitle(cx),
                     cx,
                 ))
-                .child(self.render_unstarted_body(cx)),
-            SessionPhase::Live { .. } => pane.child(self.render_transcript(cx)),
+                .child(self.render_unstarted_body(cx).into_any_element()),
+            ChatId::Session(_) => pane.child(self.render_transcript(cx).into_any_element()),
         };
 
         pane.child(self.render_bottom_row(window, cx))
     }
+}
+
+fn transcript_signature(snapshot: &ClientSnapshot, chat: &ChatId) -> Option<TranscriptSignature> {
+    let ChatId::Session(key) = chat else {
+        return None;
+    };
+    Some(snapshot.live_session(key)?.replica.revision())
 }

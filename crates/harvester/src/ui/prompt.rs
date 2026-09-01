@@ -186,6 +186,7 @@ pub struct PromptStripControl {
 
 pub enum PromptStripNotice {
     SessionStarting,
+    SessionUnavailable(SharedString),
     SessionExited(SharedString),
 }
 
@@ -193,7 +194,7 @@ impl PromptStripNotice {
     fn text(self) -> SharedString {
         match self {
             Self::SessionStarting => SESSION_STARTING_NOTICE.into(),
-            Self::SessionExited(detail) => detail,
+            Self::SessionUnavailable(detail) | Self::SessionExited(detail) => detail,
         }
     }
 }

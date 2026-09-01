@@ -1,16 +1,14 @@
-mod catalog;
 mod chat;
 mod dialogs;
 mod models;
-mod session_state;
 mod store;
 mod workbench;
-mod workspaces;
 
 pub use harvester::{assets, ui};
 
 use gpui::AppContext;
 use harvester::shell_bootstrap::{run_desktop_shell, ShellWindow};
+use harvester_client_core::{ClientRuntimeOwner, MachineId};
 use harvester_proto::DEV_DAEMON_PATH;
 
 use crate::workbench::Workbench;
@@ -30,10 +28,21 @@ fn main() {
         }
     };
 
-    run(argv_machine, daemon_binary);
+    let runtime = match ClientRuntimeOwner::start(
+        argv_machine.clone().and_then(MachineId::new),
+        daemon_binary,
+    ) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("harvester: start client runtime: {error}");
+            std::process::exit(1);
+        }
+    };
+
+    run(argv_machine, runtime);
 }
 
-fn run(argv_machine: Option<String>, daemon_binary: Vec<u8>) {
+fn run(argv_machine: Option<String>, runtime: ClientRuntimeOwner) {
     let shell_window = ShellWindow {
         title: main_window_title(argv_machine.as_deref()),
         width_in_pixels: MAIN_WINDOW_WIDTH,
@@ -41,7 +50,7 @@ fn run(argv_machine: Option<String>, daemon_binary: Vec<u8>) {
     };
 
     run_desktop_shell(shell_window, move |window, cx| {
-        cx.new(|cx| Workbench::new(argv_machine, daemon_binary, window, cx))
+        cx.new(|cx| Workbench::new(runtime.handle(), window, cx))
             .into()
     });
 }

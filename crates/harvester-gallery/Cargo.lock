@@ -2744,10 +2744,7 @@ dependencies = [
  "gpui_platform",
  "harvester-client-core",
  "harvester-proto",
- "serde",
  "serde_json",
- "tokio",
- "uuid",
 ]
 
 [[package]]
@@ -2758,6 +2755,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

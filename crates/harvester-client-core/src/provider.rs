@@ -112,7 +112,10 @@ pub(crate) fn discover_providers() -> Result<Vec<Provider>> {
         let path = entry.path();
 
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            eprintln!("harvester: ignoring non-UTF-8 provider name: {path:?}");
+            eprintln!(
+                "harvester: ignoring non-UTF-8 provider name: {}",
+                path.display()
+            );
 
             continue;
         };
@@ -122,7 +125,10 @@ pub(crate) fn discover_providers() -> Result<Vec<Provider>> {
         }
 
         let Ok(metadata) = std::fs::metadata(&path) else {
-            eprintln!("harvester: skipping unreadable provider entry {path:?}");
+            eprintln!(
+                "harvester: skipping unreadable provider entry {}",
+                path.display()
+            );
 
             continue;
         };
@@ -205,10 +211,10 @@ struct ErrorResult {
 #[derive(Deserialize)]
 struct InfoResult {
     protocol: u64,
-    #[expect(dead_code)]
-    name: String,
-    #[expect(dead_code)]
-    capabilities: Vec<String>,
+    #[serde(rename = "name")]
+    _name: String,
+    #[serde(rename = "capabilities")]
+    _capabilities: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -220,8 +226,8 @@ struct ListResult {
 struct MachineEntry {
     id: String,
     label: String,
-    #[expect(dead_code)]
-    status: String,
+    #[serde(rename = "status")]
+    _status: String,
     ssh: Value,
 }
 
@@ -232,6 +238,8 @@ struct HostSshEntry {
     user: Option<String>,
     #[serde(default)]
     port: Option<u16>,
+    #[serde(default)]
+    options: Vec<String>,
 }
 
 fn check_info(provider: &str, result: Value) -> Result<()> {
@@ -294,6 +302,7 @@ fn parse_ssh_target(ssh: Value) -> serde_json::Result<Option<SshTarget>> {
     Ok(Some(SshTarget {
         dest,
         port: host.port,
+        options: host.options,
     }))
 }
 
@@ -356,6 +365,44 @@ mod tests {
             "an omitted user leaves the destination bare, so ssh applies its own default"
         );
         assert_eq!(target.port, None);
+    }
+
+    #[test]
+    fn host_form_carries_ssh_options_through() {
+        let entry = json!({
+            "id": "nidus-zhpxe85r",
+            "label": "nidus-zhpxe85r",
+            "status": "running",
+            "ssh": {
+                "host": "nidus-zhpxe85r",
+                "user": "sprite",
+                "options": ["ProxyCommand=sprite proxy -s %h -W :22"],
+            },
+        });
+        let machines =
+            parse_machine_list("nidus", list_result(json!([entry]))).expect("must parse");
+        let target = machines[0]
+            .target
+            .as_ref()
+            .expect("the host form resolves to a target");
+
+        assert_eq!(target.options, ["ProxyCommand=sprite proxy -s %h -W :22"]);
+    }
+
+    #[test]
+    fn a_machine_without_options_carries_none() {
+        let machines = parse_machine_list("exe-dev", list_result(json!([host_machine("bloggy")])))
+            .expect("must parse");
+
+        assert!(
+            machines[0]
+                .target
+                .as_ref()
+                .expect("the host form resolves to a target")
+                .options
+                .is_empty(),
+            "options is optional, and its absence must not invent one"
+        );
     }
 
     #[test]

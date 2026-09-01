@@ -81,10 +81,7 @@ contents, so a change here is a deliberate, visible one.
 
 ### The shared pi wire tokens
 
-`PI_EXTENSION_UI_RESPONSE`, `PI_GET_AVAILABLE_MODELS` and `PI_AGENT_SETTLED`
-are pi's own vocabulary, named here because each is written in **more than one
-crate** and a typo in one of them is a silent behaviour change rather than a
-compile error.
+`PI_EXTENSION_UI_RESPONSE` and `PI_GET_AVAILABLE_MODELS` are pi's own vocabulary, named here because each is written in **more than one crate** and a typo in one of them is a silent behaviour change rather than a compile error. `agent_settled` is now client-only and therefore lives as a crate-private client-core constant.
 
 Deliberately *not* an exhaustive `pi` module: the ~20 other pi tokens each live
 inside a single `match` in a single file (`client-core`'s transcript event

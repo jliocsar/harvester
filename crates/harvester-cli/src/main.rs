@@ -50,6 +50,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let target = SshTarget {
         dest: cli.dest,
         port: None,
+        options: Vec::new(),
     };
     let connected = bootstrap_and_connect(&Host::Ssh(target.clone()), &daemon_binary).await?;
     eprintln!("harvesterd on {} ({:?})", target.dest, connected.outcome);

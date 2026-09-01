@@ -2,9 +2,9 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use harvester_client_core::transcript::{message_text, Transcript};
+use harvester_client_core::{message_text, Transcript};
 use harvester_proto::{CR, LF};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 pub const APP_CRATE_FIXTURES_DIR: &str = "../harvester/fixtures";
 pub const STREAMING_FIXTURE_NAME: &str = "streaming.jsonl";
@@ -112,7 +112,10 @@ pub fn fold_events<'a>(events: impl Iterator<Item = &'a Value>) -> Transcript {
 
 pub fn apply_event(transcript: &mut Transcript, event: &Value) {
     if let Some(prompt) = user_prompt_text(event) {
-        transcript.push_user_prompt(prompt);
+        transcript.apply(&json!({
+            "type": "message_end",
+            "message": {"role": "user", "content": prompt}
+        }));
 
         return;
     }

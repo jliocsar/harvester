@@ -1,8 +1,9 @@
 use gpui::SharedString;
-use harvester_client_core::{folder_name, MachineCandidate};
-use serde_json::Value;
+use harvester_client_core::{
+    folder_name, ChatId, ClientSnapshot, DraftLifecycle, MachineSnapshot, ModelChoice,
+    ModelSelection, ModelsState, SessionLifecycle, WorkspaceId,
+};
 
-use crate::session_state::{ModelSelection, ModelsState, SessionPhase, SessionState};
 use crate::ui::{self, DEFAULT_MODEL_ROW};
 
 const NO_MACHINE_LABEL: &str = "No machines";
@@ -12,94 +13,112 @@ const LOADING_MODELS_LABEL: &str = "Loading models…";
 const DEFAULT_MODEL_LABEL: &str = "Default model";
 const PENDING_MODEL_LABEL: &str = "Model";
 const UNAVAILABLE_MODEL_LABEL: &str = "Model unavailable";
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ModelChoice {
-    pub name: String,
-    pub provider: String,
-    pub id: String,
-}
-
-pub(crate) fn model_choice_from_value(model: &Value) -> Option<ModelChoice> {
-    let id = model.get("id").and_then(Value::as_str)?;
-    let provider = model.get("provider").and_then(Value::as_str)?;
-    let name = model.get("name").and_then(Value::as_str).unwrap_or(id);
-
-    Some(ModelChoice {
-        name: name.to_string(),
-        provider: provider.to_string(),
-        id: id.to_string(),
-    })
-}
-
-pub(crate) fn extract_model_choices(data: &Value) -> Vec<ModelChoice> {
-    let Some(models) = data.get("models").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-
-    models.iter().filter_map(model_choice_from_value).collect()
-}
+const OPENING_SESSION_NOTICE: &str = "Opening session…";
+const FAILED_SESSION_PREFIX: &str = "Session failed: ";
+const DISCONNECTED_SESSION_PREFIX: &str = "Session disconnected: ";
+const EXITED_SESSION_NOTICE: &str = "Session exited";
 
 pub(crate) fn present_prompt_strip(
-    state: &SessionState,
-    model_picks: &[Option<ModelChoice>],
-    machine_candidates: &[MachineCandidate],
-    machine_label: &str,
-    repo_candidates: &[String],
+    snapshot: &ClientSnapshot,
+    chat: &ChatId,
     focused: bool,
+    accepts_prompt: bool,
 ) -> ui::PromptStrip {
+    let picks = model_picks(snapshot, chat);
+    let machine = chat_machine(snapshot, chat);
+    let machine_candidates = snapshot.machine_candidates();
+    let repos = machine
+        .map(|machine| snapshot.repos_on(machine))
+        .unwrap_or_default();
+
     ui::PromptStrip {
-        notice: prompt_strip_notice(state),
-        model: model_control(state, model_picks),
-        machine: machine_control(state, machine_candidates, machine_label),
-        repo: repo_control(state, repo_candidates),
-        branch: state.branch().map(|branch| branch.to_string().into()),
-        can_send: can_send(state),
-        can_stop: state.can_stop(),
+        notice: prompt_strip_notice(snapshot, chat),
+        model: model_control(snapshot, chat, &picks),
+        machine: machine_control(snapshot, chat, &machine_candidates),
+        repo: repo_control(snapshot, chat, &repos),
+        branch: chat_branch(snapshot, chat).map(|branch| branch.to_string().into()),
+        can_send: accepts_prompt && can_send(snapshot, chat),
+        can_stop: can_stop(snapshot, chat),
         focused,
     }
 }
 
-pub(crate) fn model_picks(state: &SessionState) -> Vec<Option<ModelChoice>> {
-    if matches!(state.phase(), SessionPhase::Starting { .. }) {
+pub(crate) fn model_picks(snapshot: &ClientSnapshot, chat: &ChatId) -> Vec<Option<ModelChoice>> {
+    let Some(models) = chat_models(snapshot, chat) else {
         return Vec::new();
-    }
-
-    let offer_default = matches!(state.phase(), SessionPhase::Unstarted);
+    };
+    let offer_default = match chat {
+        ChatId::Draft(id) => snapshot
+            .draft(*id)
+            .is_some_and(|draft| matches!(draft.lifecycle, DraftLifecycle::Ready)),
+        ChatId::Session(_) => false,
+    };
 
     offer_default
         .then_some(None)
         .into_iter()
-        .chain(state.model_choices().iter().cloned().map(Some))
+        .chain(models.choices().iter().cloned().map(Some))
         .collect()
 }
 
-fn prompt_strip_notice(state: &SessionState) -> Option<ui::PromptStripNotice> {
-    match (state.exited_notice(), state.phase()) {
-        (Some(notice), _) => Some(ui::PromptStripNotice::SessionExited(
-            notice.to_string().into(),
-        )),
-        (None, SessionPhase::Starting { .. }) => Some(ui::PromptStripNotice::SessionStarting),
-        (None, _) => None,
+pub(crate) fn machine_candidates(snapshot: &ClientSnapshot) -> Vec<&MachineSnapshot> {
+    snapshot.machine_candidates()
+}
+
+pub(crate) fn repo_candidates<'a>(
+    snapshot: &'a ClientSnapshot,
+    chat: &ChatId,
+) -> Vec<&'a WorkspaceId> {
+    chat_machine(snapshot, chat)
+        .map(|machine| snapshot.repos_on(machine))
+        .unwrap_or_default()
+}
+
+fn prompt_strip_notice(snapshot: &ClientSnapshot, chat: &ChatId) -> Option<ui::PromptStripNotice> {
+    match chat {
+        ChatId::Draft(id) => match &snapshot.draft(*id)?.lifecycle {
+            DraftLifecycle::Ready => None,
+            DraftLifecycle::Starting(_) => Some(ui::PromptStripNotice::SessionStarting),
+        },
+        ChatId::Session(key) => match &snapshot.live_session(key)?.lifecycle {
+            SessionLifecycle::Opening | SessionLifecycle::Starting => Some(
+                ui::PromptStripNotice::SessionUnavailable(OPENING_SESSION_NOTICE.into()),
+            ),
+            SessionLifecycle::Attached => None,
+            SessionLifecycle::Failed(detail) => Some(ui::PromptStripNotice::SessionUnavailable(
+                format!("{FAILED_SESSION_PREFIX}{detail}").into(),
+            )),
+            SessionLifecycle::Disconnected(detail) => {
+                Some(ui::PromptStripNotice::SessionUnavailable(
+                    format!("{DISCONNECTED_SESSION_PREFIX}{detail}").into(),
+                ))
+            }
+            SessionLifecycle::Exited(Some(code)) => Some(ui::PromptStripNotice::SessionExited(
+                format!("{EXITED_SESSION_NOTICE} with code {code}").into(),
+            )),
+            SessionLifecycle::Exited(None) => Some(ui::PromptStripNotice::SessionExited(
+                EXITED_SESSION_NOTICE.into(),
+            )),
+        },
     }
 }
 
-const fn is_unstarted(state: &SessionState) -> bool {
-    matches!(state.phase(), SessionPhase::Unstarted)
-}
-
-const fn can_send(state: &SessionState) -> bool {
-    !is_unstarted(state) || state.target().is_resolved()
-}
-
-fn model_control(state: &SessionState, picks: &[Option<ModelChoice>]) -> ui::PromptStripControl {
-    let (label, enabled) =
-        model_control_state(state.selection(), state.models(), state.model_choices());
+fn model_control(
+    snapshot: &ClientSnapshot,
+    chat: &ChatId,
+    picks: &[Option<ModelChoice>],
+) -> ui::PromptStripControl {
+    let selection = chat_selection(snapshot, chat);
+    let models = chat_models(snapshot, chat);
+    let (label, enabled) = match (selection, models) {
+        (Some(selection), Some(models)) => model_control_state(selection, models),
+        _ => (PENDING_MODEL_LABEL.into(), false),
+    };
     let rows = picks
         .iter()
         .map(|pick| ui::DropdownRow {
             label: model_row_label(pick.as_ref()),
-            selected: is_current_model(state, pick),
+            selected: selection.is_some_and(|selection| is_current_model(selection, pick)),
             divider_above: false,
         })
         .collect();
@@ -108,31 +127,25 @@ fn model_control(state: &SessionState, picks: &[Option<ModelChoice>]) -> ui::Pro
         label,
         enabled,
         rows,
-    }
-}
-
-fn is_current_model(state: &SessionState, pick: &Option<ModelChoice>) -> bool {
-    match (pick, state.selection()) {
-        (None, ModelSelection::LaunchDefault) => true,
-        (Some(choice), ModelSelection::Launch(current) | ModelSelection::Live(current)) => {
-            choice.provider == current.provider && choice.id == current.id
-        }
-        _ => false,
     }
 }
 
 fn machine_control(
-    state: &SessionState,
-    candidates: &[MachineCandidate],
-    machine_label: &str,
+    snapshot: &ClientSnapshot,
+    chat: &ChatId,
+    candidates: &[&MachineSnapshot],
 ) -> ui::PromptStripControl {
-    let label = machine_control_label(&state.target().machine, machine_label, candidates);
-    let enabled = is_unstarted(state) && !candidates.is_empty();
+    let machine = chat_machine(snapshot, chat);
+    let label = machine_control_label(
+        machine.map(|machine| snapshot.machine_label(machine)),
+        candidates.is_empty(),
+    );
+    let enabled = draft_ready(snapshot, chat) && !candidates.is_empty();
     let rows = candidates
         .iter()
         .map(|candidate| ui::DropdownRow {
             label: candidate.label.clone().into(),
-            selected: candidate.key == state.target().machine,
+            selected: machine == Some(&candidate.id),
             divider_above: false,
         })
         .collect();
@@ -144,15 +157,19 @@ fn machine_control(
     }
 }
 
-fn repo_control(state: &SessionState, repos: &[String]) -> ui::PromptStripControl {
-    let path = &state.target().workspace_path;
-    let label = repo_control_label(path);
-    let enabled = is_unstarted(state) && !state.target().machine.is_empty();
+fn repo_control(
+    snapshot: &ClientSnapshot,
+    chat: &ChatId,
+    repos: &[&WorkspaceId],
+) -> ui::PromptStripControl {
+    let selected = chat_workspace(snapshot, chat);
+    let label = repo_control_label(selected.map(WorkspaceId::path));
+    let enabled = draft_ready(snapshot, chat) && chat_machine(snapshot, chat).is_some();
     let mut rows: Vec<ui::DropdownRow> = repos
         .iter()
         .map(|repo| ui::DropdownRow {
-            label: repo.clone().into(),
-            selected: repo == path,
+            label: repo.path().to_string().into(),
+            selected: selected == Some(*repo),
             divider_above: false,
         })
         .collect();
@@ -170,12 +187,8 @@ fn repo_control(state: &SessionState, repos: &[String]) -> ui::PromptStripContro
     }
 }
 
-fn model_control_state(
-    selection: &ModelSelection,
-    models: &ModelsState,
-    choices: &[ModelChoice],
-) -> (SharedString, bool) {
-    let choices_available = !choices.is_empty();
+fn model_control_state(selection: &ModelSelection, models: &ModelsState) -> (SharedString, bool) {
+    let choices_available = !models.choices().is_empty();
 
     match selection {
         ModelSelection::Launch(choice) | ModelSelection::Live(choice) => {
@@ -193,6 +206,16 @@ fn model_control_state(
     }
 }
 
+fn is_current_model(selection: &ModelSelection, pick: &Option<ModelChoice>) -> bool {
+    match (pick, selection) {
+        (None, ModelSelection::LaunchDefault) => true,
+        (Some(choice), ModelSelection::Launch(current) | ModelSelection::Live(current)) => {
+            choice.provider == current.provider && choice.id == current.id
+        }
+        _ => false,
+    }
+}
+
 fn model_row_label(pick: Option<&ModelChoice>) -> SharedString {
     match pick {
         Some(choice) => choice.name.clone().into(),
@@ -200,35 +223,92 @@ fn model_row_label(pick: Option<&ModelChoice>) -> SharedString {
     }
 }
 
-fn machine_control_label(
-    machine: &str,
-    machine_label: &str,
-    candidates: &[MachineCandidate],
-) -> SharedString {
-    if !machine.is_empty() {
-        return machine_label.to_string().into();
+fn machine_control_label(machine_label: Option<String>, candidates_empty: bool) -> SharedString {
+    match machine_label {
+        Some(label) => label.into(),
+        None if candidates_empty => NO_MACHINE_LABEL.into(),
+        None => CHOOSE_MACHINE_LABEL.into(),
     }
-
-    if candidates.is_empty() {
-        return NO_MACHINE_LABEL.into();
-    }
-
-    CHOOSE_MACHINE_LABEL.into()
 }
 
-fn repo_control_label(workspace_path: &str) -> SharedString {
-    if workspace_path.is_empty() {
-        return CHOOSE_REPO_LABEL.into();
+fn repo_control_label(workspace_path: Option<&str>) -> SharedString {
+    match workspace_path {
+        Some(path) => folder_name(path).to_string().into(),
+        None => CHOOSE_REPO_LABEL.into(),
     }
+}
 
-    folder_name(workspace_path).to_string().into()
+fn draft_ready(snapshot: &ClientSnapshot, chat: &ChatId) -> bool {
+    matches!(
+        chat,
+        ChatId::Draft(id)
+            if snapshot
+                .draft(*id)
+                .is_some_and(|draft| matches!(draft.lifecycle, DraftLifecycle::Ready))
+    )
+}
+
+pub(crate) fn can_send(snapshot: &ClientSnapshot, chat: &ChatId) -> bool {
+    match chat {
+        ChatId::Draft(id) => snapshot.draft(*id).is_some_and(|draft| {
+            matches!(draft.lifecycle, DraftLifecycle::Ready) && draft.target.is_resolved()
+        }),
+        ChatId::Session(key) => snapshot
+            .live_session(key)
+            .is_some_and(|session| matches!(session.lifecycle, SessionLifecycle::Attached)),
+    }
+}
+
+fn can_stop(snapshot: &ClientSnapshot, chat: &ChatId) -> bool {
+    match chat {
+        ChatId::Draft(_) => false,
+        ChatId::Session(key) => snapshot
+            .live_session(key)
+            .is_some_and(harvester_client_core::LiveSession::can_stop),
+    }
+}
+
+fn chat_machine<'a>(
+    snapshot: &'a ClientSnapshot,
+    chat: &'a ChatId,
+) -> Option<&'a harvester_client_core::MachineId> {
+    match chat {
+        ChatId::Draft(id) => snapshot.draft(*id)?.target.machine.as_ref(),
+        ChatId::Session(key) => Some(key.machine()),
+    }
+}
+
+fn chat_workspace<'a>(snapshot: &'a ClientSnapshot, chat: &ChatId) -> Option<&'a WorkspaceId> {
+    match chat {
+        ChatId::Draft(id) => snapshot.draft(*id)?.target.workspace.as_ref(),
+        ChatId::Session(key) => Some(&snapshot.live_session(key)?.workspace),
+    }
+}
+
+fn chat_models<'a>(snapshot: &'a ClientSnapshot, chat: &ChatId) -> Option<&'a ModelsState> {
+    match chat {
+        ChatId::Draft(id) => Some(&snapshot.draft(*id)?.models),
+        ChatId::Session(key) => Some(&snapshot.live_session(key)?.model_catalog),
+    }
+}
+
+fn chat_selection<'a>(snapshot: &'a ClientSnapshot, chat: &ChatId) -> Option<&'a ModelSelection> {
+    match chat {
+        ChatId::Draft(id) => Some(&snapshot.draft(*id)?.model_selection),
+        ChatId::Session(key) => Some(&snapshot.live_session(key)?.model_selection),
+    }
+}
+
+fn chat_branch<'a>(snapshot: &'a ClientSnapshot, chat: &ChatId) -> Option<&'a str> {
+    match chat {
+        ChatId::Draft(id) => snapshot.draft(*id)?.branch.as_deref(),
+        ChatId::Session(key) => snapshot.live_session(key)?.branch.as_deref(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session_state::ChatTarget;
-    use harvester_client_core::RequestTokens;
 
     fn choice(name: &str) -> ModelChoice {
         ModelChoice {
@@ -238,163 +318,10 @@ mod tests {
         }
     }
 
-    fn candidate(key: &str) -> MachineCandidate {
-        MachineCandidate {
-            key: key.to_string(),
-            label: key.to_string(),
-        }
-    }
-
-    fn target() -> ChatTarget {
-        ChatTarget {
-            machine: "exe-dev/vm".to_string(),
-            workspace_path: "/home/exedev/bloggy".to_string(),
-        }
-    }
-
-    fn unstarted_state(target: ChatTarget) -> SessionState {
-        SessionState::unstarted(target, RequestTokens::default())
-    }
-
-    fn live_state() -> SessionState {
-        SessionState::live("01H".to_string(), target(), &[], RequestTokens::default())
-    }
-
-    fn strip(
-        state: &SessionState,
-        candidates: &[MachineCandidate],
-        repos: &[String],
-    ) -> ui::PromptStrip {
-        let picks = model_picks(state);
-
-        present_prompt_strip(state, &picks, candidates, "vm", repos, false)
-    }
-
-    #[test]
-    fn an_unresolved_target_leaves_the_send_button_off() {
-        let unresolved = strip(&unstarted_state(ChatTarget::unresolved()), &[], &[]);
-        let resolved = strip(&unstarted_state(target()), &[], &[]);
-
-        assert!(!unresolved.can_send);
-        assert!(resolved.can_send);
-    }
-
-    #[test]
-    fn a_live_session_can_send_but_can_no_longer_move_machine_or_repo() {
-        let candidates = [candidate("exe-dev/vm")];
-        let repos = ["/home/exedev/bloggy".to_string()];
-        let live = strip(&live_state(), &candidates, &repos);
-        let unstarted = strip(&unstarted_state(target()), &candidates, &repos);
-
-        assert!(live.can_send);
-        assert!(!live.machine.enabled);
-        assert!(!live.repo.enabled);
-        assert!(unstarted.machine.enabled);
-        assert!(unstarted.repo.enabled);
-    }
-
-    #[test]
-    fn the_repo_control_always_offers_the_add_row_last() {
-        let repos = ["/home/exedev/bloggy".to_string()];
-        let empty = strip(&unstarted_state(target()), &[], &[]);
-        let listed = strip(&unstarted_state(target()), &[], &repos);
-        let last = listed.repo.rows.last().expect("the add row");
-
-        assert_eq!(empty.repo.rows.len(), 1);
-        assert_eq!(empty.repo.rows[0].label, ui::ADD_REPO_ROW);
-        assert!(!empty.repo.rows[0].divider_above);
-        assert_eq!(last.label, ui::ADD_REPO_ROW);
-        assert!(
-            last.divider_above,
-            "the add row is separated from real repositories"
-        );
-        assert!(listed.repo.rows[0].selected, "the picked repo is checked");
-    }
-
-    #[test]
-    fn a_starting_session_says_so_and_offers_no_model_to_pick() {
-        let mut state = unstarted_state(target());
-        drop(state.submit_prompt("fix it".to_string()));
-        let starting = strip(&state, &[], &[]);
-
-        assert!(matches!(
-            starting.notice,
-            Some(ui::PromptStripNotice::SessionStarting)
-        ));
-        assert!(model_picks(&state).is_empty());
-        assert!(starting.model.rows.is_empty());
-    }
-
-    #[test]
-    fn an_exited_session_carries_pis_own_notice() {
-        let mut state = live_state();
-
-        assert!(state.exit(Some(17)));
-
-        let exited = strip(&state, &[], &[]);
-        let Some(ui::PromptStripNotice::SessionExited(notice)) = exited.notice else {
-            panic!("an exited session must say so above the prompt box");
-        };
-
-        assert!(notice.contains("17"));
-        assert!(!exited.can_stop);
-    }
-
-    #[test]
-    fn only_an_unstarted_session_offers_the_default_model_row() {
-        let unstarted = model_picks(&unstarted_state(target()));
-        let live = model_picks(&live_state());
-
-        assert_eq!(unstarted, vec![None]);
-        assert!(live.is_empty());
-    }
-
-    #[test]
-    fn the_picked_model_is_the_checked_row() {
-        let mut state = unstarted_state(target());
-        let token = model_list_token(&mut state);
-
-        assert!(state.accept_models(
-            token,
-            Ok(serde_json::json!({"models": [
-                {"id": "claude", "provider": "anthropic", "name": "Opus"},
-                {"id": "other", "provider": "anthropic", "name": "Haiku"}
-            ]}))
-        ));
-        state.pick_model(Some(choice("Opus")));
-
-        let rows = strip(&state, &[], &[]).model.rows;
-
-        assert_eq!(rows[0].label, DEFAULT_MODEL_ROW);
-        assert!(!rows[0].selected);
-        assert!(rows[1].selected, "the picked model is the checked row");
-        assert!(!rows[2].selected);
-    }
-
-    fn model_list_token(state: &mut SessionState) -> harvester_client_core::RequestToken {
-        match state.request_model_list().expect("a repo to ask about") {
-            harvester_client_core::bridge::Command::ListModels { token, .. } => token,
-            _ => unreachable!(),
-        }
-    }
-
-    #[test]
-    fn a_model_list_still_loading_disables_the_control() {
-        let (label, enabled) =
-            model_control_state(&ModelSelection::LaunchDefault, &ModelsState::Loading, &[]);
-
-        assert_eq!(label, "Loading models…");
-        assert!(!enabled);
-    }
-
     #[test]
     fn a_loaded_list_makes_the_default_row_pickable() {
-        let choices = vec![choice("Sonnet")];
-        let (label, enabled) = model_control_state(
-            &ModelSelection::LaunchDefault,
-            &ModelsState::Loaded(choices.clone()),
-            &choices,
-        );
+        let models = ModelsState::Loaded(vec![choice("Sonnet")]);
+        let (label, enabled) = model_control_state(&ModelSelection::LaunchDefault, &models);
 
         assert_eq!(label, "Default model");
         assert!(enabled);
@@ -402,84 +329,16 @@ mod tests {
 
     #[test]
     fn a_failed_list_keeps_the_default_label_but_offers_nothing() {
-        let (label, enabled) = model_control_state(
-            &ModelSelection::LaunchDefault,
-            &ModelsState::Failed("no gateway".to_string()),
-            &[],
-        );
+        let models = ModelsState::Failed("no gateway".to_string());
+        let (label, enabled) = model_control_state(&ModelSelection::LaunchDefault, &models);
 
         assert_eq!(label, "Default model");
         assert!(!enabled);
     }
 
     #[test]
-    fn a_selection_names_its_own_model_and_is_pickable_while_choices_exist() {
-        let choices = vec![choice("Opus")];
-        let (live_label, live_enabled) = model_control_state(
-            &ModelSelection::Live(choice("Opus")),
-            &ModelsState::Loaded(choices.clone()),
-            &choices,
-        );
-        let (orphan_label, orphan_enabled) = model_control_state(
-            &ModelSelection::Launch(choice("Opus")),
-            &ModelsState::NotRequested,
-            &[],
-        );
-
-        assert_eq!(live_label, "Opus");
-        assert!(live_enabled);
-        assert_eq!(orphan_label, "Opus");
-        assert!(!orphan_enabled);
-    }
-
-    #[test]
-    fn a_session_whose_model_pi_never_confirmed_says_so() {
-        let choices = vec![choice("Opus")];
-        let (pending_label, _) = model_control_state(
-            &ModelSelection::LivePending,
-            &ModelsState::Loaded(choices.clone()),
-            &choices,
-        );
-        let (unavailable_label, _) = model_control_state(
-            &ModelSelection::LiveUnavailable,
-            &ModelsState::Loaded(choices.clone()),
-            &choices,
-        );
-
-        assert_eq!(pending_label, "Model");
-        assert_eq!(unavailable_label, "Model unavailable");
-    }
-
-    #[test]
-    fn the_default_row_is_named_rather_than_blank() {
-        assert_eq!(model_row_label(None), DEFAULT_MODEL_ROW);
-        assert_eq!(model_row_label(Some(&choice("Sonnet"))), "Sonnet");
-    }
-
-    #[test]
-    fn an_empty_fleet_says_there_is_nothing_to_pick() {
-        assert_eq!(machine_control_label("", "", &[]), NO_MACHINE_LABEL);
-    }
-
-    #[test]
-    fn an_unpicked_machine_with_candidates_invites_a_pick() {
-        assert_eq!(
-            machine_control_label("", "", &[candidate("exe-dev/vm")]),
-            CHOOSE_MACHINE_LABEL
-        );
-    }
-
-    #[test]
-    fn a_picked_machine_shows_the_fleets_label_for_it() {
-        assert_eq!(
-            machine_control_label("exe-dev/vm", "vm", &[candidate("exe-dev/vm")]),
-            "vm"
-        );
-    }
-
-    #[test]
     fn the_repo_control_names_the_folder_not_the_path() {
-        assert_eq!(repo_control_label(""), CHOOSE_REPO_LABEL);
-        assert_eq!(repo_control_label("/home/exedev/bloggy"), "bloggy");
+        assert_eq!(repo_control_label(None), CHOOSE_REPO_LABEL);
+        assert_eq!(repo_control_label(Some("/home/exedev/bloggy")), "bloggy");
     }
 }

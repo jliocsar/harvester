@@ -24,9 +24,18 @@ pub const DIALOG_METHODS: [&str; 4] = ["select", "confirm", "input", "editor"];
 
 pub const PI_EXTENSION_UI_RESPONSE: &str = "extension_ui_response";
 pub const PI_GET_AVAILABLE_MODELS: &str = "get_available_models";
-pub const PI_AGENT_SETTLED: &str = "agent_settled";
 
 pub const STAGED_FILE_SUFFIX: &str = "next";
+
+pub fn is_valid_session_id(candidate: &str) -> bool {
+    let alphanumeric = |character: char| character.is_ascii_alphanumeric();
+
+    candidate.starts_with(alphanumeric)
+        && candidate.ends_with(alphanumeric)
+        && candidate
+            .chars()
+            .all(|character| alphanumeric(character) || matches!(character, '.' | '_' | '-'))
+}
 
 const FINGERPRINT_CHUNK_BYTES: usize = 64 * 1024;
 
@@ -338,6 +347,17 @@ mod tests {
         let parsed = serde_json::from_slice(&frame).expect("a frame round-trips as JSON");
 
         (parsed, encoded)
+    }
+
+    #[test]
+    fn session_ids_are_path_safe_plain_tokens() {
+        assert!(is_valid_session_id("0198a2f1-4b3c-7def-8901-23456789abcd"));
+        assert!(is_valid_session_id("my.session_name-2"));
+        assert!(!is_valid_session_id(""));
+        assert!(!is_valid_session_id("../../escape"));
+        assert!(!is_valid_session_id("-leading"));
+        assert!(!is_valid_session_id("trailing_"));
+        assert!(!is_valid_session_id("two words"));
     }
 
     #[tokio::test]
@@ -1060,7 +1080,6 @@ mod tests {
     fn the_shared_pi_tokens_are_spelled_the_way_pi_spells_them() {
         assert_eq!(PI_EXTENSION_UI_RESPONSE, "extension_ui_response");
         assert_eq!(PI_GET_AVAILABLE_MODELS, "get_available_models");
-        assert_eq!(PI_AGENT_SETTLED, "agent_settled");
     }
 
     #[test]

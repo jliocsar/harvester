@@ -10,6 +10,7 @@ use tokio::process::Command;
 pub struct SshTarget {
     pub dest: String,
     pub port: Option<u16>,
+    pub options: Vec<String>,
 }
 
 const SSH_BASE_ARGS: &[&str] = &[
@@ -67,6 +68,10 @@ impl SshTarget {
             .arg("-o")
             .arg(format!("ControlPath={}", control_path.display()));
         command.args(extra_args);
+
+        for option in &self.options {
+            command.arg("-o").arg(option);
+        }
 
         if let Some(port) = self.port {
             command.arg("-p").arg(port.to_string());

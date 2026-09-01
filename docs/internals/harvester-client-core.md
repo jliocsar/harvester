@@ -143,532 +143,35 @@ and `mv`, so a truncated upload is never made executable or installed).
 
 ## crates/harvester-client-core/src/bridge.rs
 
-**Module shape and threading model.** The bridge is one background thread per
-machine, running a current-thread tokio runtime that owns that machine's
-daemon connection — this crate is tokio-based, but gpui's own executor has no
-tokio reactor, so the daemon connection has to live on a dedicated thread.
-Frontends talk to a bridge over tokio mpsc channels (reactor-independent, so
-awaitable straight from gpui tasks): commands go down each bridge's own
-sender, and events from every bridge come back tagged with the machine key on
-one shared channel. The module is deliberately gpui-free.
+The bridge is one long-lived Tokio task and one daemon connection per machine. All bridge tasks share the client runtime's current-thread reactor and remain GPUI-independent. `Command` is the runtime-to-bridge vocabulary; `EventSender` tags every event with the machine's bridge generation before it reaches `Fleet`. Pi commands and payloads remain `serde_json::Value`.
 
-`bridge.rs` is the whole of the bridge: the `Command`/`Event` contract a
-frontend codes against, the thread and its `tokio::select!` loop, the router
-(`dispatch`) that turns one command into one spawned flow, and the flows
-themselves (see Flows below) — one straight-line async future per command, so
-responses resolve at their await points and there is no response-routing state
-machine anywhere in the crate. That is *why* the select loop can stay a pure
-router — see `dispatch`'s note below. One piece stays deliberately factored
-out as the module's one submodule:
-- `attach_window` — the live events held back between `attach` landing and
-  `Event::Attached` publishing; pure, synchronous, and tested standalone. Its
-  purity and isolation are a documented design property, which is why it
-  survives as a separate file while the former `bridge/mod.rs` and
-  `bridge/flows.rs` were folded into `bridge.rs`.
+`attachments` is keyed by sid. Each `Attachment` owns its attachment generation and `get_entries` cursor, so one machine may keep multiple Pi rooms attached concurrently. `Open` and `StartSession` install the runtime-supplied generation; prompt, stop, dialog and generic Pi commands check that generation before crossing the daemon connection. `RoomJoined`, `RoomLeft`, replay, live Pi, exit, operation and prompt outcomes echo it. The runtime performs the second generation check before mutating a replica.
 
-**`Command` (UI → bridge).** A command answered by exactly one event carries
-a `RequestToken` that the answering event echoes (docs/SPEC.md §Decisions,
-C2). `Open`, `StartSession`, and `Prompt` carry no token: they have no single
-reply — what they produce is the session's own event stream, keyed by sid,
-which outlives the request that started it.
-- `Open`: `create_session` (resume-or-create, idempotent for an
-  already-running sid) then attach. Deliberately carries no "is it running"
-  flag — the daemon owns that truth, and any client-cached copy goes stale
-  the instant a session exits while the client is detached. Ends in
-  `Event::Attached` or a failure event.
-- `StartSession`: turns an unstarted chat into a real session (SPEC §Flows
-  "Start session"): `create_session` → `attach` → first prompt, all riding
-  pi's in-order stdin queue, no readiness probe needed. Ends in
-  `Event::Attached` with empty entries (session is brand new) or a failure
-  event.
-- `ListModels`: daemon `list_models`, uncached — costs a real pi startup.
-  Answered by `Event::ModelsListed`. Deliberately *not* folded into
-  `PiRequest`: it is a harvester command to the daemon's throwaway
-  `--no-session` pi, not a passthrough scoped to a running session, so it has
-  no sid to carry. Use `PiRequest` instead for a session that is already
-  running — `get_available_models` works against a live pi and costs
-  milliseconds instead of a process start.
-- `PiRequest { sid, cmd, token }`: the one session-scoped round trip. `cmd` is
-  a pi command verbatim (`get_available_models`, `get_state`, `set_model`,
-  `get_session_stats`, `set_session_name`, `set_thinking_level`, `compact`, …)
-  and the bridge neither reads nor rewrites it beyond echoing its `type` back
-  as `method`. Answered by `Event::PiAnswered`. This replaced three typed
-  commands (`ListSessionModels`/`GetSessionState`/`SetModel`) that were each a
-  variant, an identically shaped event and a one-line flow over
-  `pi_flow_result` — a typed shadow of an untyped thing, in a crate whose
-  whole rule is that the client speaks Pi. Every further pi command is now
-  zero bridge code.
-- `Stop`: runs the daemon's stop ladder (pi `abort`, then stdin EOF, then a
-  SIGKILL backstop). The session file survives, and the same sid resumes
-  through `Open` — this is a reap, not a delete. Carries no token because the
-  reply is not the outcome: `stop` answers `{"stopping": true}` the instant
-  the ladder starts, and the authoritative completion signal is
-  `Event::SessionExit`, which the daemon may deliver *before* that reply
-  since events and responses travel independent paths (docs/DAEMON.md
-  §stop).
-- `AnswerDialog`: passthrough `extension_ui_response`. Carries no token
-  because there is nothing to correlate: pi resolves an
-  `extension_ui_response` with `null`, and the daemon replies the same way
-  for a dialog id it has already retired — success and "answered too late"
-  are indistinguishable by design (docs/DAEMON.md §Dialogs).
+Attachment transitions use the persistent `attachment_changes` map of sid to async mutex. Open/start/repair for the same sid serialize, preventing a repair detach from racing a replacement generation. Different sids use different mutexes and therefore do not make a slow history fetch on one session block another session on the machine. Entries intentionally remain in this lock map for the bridge lifetime: deleting a key while an old flow retains its `Arc` could create two locks for one sid.
 
-**`Event` (bridge → UI).** Pi payloads stay verbatim `Value` — the client
-speaks Pi. An event answering a command echoes that command's `RequestToken`;
-where a session-scoped answer also carries `sid`, that `sid` is routing (which
-chat renders it), not correlation. Everything else is unsolicited (connection
-lifecycle, the session event stream) and carries no token.
-- `Attached`: a session was opened — attach completed and history was
-  replayed via passthrough `get_entries`, with `entries` being pi's list
-  verbatim. This is the frontend's cue to *create* the chat for `sid`.
-- `AttachmentLeft`: this bridge successfully detached from its previous
-  session. Emitted before the flow creates or attaches its replacement, so
-  frontend state tied to that exact attachment room can retire immediately.
-- `HistoryReplaced`: the same `get_entries` snapshot as `Attached`, but as a
-  repair after events were lost (a daemon `event_gap`, or the attach window
-  itself overflowing) for a session the frontend already has a chat for.
-  Split from `Attached` because the two mean different things and conflating
-  them was a real bug: rebuilding the chat entity on a repair is what let a
-  late resync clobber the chat on screen. A `HistoryReplaced` should replace
-  the existing chat's entries; if there's no chat for `sid`, ignore it — the
-  bridge only ever repairs the session it is attached to.
-- `HistoryExtended`: the cheap repair variant — `entries` are only those
-  *after* the cursor the last fetch left (docs/SPEC.md C6), so they extend
-  the frontend's replica rather than replacing it. Same "ignore if no chat"
-  rule as `HistoryReplaced`. The frontend must drop whatever it built from
-  live events before applying these: live events carry no entry ids, so the
-  delta is the authoritative account of the very span the frontend was
-  guessing at while attached. `Transcript::extend_history` encodes this rule
-  once.
-- `Pi`: one live pi event for an attached session, verbatim.
-- `RequestFailed`: a request failed daemon- or pi-side. Statusbar material —
-  the connection itself is still healthy.
-- `PromptFailed`: the prompt for `sid` never reached pi (the daemon or pi
-  refused it, or the connection broke under it). Sid-scoped rather than
-  machine-scoped because the damage is sid-scoped: the frontend already
-  rendered that prompt and raised its busy indicator, and only the chat
-  showing `sid` can end that turn and say why. The machine-wide
-  `RequestFailed` it used to ride mapped to a start-phase reset, which is a
-  no-op on a live session — the prompt sat there forever with a spinner. The
-  flow also logs the detail to stderr, since the only UI for it is one chat
-  that may no longer exist.
-- `ModelsListed`: answers `ListModels`; pi's `data` verbatim (the client
-  speaks Pi — the workbench extracts what its picker renders). Errors render
-  inside the unstarted chat, not the statusbar.
-- `PiAnswered { sid, token, method, result }`: answers `PiRequest`. `result`
-  is pi's `data` verbatim on success and pi's own error string on failure.
-  `token` is the correlation (the asking control's slot rejects anything
-  else); `sid` is routing (which chat renders it). `method` is the `type`
-  field of the `cmd` that was sent, echoed by the one generic flow, and it
-  exists for the consumer that is *not* the asking control: the statusbar
-  reports a failed `set_model` no matter which chat asked, and re-deriving
-  that from the token alone would mean re-typing the command the frontend
-  just erased. Empty when the command carried no `type` — a malformed request
-  nobody can build from the app today.
+An attach registers its `(sid, generation)` replay window before sending daemon `attach`, then fetches full history, emits `Attached`, records `leafId`, and flushes held live events. A malformed success without an `entries` array is a history failure, never an authoritative empty transcript. `Attached.history_available = false` establishes the live room while instructing the runtime to retain any reconnect replica. The bridge reports `OpenHistory` failure and schedules repair.
 
-**`BridgeContext` fields and their invariants.**
-- `attached: Arc<AsyncMutex<Option<Attachment>>>` — the one session this
-  bridge is attached to (single chat pane per bridge), together with that
-  session's replay cursor. The *async* mutex also *serializes* attachment
-  changes: a second `Open` waits out the first flow rather than interleaving
-  with it.
-- `attach_buffers` — live events held back while an attach flow is still
-  fetching history (see `attach_window.rs`).
-- `resyncing: Arc<Mutex<HashSet<String>>>` — sessions with a repair already
-  in flight, so a burst of gaps costs one `get_entries` rather than one per
-  gap.
+After a direct `agent_settled`, the bridge registers a replay window before forwarding the boundary to the runtime, then fetches `get_entries {since}`. This makes persisted history authoritative and bounds the raw live suffix without letting a queued next turn slip between settlement and window registration. A settlement already held by another replay window schedules one follow-up sync after that window flushes.
 
-`Attachment { sid, cursor }` is one cell, not two. The cursor is pi's
-`leafId` from the last `get_entries` (docs/SPEC.md C6) and there is only ever
-one, because one bridge holds exactly one attachment. Keeping it *inside* the
-attachment is what makes the two rules structural instead of remembered: a
-cursor cannot outlive the session it was fetched for (dropping the attachment
-drops it), and it cannot be written for a session that is no longer attached
-(there is no slot to write into). This replaced a second
-`Arc<Mutex<Option<SessionCursor>>>` whose `SessionCursor` re-carried the sid
-so the two cells could be compared against each other by hand on every read
-and every write.
+Daemon `event_gap` and attach-window overflow use the same repair. `ResyncGuard` admits one repair per `(sid, generation)`. Repair marks the lifecycle observable, takes the sid lock, verifies ownership on every retry, detaches, registers a fresh replay window, reattaches, tries `get_entries {since: leafId}`, and falls back to a full `get_entries` for any delta error. A successful delta emits `HistoryExtended`; a full fetch emits `HistoryReplaced`. Cursor reads and writes are generation-filtered. Live events held after the selected snapshot are then delivered in order. Dialog room leave/join events surround detach/reattach so obligations cannot outlive daemon room ownership.
 
-The two cells were also a lock-ordering question nobody wanted to have to
-answer. There is now one lock on this path: no flow holds the attachment
-guard across a cursor read or write, because reading and writing the cursor
-*is* taking that guard.
+Prompt delivery has its own exactly-once arbitration. `spawn_prompt_flow` registers `SubmissionId -> (sid, generation)` before spawning the Pi request. Pi success or failure removes that registration before emitting `PromptDelivered` or `PromptFailed`. Connection loss atomically drains the same map and emits failures before `Disconnected`; a response task that wakes later finds no registration and emits nothing. This ordering lets the runtime distinguish bridge queue acceptance from Pi acceptance and prevents disconnect/response races from restoring a prompt Pi accepted.
 
-**Bridge main loop notes.**
-- The sidebar renders from `sessions_flow`, so it's fired immediately on
-  connect.
-- In the `tokio::select!` loop: a `None` from the command channel means the
-  UI dropped the bridge — dropping the `client` tears down the connection and
-  any ssh forward. A `None` from `session_events` means the client itself
-  stopped, so this bridge is done; there's no attachment left to explicitly
-  forget because this whole context (and its daemon client) dies with the
-  loop.
-- `EventGap` is recovered in the backbone, not the UI: refetch the history
-  that was just lost and republish it through the same events every frontend
-  already knows how to render (`HistoryReplaced`/`HistoryExtended`).
-- `dispatch`: every command is its own spawned straight-line flow so the
-  select loop above never itself awaits on the daemon — event forwarding
-  therefore cannot stall behind a slow command.
-- `handle_pi_event`: dialog requests ride this same path as any other pi
-  event — answering a dialog is the frontend's obligation now (docs/SPEC.md
-  C5), and the bridge's only job is to put the question in front of it
-  unaltered.
-- Reading a pi payload's `type` is written `get("type").and_then(Value::as_str)`
-  everywhere, inline, with no crate-local helper. There used to be two
-  spellings of it here — a private `pi_event_type` in this module and a
-  `string_field` in `dialog.rs` returning the same read owned rather than
-  borrowed — while fifteen other sites across the workspace used the plain
-  idiom anyway. A wrapper that saves no lines is one more name a reader has
-  to look up; the std vocabulary is already the majority and is now the only
-  one.
+`StartSession` uses daemon `create_session` with a generated uuidv7 sid, attaches, publishes the empty optimistic replica without replacing its first prompt, then enters the same registered prompt flow. Create remains resume-or-create. The bridge never sends Pi session-switching commands. Stop delegates to the daemon stop ladder; no client layer signals Pi.
 
-### Flows
+`fetch_entries` accepts a nullable or absent `leafId`, but requires `entries` to be an array. Unknown future entries and live events are not interpreted here. The only Pi response fields the bridge reads are `success`, `error`, `data`, and the `type` needed to echo a generic request method.
 
-One straight-line async flow per command, plus two the bridge starts on its
-own (the initial `sessions_flow` list_sessions, and `resync_flow` after
-events are lost). Every flow publishes exactly one outcome — an `Event` the
-frontend renders, or a `RequestFailed` via `report_failure` — and none of them
-return a value; spawning a flow is fire-and-forget.
+`DISCONNECTED_PROMPT_DETAIL` is the stable local diagnosis for a submission whose bridge died before one Pi outcome won. `UNKNOWN_PI_ERROR` is used only when a failed Pi response omits its error string.
 
-`UNKNOWN_PI_ERROR` is the stand-in detail for a pi response that says
-`success: false` without saying why — a contract violation on pi's side, but
-one that must still produce a sentence rather than an empty error string.
-
-**`attach_session`.** The spine both entry points share: take the `attached`
-guard, leave the previous session, create-or-resume, register the attach
-window, attach. It hands back the `AttachRegistration` on success and `None`
-on any failure — each failure already published its own `RequestFailed`, so
-the caller has nothing to add. Extracted because `open_flow` and
-`start_session_flow` had drifted into two copies of it that differed only in
-which `create_session` fields they filled in; a fix to the ordering rules
-below had to be made twice, which is exactly how the ordering rules get
-broken. The guard is dropped when this helper returns, so both flows now
-publish their snapshot event outside the attachment lock — previously only
-`open_flow` did. The `create_session` fields ride in as one `NewSession`
-value rather than positional arguments, because three adjacent
-`Option<String>`s (provider, model, name) were transposable at a call site
-with no compiler to catch it — both callers now spell the fields by name.
-
-**`WindowFlush`.** The shared vocabulary for "what did releasing an attach
-window find": `Delivered` (the held events are out, nothing further owed) or
-`Overflowed` (events were lost, a resync is owed). `deliver_buffered_events`
-and `replay_history` both answer in it; it replaced two bare `bool`s whose
-polarity was recorded only here, and it lets `resync_flow`'s loop read as a
-`match` instead of stacked negations.
-
-**`open_flow`.** `Open`'s implementation: create-or-resume, then attach.
-Resume is the *same call* as create (per DAEMON.md), and it's idempotent for
-an already-live session, so this one chain correctly covers a running
-session, an exited one, and one that died while the client was detached —
-with no client-side "is it running" state that could go stale. Follow-up
-requests queue on pi's stdin in order, so no readiness probe is needed after
-attach.
-
-Sequencing details that are load-bearing, not incidental (the first two now
-live in `attach_session`, which is what makes them true of both flows):
-- The `AttachRegistration` is created *before* the attach request goes out,
-  not after — the daemon streams events from the moment `attach` lands, and
-  `Event::Attached` is a whole `get_entries` round trip later. Registering
-  early is what closes the window; registering late would miss the same
-  events it exists to catch.
-- The async `attached` mutex guard is dropped as soon as the attachment
-  transition itself is done, before `get_entries` runs: an async mutex should
-  cover a state transition, never a remote call. Holding it across
-  `get_entries` used to let one wedged pi block every later `Open` on this
-  bridge for the life of the app.
-- History replay order is attach → `get_entries` → live events
-  (DAEMON.md §attach) — deliberately not reorderable.
-
-**`resync_flow`.** Handles both the daemon's `event_gap` and the bridge's own
-attach-window overflow with the same `get_entries` cure, since they're the
-same underlying situation (events lost, need a fresh source of truth). It
-registers its *own* attach window — a resync that let events arrive
-unbuffered during its own fetch would reintroduce exactly the hole it exists
-to close. It deliberately declines to do two things it used to do: repair a
-session nobody is watching, and run two concurrent repairs for the same
-session (guarded by `ResyncGuard`/`resyncing`). The
-retry-on-overflow is a `loop`, not a respawn, because the retry belongs to the
-claim this flow already holds; it can in principle overflow again, but that
-would require the session to outrun the cap on every single attempt — the
-daemon's own ring buffer in front of the bridge is the narrower bound in
-practice.
-
-The `attached` check sits at the *top of the loop*, not at the flow's
-entry: an overflow retry can start arbitrarily long after the entry check,
-and by then the pane may have moved to another session — the retry would
-then refetch a session nobody watches and publish history for a detached
-sid. Checking per iteration costs one uncontended lock and makes "only the
-attached session is worth repairing" true for every iteration rather than
-only the first.
-
-A *failed* repair still flushes the attach window before returning. The
-window was registered for the duration of the fetch, so the live events that
-arrived during it are sitting in the buffer with nobody but
-`AttachRegistration::drop` to reach them — and dropping them was pure loss,
-because no snapshot replaced them. Those events are still valid and still
-the only account of what happened: a discarded `tool_execution_end` leaves a
-tool card spinning on screen forever, which is the exact loss class the
-attach window exists to prevent (docs/SPEC.md, "any doubt → refetch"). The
-`RequestFailed` for the failed repair — published here, by `repair_history`'s
-one caller — remains the user-visible signal that the repair itself did not
-land.
-
-**`repair_history`.** Implements docs/SPEC.md C6: a delta refetch when this
-session left a cursor, a full refetch otherwise — so a long-lived session
-repairs by fetching only the handful of entries it missed rather than its
-whole history. It returns `Result<(), String>` and never publishes its own
-failure — `resync_flow`, the one caller, does the `report_failure`, so "who
-publishes the failure" has exactly one answer. A failed delta silently falls
-back to a full refetch instead of being reported as an error: the cursor has one specific documented failure
-mode — pi answering `Entry not found: <since>` for an id that compaction
-retired — and starting over is the documented cure. Matching pi's error text
-to special-case that would be the narrower, more brittle check; falling back
-unconditionally is less code and produces the same answer, because a fetch
-that fails for any other reason fails again on the fallback and is reported
-there.
-
-**`fetch_entries`.** One `get_entries` call, with or without a `since`
-cursor, returning pi's entries plus the `leafId` that becomes the next
-cursor. Per HARNESS_RESEARCH.md, "an entry id works as a durable cursor …
-even across client restarts."
-
-**`cursor_for` / `record_cursor`.** Both are a single guarded read of
-`attached`, filtered by sid. Read: the cursor of the attachment, if the
-attachment is still this session's; a fetch that returned no `leafId` leaves
-`cursor: None`, and the next repair for that session simply refetches whole,
-which is always correct and never worse than guessing wrong. Write: store
-into the attachment, if the attachment is still this session's.
-
-The rule "a stale flow must not spend the new session's cursor slot" is now
-structural rather than enforced. There is no free-floating slot to claim: a
-resync that finishes after the pane has moved on finds a different sid on the
-attachment and writes nothing, and when the attachment is replaced its cursor
-goes with it, so nothing can be inherited across a session swap either. This
-used to be a hand-written compare-and-set of one shared cell against another
-— `record_cursor` re-read `attached` to decide whether the cursor cell was
-still its to write — and the failure it prevents is real: without the gate the
-new session's next repair spends a foreign cursor, self-healing (pi answers
-`Entry not found` and the fallback refetches whole) but a wasted round trip
-born of a slot nobody owned. `is_attached` remains the shared one-line
-predicate for the resync loop's per-iteration check.
-
-**`ResyncGuard`.** RAII guard enforcing "one repair per session at a time",
-for the same reason `AttachRegistration` is RAII: a flow that returns early —
-or gets cancelled — while still holding a claimed sid would block every later
-repair for the life of the bridge, which is strictly worse than the duplicate
-work the guard prevents.
-
-**`forget_attachment`.** Runs when a pi exits: a pi that exited took its
-attachment with it. Without this, the bridge kept believing it was still
-attached, and the next `Open` sent a `Detach` for a session whose pi is
-already gone — which fails and surfaces to the user as a statusbar error for
-an action they never took.
-
-**`replay_history`.** The opening-fetch counterpart to `repair_history`: seeds
-a chat with a session's whole history because there's no cursor to work from
-yet (nothing has been fetched for this session before). Returns
-`WindowFlush::Overflowed` when events were lost anyway during the fetch and a
-follow-up repair is owed. A failed opening fetch reports its own failure and
-answers `Delivered`: no chat was created, the dropped registration reopens
-the live stream, and nothing further is owed to the caller.
-
-**`deliver_buffered_events`.** Releases the attach window the instant the
-frontend has a chat to put events into. There is no `await` between sending
-the snapshot event and this call, so no live event can slip in ahead of the
-events the window held back. `WindowFlush::Overflowed` means the snapshot
-just published is already stale — deliberately reusing the daemon's own
-`event_gap` vocabulary/semantics rather than inventing a second recovery
-concept.
-
-**`start_session_flow`.** `StartSession`'s half of `attach_session` plus the
-first prompt. `Attached` publishes with empty entries since the session
-file is brand new — there is no history to fetch. It still comes back from
-`attach_session` holding an `AttachRegistration` even though the window will
-be empty in practice, purely so that "events between attach and `Attached`
-are held" remains a property of every attach path, not an accident specific
-to `open_flow`. The chat is moved
-into live state immediately after attach (no waiting on the prompt): the
-prompt's queued-ack rides its own flow and only rejection there is notable.
-Correspondingly there's no cursor recorded here — the session file is brand
-new, so the first repair (if any) will fetch it whole anyway.
-
-**`detach_previous`.** One chat pane implies one attachment: leaving the
-previous session is what stops the daemon from streaming events nobody
-renders. A refused detach aborts the whole transition and preserves the
-previous attachment rather than proceeding — proceeding anyway would leave
-two rooms attached daemon-side while the bridge's own bookkeeping remembered
-only the replacement.
-
-**`prompt_flow`.** Sends `{"type": "prompt", ..., "streamingBehavior":
-"steer"}` through `pi_flow_result` and discards the `data` it returns.
-Acceptance means queued, not completed — progress arrives separately as
-events, so only rejection here is notable, which is why the shared helper's
-`Ok` half is dropped rather than read. Rejection publishes
-`Event::PromptFailed` (sid-scoped), *not* `RequestFailed` (machine-scoped):
-the frontend rendered this prompt and raised a busy indicator for it before
-the flow ran, and only the chat holding that sid can retire them. It also
-goes to stderr, because that chat may have been closed in the meantime and
-a lost prompt is worth a line either way. `streamingBehavior`
-is mandatory in practice, not just documented: pi rejects a prompt outright
-while it's mid-stream unless this field is given (verified against
-`agent-session.ts`, pi 0.83.0) — without it, every prompt typed mid-turn
-would silently be dropped. `"steer"` specifically matches what pi's own
-interactive mode does with a mid-turn message; pi ignores the field entirely
-when the session is idle, so it's always safe to send.
-
-**`stop_flow`.** Hands the session to the daemon's stop ladder and stops
-caring. Nothing is published here on success: the reply only confirms the
-ladder started, and the outcome the frontend actually renders
-(`Event::SessionExit`) arrives on the session stream, possibly *before* this
-response returns (DAEMON.md §stop) — publishing anything from this flow would
-be a second, earlier, and less true account of the same fact. There is
-deliberately no explicit detach here either, because the resulting session
-exit already runs `forget_attachment`.
-
-**`answer_dialog_flow`.** The client's half of the dialog contract: with a
-client attached, the daemon forwards rather than auto-cancels, so pi stays
-blocked until this lands (docs/DAEMON.md §Dialogs). Deliberately does *not*
-use `pi_flow_result`, because that helper interprets `success`, and the
-daemon answers every `extension_ui_response` with a bare `null` regardless of
-whether it actually forwarded the answer or dropped it as too late — reading
-a verdict out of that `null` would falsely report a failure for every dialog
-answered normally. Only a transport-level error means anything here, so only
-that is reported.
-
-**`pi_request_flow`.** The whole implementation of `Command::PiRequest`: run
-the verbatim `cmd` through `pi_flow_result` and publish `Event::PiAnswered`
-with the same sid, the same token, and the command's own `type` string, so no
-other layer has to re-type the command it just sent. It is the only place in the bridge
-that inspects a pi payload's contents at all, and it inspects exactly one
-field it then copies verbatim.
-
-**`pi_flow_result`.** Shared helper turning a pi command into the `Result`
-that picker/statusbar-facing events carry: `data` verbatim on success, pi's
-error string otherwise. Every flow that wants a verdict out of pi goes
-through it — `fetch_entries`, `pi_request_flow` and `prompt_flow` — so
-`pi_success`, `pi_error` and `UNKNOWN_PI_ERROR` have exactly one reader.
-`answer_dialog_flow` is the one deliberate exception, for the reason given
-above.
-
-### Test harness
-
-`Harness` wires a `BridgeContext` to a fake daemon over
-an in-memory `tokio::io::duplex` pair — this is the whole reason
-`DaemonConnection` stopped being hardwired to `UnixStream`.
-
-Recorded regression coverage (why these tests exist, not just what they
-assert):
-- A session that exited must not be detached from on the next `Open` — the
-  bridge used to remember an attachment forever (cleared only by
-  `detach_previous`), so opening a second session after the first one's pi
-  exited sent a `Detach` for an already-dead sid, surfacing the daemon's
-  refusal to the user as a statusbar error for an action they never took.
-- Forgetting an attachment on exit must be scoped to the session that
-  actually exited, or one chat pane can silently end up with two live
-  attachments.
-- A gap for a session nobody is watching must cost nothing — `event_gap`
-  handling used to spawn a full `get_entries` without consulting `attached`,
-  so unwatched sessions still paid for a history refetch.
-- A burst of `event_gap`s must cost exactly one refetch, not N concurrent
-  ones.
-- A repair must publish as its own event (`HistoryReplaced`), not reuse
-  `Attached` — `Attached` means "create the chat", conflating the two let a
-  late-landing resync clobber the chat already on screen.
+Focused fake-daemon tests drive list/open/attach, failed history and repair, multiple attached sessions, independent sid locks, delta/full repair behavior, prompt acknowledgement and disconnect arbitration, generation-scoped removal, and stale cursor rejection.
 
 ## crates/harvester-client-core/src/bridge/attach_window.rs
 
-**Purpose.** Buffers the live events a session emits between its `attach`
-landing daemon-side and its history reaching the frontend. The daemon starts
-streaming a session's events the instant `attach` lands (docs/DAEMON.md
-§attach — deliberate daemon behavior, not something this client can or should
-reorder), but the frontend has nowhere to put those events until
-`Event::Attached` publishes the `get_entries` snapshot one round trip later.
-An event arriving in that window is missing from the snapshot *and* would be
-dropped by the frontend if delivered live — concretely, a lost
-`tool_execution_end` leaves a tool card spinning for the life of that chat,
-because streaming text self-repairs (on pi 0.83 every `message_update`
-carries the whole partial; on every version `message_end` is authoritative)
-but tool-end events do not. Hence the bridge holds that window back and
-flushes it right after the snapshot.
+This pure synchronous module closes the attach snapshot/live race. `AttachRegistration` is an RAII owner for one `(sid, generation)` buffer registration. Dropping a cancelled or failed flow removes only that owner; flushing removes the shared entry and gives exactly one concurrent attach flow the buffered result.
 
-Everything in this file is pure and synchronous by design — no daemon, no pi,
-no async runtime — specifically so it is the one piece of the whole fix that
-can be unit-tested in isolation (see the test module).
+`ATTACH_EVENT_BUFFER_CAP = 1024` bounds only the temporary replay window, not the runtime's raw live-event retention. At the cap, the buffer becomes `Overflowed` and stops pretending it has a complete sequence. Flushing overflow schedules generation-correlated history repair. A custom `LF`-independent structure is unnecessary here because values have already crossed JSONL framing.
 
-**`ATTACH_EVENT_BUFFER_CAP = 1024`.** How many live events one session may
-hold back while its history fetch is in flight. Chosen as generous headroom,
-not a tuned limit: a `get_entries` round trip is on the order of
-milliseconds, and pi emits only a few events per second, so 1024 is orders of
-magnitude more than should ever be needed. The cap exists purely so a wedged
-fetch can't grow an unbounded `Vec`.
-
-**`PushOutcome`** — what the select loop should do with a live event it just
-offered to the buffers: `Deliver` (no flow is holding this session back —
-send it live), `Buffered`, `Overflowed` (the cap was just hit on this event —
-the held events are dropped and the session is marked for resync; this is the
-one outcome worth a stderr line), `Discarded` (already overflowed —
-everything after the trip point is dropped on the floor because the
-resulting resync is authoritative anyway, so re-holding events is pointless).
-
-**`FlushOutcome`** — what an attach flow finds waiting once `Attached` is
-about to be published: `Events` (deliver these, in arrival order, before
-anything else) or `Overflowed` (events were lost, so the snapshot just about
-to be published is already stale).
-
-**`AttachEventBuffers::register`.** Idempotent by design: a resync racing an
-already-in-flight open joins the window that flow already registered rather
-than resetting it — resetting would discard everything held so far for that
-race loser's benefit, silently reintroducing the exact gap the mechanism
-exists to close.
-
-**`AttachEventBuffers::flush` returning `Events(vec![])` for an absent
-session** is not an error path: it means another flow for the same sid
-already flushed first, its events are already out, and its own `Attached`/
-repair event already seeded the chat — so there's nothing left owed to this
-caller.
-
-**`AttachRegistration`.** RAII guard owning one session's registration for
-the length of an attach flow. RAII specifically because the ways a flow can
-exit early outnumber the way it completes normally — a failed attach and a
-failed `get_entries` both return early — and a registration that outlived its
-owning flow would silently swallow that session's live events for the rest of
-the bridge's life, which is strictly worse than the buffering gap this whole
-mechanism exists to close. Same defensive shape as `PendingRequestGuard`
-and `Forward` in `connection.rs` elsewhere in this crate — a recurring
-pattern worth recognizing.
-- Must be constructed *before* the `attach` request is sent, not after: the
-  daemon's event stream starts the moment `attach` lands, not when its
-  response comes back to the client.
-- `flushed: bool` field exists because `flush()` already removed the buffer
-  entry from the map; without tracking that, a `Drop` running after a
-  same-sid *re-registration* (e.g. a resync racing right behind a flush)
-  would wipe a window it no longer owns, belonging to someone else's
-  in-progress registration.
-
-**Test coverage worth knowing about (regression intent, not just assertions):**
-- Order of flushed events is asserted explicitly because a `tool_execution_end`
-  only mutates an already-existing block rather than being self-contained —
-  delivering it out of order relative to `tool_execution_start` breaks
-  rendering, so arrival order is a real invariant, not incidental.
-- A dropped (never flushed) registration must reopen the live stream — this
-  is the concrete failure mode a failed attach or failed `get_entries` must
-  not trigger: an early return must not leave the session's events
-  permanently buffered.
-- Overflow test: the event that trips the cap is the only one that logs
-  `Overflowed`; everything after is `Discarded` silently, and the eventual
-  flush reports `Overflowed` — mirroring the daemon's own `event_gap`
-  semantics rather than inventing a parallel concept.
-- A flushed registration's `Drop` must not wipe a subsequent same-sid
-  registration's window (the `flushed` flag's whole reason to exist).
-- A second registration joining a window already in flight (open racing a
-  resync) means the "loser" of the race owes nothing on its own flush — the
-  winner already delivered everything.
-
-### Recorded follow-up
-
-None — no unresolved TODOs or deferred decisions were embedded as comments in
-the bridge's sources (now `bridge.rs` plus this file); every comment either
-explained current, intentional behavior or documented a past bug being guarded
-against by a test.
+Owner ids and attachment generations use checked increment rather than wrapping. `BufferKey` includes generation, so a stale registration cannot flush or remove a replacement attachment's events. Unit tests cover ordering, overflow, duplicate owners, RAII cleanup and stale-generation isolation.
 
 ## crates/harvester-client-core/src/connection.rs
 
@@ -879,157 +382,13 @@ drives its tests with, so they cannot narrow to private.
 
 ## crates/harvester-client-core/src/dialog.rs
 
-### The pi wire shape (pinned to pi 0.83.0)
+`DialogRequest` parses Pi's blocking `extension_ui_request` methods named by the shared protocol dialog-method set. The raw request id is retained; only the fields required to render and answer confirm/select/input/editor are extracted. Unknown or malformed requests are not invented into answerable dialogs.
 
-Pi's dialog vocabulary: the four blocking questions an extension can raise, and
-the three answer shapes. This is the one place in the client that reads a
-dialog payload's shape — everywhere else the client speaks Pi verbatim, but a
-modal has to know whether to draw a list, a yes/no, or a text box, and that
-decision is pi's wire format, not a rendering choice. Keeping the parsing here
-(instead of the gpui crate) lets the vocabulary be tested without a window.
+`DialogObligations` is window-free runtime state. Active rooms are a `HashSet<SessionKey>`, so every attached session on every machine may hold its own queued obligations. The global `VecDeque` gives Root's one modal surface a deterministic FIFO. Identity is `(SessionKey, dialog id)`; duplicate replay is ignored.
 
-**Pi-version-coupled**: pi 0.83.0, `dist/modes/rpc/rpc-types.d.ts:385-455`.
-Two shape facts are easy to get wrong and are the reason this module exists:
+`enter_room` and `leave_room` follow bridge `RoomJoined`/`RoomLeft`. Leaving one room removes only that session's obligations; `leave_machine` removes only rooms and obligations on that machine. `answer_front` requires the exact `DialogKey`. The runtime records one in-flight answer per key and retires the local front only after Pi acknowledges success; rejection preserves the obligation and emits `DialogAnswerFailed` so the presenting window can reopen it for retry.
 
-- Both request and response envelopes are **flat**. There is no `params`
-  object — `title`, `options`, `message`, etc. sit beside `type`/`id`/`method`
-  because pi spreads the request into the envelope (`rpc-mode.js:76`).
-- The answer field is **not** called `response`. It is `value` (a string — for
-  `select` the option's *text*, never its index), `confirmed` (a bool), or
-  `cancelled: true`. Pi reads these fields in that priority and a second field
-  present alongside would be silently ignored (`rpc-mode.js:83-85`), so
-  `DialogAnswer::to_response` sets exactly one.
-
-`DIALOG_METHODS` (`select`, `confirm`, `input`, `editor`) are the
-`extension_ui_request` methods that actually block pi until answered. The list
-lives in `harvester-proto`, not here: `harvesterd`'s dialog module decides
-from the same list whether a dialog is *held open*, and this module decides
-whether one is *rendered*. They are not two lists that happen to match — they
-are one list the protocol requires to match, and a byte-identical copy on each
-side of the daemon seam meant a future pi adding a fifth blocking method could
-teach one side and not the other, parking a dialog nobody can answer while pi
-blocks forever. A proto test pins the contents. `PI_EXTENSION_UI_RESPONSE` is
-in proto for the same reason — the daemon's dialog policy and
-`DialogAnswer::to_response` have to spell the answer envelope's `type`
-identically. The
-fire-and-forget UI methods (`notify`, `setStatus`, `setWidget`, `setTitle`, …)
-are forwarded to the client but never answered — `DialogRequest::parse`
-returning `None` for them is what keeps a response off the wire for an id pi
-is not waiting on. Sending an answer for a non-blocking method would be a
-response to nothing.
-
-`DialogRequest.id` is pi's dialog id, echoed back verbatim in the answer — the
-only correlation there is, since a response carries no `method`.
-
-`DialogKind::Editor` is unique among the four: pi gives it **no timeout and no
-abort path** (`rpc-mode.js:173-192`), so an unanswered editor dialog blocks the
-extension for the life of the process. Nothing rescues it but an answer — this
-is why the client must never leave a dialog unanswered (see docs/DAEMON.md
-§Dialogs).
-
-A missing `title` on a request is not treated as fatal — the dialog still
-blocks pi regardless, so showing it untitled beats leaving it unanswerable.
-
-Pi omits absent optionals rather than sending `null` (it serializes with
-`JSON.stringify`), so "absent" and "null" collapse to the same `None` when
-reading fields like `placeholder`/`prefill`. Those reads are written inline as
-`get(field).and_then(Value::as_str)` — the crate-wide spelling; the local
-`string_field` helper that used to wrap them is gone (see `bridge.rs`, "reading
-a pi payload's `type`").
-
-`DialogAnswer::Cancelled` corresponds to Escape, or to a dialog Harvester could
-not render — identical in effect to a human dismissing the dialog in pi's own
-TUI. For `confirm` specifically, pi has no distinct cancellation shape: a
-cancelled confirm resolves to `false`, the same outcome as `confirmed: false`
-(`rpc-mode.js:84`). That equivalence is what lets the modal map Escape onto
-"No" for confirm dialogs — the one dialog kind where dismissing counts as a
-real answer rather than a refusal to answer.
-
-### The obligation room and its FIFO
-
-This was `dialog_obligation.rs` until it folded in here — the dialog
-vocabulary and the obligation state machine over it are one file now.
-
-Client-side state machine for dialogs forwarded by the daemon while a client
-is attached (pi stays suspended until answered). This module is deliberately
-window-free — a GPUI modal is only an adapter over the "front obligation".
-
-Core invariant: **empty-room cancellation is daemon policy, not client
-policy.** Leaving a room here only retires the client's *view* of questions
-the daemon has already cancelled (or is about to); this module never
-manufactures a `cancelled: true` answer itself. Retirement removes obligations
-without ever sending pi an answer.
-
-Room model: one active room (`machine` + `sid` pair) per machine, tracked
-independently, so rooms on different machines never retire each other and
-share one global FIFO presentation queue (`DialogObligations.pending`). This
-lets multiple machines' dialogs queue fairly rather than one machine starving
-another.
-
-`enter_room`: switching a machine's active sid (including to a brand-new sid)
-retires only that machine's previously-owed questions. Attachments on other
-machines are untouched and keep their queue position.
-
-`leave_machine` (bridge disconnect) empties only that machine's room, without
-touching the queue for other attached machines.
-
-`retire_room` (attachment leave or pi's authoritative session exit) retires
-only the exact matching room. Session ids are always paired with a machine
-rather than assumed globally unique — consistent with how every other bridge
-event is routed.
-
-`enter_room` and `leave_machine` share one predicate — retire everything on
-that machine — because an obligation belonging to the room being entered
-cannot be pending in the first place: `enqueue` only accepts obligations for
-the machine's current room, and every path that changes that room retires
-what it replaces. The disjunct that used to spare "obligations already in the
-new room" was therefore dead, and the two operations differ only in what they
-leave in `rooms_by_machine`.
-
-`retire_room` (attachment leave or pi's authoritative session exit) keeps the
-one guard that is *not* redundant: it clears `rooms_by_machine` only when the
-entry still names the room being retired. A `SessionExit` for a sid that has
-already been replaced must retire that sid's obligations without evicting the
-room that replaced it — evicting it would make every later `enqueue` for the
-new room a rejection, which is a permanently wedged queue, not a lost dialog.
-`a_stale_session_exit_cannot_close_the_room_that_replaced_it` pins exactly
-that.
-
-Retirement returns the obligations it dropped and nothing else. It used to
-also report whether the FIFO front changed; the only consumer needs "was the
-dialog on screen retired", which is a strictly stronger question (the
-displayed obligation is always the front), so the flag was a second way to
-ask something already answered.
-
-`enqueue` accepts a forwarded request only if it belongs to the machine's
-*currently* attached room and is not already pending; everything else is
-`Rejected`. Identity for duplicate detection is `(room, dialog_id)`, not full
-payload equality — pi replays pending requests on attach, and a replay must
-collapse into the obligation already queued rather than create a second one.
-`EnqueueResult` says only accepted-or-rejected: a duplicate and a
-wrong-room request are the same non-event to a caller, and "visible" versus
-"queued" is not worth distinguishing either, because the caller's advance is
-idempotent — it shows the front when nothing is on screen and returns
-otherwise. `accepted()` (`#[must_use]`) is how the one production caller
-reads it — a named question instead of an `==` against a variant — while the
-tests keep asserting the typed variants.
-
-`DialogRoom` and `DialogObligation` are plain `pub`-field structs built as
-literals; they had `new` constructors that only re-spelled the fields in
-order, so the constructors were dropped rather than kept as a second way to
-say the same thing.
-
-`answer_front` accepts exactly one answer for a given key: if the modal
-callback fires after the front obligation has already advanced (e.g. a stale
-closure), the accept is a no-op rather than mis-answering the new front.
-
-`len`, `is_empty` and `room` are `#[cfg(test)]`: they read internal state that
-only this module's own tests ask about, and a published accessor with no
-caller is a promise that constrains refactors for nothing.
-
-Recorded follow-up: none beyond what's captured above — the module's own docs
-frame this as the deliberate, finished design (single active room per
-machine, global FIFO, retirement never answers).
+The daemon remains responsible for auto-cancelling when no client room is attached. The client never leaves an obligation parked merely because another session is also attached.
 
 ## crates/harvester-client-core/src/fleet.rs
 
@@ -1044,16 +403,7 @@ where a second frontend could not reach them.
 
 ### Reactor boundary
 
-The fleet is as reactor-independent as the workers it owns, for the same
-reason `bridge.rs` documents: gpui's executor has no tokio reactor, so a
-frontend must never be handed something it has to `await` on a tokio
-primitive. Every method here is therefore *synchronous and non-blocking*:
-commands go out down unbounded senders (which never block and never need a
-reactor), and answers come back as events on the two receivers `FleetEvents`
-hands the frontend, which the frontend pumps however it likes (gpui task,
-tokio task, thread — its choice). The fleet itself never awaits, never
-spawns a task, and holds no runtime; the two worker threads it starts hold
-their own.
+The fleet is owned by the runtime engine inside its current-thread Tokio reactor. Its methods stay synchronous and non-blocking: commands go through unbounded channels, while `FleetEvents` returns already-correlated bridge and machines events to the engine's select loop. Fleet starts async tasks but neither stores a runtime nor exposes Tokio primitives to the desktop. GPUI observes only `ClientRuntime` snapshots and runtime events.
 
 ### Probe verdicts and daemon links are one state, not two
 
@@ -1078,11 +428,7 @@ always the string "1", because bootstrap asserts the daemon's protocol
 version equals ours and then had nothing else to report. A machine that is
 connected is connected; the statusbar names the machine, not a constant.
 
-`Machine::Linked` keeps its `BridgeHandle` even after a failure, for two
-reasons: a command sent to a dying machine still has somewhere to go (the
-send becomes a no-op once the thread is gone), and retouching the machine
-(calling `ensure_connection` again) is literally how a failed/lost bridge
-gets retried — there is no separate retry path.
+`Machine::Linked` keeps its `BridgeHandle` even after a failure, for two reasons: sending through the closed channel produces an explicit stopped-bridge error, and retouching the machine (`ensure_connection`) is the single retry path for failed or lost bridges.
 
 ### `MachineState`
 
@@ -1100,32 +446,17 @@ one predicate that means "usable — commands queue on it."
 
 ### Fleet failures
 
-`Fleet`'s fallible methods (`ensure_connection`, `host_for`,
-`send_host_command`) return `crate::Result`. The four failures they can
-actually produce — `NotConnectable`, `BridgeStart`, `HostWorkerMissing`,
-`HostWorkerStopped` — are variants of `crate::Error`, documented in the
-`lib.rs` section along with why they stopped being a separate `FleetError`
-enum.
+`Fleet`'s fallible methods (`ensure_connection`, `host_for`, `send_host_command`) return `crate::Result`. Their failures — `NotConnectable`, `HostWorkerMissing` and `HostWorkerStopped` — are variants of `crate::Error`; bridge startup itself is infallible once the runtime reactor exists.
 
 Every one of them renders the exact sentence the statusbar showed before any
 of this was typed at all. The human-readable `detail` string *is* the payload
 — a frontend that collapsed this down to "not connectable" would throw away
 the only diagnosis a user gets for a machine that will not come up.
-`HostWorkerMissing` vs `HostWorkerStopped` distinguishes "the machines
-worker thread never started, so there's no runtime to exec host ops on and
-nothing to wait for" from "it started but its thread has since ended."
+`HostWorkerMissing` vs `HostWorkerStopped` distinguishes an inert test fleet with no machines task from a runtime whose machines task has ended.
 
 ### `Unapplied<T>` — making a footgun unrepresentable
 
-Bridge/machines-worker events used to be handed to the frontend bare, and
-the fleet was fed by convention (the frontend had to remember to call the
-record method *before* rendering). A frontend that forgot got a
-`MachineState` table that silently stopped tracking reality. `Unapplied<T>`
-is an opaque wrapper — the type has no public way to reach the value inside
-except by handing it to `Fleet::observe_bridge_event` /
-`observe_machines_event`, which applies it on the way through. This makes
-the wrong order (render before record) a compile error instead of merely a
-documented rule.
+Bridge and machines events are wrapped in opaque `Unapplied<T>` values. The runtime engine can reach a value only through `Fleet::observe_bridge_event` or `observe_machines_event`, which updates fleet state first. This makes routing an event before recording its machine state a compile error instead of a convention.
 
 ### `Fleet` fields (why, not what)
 
@@ -1154,8 +485,8 @@ documented rule.
 - `forget_unknown_machines`: drops every machine the client no longer knows
   about (neither tracked nor listed). Without this, a machine deleted
   upstream stayed `Connected` forever and kept being counted in
-  `linked_machine_count`; dropping the row is also what drops its
-  `BridgeHandle`, which is what actually stops the bridge thread.
+  `linked_machine_count`; dropping the row also drops its command handle,
+  which lets the bridge task end.
 - `auto_connect_tracked` / `connectable_tracked_machines`: connects every
   tracked machine that has no bridge yet *and* resolves to a host. Quiet by
   design — an unresolvable machine (a provider that hasn't listed yet) is
@@ -1168,22 +499,22 @@ documented rule.
   "is this skip permanent?" `connectable_tracked_machines` is split out
   purely so the borrow of `self.tracked` ends before connecting, and because
   it is the entire policy in one place — testable without starting a
-  thread.
+  network task.
 - `ensure_connection` / `connect_decision` / `spawn_bridge`: lazily
   connects. Reuses a live bridge, respawns a failed-or-lost one (retouching
   a machine is the retry, by design), spawns a fresh one otherwise. The
   decision is computed in a pure `connect_decision` before anything is
   spawned, which is what makes the connect policy unit-testable without
-  threads (see the `ConnectDecision` enum, tested directly in `tests`).
+  network tasks (see the `ConnectDecision` enum, tested directly in `tests`).
   `spawn_bridge` unconditionally replaces any previous handle in the table —
   that replacement is what makes "retouch a failed machine" equivalent to
   "retry it."
 - `send` / `send_host_command`: `send` routes a command to a machine's
   bridge. Link *state* still comes from link events, never from the send's
   return value, but both ways of losing a command (no row/no bridge, or a
-  bridge thread that has already ended) are logged to stderr rather than
-  swallowed: this is the "forget racing a send" path, and a command that
-  evaporates in silence is indistinguishable from one the daemon ignored.
+  bridge task whose command channel has closed) return an error rather than
+  being swallowed. This is the "forget racing a send" path, and a command
+  that evaporates in silence is indistinguishable from one the daemon ignored.
   The command's own payload is deliberately not logged — a dropped prompt's
   text is the user's, not the log's. Host ops
   (`$HOME`, `ls`, `git rev-parse`) go through `send_host_command` to the
@@ -1251,8 +582,7 @@ documented rule.
 
 ### Recorded follow-up
 
-None beyond what's captured above — the module's doc comments recorded
-design rationale, not open TODOs.
+None beyond what is captured above; unresolved behavior belongs in the contract docs.
 
 ### Machine identity
 
@@ -1306,6 +636,17 @@ commands through the user's *login* shell, which is only POSIX-compatible by
 luck — fish and csh reject the arithmetic, async-subshell and `&&`-chain
 constructs the project's scripts are written in. Re-execing through `sh`
 guarantees both arms really get the POSIX shell this module promises.
+
+`SshTarget.options` is the provider contract's `ssh.options` (PROVIDERS.md
+§list), each entry emitted as one `-o` argument. They are appended *after*
+`SSH_BASE_ARGS` and after `ControlPath`, and the order is the whole safety
+argument: ssh uses the first value it obtains for a setting, so a provider can
+add a `ProxyCommand` for a machine that is not directly routable, but cannot
+turn off `BatchMode` (which is what stops a provider's machine hanging the app
+on a password prompt) or redirect the control socket. Every other `SshTarget`
+in the crate is built with an empty `options` — an ad-hoc `--machine` argument
+and the CLI's `--dest` name a target the user's own ssh config already
+resolves.
 
 `HOME_SCRIPT` uses `printf '%s\n' "$HOME"` rather than `echo`, because
 `echo`'s handling of backslashes is shell-dependent (differs across
@@ -1436,153 +777,19 @@ every ssh invocation the client builds (every machine probe, every
 folder-picker click), and re-resolving meant a `create_dir_all` +
 `set_permissions` pair on each one.
 
-`SshTarget::command` builds the actual ssh invocation; `extra_args` are
-inserted before the destination because ssh requires options before the
-target argument.
+`SshTarget::command` builds the actual ssh invocation; `extra_args` are inserted before the destination because ssh requires options before the target argument.
 
 ## crates/harvester-client-core/src/lib.rs
 
-Crate-level docs describe `harvester-client-core` as the client backbone:
-bootstrapping harvesterd on a machine (plain SSH or the local shell — unified
-through one exec boundary, `Host`), forwarding its Unix socket, and speaking
-the docs/DAEMON.md envelope. Deliberately gpui-free so a second frontend could
-be built on it.
+The crate is the GPUI-independent client boundary. `ClientRuntimeOwner::start` is the primary entry point. The public surface re-exports typed identities, snapshots, runtime events, dialog answers, model choices, raw/derived session replicas, transcript presentation data and workspace ids. Worker implementation types remain `pub(crate)`.
 
-Three layers, bottom-up:
-1. **One machine at a time**: `bridge` (that machine's daemon connection,
-   command flows, event fan-in) and `machines` (provider listing, reachability
-   probes, and the daemon-free host ops the folder picker runs directly).
-2. **Machine identity**: `MachineRef` is the one place that decides what a
-   stored machine string actually means. It is private to `fleet.rs`: every
-   question a frontend asks about a machine string (`host_for`, `label`,
-   `state`) is answered by `Fleet`, which is the only caller.
-3. **Across machines**: `Fleet` owns the bridge pool, the machine table, probe
-   verdicts, and the connect policy — modeling a machine's reachability as one
-   `MachineState` specifically so a probe verdict and an actual daemon link
-   can never disagree with each other.
+The runtime is process-owned; a frontend clones `ClientRuntime`, reads immutable `Arc<ClientSnapshot>` values, subscribes to runtime events, and submits typed intents. GPUI does not appear in this crate. Every I/O task that needs Tokio runs under the one runtime engine reactor; startup and terminal failures are surfaced in the snapshot rather than swallowed.
 
-What a second frontend gets "for free" from this crate: connecting a machine,
-listing/opening sessions, streaming a turn, browsing folders, reading every
-machine's state, and the two policies that are easy to get subtly wrong —
-*when* to start a bridge, and which of a probe result vs. an active daemon
-link to trust when they might conflict. Everything exposed is synchronous and
-event-driven on purpose; nothing here requires the caller to run its own tokio
-reactor (tokio is used internally — see `fleet`'s own module docs for how that
-boundary is crossed).
-
-What this crate does **not** own, by design, and would have to be rebuilt if
-someone tried to reuse it without the gpui crate: the workspace store
-(`~/.harvester/workspaces.json` lives in the gpui crate, not here), the merged
-newest-first session list across machines, and any rendering decision (what
-color a `MachineState` maps to, what a session row says, how a chat with no
-session yet behind it behaves).
-
-Two entry points matter most for a new integrator: `Fleet::start` (the whole
-client backbone) and, underneath it, `bootstrap_and_connect` + `DaemonClient`
-for anyone driving the protocol directly (this is what the `harvester-cli`
-dev tool does).
-
-`folder_name` (from `host.rs`) is the one export that is neither a door nor a
-protocol vocabulary: it is a pure display helper, published because the two
-halves of the `harvester` crate — its lib-side `ui/` and its bin-side screens —
-both need the same answer and cannot see each other. See the `host.rs` section.
-
-The exported surface is deliberately no wider than those two doors. Names
-that only this crate's own layers call — `bridge::start`/`BridgeHandle`,
-`machines::start`/`MachinesWorker`, `run_on_tokio_thread`,
-`RequestTokens::mint`, `DialogAnswer::to_response` and all of `provider.rs`
-— are `pub(crate)`.
-Publishing them was speculative: each was offered as "a frontend that wants
-less could use this", none ever had a caller outside the crate, and every
-published name is a promise that constrains refactors. Two former entries on
-this list have since narrowed past `pub(crate)` entirely, for the same
-reason: `MachineRef` is private to `fleet.rs`, and the four host ops
-(`resolve_home`, `list_directory`, `validate_git_workspace`,
-`resolve_git_branch`, all reached through `machines::Command`) are private to
-`machines.rs` — only `RemoteDirEntry`, the shape a listing answer carries,
-is still re-exported here. Re-widening any of
-them is a one-word change the day a second frontend actually asks; the
-vocabulary those workers speak (`bridge::Command`/`Event`,
-`machines::Command`/`Event`) stays public, so nothing about the design is
-hidden.
-
-`Error` variants and when each applies:
-- `Io`: local I/O — spawning ssh, the forwarded socket, serialization.
-- `Exec`: a control-plane exec failed (transport error or non-zero exit),
-  uniformly whether it ran over SSH or through the local shell (both cross the
-  same `host.rs` boundary).
-- `DaemonConnect`: the daemon never became reachable — the socket forward
-  never came up, or the handshake went unanswered. This also covers the local
-  machine, where there is no SSH forward at all, so the same variant has to
-  mean "reachable" in a forward-free sense too.
-- `VersionMismatch`: the daemon still reports the wrong version *after* a
-  forced reinstall was attempted — in practice this almost always means a
-  stale local daemon binary (the fix is rebuilding the musl target, see
-  Build & test in CLAUDE.md).
-- `Provider`: a machine provider executable misbehaved — contract violation,
-  timeout, or its own `{"error"}` object surfaced verbatim (docs/PROVIDERS.md
-  defines the provider contract this maps to).
-- `NotConnectable`: a machine string resolved to no SSH target — an unlisted
-  provider machine, or a listed one whose entry carries the argv ssh form.
-- `BridgeStart`: the OS refused the bridge's thread, so that machine has no
-  daemon connection and never will until the user retries.
-- `HostWorkerMissing` / `HostWorkerStopped`: the machines worker never started
-  or has since gone, so a daemon-free host op (the folder picker's `$HOME`,
-  `ls`, git probes) has nowhere to run.
-
-The last four were a second enum, `FleetError`, until the simplification
-round. Nothing anywhere ever matched on its variants — every consumer called
-`to_string()` immediately, and `FleetStore::host_for` existed largely to
-demote it to a `String` — so a whole enum plus a `Display` plus an
-`std::error::Error` impl plus a `lib.rs` re-export were buying one thing:
-the ability to say `FleetError` instead of `Error`. The trade taken here is
-that `Fleet`'s synchronous API now returns a type carrying `Io`, `Provider`
-and `VersionMismatch` variants it can never produce; the rule that made it
-worth taking is "no error type exists unless something matches on its
-variants".
-
-**`run_on_tokio_thread`.** The one way this crate gets a tokio reactor. gpui
-drives its own executor and never installs a tokio reactor, so no async work
-in this crate can run on the caller's thread — every I/O-owning worker (a
-bridge's daemon connection, the machines worker) instead lives on a dedicated
-std thread that builds its own runtime and blocks on one future for its whole
-life. The runtime is current-thread on purpose: one worker is one logical
-actor, so a work-stealing pool would buy nothing and would cost extra threads.
-
-It lives at the crate root rather than inside either worker because it belongs
-to neither: it was in `machines.rs`, which made `bridge.rs` import the machines
-worker for a runtime helper that has nothing to do with machines.
-
-The *failure* case is the interesting half: building a runtime fails only when
-the OS refuses a resource, and at that point the worker cannot start at all,
-so its owner must be told in whatever way that particular worker reports
-failure. That disagreement — a `ConnectFailed` event on one side, a stderr
-line on the other — used to be an `impl FnOnce(String)` error sink parameter,
-the crate's only error-reporting callback in a codebase that otherwise reports
-through a `Result` or a channel. It is a plain `std::io::Result<()>` now and
-each caller decides at its own call site. When the build fails, `main` is
-dropped un-polled — safe here because every worker's main future does all of
-its real work only after its first poll (no worker relies on
-drop-without-polling side effects).
-
-**`scratch`.** A `#[cfg(test)]` `ScratchDir` shared by `connection.rs` and
-`provider.rs`: `create(label)` makes `<temp>/harvester-<label>-<pid>` and
-`Drop` removes it. Three tests used to hand-roll that directory and call
-`remove_dir_all` as their last statement, so any failing assertion leaked the
-directory into the temp dir — in all three copies. This crate already leans on
-RAII for exactly this class of obligation in production
-(`AttachRegistration`, `ResyncGuard`, `PendingRequestGuard`, `Forward`); the
-tests now use the same pattern. `Drop` logs rather than panics: a panicking
-`Drop` during an already-failing test would replace the assertion message with
-its own.
+`LOCAL_MACHINE` is the one wire/storage key for the local host. `Error` remains only where callers match its variants; runtime-to-desktop failures cross as display strings and semantic events.
 
 ## crates/harvester-client-core/src/machines.rs
 
-The machines worker: one background thread (same tokio-on-a-thread shape as
-`bridge.rs`) that owns everything that execs on a machine *without* a
-daemon — the one-shot provider executables, the SSH probes, and the folder
-picker's path work are all tokio-process work, which gpui's executor cannot
-run.
+The machines worker is one long-lived task on the client runtime's Tokio reactor. It owns everything that execs on a machine *without* a daemon: one-shot provider executables, SSH probes, folder-picker path work and branch resolution.
 
 It enumerates `~/.harvester/providers/` (docs/PROVIDERS.md), lists each
 provider's machines on a slow cycle, and drives the sidebar dots with
@@ -1611,13 +818,7 @@ Cadence constants (why these values, not what they are):
 Both intervals fire immediately on their first tick, so startup does one
 list cycle and one probe cycle for free, without extra bootstrap code.
 
-`Command`/`Event` are the worker's UI-facing protocol. Every `Command` that
-is answered carries the `RequestToken` its answer echoes; `SetAdHocMachines`
-has no answer, so it carries none. On the `Event` side, the three host-op
-answers carry only the token of the request that asked for them — nothing
-else identifying — so a frontend applies an answer only while that token is
-still the one it has outstanding (stale in-flight requests are naturally
-ignored). All four answers are shaped `result: Result<_, String>`;
+`Command`/`Event` are the worker's runtime-facing protocol. Every `Command` that is answered carries the `RequestToken` its answer echoes; `SetAdHocMachines` has no answer, so it carries none. On the `Event` side, host-op answers carry only the requesting token, so the engine applies an answer only while that token is still current; stale in-flight requests are ignored. All four answers are shaped `result: Result<_, String>`;
 `WorkspaceValidated` used to be `error: Option<String>` because
 `validate_git_workspace` returns `crate::Result<()>` and `Option` was the
 shorter way to spell "nothing to hand back on success". One sibling in four
@@ -1712,15 +913,9 @@ file).
 form) — no target means no probe, and the dot stays unknown rather than
 being reported unreachable.
 
-### The runtime thread
+### Runtime ownership
 
-`run_on_tokio_thread` used to live here, and `bridge.rs` imported this module
-to reach it — a dependency edge from the bridge onto the machines worker that
-had nothing to do with machines. It now lives in `lib.rs`; see that section
-for what it is and why the failure case is the interesting half.
-`run_worker_thread` is the caller on this side: a runtime that will not build
-means the machines worker never starts, and there is no channel to say so on
-yet, so it goes to stderr.
+`start` calls `tokio::spawn`; it is invoked only while the process-owned client runtime reactor is active. The task ends when its command and result channels close. Runtime startup builds the reactor before publishing an owner, so there is no half-started machines worker.
 
 ### Daemon-free host ops
 
@@ -1792,6 +987,12 @@ never touches a provider. Each operation is one local exec: an optional JSON
 object on stdin, a JSON object result on stdout, diagnostics on stderr
 (logged, never parsed). This file implements the mandatory core (`info`,
 `list`); `create`/`delete` are a later slice.
+
+`parse_ssh_target` reads the `{host, user, port, options}` form and answers
+`None` for the `{argv}` form, which the client does not implement — such
+machines list and never connect (PROVIDERS.md §list says so normatively).
+`options` is `#[serde(default)]`, so a provider written before the field
+existed keeps parsing and gets an empty list rather than an error.
 
 `SUPPORTED_PROVIDER_PROTOCOL = 1`: providers reporting any other protocol
 version are rejected at `check_info` (docs/PROVIDERS.md §info). It is the one
@@ -1908,9 +1109,7 @@ call sites happen to follow. The cost is that a provider timeout now reads
 `` provider exe-dev: `list`: timed out after 30s `` instead of a
 hand-written near-identical sentence.
 
-`InfoResult.name`, `InfoResult.capabilities` and `MachineEntry.status` are
-`#[allow(dead_code)]` and stay that way. **The field is not the point; the
-deserialization is.** All three are required *by contract*
+`InfoResult._name`, `InfoResult._capabilities` and `MachineEntry._status` use `#[serde(rename = ...)]`. **The field is not the point; the deserialization is.** The underscore records that code does not read the value while the serde rename still requires the contract's original field. All three are required *by contract*
 (docs/PROVIDERS.md §info, §list), so declaring them is what makes serde
 reject a provider that omitted them — deleting the fields would silently
 accept a non-conforming provider, and the `info_rejects_missing_required_fields`
@@ -1918,8 +1117,7 @@ test would stop testing anything. Nothing in this crate consumes their
 *value*: `name` and `capabilities` because the UI labels machines by the
 provider's file name and no capability gate exists yet, `status` because
 Harvester's own SSH probe is authoritative (docs/SPEC.md §Machine). The
-`allow` says "read by the contract, not by the code", which is why it is not
-a smell to be cleared.
+underscore says "read by the contract, not by the code" without a lint suppression.
 
 `parse_ssh_target` deliberately is not an untagged enum over `{host,...}` vs
 `{argv,...}`: untagged enums report "data did not match any variant" on
@@ -1936,63 +1134,83 @@ hard error.
 
 ## crates/harvester-client-core/src/token.rs
 
-Reply correlation for the client's workers — see docs/SPEC.md §Decisions, C2.
+`RequestToken` is the opaque equality key for worker and Pi answers. `RequestTokens::mint` uses a checked atomic increment: tokens are process-global to the runtime engine, never inferred from cwd/path/sid and never reused by wrapping. The numeric value has no meaning outside comparison.
 
-Problem this replaces: a frontend fires a command at a worker and gets the
-answer back as an event a round trip later. Historically "which request does
-this answer belong to" was inferred from an echoed key (the `cwd` a model
-list was asked for, the `path` a listing walked), which needed a bespoke
-staleness guard per command and still could not distinguish two in-flight
-requests that happen to share the same key. `RequestToken` replaces all of
-that with one mechanism: mint a monotonic token per request, echo it on the
-answer, and only apply an answer whose token still matches the one recorded
-as outstanding.
+The engine records the latest token per chat, session or browser and removes associated context on cancellation, disconnect, replacement generation or completion. A stale answer therefore cannot mutate current state even when its echoed path or sid is identical. Token context lives next to the state machine that consumes it rather than in a generic compatibility `Pending<T>` layer.
 
-`RequestToken` is intentionally opaque — nothing may derive meaning from the
-number, only compare it for equality.
+## crates/harvester-client-core/src/identity.rs
 
-`RequestTokens` is cloneable and meant to be shared by every surface that
-talks to a worker (e.g. the workbench and each chat hold the same source), so
-a token identifies a request across the *whole client*, not just within one
-surface. This is what keeps two surfaces asking the same worker the same
-question at the same moment distinguishable. Wrapping a `u64` counter is not
-a real concern — at one mint per nanosecond it takes centuries.
+All runtime identities are value types rather than strings passed by convention. `MachineId` rejects empty keys. `SessionId` uses `harvester_proto::is_valid_session_id`, the same validation as the daemon's session-file boundary. `SessionKey` always pairs a sid with its machine; same-sid sessions on two machines are distinct map keys. `ChatId` separates draft and live-session namespaces. `DraftId`, `WorkspaceBrowserId` and `SubmissionId` are independently minted counters.
 
-`Pending<T>` is "the other half" of the mechanism: minting a token is only
-half of it, this type is the hand-rolled bookkeeping that used to be
-duplicated three different ways in the frontend. All three needed the same
-three rules: a re-ask supersedes the request before it, an answer is applied
-only while its token is still the outstanding one, and everything else is
-dropped on the floor. `T` is whatever context the asker needs to apply the
-eventual answer (a path, a sid, or `()` when the answer speaks for itself).
+Workspace paths are opaque remote POSIX strings after the module rejects empty or non-absolute values. Equality and hashing include machine and path. Display conversions are for labels and wire fields only; routing retains the typed key.
 
-`Pending::ask` **records on intent, not on delivery** — the request counts as
-outstanding as soon as `ask` is called, before the command has actually
-reached the worker. This means any caller whose send can fail must call
-`cancel` on that failure path, or the pending state waits forever for an
-answer nobody is coming to send. Anything gated on `is_waiting` (e.g. the
-folder picker's modal, the first caller that needed this) stays incorrectly
-gated otherwise.
+## crates/harvester-client-core/src/model.rs
 
-`Pending::accept` returns `None` for exactly three cases that used to each
-need their own bespoke staleness guard: a late answer, an answer to a
-superseded (re-asked) request, and an answer to a request already applied.
+This module owns the window-free model vocabulary. `ModelChoice` preserves provider and id as the command identity and carries Pi's display name separately. `ModelsState` distinguishes not-requested, loading, loaded and failed. `ModelSelection` distinguishes launch default/choice from live pending/unavailable/current states so draft and attached controls cannot accidentally share transition rules.
 
-`Pending::accept` is one `Option::take_if`: the token comparison and the
-take are a single read of `outstanding`, so there is no window in which the
-staleness test and the consumption could disagree.
+Extractors read only the fields needed by pickers. The enclosing Pi payload remains raw at the bridge/replica boundary.
 
-`Pending::is_outstanding` peeks without consuming. It is `#[cfg(test)]`: it
-was published for answers arriving in installments (a stream, a progress
-event), and no such caller ever appeared; since `accept` folded the
-staleness test into its `take_if`, the tests pinning peek semantics are its
-only remaining reader. `RequestTokens::mint` is `pub(crate)` for a similar
-reason and one stronger: minting a token outside `Pending::ask` produces a
-token nothing is waiting on.
+## crates/harvester-client-core/src/replica.rs
 
-`Pending::is_waiting` answers "is any answer still wanted" without needing to
-hold the specific token — for a surface (like a modal) that just wants to gate
-its input while a request is in flight.
+`SessionReplica` keeps three related but non-interchangeable views: raw persisted entries, the raw live-event suffix, and the derived `Transcript`. Disk remains authoritative; the replica is evictable and repairable.
+
+Persisted entries use `Arc<Vec<Value>>`. Raw live events use a persistent reverse-linked log, making a cloned snapshot and one append O(1) while preserving every current-suffix `Value`. `live_events()` allocates only the reference index needed to iterate oldest-first. The log has no arbitrary retention cap: on each settled turn the bridge fetches an authoritative history delta and clears the covered live suffix, and repair does the same after a gap.
+
+Full history replacement and delta extension clear the old live suffix because fetched persisted entries authoritatively cover that span. The bridge's replay window then delivers events after the selected cursor. Unknown custom entries and events remain available even when `Transcript::apply` returns false.
+
+Every mutation advances a checked `revision`. The desktop uses this value to observe same-length stream replacements and tool changes without deep comparisons. Snapshot cloning is cheap: raw log nodes, history and transcript items are shared until the one replica being changed needs copy-on-write derived data. Runtime handlers transfer owned history vectors and live values into the replica, avoiding a second deep clone at the bridge-to-engine seam.
+
+## crates/harvester-client-core/src/runtime.rs
+
+`ClientRuntimeOwner` constructs a current-thread Tokio runtime first, then starts one dedicated process thread and seeds one `Engine`. If runtime construction fails, no owner or thread escapes. `ClientRuntime` is the cloneable frontend handle: latest snapshot, event subscription and typed intents only. Draft, browser and prompt ids use checked atomic increments; prompt submission is explicitly reserved before `submit_prompt`, allowing a view to register its input before a stopped runtime can synchronously reject it.
+
+`RuntimeEventHub` gives each subscriber a private FIFO. `Changed` is the sole coalescible event because it only means “read the latest snapshot”. Semantic events are never dropped or translated into `Changed`: prompt accepted/rejected/completed, dialog-answer failure, draft promotion, workspace completion and machine-forget outcomes must drive view-local ownership transitions exactly once. Queues are intentionally unbounded for semantic correctness. Dropping or explicitly closing the hub wakes subscribers and makes `next()` return `None` after queued events drain. If the engine loop ends unexpectedly, the worker publishes a fatal runtime message before closing the hub, so the desktop cannot remain silently stale.
+
+Prompt acceptance means Pi acknowledged the request, not merely that a bridge channel accepted a command. Rejection carries the original `SubmissionId`, `ChatId`, text and detail. Desktop adapters must reserve, record, then submit in that order. If scheduling delivers `agent_settled` before the prompt response task, the pending prompt records the boundary; a later success emits acceptance immediately followed by completion, while a later failure still rejects.
+
+## crates/harvester-client-core/src/runtime/snapshot.rs
+
+`ClientSnapshot` is the immutable observation model. Large collections are `Arc`-backed. The live-session map stores `Arc<LiveSession>` values as well as living behind an `Arc<HashMap<...>>`, so one streamed event clones map pointers and only the targeted live-session value. Old GPUI frames may safely retain older snapshots.
+
+`LiveSession` owns lifecycle, attachment generation, replay cursor/repair state, model and branch controls, `SessionReplica`, queued dialog requests and the generation-local turn revision. `can_stop` is true only for an attached busy transcript. `DraftSession` owns target and launch controls before promotion. Browser state, machine presentation state and session summaries are read-only values to frontends.
+
+Snapshot `revision` is checked-monotonic. `SessionReplica::revision` is the transcript-observation key; collection lengths are not a valid substitute because cumulative streaming and tool updates can change content without changing shape.
+
+## crates/harvester-client-core/src/runtime/engine.rs
+
+`Engine` is the only client orchestration owner. It routes intents and already-generation-filtered fleet events into workspace, index, draft, live-session, model, branch, browser, dialog and prompt state. The file follows named handlers; the top-level matches only dispatch.
+
+Session attachment generations are monotonic per `SessionKey`. Opening an exited, failed or disconnected session retains its replica and controls until authoritative `Attached` history arrives. `Attached.history_available = false` changes lifecycle and room ownership without replacing that replica. History replacement/extension and live Pi events mutate only a matching generation. Turn boundaries advance `event_revision`; stale `get_state` may still provide model identity but cannot overwrite newer start or settlement evidence. Message and tool events mark the transcript busy without making every streaming delta invalidate the state request, covering attach in the middle of a turn when `agent_start` was missed while still allowing an initial `isStreaming` answer to settle.
+
+`pending_prompts` records submission id, chat, session generation, prior busy state, submission event revision and whether Pi acknowledged delivery. The optimistic transcript row carries the same `SubmissionId`, so duplicate prompt text reconciles and fails independently. Queue acceptance creates the optimistic user item but emits no acceptance. `PromptDelivered` marks and emits acceptance once. `agent_settled` completes only delivered submissions, so a settlement racing ahead of the response cannot erase a later rejection. Failure removes the optimistic obligation, appends its diagnosis and preserves another/newer active turn. Exit, disconnect and forget complete acknowledged submissions but reject unacknowledged ones. Bridge-side arbitration guarantees one response/disconnect outcome.
+
+Dialog obligations enter and leave exact session rooms. An answer remains in flight until the bridge returns Pi's success verdict; failure keeps the obligation at the FIFO front for retry. Model, state, set-model, branch and browser answers are token-correlated; displaced set-model responses are ignored. A latest set-model failure restores its prior presentation and requests fresh controls so an earlier successful request cannot leave the UI lying about Pi's actual model.
+
+Every handled external event republishes the latest snapshot. Semantic events are emitted separately through the lossless hub. Pure helper tests and fake bridge tests cover keyed same-sid routing, generation rejection, multiple sessions, history preservation/repair, raw custom data, dialogs, mid-turn state, prompt races, stale model/branch/browser answers, persistence and forget cascades.
+
+## crates/harvester-client-core/src/runtime/engine/browser.rs
+
+Browser handlers own the daemon-free remote folder workflow. A browser id and latest request token correlate home resolution, directory listings and workspace validation. Navigation uses remote POSIX joins, including a single slash at root. Cancel or completion removes the run and invalidates all pending tokens.
+
+Navigation accepts only directory names present in the current listing, preventing stale or forged path traversal. Validation stages the new workspace vector through `WorkspaceStore` before publishing it. Duplicate confirmation closes the browser without rewriting. `WorkspaceAdded` includes the originating browser id and is semantic because only that modal coordinator may release its matching picker if snapshot repaint events coalesce.
+
+## crates/harvester-client-core/src/runtime/engine/tests.rs
+
+These focused tests live beside the non-trivial engine rather than in `tests/`. They exercise real handlers and intents with an inert fleet, private event subscriber and scratch persistence paths. Coverage includes same-sid keys on different machines, monotonic reopen generations, stale attachment events, room/dialog replay, mid-turn `get_state`, model/branch/browser token retirement, arbitrary intent rejection, optimistic prompt failure and delivery/settlement races, semantic-event burst preservation, reconnect-history preservation, workspace persistence and machine-forget policy.
+
+Bridge fake-daemon tests cover the transport half; engine tests do not duplicate JSONL framing.
+
+## crates/harvester-client-core/src/session_index.rs
+
+`SessionIndex` merges per-machine daemon listings with sessions synthesized immediately after a successful start command. Keys are full `SessionKey`s. Replacing one machine's listing cannot erase another machine's rows. Visibility is restricted to stored workspaces, sorted newest-first, and status updates affect only the exact key.
+
+A later daemon listing supersedes synthesized metadata because disk/daemon listing is authoritative. Removing a machine clears only its rows.
+
+## crates/harvester-client-core/src/workspace.rs
+
+`WorkspaceStore` is the sole implementation of `~/.harvester/workspaces.json` persistence. It resolves `$HOME`, treats a missing file as empty, reports malformed/unreadable files to stderr and returns an empty observable list rather than inventing state. Saves serialize the typed `(machine, path)` records and use `harvester_proto::replace_atomically` after creating the parent directory.
+
+Runtime mutations stage a new vector, save it, then publish it. A failed add or forget therefore leaves both memory and disk unchanged. Tests use `WorkspaceStore::at` with scratch paths.
 
 ## crates/harvester-client-core/src/transcript.rs
 
@@ -2025,8 +1243,7 @@ or the session died with it still outstanding.
 `ToolBlock` is correlated by `toolCallId`. Pi runs tool executions in parallel
 and their `tool_execution_end` events arrive out of order (verified live
 against pi 0.83.0), so position in the list never identifies a block — only
-the id does. `ToolBlock.diff` holds edit's pre-rendered numbered diff
-(`result.details.diff`).
+the id does. Every block also keeps raw call arguments, the latest raw partial result and the raw final result; the built-in output, diff and line statistics are only a projection. `ToolBlock.diff` holds edit's pre-rendered numbered diff (`result.details.diff`).
 
 `ToolBlock::running` is the only way a block is born, from either source: a
 live `tool_execution_start` and a history `toolCall` block differ solely in
@@ -2044,8 +1261,7 @@ byte is the marker. Only these two tools report line changes in pi 0.83.0 —
 counting a `+` in some future tool's output would fabricate a stat, so
 everything else returns `None`.
 
-`Item` is the conversation in render order: messages interleaved with tool
-blocks. Pi emits the assistant `message_end` before its tool executions start,
+`Item` is the conversation in render order: messages interleaved with boxed tool blocks. The indirection keeps ordinary message items small even though a tool block preserves several raw Pi values. Pi emits the assistant `message_end` before its tool executions start,
 so plain push order is the true chronological order. `Item::Failure` is its
 own variant (not rendered as an assistant message) because a failed turn is
 not something pi *said* — rendering it as an assistant message would put words
@@ -2093,20 +1309,16 @@ it rather than appended to.
   reconciled entry by entry); what survives is the prefix pi already
   confirmed. A session with a thousand entries repairs by fetching only the
   handful it missed. `busy` survives here too, for the same reason as above.
-- `Transcript::push_user_prompt` renders the prompt before pi echoes anything
-  back, and starts the turn immediately: `agent_start` may be milliseconds
-  away, and the input must not look idle in the interim.
+- `Transcript::push_user_prompt` renders the prompt before pi echoes anything back, tags the row with its `SubmissionId`, and starts the turn immediately. The private tag lets identical prompt text reconcile independently and is cleared when authoritative history or Pi's user-message echo confirms the row.
 - `Transcript::end_turn` fires on `agent_settled`, or on a `session_exit` that
   ended a turn the hard way; the streaming partial is dropped with it since
   whatever was streaming will never be completed now.
-- `Transcript::fail_turn` is `end_turn` plus the reason, for the turn that
-  ended before pi ever saw it (a prompt the client could not deliver). The
-  user's prompt stays in the list — they did type it — and the `Item::Failure`
-  under it is what says it went nowhere; deleting the prompt instead would
-  make the input's contents vanish with no account of why.
-- `Transcript::apply` advances by one pi event and returns `false` when the
-  event belongs to a slice this model does not cover yet (retries, compaction,
-  queue) — the frontend need not redraw in that case.
+- `Transcript::fail_prompt` removes the matching optimistic obligation and
+  appends the delivery diagnosis. It ends a turn only when that submission
+  started from idle and no newer turn event has arrived. A rejected steering
+  prompt must not clear the partial text or busy state of the turn it tried to
+  steer. The rejected optimistic row is removed; `RuntimeEvent::PromptRejected` restores the exact input text in the originating view and the transcript keeps the delivery diagnosis.
+- `Transcript::apply` advances by one recognized Pi event and returns `false` for a shape the current derived renderer does not cover. `SessionReplica` retains that raw value for the current live suffix and advances its revision so observers can refresh; after settlement, Pi's raw persisted entries become the authoritative extension surface.
 - `apply_message_end`: text is pushed first, then a possible `Item::Failure`
   — a turn can stream a partial answer and *then* fail, and both halves are
   things the user needs to see.
@@ -2159,13 +1371,7 @@ it rather than appended to.
   `a_delta_finishes_a_tool_call_left_running_before_the_cursor`; the
   same-slice case is pinned by
   `history_matches_tool_calls_to_their_results_across_entries`.
-- `PI_AGENT_SETTLED` is the one named token in `Transcript::apply`'s event
-  match; the other six arms are bare literals on purpose. The rule is that a
-  pi token crossing a crate boundary is named in `harvester-proto` and a token
-  living inside one match is not — `"agent_settled"` is read by the gpui
-  crate's `session_state.rs` as well as here, and a typo in one copy would be
-  a silent no-op rather than a compile error, while `"message_update"` and its
-  neighbours are read nowhere else and sit one screen apart.
+- `PI_AGENT_SETTLED` is the one named token in `Transcript::apply`'s event match because bridge replay and runtime orchestration also read it. It lives at client-core's crate root, the lowest common module for those readers. The other event tokens are local to this match and remain literals; `harvester-proto` names only tokens read by more than one crate.
 - Pi persists its failure messages, so `extend_items` reads them back on
   reopen the same way the live stream does — otherwise history would be
   quietly shorter than the conversation the user actually had.

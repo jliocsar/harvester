@@ -2,13 +2,16 @@ use gpui::{div, prelude::*, Context, Entity, EventEmitter, Role, SharedString};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::list::ListItem;
 use gpui_component::{ActiveTheme as _, Icon, IconName};
-use harvester_client_core::{folder_name, LOCAL_MACHINE};
+use harvester_client_core::{
+    folder_name, ChatId, MachineId, MachineSnapshot, MachineStatus, SessionKey, SessionLifecycle,
+    SessionSummary,
+};
 use harvester_proto::SessionStatus;
 
 use super::machine_presentation::{present_machine, MISSING_MACHINE_DETAIL};
 use crate::assets::TRASH_ICON_PATH;
 use crate::chat::NEW_SESSION_LABEL;
-use crate::store::{FleetStore, MachineSession};
+use crate::store::FleetStore;
 use crate::ui::{self, KeyboardFocusRing as _, Tone};
 
 const SID_PREVIEW_CHARS: usize = 8;
@@ -20,12 +23,13 @@ const OPENING_SESSION_NOTE: &str = "opening…";
 
 pub(super) enum SidebarIntent {
     NewSession,
-    OpenSession { sid: String },
-    ForgetMachine { machine: String },
+    OpenSession { session: SessionKey },
+    ForgetMachine { machine: MachineId },
 }
 
 pub(super) struct Sidebar {
     store: Entity<FleetStore>,
+    selected: Option<ChatId>,
     machines_collapsed: bool,
     sessions_collapsed: bool,
     _store_repaint: gpui::Subscription,
@@ -39,20 +43,25 @@ impl Sidebar {
 
         Self {
             store,
+            selected: None,
             machines_collapsed: false,
             sessions_collapsed: false,
             _store_repaint: store_repaint,
         }
     }
 
+    pub(super) fn select(&mut self, selected: Option<ChatId>, cx: &mut Context<'_, Self>) {
+        self.selected = selected;
+        cx.notify();
+    }
+
     fn render_session_list(&self, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        let rows: Vec<SessionRow> = self
-            .store
-            .read(cx)
-            .catalog()
-            .visible_sessions()
-            .into_iter()
-            .map(|session| self.session_row(session, cx))
+        let store = self.store.read(cx);
+        let snapshot = store.snapshot();
+        let rows: Vec<SessionRow> = snapshot
+            .sessions()
+            .iter()
+            .map(|session| self.session_row(session, snapshot))
             .collect();
         let empty = rows.is_empty();
 
@@ -86,93 +95,51 @@ impl Sidebar {
 
     fn render_machine_list(&self, cx: &Context<'_, Self>) -> impl IntoElement {
         let store = self.store.read(cx);
-        let provider_rows: Vec<_> = store
-            .provider_machines()
+        let snapshot = store.snapshot();
+        let rows: Vec<_> = snapshot
+            .machines()
             .iter()
             .enumerate()
-            .map(|(index, row)| {
-                self.render_machine_row(
-                    ("provider-machine", index),
-                    row.label.clone().into(),
-                    Some(row.provider.clone().into()),
-                    &row.key,
-                    cx,
-                )
-            })
-            .collect();
-        let missing_rows: Vec<_> = store
-            .missing_tracked_machines()
-            .into_iter()
-            .enumerate()
-            .map(|(index, machine)| self.render_missing_machine_row(index, machine, cx))
-            .collect();
-        let ad_hoc_rows: Vec<_> = store
-            .ad_hoc_machines()
-            .into_iter()
-            .enumerate()
-            .map(|(index, machine)| {
-                self.render_machine_row(
-                    ("ad-hoc-machine", index),
-                    machine.clone().into(),
-                    Some("ssh".into()),
-                    &machine,
-                    cx,
-                )
-            })
+            .map(|(index, machine)| self.render_machine_row(index, machine, cx))
             .collect();
 
-        div()
-            .flex()
-            .flex_col()
-            .child(self.render_machine_row(
-                "local-machine",
-                LOCAL_MACHINE.into(),
-                None,
-                LOCAL_MACHINE,
-                cx,
-            ))
-            .children(provider_rows)
-            .children(missing_rows)
-            .children(ad_hoc_rows)
+        div().flex().flex_col().children(rows)
     }
 
     fn render_machine_row(
         &self,
-        id: impl Into<gpui::ElementId>,
-        label: SharedString,
-        detail: Option<SharedString>,
-        key: &str,
+        index: usize,
+        machine: &MachineSnapshot,
         cx: &Context<'_, Self>,
     ) -> ListItem {
-        let tone = present_machine(self.store.read(cx).state(key), key).tone;
-
-        ui::sidebar_row(id)
+        let presentation = present_machine(&machine.status, &machine.label);
+        let detail: Option<SharedString> = match &machine.status {
+            MachineStatus::Missing => Some(MISSING_MACHINE_DETAIL.into()),
+            _ => machine.provider.clone().map(Into::into),
+        };
+        let row = ui::sidebar_row(("machine", index))
             .role(Role::ListItem)
-            .aria_label(label.clone())
+            .aria_label(machine.label.clone())
             .disabled(true)
             .tab_stop(false)
-            .child(ui::sidebar_stacked_row(tone, label, detail, None, cx))
-    }
+            .child(ui::sidebar_stacked_row(
+                presentation.tone,
+                machine.label.clone().into(),
+                detail,
+                None,
+                cx,
+            ));
 
-    fn render_missing_machine_row(
-        &self,
-        index: usize,
-        machine: String,
-        cx: &Context<'_, Self>,
-    ) -> ListItem {
-        let label = self.store.read(cx).label(&machine);
+        if !matches!(&machine.status, MachineStatus::Missing) {
+            return row;
+        }
+
         let sidebar = cx.entity();
+        let machine_id = machine.id.clone();
 
-        self.render_machine_row(
-            ("missing-machine", index),
-            label.into(),
-            Some(MISSING_MACHINE_DETAIL.into()),
-            &machine,
-            cx,
-        )
-        .suffix(move |_window, _cx| {
+        row.suffix(move |_window, _cx| {
             let sidebar = sidebar.clone();
-            let machine = machine.clone();
+            let machine = machine_id.clone();
 
             Button::new(("forget-machine", index))
                 .icon(Icon::default().path(TRASH_ICON_PATH))
@@ -188,28 +155,36 @@ impl Sidebar {
         })
     }
 
-    fn session_row(&self, session: &MachineSession, cx: &Context<'_, Self>) -> SessionRow {
-        let store = self.store.read(cx);
-        let info = &session.info;
+    fn session_row(
+        &self,
+        session: &SessionSummary,
+        snapshot: &harvester_client_core::ClientSnapshot,
+    ) -> SessionRow {
+        let opening = snapshot.live_session(&session.key).is_some_and(|live| {
+            matches!(
+                live.lifecycle,
+                SessionLifecycle::Opening | SessionLifecycle::Starting
+            )
+        });
 
         SessionRow {
-            title: match &info.name {
+            title: match &session.name {
                 Some(name) => name.clone().into(),
-                None => sid_preview(&info.sid).into(),
+                None => sid_preview(session.key.session().as_str()).into(),
             },
             subtitle: format!(
                 "{} · {}",
-                folder_name(&info.cwd),
-                store.label(&session.machine)
+                folder_name(session.workspace.path()),
+                snapshot.machine_label(session.key.machine())
             )
             .into(),
-            tone: match info.status {
+            tone: match session.status {
                 SessionStatus::Running => Tone::Live,
                 SessionStatus::Exited => Tone::Idle,
             },
-            selected: store.catalog().is_selected_session(&info.sid),
-            opening: store.catalog().opening_sid() == Some(info.sid.as_str()),
-            sid: info.sid.clone(),
+            selected: self.selected.as_ref() == Some(&ChatId::Session(session.key.clone())),
+            opening,
+            key: session.key.clone(),
         }
     }
 
@@ -219,7 +194,7 @@ impl Sidebar {
         row: SessionRow,
         cx: &mut Context<'_, Self>,
     ) -> impl IntoElement {
-        let sid = row.sid;
+        let session = row.key;
         let title = row.title.clone();
         let body = ui::sidebar_stacked_row(
             row.tone,
@@ -237,7 +212,9 @@ impl Sidebar {
             .keyboard_focus_ring(cx)
             .child(body)
             .on_click(cx.listener(move |_, _, _, cx| {
-                cx.emit(SidebarIntent::OpenSession { sid: sid.clone() });
+                cx.emit(SidebarIntent::OpenSession {
+                    session: session.clone(),
+                });
             }))
     }
 }
@@ -256,7 +233,7 @@ impl Render for Sidebar {
             .flex_col()
             .bg(cx.theme().sidebar)
             .border_r_1()
-            .border_color(cx.theme().sidebar_border)
+            .border_color(cx.theme().border)
             .child(self.render_new_session_button(cx))
             .child(ui::collapsible_section(
                 "machines-header",
@@ -293,7 +270,7 @@ struct SessionRow {
     tone: Tone,
     selected: bool,
     opening: bool,
-    sid: String,
+    key: SessionKey,
 }
 
 fn sid_preview(sid: &str) -> String {

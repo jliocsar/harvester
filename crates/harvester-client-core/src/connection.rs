@@ -83,6 +83,10 @@ impl DaemonWriter {
         self.writer.write_all(frame).await?;
         self.writer.flush().await
     }
+
+    async fn shutdown(&mut self) -> std::io::Result<()> {
+        self.writer.shutdown().await
+    }
 }
 
 pub struct DaemonConnection {
@@ -196,11 +200,26 @@ impl DaemonClient {
         }
     }
 
+    pub(crate) async fn close(&self) {
+        if let Err(error) = self.inner.writer.lock().await.shutdown().await {
+            eprintln!("daemon client: close failed: {error}");
+        }
+    }
+
     async fn request(
         &self,
         build: impl FnOnce(Option<Value>) -> Request,
     ) -> std::io::Result<Outgoing> {
-        let id = self.inner.last_request_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let previous = self
+            .inner
+            .last_request_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("daemon request id exhausted");
+        let id = previous
+            .checked_add(1)
+            .expect("daemon request id exhausted");
         let (sender, receiver) = oneshot::channel();
         let _pending = PendingRequestGuard::register(self, id, sender);
         let request = build(Some(json!(id)));

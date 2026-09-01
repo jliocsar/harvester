@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use harvester_client_core::transcript::{Item, Role, ToolBlock, ToolStatus, Transcript};
+use harvester_client_core::{Item, Role, ToolBlock, ToolStatus, Transcript};
 use harvester_proto::{CR, LF};
 use serde_json::Value;
 
@@ -38,7 +38,7 @@ fn tool_blocks(transcript: &Transcript) -> Vec<&ToolBlock> {
         .items()
         .iter()
         .filter_map(|item| match item {
-            Item::Tool(block) => Some(block),
+            Item::Tool(block) => Some(block.as_ref()),
             Item::Message(_) | Item::Failure(_) => None,
         })
         .collect()

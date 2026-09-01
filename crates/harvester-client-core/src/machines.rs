@@ -3,7 +3,7 @@ use crate::provider::{
     discover_providers, install_bundled_providers, MachineKey, Provider, ProviderMachine,
 };
 use crate::token::RequestToken;
-use crate::{run_on_tokio_thread, Error};
+use crate::Error;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 const PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -12,7 +12,7 @@ const LIST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 const WORKSPACE_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Debug)]
-pub enum Command {
+pub(crate) enum Command {
     SetAdHocMachines(Vec<String>),
     ResolveHome {
         host: Host,
@@ -36,7 +36,7 @@ pub enum Command {
 }
 
 #[derive(Debug)]
-pub enum Event {
+pub(crate) enum Event {
     Listed {
         rows: Vec<MachineRow>,
         listed_providers: Vec<String>,
@@ -68,7 +68,7 @@ pub enum Event {
 }
 
 #[derive(Debug, Clone)]
-pub struct MachineRow {
+pub(crate) struct MachineRow {
     pub key: String,
     pub label: String,
     pub provider: String,
@@ -86,23 +86,15 @@ pub(crate) struct MachinesWorker {
     pub events: UnboundedReceiver<Event>,
 }
 
-pub(crate) fn start() -> std::io::Result<MachinesWorker> {
+pub(crate) fn start() -> MachinesWorker {
     let (command_sender, command_receiver) = unbounded_channel();
     let (event_sender, event_receiver) = unbounded_channel();
 
-    std::thread::Builder::new()
-        .name("harvester-machines".to_string())
-        .spawn(move || run_worker_thread(command_receiver, event_sender))?;
+    tokio::spawn(worker_main(command_receiver, event_sender));
 
-    Ok(MachinesWorker {
+    MachinesWorker {
         commands: command_sender,
         events: event_receiver,
-    })
-}
-
-fn run_worker_thread(commands: UnboundedReceiver<Command>, events: UnboundedSender<Event>) {
-    if let Err(error) = run_on_tokio_thread(worker_main(commands, events)) {
-        eprintln!("harvester: machines worker: tokio runtime: {error}");
     }
 }
 
@@ -464,6 +456,7 @@ fn probe_ad_hoc(machines: &[String], events: &UnboundedSender<Event>) {
         let target = SshTarget {
             dest: machine.clone(),
             port: None,
+            options: Vec::new(),
         };
 
         probe_machine(machine.clone(), target, events);

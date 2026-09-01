@@ -1,17 +1,8 @@
 use std::borrow::Borrow;
 use std::fmt;
 
+use harvester_proto::is_valid_session_id;
 use serde::Serialize;
-
-fn is_valid_session_id(candidate: &str) -> bool {
-    let alphanumeric = |character: char| character.is_ascii_alphanumeric();
-
-    candidate.starts_with(alphanumeric)
-        && candidate.ends_with(alphanumeric)
-        && candidate
-            .chars()
-            .all(|character| alphanumeric(character) || matches!(character, '.' | '_' | '-'))
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]

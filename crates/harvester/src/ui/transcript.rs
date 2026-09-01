@@ -10,8 +10,7 @@ use gpui_component::highlighter::HighlightTheme;
 use gpui_component::text::{TextView, TextViewStyle};
 use gpui_component::tooltip::Tooltip;
 use gpui_component::ActiveTheme as _;
-use harvester_client_core::folder_name;
-use harvester_client_core::transcript::{Item, Message, Role, ToolBlock, ToolStatus, Transcript};
+use harvester_client_core::{folder_name, Item, Message, Role, ToolBlock, ToolStatus, Transcript};
 use serde_json::Value;
 
 use super::core::{
@@ -572,6 +571,8 @@ mod tests {
             tool_call_id: "call-1".to_string(),
             tool_name: tool_name.to_string(),
             args,
+            partial_result: None,
+            result: None,
             output: String::new(),
             output_truncated: false,
             diff: None,

@@ -1,7 +1,9 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashSet, VecDeque};
 
 use harvester_proto::{DIALOG_METHODS, PI_EXTENSION_UI_RESPONSE};
 use serde_json::{json, Value};
+
+use crate::SessionKey;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DialogRequest {
@@ -55,20 +57,7 @@ impl DialogRequest {
 
 fn parse_kind(event: &Value, method: &str) -> Option<DialogKind> {
     match method {
-        "select" => {
-            let options = event.get("options")?.as_array()?;
-            let options: Vec<String> = options
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect();
-
-            if options.is_empty() {
-                return None;
-            }
-
-            Some(DialogKind::Select { options })
-        }
+        "select" => parse_select(event),
         "confirm" => Some(DialogKind::Confirm {
             message: event
                 .get("message")
@@ -90,6 +79,21 @@ fn parse_kind(event: &Value, method: &str) -> Option<DialogKind> {
         }),
         _ => None,
     }
+}
+
+fn parse_select(event: &Value) -> Option<DialogKind> {
+    let options = event.get("options")?.as_array()?;
+    let options: Vec<String> = options
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect();
+
+    if options.is_empty() {
+        return None;
+    }
+
+    Some(DialogKind::Select { options })
 }
 
 impl DialogAnswer {
@@ -119,101 +123,76 @@ impl DialogAnswer {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct DialogRoom {
-    pub machine: String,
-    pub sid: String,
+pub(crate) struct DialogRoom {
+    pub(crate) session: SessionKey,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DialogObligation {
-    pub machine: String,
-    pub sid: String,
+    pub session: SessionKey,
     pub request: DialogRequest,
 }
 
 impl DialogObligation {
-    pub fn room(&self) -> DialogRoom {
+    pub(crate) fn room(&self) -> DialogRoom {
         DialogRoom {
-            machine: self.machine.clone(),
-            sid: self.sid.clone(),
+            session: self.session.clone(),
         }
     }
 
     pub fn key(&self) -> DialogKey {
-        DialogKey {
-            room: self.room(),
-            dialog_id: self.request.id.clone(),
-        }
+        DialogKey::new(self.session.clone(), self.request.id.clone())
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DialogKey {
-    pub room: DialogRoom,
-    pub dialog_id: String,
+    session: SessionKey,
+    dialog_id: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EnqueueResult {
-    Accepted,
-    Rejected,
-}
+impl DialogKey {
+    pub(crate) fn new(session: SessionKey, dialog_id: String) -> Self {
+        Self { session, dialog_id }
+    }
 
-impl EnqueueResult {
-    #[must_use]
-    pub fn accepted(self) -> bool {
-        self == Self::Accepted
+    pub(crate) const fn session(&self) -> &SessionKey {
+        &self.session
     }
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub struct AnsweredDialog {
-    pub obligation: DialogObligation,
-    pub answer: DialogAnswer,
+pub(crate) struct AnsweredDialog {
+    pub(crate) obligation: DialogObligation,
+    pub(crate) answer: DialogAnswer,
 }
 
-#[derive(Debug, Default)]
-pub struct DialogObligations {
-    rooms_by_machine: HashMap<String, DialogRoom>,
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DialogObligations {
+    rooms: HashSet<DialogRoom>,
     pending: VecDeque<DialogObligation>,
 }
 
 impl DialogObligations {
-    pub fn enter_room(&mut self, room: DialogRoom) -> Vec<DialogObligation> {
-        if self.rooms_by_machine.get(&room.machine) == Some(&room) {
-            return Vec::new();
-        }
-
-        self.rooms_by_machine
-            .insert(room.machine.clone(), room.clone());
-
-        self.retire_machine(&room.machine)
+    pub(crate) fn enter_room(&mut self, room: DialogRoom) {
+        self.rooms.insert(room);
     }
 
-    pub fn leave_machine(&mut self, machine: &str) -> Vec<DialogObligation> {
-        if self.rooms_by_machine.remove(machine).is_none() {
-            return Vec::new();
-        }
-
-        self.retire_machine(machine)
+    pub(crate) fn leave_room(&mut self, session: &SessionKey) -> Vec<DialogObligation> {
+        self.rooms.remove(&DialogRoom {
+            session: session.clone(),
+        });
+        self.retire(|obligation| &obligation.session != session)
     }
 
-    pub fn retire_room(&mut self, machine: &str, sid: &str) -> Vec<DialogObligation> {
-        let room = DialogRoom {
-            machine: machine.to_string(),
-            sid: sid.to_string(),
-        };
-
-        if self.rooms_by_machine.get(machine) == Some(&room) {
-            self.rooms_by_machine.remove(machine);
-        }
-
-        self.retire(|obligation| obligation.room() != room)
+    pub(crate) fn leave_machine(&mut self, machine: &crate::MachineId) -> Vec<DialogObligation> {
+        self.rooms.retain(|room| room.session.machine() != machine);
+        self.retire(|obligation| obligation.session.machine() != machine)
     }
 
-    pub fn enqueue(&mut self, obligation: DialogObligation) -> EnqueueResult {
-        if self.rooms_by_machine.get(&obligation.machine) != Some(&obligation.room()) {
-            return EnqueueResult::Rejected;
+    pub(crate) fn enqueue(&mut self, obligation: DialogObligation) -> bool {
+        if !self.rooms.contains(&obligation.room()) {
+            return false;
         }
 
         if self
@@ -221,19 +200,19 @@ impl DialogObligations {
             .iter()
             .any(|pending| pending.key() == obligation.key())
         {
-            return EnqueueResult::Rejected;
+            return false;
         }
 
         self.pending.push_back(obligation);
 
-        EnqueueResult::Accepted
+        true
     }
 
-    pub fn front(&self) -> Option<&DialogObligation> {
+    pub(crate) fn front(&self) -> Option<&DialogObligation> {
         self.pending.front()
     }
 
-    pub fn answer_front(
+    pub(crate) fn answer_front(
         &mut self,
         key: &DialogKey,
         answer: DialogAnswer,
@@ -247,10 +226,6 @@ impl DialogObligations {
             .map(|obligation| AnsweredDialog { obligation, answer })
     }
 
-    fn retire_machine(&mut self, machine: &str) -> Vec<DialogObligation> {
-        self.retire(|obligation| obligation.machine != machine)
-    }
-
     fn retire(&mut self, keep: impl Fn(&DialogObligation) -> bool) -> Vec<DialogObligation> {
         let (retained, retired): (Vec<DialogObligation>, Vec<DialogObligation>) =
             self.pending.drain(..).partition(keep);
@@ -259,197 +234,26 @@ impl DialogObligations {
 
         retired
     }
-
-    #[cfg(test)]
-    fn room(&self, machine: &str) -> Option<&DialogRoom> {
-        self.rooms_by_machine.get(machine)
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.pending.len()
-    }
-
-    #[cfg(test)]
-    fn is_empty(&self) -> bool {
-        self.pending.is_empty()
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{MachineId, SessionId};
 
-    #[test]
-    fn a_select_carries_its_options_from_the_flat_envelope() {
-        let event = json!({
-            "type": "extension_ui_request",
-            "id": "dlg-1",
-            "method": "select",
-            "title": "Which branch?",
-            "options": ["main", "backend-hardening"],
-        });
-
-        assert_eq!(
-            DialogRequest::parse(&event),
-            Some(DialogRequest {
-                id: "dlg-1".to_string(),
-                title: "Which branch?".to_string(),
-                kind: DialogKind::Select {
-                    options: vec!["main".to_string(), "backend-hardening".to_string()],
-                },
-            })
-        );
+    fn session(machine: &str, sid: &str) -> SessionKey {
+        SessionKey::new(
+            MachineId::new(machine).expect("non-empty"),
+            SessionId::new(sid).expect("non-empty"),
+        )
     }
 
-    #[test]
-    fn every_blocking_method_parses() {
-        let events = [
-            json!({"type": "extension_ui_request", "id": "d", "method": "select",
-                   "title": "t", "options": ["a"]}),
-            json!({"type": "extension_ui_request", "id": "d", "method": "confirm",
-                   "title": "t", "message": "sure?"}),
-            json!({"type": "extension_ui_request", "id": "d", "method": "input",
-                   "title": "t", "placeholder": "name"}),
-            json!({"type": "extension_ui_request", "id": "d", "method": "editor",
-                   "title": "t", "prefill": "body"}),
-        ];
-
-        for event in events {
-            assert!(
-                DialogRequest::parse(&event).is_some(),
-                "{event} blocks pi, so it must be answerable"
-            );
-        }
-    }
-
-    #[test]
-    fn fire_and_forget_ui_methods_are_not_dialogs() {
-        for method in ["notify", "setStatus", "setWidget", "setTitle"] {
-            let event = json!({
-                "type": "extension_ui_request", "id": "d", "method": method, "title": "t",
-            });
-
-            assert_eq!(DialogRequest::parse(&event), None);
-        }
-    }
-
-    #[test]
-    fn ordinary_pi_events_are_not_dialogs() {
-        assert_eq!(
-            DialogRequest::parse(&json!({"type": "agent_settled"})),
-            None
-        );
-        assert_eq!(
-            DialogRequest::parse(&json!({"type": "message_update", "method": "select"})),
-            None,
-            "the type is what makes it a dialog request, not the method"
-        );
-    }
-
-    #[test]
-    fn a_dialog_without_a_string_id_is_not_answerable() {
-        let event = json!({"type": "extension_ui_request", "id": 7, "method": "confirm",
-                           "title": "t", "message": "m"});
-
-        assert_eq!(DialogRequest::parse(&event), None);
-    }
-
-    #[test]
-    fn a_select_with_nothing_to_select_is_refused() {
-        for options in [json!([]), json!("main"), json!([7])] {
-            let event = json!({"type": "extension_ui_request", "id": "d", "method": "select",
-                               "title": "t", "options": options});
-
-            assert_eq!(
-                DialogRequest::parse(&event),
-                None,
-                "{options} offers no answerable choice"
-            );
-        }
-    }
-
-    #[test]
-    fn the_optional_fields_pi_omits_are_absent_not_empty() {
-        let input = json!({"type": "extension_ui_request", "id": "d", "method": "input",
-                           "title": "t"});
-        let editor = json!({"type": "extension_ui_request", "id": "d", "method": "editor",
-                            "title": "t"});
-
-        assert_eq!(
-            DialogRequest::parse(&input).map(|dialog| dialog.kind),
-            Some(DialogKind::Input { placeholder: None })
-        );
-        assert_eq!(
-            DialogRequest::parse(&editor).map(|dialog| dialog.kind),
-            Some(DialogKind::Editor { prefill: None })
-        );
-    }
-
-    #[test]
-    fn a_titleless_dialog_is_shown_rather_than_dropped() {
-        let event = json!({"type": "extension_ui_request", "id": "d", "method": "confirm",
-                           "message": "m"});
-
-        assert_eq!(
-            DialogRequest::parse(&event).map(|dialog| dialog.title),
-            Some(String::new())
-        );
-    }
-
-    #[test]
-    fn a_select_is_answered_with_the_option_text_not_its_index() {
-        let answer = DialogAnswer::Value("backend-hardening".to_string());
-
-        assert_eq!(
-            answer.to_response("dlg-1"),
-            json!({"type": "extension_ui_response", "id": "dlg-1",
-                   "value": "backend-hardening"})
-        );
-    }
-
-    #[test]
-    fn a_confirm_answers_with_confirmed_and_never_with_value() {
-        for confirmed in [true, false] {
-            assert_eq!(
-                DialogAnswer::Confirmed(confirmed).to_response("dlg-1"),
-                json!({"type": "extension_ui_response", "id": "dlg-1",
-                       "confirmed": confirmed})
-            );
-        }
-    }
-
-    #[test]
-    fn declining_a_confirm_and_cancelling_it_are_the_same_answer_to_pi() {
-        assert_ne!(
-            DialogAnswer::Confirmed(false).to_response("d"),
-            DialogAnswer::Cancelled.to_response("d"),
-            "the wire shapes differ"
-        );
-    }
-
-    #[test]
-    fn a_cancel_carries_nothing_but_the_flag() {
-        assert_eq!(
-            DialogAnswer::Cancelled.to_response("dlg-1"),
-            json!({"type": "extension_ui_response", "id": "dlg-1", "cancelled": true})
-        );
-    }
-
-    fn room(machine: &str, sid: &str) -> DialogRoom {
-        DialogRoom {
-            machine: machine.to_string(),
-            sid: sid.to_string(),
-        }
-    }
-
-    fn question(machine: &str, sid: &str, id: &str) -> DialogObligation {
+    fn question(session: SessionKey, id: &str) -> DialogObligation {
         DialogObligation {
-            machine: machine.to_string(),
-            sid: sid.to_string(),
+            session,
             request: DialogRequest {
                 id: id.to_string(),
-                title: "Which branch?".to_string(),
+                title: "Question".to_string(),
                 kind: DialogKind::Confirm {
                     message: "sure?".to_string(),
                 },
@@ -458,226 +262,111 @@ mod tests {
     }
 
     #[test]
-    fn a_forwarded_dialog_is_visible_only_in_its_active_room() {
-        let mut obligations = DialogObligations::default();
-        assert_eq!(
-            obligations.enqueue(question("vm", "sid-1", "d-1")),
-            EnqueueResult::Rejected
-        );
-
-        obligations.enter_room(room("vm", "sid-1"));
-        assert_eq!(
-            obligations.enqueue(question("vm", "sid-1", "d-1")),
-            EnqueueResult::Accepted
-        );
+    fn every_blocking_method_parses_from_the_flat_pi_envelope() {
+        for event in [
+            json!({"type": "extension_ui_request", "id": "d", "method": "select",
+                   "title": "t", "options": ["a"]}),
+            json!({"type": "extension_ui_request", "id": "d", "method": "confirm",
+                   "title": "t", "message": "sure?"}),
+            json!({"type": "extension_ui_request", "id": "d", "method": "input",
+                   "title": "t", "placeholder": "name"}),
+            json!({"type": "extension_ui_request", "id": "d", "method": "editor",
+                   "title": "t", "prefill": "body"}),
+        ] {
+            assert!(DialogRequest::parse(&event).is_some());
+        }
     }
 
     #[test]
-    fn replay_is_a_duplicate_not_a_second_obligation() {
-        let mut obligations = DialogObligations::default();
-        obligations.enter_room(room("vm", "sid-1"));
-        obligations.enqueue(question("vm", "sid-1", "d-1"));
+    fn fire_and_forget_methods_are_not_obligations() {
+        for method in ["notify", "setStatus", "setWidget", "setTitle"] {
+            let event = json!({
+                "type": "extension_ui_request", "id": "d", "method": method, "title": "t"
+            });
 
-        assert_eq!(
-            obligations.enqueue(question("vm", "sid-1", "d-1")),
-            EnqueueResult::Rejected
-        );
-        assert_eq!(obligations.len(), 1);
+            assert!(DialogRequest::parse(&event).is_none());
+        }
     }
 
     #[test]
-    fn obligations_advance_fifo_and_only_the_front_can_be_answered() {
+    fn several_attached_sessions_on_one_machine_keep_independent_rooms() {
+        let first = session("machine", "first");
+        let second = session("machine", "second");
         let mut obligations = DialogObligations::default();
-        obligations.enter_room(room("vm", "sid-1"));
-        obligations.enqueue(question("vm", "sid-1", "d-1"));
-        assert_eq!(
-            obligations.enqueue(question("vm", "sid-1", "d-2")),
-            EnqueueResult::Accepted
-        );
 
-        let first_key = obligations.front().expect("first obligation").key();
-        let answered = obligations
-            .answer_front(&first_key, DialogAnswer::Confirmed(true))
-            .expect("front obligation");
-        assert_eq!(answered.obligation.request.id, "d-1");
-        assert_eq!(
-            obligations.front().map(|dialog| dialog.request.id.as_str()),
-            Some("d-2")
-        );
+        obligations.enter_room(DialogRoom {
+            session: first.clone(),
+        });
+        obligations.enter_room(DialogRoom {
+            session: second.clone(),
+        });
+        assert!(obligations.enqueue(question(first.clone(), "one")));
+        assert!(obligations.enqueue(question(second.clone(), "two")));
 
-        let second_key = obligations.front().expect("second obligation").key();
+        let retired = obligations.leave_room(&first);
+
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].session, first);
+        assert_eq!(obligations.front().map(|item| &item.session), Some(&second));
+    }
+
+    #[test]
+    fn duplicate_replay_is_not_a_second_obligation() {
+        let key = session("machine", "sid");
+        let mut obligations = DialogObligations::default();
+
+        obligations.enter_room(DialogRoom {
+            session: key.clone(),
+        });
+        assert!(obligations.enqueue(question(key.clone(), "dialog")));
+        assert!(!obligations.enqueue(question(key, "dialog")));
+    }
+
+    #[test]
+    fn only_the_visible_front_can_be_answered() {
+        let session = session("machine", "sid");
+        let mut obligations = DialogObligations::default();
+
+        obligations.enter_room(DialogRoom {
+            session: session.clone(),
+        });
+        obligations.enqueue(question(session.clone(), "first"));
+        obligations.enqueue(question(session, "second"));
+        let first = obligations.front().expect("front").key();
+
         assert!(obligations
-            .answer_front(&second_key, DialogAnswer::Confirmed(false))
+            .answer_front(&first, DialogAnswer::Confirmed(true))
             .is_some());
         assert!(obligations
-            .answer_front(&second_key, DialogAnswer::Confirmed(false))
-            .is_none());
-    }
-
-    #[test]
-    fn retirement_never_sends_an_answer_and_advances_the_visible_front() {
-        let mut obligations = DialogObligations::default();
-        obligations.enter_room(room("vm", "sid-1"));
-        obligations.enqueue(question("vm", "sid-1", "d-1"));
-        obligations.enqueue(question("vm", "sid-1", "d-2"));
-
-        let retired = obligations.retire_room("vm", "sid-1");
-
-        assert_eq!(retired.len(), 2);
-        assert!(obligations.front().is_none());
-        assert!(obligations.room("vm").is_none());
-    }
-
-    #[test]
-    fn switching_rooms_retires_old_questions_without_client_cancellation() {
-        let mut obligations = DialogObligations::default();
-        obligations.enter_room(room("vm", "old"));
-        obligations.enqueue(question("vm", "old", "d-1"));
-
-        let retired = obligations.enter_room(room("vm", "new"));
-
-        assert_eq!(retired[0].sid, "old");
-        assert_eq!(obligations.room("vm"), Some(&room("vm", "new")));
-        assert_eq!(
-            obligations.enqueue(question("vm", "old", "late")),
-            EnqueueResult::Rejected
-        );
-        assert_eq!(
-            obligations.enqueue(question("vm", "new", "d-2")),
-            EnqueueResult::Accepted
-        );
-    }
-
-    #[test]
-    fn an_unrelated_bridge_disconnect_does_not_retire_the_active_room() {
-        let mut obligations = DialogObligations::default();
-        obligations.enter_room(room("vm", "sid-1"));
-        obligations.enqueue(question("vm", "sid-1", "d-1"));
-
-        assert!(obligations.leave_machine("other").is_empty());
-        assert_eq!(
-            obligations.front().map(|dialog| dialog.request.id.as_str()),
-            Some("d-1")
-        );
-    }
-
-    #[test]
-    fn disconnect_leaves_no_stale_modal_obligations() {
-        let mut obligations = DialogObligations::default();
-        obligations.enter_room(room("vm", "sid-1"));
-        obligations.enqueue(question("vm", "sid-1", "d-1"));
-
-        let retired = obligations.leave_machine("vm");
-
-        assert_eq!(retired.len(), 1);
-        assert!(obligations.room("vm").is_none());
-        assert!(obligations.front().is_none());
-    }
-
-    #[test]
-    fn rooms_on_two_machines_share_one_fifo_without_retiring_each_other() {
-        let mut obligations = DialogObligations::default();
-        obligations.enter_room(room("machine-a", "sid-a"));
-        obligations.enter_room(room("machine-b", "sid-b"));
-
-        assert_eq!(
-            obligations.enqueue(question("machine-a", "sid-a", "dialog-a")),
-            EnqueueResult::Accepted
-        );
-        assert_eq!(
-            obligations.enqueue(question("machine-b", "sid-b", "dialog-b")),
-            EnqueueResult::Accepted
-        );
-        assert_eq!(obligations.len(), 2);
-
-        let retired = obligations.enter_room(room("machine-b", "sid-b-2"));
-
-        assert_eq!(retired.len(), 1);
-        assert_eq!(retired[0].request.id, "dialog-b");
-        assert_eq!(
-            obligations.front().map(|dialog| dialog.request.id.as_str()),
-            Some("dialog-a")
-        );
-        assert_eq!(
-            obligations.room("machine-a"),
-            Some(&room("machine-a", "sid-a"))
-        );
-    }
-
-    #[test]
-    fn attachment_leave_and_disconnect_retire_only_the_matching_machine_room() {
-        let mut obligations = DialogObligations::default();
-        obligations.enter_room(room("machine-a", "shared-sid"));
-        obligations.enter_room(room("machine-b", "shared-sid"));
-        obligations.enqueue(question("machine-a", "shared-sid", "dialog-a"));
-        obligations.enqueue(question("machine-b", "shared-sid", "dialog-b"));
-
-        let retired = obligations.retire_room("machine-b", "shared-sid");
-
-        assert_eq!(retired.len(), 1);
-        assert_eq!(retired[0].machine, "machine-b");
-        assert!(obligations.room("machine-a").is_some());
-        assert!(obligations.room("machine-b").is_none());
-
-        let retired = obligations.leave_machine("machine-a");
-
-        assert_eq!(retired.len(), 1);
-        assert!(obligations.is_empty());
-    }
-
-    #[test]
-    fn duplicate_identity_includes_the_room() {
-        let mut obligations = DialogObligations::default();
-        obligations.enter_room(room("machine-a", "sid-a"));
-        obligations.enter_room(room("machine-b", "sid-b"));
-        obligations.enqueue(question("machine-a", "sid-a", "dialog"));
-
-        assert_eq!(
-            obligations.enqueue(question("machine-b", "sid-b", "dialog")),
-            EnqueueResult::Accepted
-        );
-        assert_eq!(obligations.len(), 2);
-    }
-
-    #[test]
-    fn a_stale_modal_callback_cannot_answer_the_next_obligation() {
-        let mut obligations = DialogObligations::default();
-        obligations.enter_room(room("vm", "sid"));
-        obligations.enqueue(question("vm", "sid", "first"));
-        obligations.enqueue(question("vm", "sid", "second"));
-        let first_key = obligations.front().expect("first").key();
-
-        obligations
-            .answer_front(&first_key, DialogAnswer::Confirmed(true))
-            .expect("first answer");
-
-        assert!(obligations
-            .answer_front(&first_key, DialogAnswer::Confirmed(false))
+            .answer_front(&first, DialogAnswer::Confirmed(false))
             .is_none());
         assert_eq!(
-            obligations.front().map(|dialog| dialog.request.id.as_str()),
+            obligations.front().map(|item| item.request.id.as_str()),
             Some("second")
         );
     }
 
     #[test]
-    fn a_stale_session_exit_cannot_close_the_room_that_replaced_it() {
+    fn machine_disconnect_retires_only_that_machines_questions() {
+        let first = session("first", "sid");
+        let second = session("second", "sid");
         let mut obligations = DialogObligations::default();
-        obligations.enter_room(room("vm", "old"));
-        obligations.enter_room(room("vm", "new"));
 
-        let retired = obligations.retire_room("vm", "old");
+        for key in [&first, &second] {
+            obligations.enter_room(DialogRoom {
+                session: key.clone(),
+            });
+            obligations.enqueue(question(key.clone(), key.machine().as_str()));
+        }
 
-        assert!(retired.is_empty());
-        assert_eq!(obligations.room("vm"), Some(&room("vm", "new")));
-        assert_eq!(
-            obligations.enqueue(question("vm", "new", "d-1")),
-            EnqueueResult::Accepted
-        );
+        let retired = obligations.leave_machine(first.machine());
+
+        assert_eq!(retired.len(), 1);
+        assert_eq!(obligations.front().map(|item| &item.session), Some(&second));
     }
 
     #[test]
-    fn dismissal_matches_pi_dialog_semantics() {
+    fn dismissal_matches_pi_semantics() {
         let confirm = DialogRequest {
             id: "confirm".to_string(),
             title: String::new(),

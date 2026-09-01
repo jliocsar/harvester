@@ -1,5 +1,10 @@
-use harvester_proto::PI_AGENT_SETTLED;
+use std::sync::Arc;
+
 use serde_json::Value;
+
+use crate::PI_AGENT_SETTLED;
+
+use crate::SubmissionId;
 
 const TOOL_OUTPUT_MAX_BYTES: usize = 64 * 1024;
 
@@ -15,6 +20,13 @@ pub enum Role {
 pub struct Message {
     pub role: Role,
     pub text: String,
+    submission: Option<SubmissionId>,
+}
+
+#[derive(Debug, Clone)]
+struct OptimisticPrompt {
+    submission: SubmissionId,
+    text: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +41,8 @@ pub struct ToolBlock {
     pub tool_call_id: String,
     pub tool_name: String,
     pub args: Value,
+    pub partial_result: Option<Value>,
+    pub result: Option<Value>,
     pub output: String,
     pub output_truncated: bool,
     pub diff: Option<String>,
@@ -41,6 +55,8 @@ impl ToolBlock {
             tool_call_id,
             tool_name,
             args,
+            partial_result: None,
+            result: None,
             output: String::new(),
             output_truncated: false,
             diff: None,
@@ -70,16 +86,17 @@ impl ToolBlock {
 #[derive(Debug, Clone)]
 pub enum Item {
     Message(Message),
-    Tool(ToolBlock),
+    Tool(Box<ToolBlock>),
     Failure(String),
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Transcript {
-    items: Vec<Item>,
+    items: Arc<Vec<Item>>,
     history_len: usize,
-    streaming: Option<String>,
+    streaming: Option<Arc<str>>,
     busy: bool,
+    optimistic_prompts: Vec<OptimisticPrompt>,
 }
 
 impl Transcript {
@@ -88,9 +105,10 @@ impl Transcript {
 
         Self {
             history_len: items.len(),
-            items,
+            items: Arc::new(items),
             streaming: None,
             busy: false,
+            optimistic_prompts: Vec::new(),
         }
     }
 
@@ -107,25 +125,45 @@ impl Transcript {
     }
 
     pub fn replace_history(&mut self, entries: &[Value]) {
-        self.items = items_from_entries(entries);
-        self.history_len = self.items.len();
+        let mut items = items_from_entries(entries);
+
+        reconcile_optimistic_prompts(&mut self.optimistic_prompts, &items);
+        self.history_len = items.len();
+        append_optimistic_prompts(&mut items, &self.optimistic_prompts);
+        self.items = Arc::new(items);
         self.streaming = None;
     }
 
     pub fn extend_history(&mut self, entries: &[Value]) {
-        self.items.truncate(self.history_len);
-        self.streaming = None;
+        let items = Arc::make_mut(&mut self.items);
 
-        extend_items(&mut self.items, entries);
-        self.history_len = self.items.len();
+        items.truncate(self.history_len);
+        extend_items(items, entries);
+        let added = items.get(self.history_len..).unwrap_or_default();
+
+        reconcile_optimistic_prompts(&mut self.optimistic_prompts, added);
+        self.history_len = items.len();
+        append_optimistic_prompts(items, &self.optimistic_prompts);
+        self.streaming = None;
     }
 
-    pub fn push_user_prompt(&mut self, text: String) {
-        self.items.push(Item::Message(Message {
+    pub(crate) fn push_user_prompt(&mut self, submission: SubmissionId, text: String) {
+        Arc::make_mut(&mut self.items).push(Item::Message(Message {
             role: Role::User,
-            text,
+            text: text.clone(),
+            submission: Some(submission),
         }));
+        self.optimistic_prompts
+            .push(OptimisticPrompt { submission, text });
         self.busy = true;
+    }
+
+    pub fn reconcile_streaming(&mut self, streaming: bool) {
+        self.busy = streaming;
+
+        if !streaming {
+            self.streaming = None;
+        }
     }
 
     pub fn end_turn(&mut self) {
@@ -133,9 +171,29 @@ impl Transcript {
         self.streaming = None;
     }
 
-    pub fn fail_turn(&mut self, detail: String) {
-        self.end_turn();
-        self.items.push(Item::Failure(detail));
+    pub(crate) fn fail_prompt(
+        &mut self,
+        submission: SubmissionId,
+        detail: String,
+        turn_was_busy: bool,
+    ) {
+        if let Some(index) = self
+            .optimistic_prompts
+            .iter()
+            .position(|pending| pending.submission == submission)
+        {
+            self.optimistic_prompts.remove(index);
+        }
+
+        Arc::make_mut(&mut self.items).retain(|item| {
+            !matches!(item, Item::Message(message) if message.submission == Some(submission))
+        });
+
+        if !turn_was_busy {
+            self.end_turn();
+        }
+
+        Arc::make_mut(&mut self.items).push(Item::Failure(detail));
     }
 
     pub fn apply(&mut self, event: &Value) -> bool {
@@ -143,8 +201,12 @@ impl Transcript {
             return false;
         };
 
+        if observes_active_turn(event_type) {
+            self.busy = true;
+        }
+
         match event_type {
-            "agent_start" => self.busy = true,
+            "agent_start" => {}
             "message_update" => self.apply_message_update(event),
             "message_end" => self.apply_message_end(event),
             "tool_execution_start" => self.apply_tool_start(event),
@@ -166,7 +228,7 @@ impl Transcript {
             let text = message_text(partial);
 
             if !text.is_empty() {
-                self.streaming = Some(text);
+                self.streaming = Some(Arc::from(text));
             }
 
             return;
@@ -184,9 +246,10 @@ impl Transcript {
             return;
         }
 
-        self.streaming
-            .get_or_insert_with(String::new)
-            .push_str(delta);
+        let mut text = self.streaming.as_deref().unwrap_or_default().to_string();
+
+        text.push_str(delta);
+        self.streaming = Some(Arc::from(text));
     }
 
     fn apply_message_end(&mut self, event: &Value) {
@@ -195,23 +258,70 @@ impl Transcript {
         let Some(message) = event.get("message") else {
             return;
         };
+        let role = message.get("role").and_then(Value::as_str);
+        let text = message_text(message);
 
-        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        if role == Some("user") {
+            self.apply_user_message_end(text);
+
             return;
         }
 
-        let text = message_text(message);
+        if role != Some("assistant") {
+            return;
+        }
+
+        let items = Arc::make_mut(&mut self.items);
 
         if !text.is_empty() {
-            self.items.push(Item::Message(Message {
+            items.push(Item::Message(Message {
                 role: Role::Assistant,
                 text,
+                submission: None,
             }));
         }
 
         if let Some(failure) = message_failure(message) {
-            self.items.push(Item::Failure(failure));
+            items.push(Item::Failure(failure));
         }
+    }
+
+    fn apply_user_message_end(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+
+        if let Some(index) = self
+            .optimistic_prompts
+            .iter()
+            .position(|pending| pending.text == text)
+        {
+            let pending = self.optimistic_prompts.remove(index);
+
+            if let Some(message) =
+                Arc::make_mut(&mut self.items)
+                    .iter_mut()
+                    .find_map(|item| match item {
+                        Item::Message(message)
+                            if message.submission == Some(pending.submission) =>
+                        {
+                            Some(message)
+                        }
+                        Item::Message(_) | Item::Tool(_) | Item::Failure(_) => None,
+                    })
+            {
+                message.submission = None;
+            }
+
+            return;
+        }
+
+        Arc::make_mut(&mut self.items).push(Item::Message(Message {
+            role: Role::User,
+            text,
+            submission: None,
+        }));
+        self.busy = true;
     }
 
     fn apply_tool_start(&mut self, event: &Value) {
@@ -219,11 +329,11 @@ impl Transcript {
             return;
         };
 
-        self.items.push(Item::Tool(ToolBlock::running(
+        Arc::make_mut(&mut self.items).push(Item::Tool(Box::new(ToolBlock::running(
             tool_call_id.to_string(),
             tool_name_or_fallback(event.get("toolName")),
             event.get("args").cloned().unwrap_or(Value::Null),
-        )));
+        ))));
     }
 
     fn apply_tool_update(&mut self, event: &Value) {
@@ -233,6 +343,7 @@ impl Transcript {
         let (output, truncated) = capped_content_text(partial_result);
 
         if let Some(block) = self.tool_block_for(event) {
+            block.partial_result = Some(partial_result.clone());
             block.output = output;
             block.output_truncated = truncated;
         }
@@ -252,8 +363,47 @@ impl Transcript {
     fn tool_block_for(&mut self, event: &Value) -> Option<&mut ToolBlock> {
         let tool_call_id = event.get("toolCallId").and_then(Value::as_str)?;
 
-        find_tool_block(&mut self.items, tool_call_id)
+        find_tool_block(Arc::make_mut(&mut self.items).as_mut_slice(), tool_call_id)
     }
+}
+
+fn observes_active_turn(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "agent_start"
+            | "message_update"
+            | "message_end"
+            | "tool_execution_start"
+            | "tool_execution_update"
+            | "tool_execution_end"
+    )
+}
+
+fn reconcile_optimistic_prompts(optimistic: &mut Vec<OptimisticPrompt>, items: &[Item]) {
+    for item in items {
+        let Item::Message(Message {
+            role: Role::User,
+            text,
+            ..
+        }) = item
+        else {
+            continue;
+        };
+
+        if let Some(index) = optimistic.iter().position(|pending| &pending.text == text) {
+            optimistic.remove(index);
+        }
+    }
+}
+
+fn append_optimistic_prompts(items: &mut Vec<Item>, optimistic: &[OptimisticPrompt]) {
+    items.extend(optimistic.iter().map(|pending| {
+        Item::Message(Message {
+            role: Role::User,
+            text: pending.text.clone(),
+            submission: Some(pending.submission),
+        })
+    }));
 }
 
 fn items_from_entries(entries: &[Value]) -> Vec<Item> {
@@ -295,7 +445,11 @@ fn push_message_items(items: &mut Vec<Item>, message: &Value, role: Role) {
     let text = message_text(message);
 
     if !text.is_empty() {
-        items.push(Item::Message(Message { role, text }));
+        items.push(Item::Message(Message {
+            role,
+            text,
+            submission: None,
+        }));
     }
 
     if role != Role::Assistant {
@@ -316,14 +470,14 @@ fn push_message_items(items: &mut Vec<Item>, message: &Value, role: Role) {
         }
 
         if let Some(tool_block) = tool_block_from_history(block) {
-            items.push(Item::Tool(tool_block));
+            items.push(Item::Tool(Box::new(tool_block)));
         }
     }
 }
 
 fn find_tool_block<'a>(items: &'a mut [Item], tool_call_id: &str) -> Option<&'a mut ToolBlock> {
     items.iter_mut().rev().find_map(|item| match item {
-        Item::Tool(block) if block.tool_call_id == tool_call_id => Some(block),
+        Item::Tool(block) if block.tool_call_id == tool_call_id => Some(block.as_mut()),
         _ => None,
     })
 }
@@ -353,6 +507,7 @@ fn finish_tool_block(tool_block: &mut ToolBlock, is_error: bool, result: Option<
         return;
     };
 
+    tool_block.result = Some(result.clone());
     (tool_block.output, tool_block.output_truncated) = capped_content_text(result);
     tool_block.diff = extract_diff(result);
 }
@@ -483,7 +638,7 @@ mod tests {
             .items()
             .iter()
             .filter_map(|item| match item {
-                Item::Tool(block) => Some(block),
+                Item::Tool(block) => Some(block.as_ref()),
                 Item::Message(_) | Item::Failure(_) => None,
             })
             .collect()
@@ -526,6 +681,72 @@ mod tests {
             "stopReason": "error",
             "errorMessage": reason,
         })
+    }
+
+    #[test]
+    fn another_clients_live_user_message_is_rendered() {
+        let mut transcript = Transcript::default();
+
+        transcript.apply(&json!({
+            "type": "message_end",
+            "message": {"role": "user", "content": "from mobile"}
+        }));
+
+        assert_eq!(message_texts(&transcript), ["from mobile"]);
+        assert!(transcript.is_busy());
+    }
+
+    #[test]
+    fn an_optimistic_prompt_is_not_duplicated_by_its_live_user_message() {
+        let mut transcript = Transcript::default();
+
+        transcript.push_user_prompt(SubmissionId(1), "same".to_string());
+        transcript.apply(&json!({
+            "type": "message_end",
+            "message": {"role": "user", "content": "same"}
+        }));
+
+        assert_eq!(message_texts(&transcript), ["same"]);
+    }
+
+    #[test]
+    fn authoritative_history_reconciles_an_optimistic_prompt_once() {
+        let mut transcript = Transcript::default();
+
+        transcript.push_user_prompt(SubmissionId(1), "same".to_string());
+        transcript.replace_history(&[user_entry("same")]);
+
+        assert_eq!(message_texts(&transcript), ["same"]);
+    }
+
+    #[test]
+    fn rejecting_the_second_identical_prompt_removes_only_its_submission() {
+        let mut transcript = Transcript::default();
+
+        transcript.push_user_prompt(SubmissionId(1), "same".to_string());
+        transcript.push_user_prompt(SubmissionId(2), "same".to_string());
+        transcript.fail_prompt(SubmissionId(2), "rejected".to_string(), true);
+
+        assert_eq!(message_texts(&transcript), ["same"]);
+        assert_eq!(failures(&transcript), ["rejected"]);
+    }
+
+    #[test]
+    fn identical_external_and_local_echoes_converge_with_authoritative_history() {
+        let mut transcript = Transcript::default();
+
+        transcript.push_user_prompt(SubmissionId(1), "same".to_string());
+        transcript.apply(&json!({
+            "type": "message_end",
+            "message": {"role": "user", "content": "same"}
+        }));
+        transcript.apply(&json!({
+            "type": "message_end",
+            "message": {"role": "user", "content": "same"}
+        }));
+        transcript.replace_history(&[user_entry("same"), user_entry("same")]);
+
+        assert_eq!(message_texts(&transcript), ["same", "same"]);
     }
 
     #[test]
@@ -691,7 +912,7 @@ mod tests {
         assert_eq!(transcript.streaming(), None);
         assert!(matches!(
             transcript.items(),
-            [Item::Message(Message { role: Role::Assistant, text })] if text == "the whole answer"
+            [Item::Message(Message { role: Role::Assistant, text, .. })] if text == "the whole answer"
         ));
     }
 
@@ -713,7 +934,7 @@ mod tests {
         assert!(transcript.is_busy(), "the turn ends at agent_settled");
         assert!(matches!(
             transcript.items(),
-            [Item::Message(Message { role: Role::Assistant, text })] if text == "the whole answer"
+            [Item::Message(Message { role: Role::Assistant, text, .. })] if text == "the whole answer"
         ));
     }
 
@@ -819,7 +1040,7 @@ mod tests {
     fn a_resync_replaces_every_item_but_not_the_running_turn() {
         let mut transcript = Transcript::default();
 
-        transcript.push_user_prompt("first".to_string());
+        transcript.push_user_prompt(SubmissionId(1), "first".to_string());
         transcript.apply(&json!({
             "type": "message_update",
             "assistantMessageEvent": { "partial": { "content": text_content("half an ans") } },
@@ -839,12 +1060,12 @@ mod tests {
     fn a_prompt_is_rendered_before_pi_says_anything() {
         let mut transcript = Transcript::default();
 
-        transcript.push_user_prompt("fix the tests".to_string());
+        transcript.push_user_prompt(SubmissionId(1), "fix the tests".to_string());
 
         assert!(transcript.is_busy());
         assert!(matches!(
             transcript.items(),
-            [Item::Message(Message { role: Role::User, text })] if text == "fix the tests"
+            [Item::Message(Message { role: Role::User, text, .. })] if text == "fix the tests"
         ));
     }
 
@@ -1016,6 +1237,34 @@ mod tests {
         assert_eq!(blocks.len(), 1, "the call is one block, not two");
         assert!(matches!(blocks[0].status, ToolStatus::Ok));
         assert_eq!(blocks[0].output, "a\nb");
+    }
+
+    #[test]
+    fn rejected_steering_prompt_preserves_the_turn_already_in_progress() {
+        let mut transcript = Transcript::default();
+
+        transcript.apply(&json!({
+            "type": "message_update",
+            "assistantMessageEvent": {"type": "text_delta", "delta": "working"}
+        }));
+        transcript.push_user_prompt(SubmissionId(1), "steer".to_string());
+        transcript.fail_prompt(SubmissionId(1), "rejected".to_string(), true);
+
+        assert!(transcript.is_busy());
+        assert_eq!(transcript.streaming(), Some("working"));
+    }
+
+    #[test]
+    fn a_mid_turn_message_observed_without_agent_start_is_busy() {
+        let mut transcript = Transcript::default();
+
+        transcript.apply(&json!({
+            "type": "message_update",
+            "assistantMessageEvent": {"type": "text_delta", "delta": "continuing"}
+        }));
+
+        assert!(transcript.is_busy());
+        assert_eq!(transcript.streaming(), Some("continuing"));
     }
 
     #[test]

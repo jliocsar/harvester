@@ -5,11 +5,10 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::bridge::{self, BridgeHandle};
 use crate::host::{Host, SshTarget};
+use crate::identity::LOCAL_MACHINE;
 use crate::machines::{self, MachineRow};
 use crate::provider::MachineKey;
 use crate::{Error, Result};
-
-pub const LOCAL_MACHINE: &str = "local";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MachineRef {
@@ -32,8 +31,14 @@ impl MachineRef {
 }
 
 enum Machine {
-    Probed { reachable: bool },
-    Linked { bridge: BridgeHandle, link: Link },
+    Probed {
+        reachable: bool,
+    },
+    Linked {
+        bridge: BridgeHandle,
+        generation: u64,
+        link: Link,
+    },
 }
 
 enum Link {
@@ -65,8 +70,8 @@ impl Machine {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum MachineState<'a> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MachineState<'a> {
     Missing,
     Unknown,
     Reachable,
@@ -78,43 +83,38 @@ pub enum MachineState<'a> {
 }
 
 impl MachineState<'_> {
-    pub const fn is_live(&self) -> bool {
+    pub(crate) const fn is_live(&self) -> bool {
         matches!(self, MachineState::Connecting | MachineState::Connected)
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MachineCandidate {
-    pub key: String,
-    pub label: String,
+pub(crate) struct FleetEvents {
+    pub(crate) bridges: BridgeEvents,
+    pub(crate) machines: MachinesEvents,
 }
 
-pub struct FleetEvents {
-    pub bridges: BridgeEvents,
-    pub machines: Option<MachinesEvents>,
-}
+pub(crate) struct Unapplied<T>(T);
 
-pub struct Unapplied<T>(T);
-
-pub struct BridgeEvents(UnboundedReceiver<(String, bridge::Event)>);
+pub(crate) struct BridgeEvents(UnboundedReceiver<(String, u64, bridge::Event)>);
 
 impl BridgeEvents {
-    pub async fn next(&mut self) -> Option<Unapplied<(String, bridge::Event)>> {
+    pub(crate) async fn next(&mut self) -> Option<Unapplied<(String, u64, bridge::Event)>> {
         self.0.recv().await.map(Unapplied)
     }
 }
 
-pub struct MachinesEvents(UnboundedReceiver<machines::Event>);
+pub(crate) struct MachinesEvents(UnboundedReceiver<machines::Event>);
 
 impl MachinesEvents {
-    pub async fn next(&mut self) -> Option<Unapplied<machines::Event>> {
+    pub(crate) async fn next(&mut self) -> Option<Unapplied<machines::Event>> {
         self.0.recv().await.map(Unapplied)
     }
 }
 
-pub struct Fleet {
+pub(crate) struct Fleet {
     daemon_binary: Arc<Vec<u8>>,
-    bridge_events: UnboundedSender<(String, bridge::Event)>,
+    bridge_events: UnboundedSender<(String, u64, bridge::Event)>,
+    bridge_generations: HashMap<String, u64>,
     machines: HashMap<String, Machine>,
     provider_rows: Vec<MachineRow>,
     listed_providers: HashSet<String>,
@@ -123,38 +123,44 @@ pub struct Fleet {
 }
 
 impl Fleet {
-    pub fn start(daemon_binary: Vec<u8>) -> (Self, FleetEvents) {
-        let (bridge_sender, bridge_receiver) = unbounded_channel();
-        let worker = match machines::start() {
-            Ok(worker) => Some(worker),
-            Err(error) => {
-                eprintln!("fleet: start machines worker: {error}");
+    #[cfg(test)]
+    pub(crate) fn inert() -> Self {
+        let (bridge_events, _events) = unbounded_channel();
 
-                None
-            }
-        };
-        let (host_commands, machine_events) = match worker {
-            Some(worker) => (Some(worker.commands), Some(worker.events)),
-            None => (None, None),
-        };
-        let fleet = Self {
-            daemon_binary: Arc::new(daemon_binary),
-            bridge_events: bridge_sender,
+        Self {
+            daemon_binary: Arc::new(Vec::new()),
+            bridge_events,
+            bridge_generations: HashMap::new(),
             machines: HashMap::new(),
             provider_rows: Vec::new(),
             listed_providers: HashSet::new(),
-            host_commands,
+            host_commands: None,
+            tracked: Vec::new(),
+        }
+    }
+
+    pub(crate) fn start(daemon_binary: Vec<u8>) -> (Self, FleetEvents) {
+        let (bridge_sender, bridge_receiver) = unbounded_channel();
+        let worker = machines::start();
+        let fleet = Self {
+            daemon_binary: Arc::new(daemon_binary),
+            bridge_events: bridge_sender,
+            bridge_generations: HashMap::new(),
+            machines: HashMap::new(),
+            provider_rows: Vec::new(),
+            listed_providers: HashSet::new(),
+            host_commands: Some(worker.commands),
             tracked: Vec::new(),
         };
         let events = FleetEvents {
             bridges: BridgeEvents(bridge_receiver),
-            machines: machine_events.map(MachinesEvents),
+            machines: MachinesEvents(worker.events),
         };
 
         (fleet, events)
     }
 
-    pub fn track_machines(&mut self, machines: Vec<String>) {
+    pub(crate) fn track_machines(&mut self, machines: Vec<String>) {
         let mut tracked = machines;
 
         tracked.sort();
@@ -186,6 +192,10 @@ impl Fleet {
     }
 
     fn auto_connect_tracked(&mut self) {
+        if self.host_commands.is_none() {
+            return;
+        }
+
         for machine in self.connectable_tracked_machines() {
             if let Err(error) = self.ensure_connection(&machine) {
                 eprintln!("fleet: auto-connect {machine}: {error}");
@@ -202,7 +212,11 @@ impl Fleet {
             .collect()
     }
 
-    pub fn ensure_connection(&mut self, machine: &str) -> Result<()> {
+    pub(crate) fn ensure_connection(&mut self, machine: &str) -> Result<()> {
+        if self.host_commands.is_none() {
+            return Err(Error::HostWorkerMissing);
+        }
+
         match self.connect_decision(machine)? {
             ConnectDecision::Reuse => Ok(()),
             ConnectDecision::Spawn(host) => self.spawn_bridge(machine, host),
@@ -218,21 +232,28 @@ impl Fleet {
     }
 
     fn spawn_bridge(&mut self, machine: &str, host: Host) -> Result<()> {
-        let started = bridge::start(
+        let generation = self
+            .bridge_generations
+            .entry(machine.to_string())
+            .or_insert(0);
+
+        *generation = generation
+            .checked_add(1)
+            .expect("bridge generation exhausted");
+        let generation = *generation;
+        let handle = bridge::start(
             machine.to_string(),
+            generation,
             host,
             self.daemon_binary.clone(),
             self.bridge_events.clone(),
         );
-        let handle = started.map_err(|error| Error::BridgeStart {
-            machine: machine.to_string(),
-            detail: error.to_string(),
-        })?;
 
         self.machines.insert(
             machine.to_string(),
             Machine::Linked {
                 bridge: handle,
+                generation,
                 link: Link::Connecting,
             },
         );
@@ -240,19 +261,22 @@ impl Fleet {
         Ok(())
     }
 
-    pub fn send(&self, machine: &str, command: bridge::Command) {
+    pub(crate) fn send(
+        &self,
+        machine: &str,
+        command: bridge::Command,
+    ) -> std::result::Result<(), String> {
         let Some(Machine::Linked { bridge, .. }) = self.machines.get(machine) else {
-            eprintln!("fleet: dropping a command for {machine}, which has no bridge");
-
-            return;
+            return Err(format!("machine {machine} has no bridge"));
         };
 
-        if bridge.commands.send(command).is_err() {
-            eprintln!("fleet: dropping a command for {machine}: its bridge thread has stopped");
-        }
+        bridge
+            .commands
+            .send(command)
+            .map_err(|_| format!("machine {machine} bridge has stopped"))
     }
 
-    pub fn send_host_command(&self, command: machines::Command) -> Result<()> {
+    pub(crate) fn send_host_command(&self, command: machines::Command) -> Result<()> {
         let Some(commands) = &self.host_commands else {
             return Err(Error::HostWorkerMissing);
         };
@@ -264,18 +288,32 @@ impl Fleet {
         Ok(())
     }
 
-    pub fn observe_bridge_event(
+    pub(crate) fn observe_bridge_event(
         &mut self,
-        event: Unapplied<(String, bridge::Event)>,
-    ) -> (String, bridge::Event) {
-        let Unapplied((machine, event)) = event;
+        event: Unapplied<(String, u64, bridge::Event)>,
+    ) -> Option<(String, bridge::Event)> {
+        let Unapplied((machine, generation, event)) = event;
+        let current = matches!(
+            self.machines.get(&machine),
+            Some(Machine::Linked {
+                generation: current,
+                ..
+            }) if *current == generation
+        );
+
+        if !current {
+            return None;
+        }
 
         self.record_bridge_event(&machine, &event);
 
-        (machine, event)
+        Some((machine, event))
     }
 
-    pub fn observe_machines_event(&mut self, event: Unapplied<machines::Event>) -> machines::Event {
+    pub(crate) fn observe_machines_event(
+        &mut self,
+        event: Unapplied<machines::Event>,
+    ) -> machines::Event {
         let Unapplied(event) = event;
 
         self.record_machines_event(&event);
@@ -342,7 +380,7 @@ impl Fleet {
         }
     }
 
-    pub fn state(&self, machine: &str) -> MachineState<'_> {
+    pub(crate) fn state(&self, machine: &str) -> MachineState<'_> {
         let state = self
             .machines
             .get(machine)
@@ -364,7 +402,7 @@ impl Fleet {
         self.listed_providers.contains(&key.provider) && self.provider_row(machine).is_none()
     }
 
-    pub fn missing_tracked_machines(&self) -> Vec<String> {
+    pub(crate) fn missing_tracked_machines(&self) -> Vec<String> {
         self.tracked
             .iter()
             .filter(|machine| self.is_missing(machine))
@@ -376,14 +414,18 @@ impl Fleet {
         matches!(self.machines.get(machine), Some(Machine::Linked { .. }))
     }
 
-    pub fn host_for(&self, machine: &str) -> Result<Host> {
+    pub(crate) fn host_for(&self, machine: &str) -> Result<Host> {
         let host = match MachineRef::parse(machine) {
             MachineRef::Local => Some(Host::Local),
             MachineRef::Provider(_) => self
                 .provider_row(machine)
                 .and_then(|row| row.target.clone())
                 .map(Host::Ssh),
-            MachineRef::AdHoc(dest) => Some(Host::Ssh(SshTarget { dest, port: None })),
+            MachineRef::AdHoc(dest) => Some(Host::Ssh(SshTarget {
+                dest,
+                port: None,
+                options: Vec::new(),
+            })),
         };
 
         host.ok_or_else(|| Error::NotConnectable {
@@ -391,7 +433,7 @@ impl Fleet {
         })
     }
 
-    pub fn label(&self, machine: &str) -> String {
+    pub(crate) fn label(&self, machine: &str) -> String {
         match MachineRef::parse(machine) {
             MachineRef::Provider(key) => self
                 .provider_row(machine)
@@ -405,11 +447,11 @@ impl Fleet {
         self.provider_rows.iter().find(|row| row.key == machine)
     }
 
-    pub fn provider_machines(&self) -> &[MachineRow] {
+    pub(crate) fn provider_machines(&self) -> &[MachineRow] {
         &self.provider_rows
     }
 
-    pub fn ad_hoc_machines(&self) -> Vec<String> {
+    pub(crate) fn ad_hoc_machines(&self) -> Vec<String> {
         self.tracked
             .iter()
             .filter_map(|machine| match MachineRef::parse(machine) {
@@ -417,40 +459,6 @@ impl Fleet {
                 MachineRef::AdHoc(dest) => Some(dest),
             })
             .collect()
-    }
-
-    pub fn machine_candidates(&self) -> Vec<MachineCandidate> {
-        std::iter::once(LOCAL_MACHINE.to_string())
-            .chain(self.provider_rows.iter().map(|row| row.key.clone()))
-            .chain(self.ad_hoc_machines())
-            .filter(|machine| self.host_for(machine).is_ok())
-            .map(|machine| MachineCandidate {
-                label: self.label(&machine),
-                key: machine,
-            })
-            .collect()
-    }
-
-    pub fn linked_machine_count(&self) -> usize {
-        self.machines
-            .values()
-            .filter(|machine| matches!(machine, Machine::Linked { .. }))
-            .count()
-    }
-
-    pub fn connected_machine_count(&self) -> usize {
-        self.machines
-            .values()
-            .filter(|machine| {
-                matches!(
-                    machine,
-                    Machine::Linked {
-                        link: Link::Connected,
-                        ..
-                    }
-                )
-            })
-            .count()
     }
 }
 
@@ -465,17 +473,7 @@ mod tests {
     use super::*;
 
     fn fleet() -> Fleet {
-        let (bridge_events, _events) = unbounded_channel();
-
-        Fleet {
-            daemon_binary: Arc::new(Vec::new()),
-            bridge_events,
-            machines: HashMap::new(),
-            provider_rows: Vec::new(),
-            listed_providers: HashSet::new(),
-            host_commands: None,
-            tracked: Vec::new(),
-        }
+        Fleet::inert()
     }
 
     fn list(fleet: &mut Fleet, rows: &[MachineRow]) {
@@ -494,6 +492,7 @@ mod tests {
             target: target.map(|dest| SshTarget {
                 dest: dest.to_string(),
                 port: None,
+                options: Vec::new(),
             }),
         }
     }
@@ -505,6 +504,7 @@ mod tests {
                 bridge: BridgeHandle {
                     commands: unbounded_channel().0,
                 },
+                generation: 1,
                 link,
             },
         );
@@ -583,8 +583,13 @@ mod tests {
 
         with_link(&mut fleet, "vm", Link::Connecting);
 
-        let (machine, event) =
-            fleet.observe_bridge_event(Unapplied(("vm".to_string(), bridge::Event::Disconnected)));
+        let (machine, event) = fleet
+            .observe_bridge_event(Unapplied((
+                "vm".to_string(),
+                1,
+                bridge::Event::Disconnected,
+            )))
+            .expect("current bridge event");
 
         assert_eq!(machine, "vm");
         assert!(
@@ -595,14 +600,37 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_bridge_generation_cannot_overwrite_its_replacement() {
+        let mut fleet = fleet();
+
+        with_link(&mut fleet, "vm", Link::Connected);
+
+        if let Some(Machine::Linked { generation, .. }) = fleet.machines.get_mut("vm") {
+            *generation = 2;
+        }
+
+        let ignored = fleet.observe_bridge_event(Unapplied((
+            "vm".to_string(),
+            1,
+            bridge::Event::Disconnected,
+        )));
+
+        assert!(ignored.is_none());
+        assert!(matches!(fleet.state("vm"), MachineState::Connected));
+    }
+
+    #[test]
     fn session_traffic_does_not_touch_the_link() {
         let mut fleet = fleet();
 
         with_link(&mut fleet, "vm", Link::Connecting);
         fleet.record_bridge_event(
             "vm",
-            &bridge::Event::RequestFailed {
-                detail: "attach: no such session".to_string(),
+            &bridge::Event::OperationFailed {
+                sid: Some("sid".to_string()),
+                generation: Some(1),
+                operation: bridge::Operation::Attach,
+                detail: "no such session".to_string(),
             },
         );
 
@@ -804,7 +832,7 @@ mod tests {
         fleet.forget_unknown_machines();
 
         assert_eq!(
-            fleet.linked_machine_count(),
+            fleet.machines.len(),
             2,
             "tracked and listed are both still known"
         );
@@ -813,41 +841,8 @@ mod tests {
         fleet.provider_rows = Vec::new();
         fleet.forget_unknown_machines();
 
-        assert_eq!(fleet.linked_machine_count(), 0);
+        assert!(fleet.machines.is_empty());
         assert!(matches!(fleet.state("exedev@vm"), MachineState::Unknown));
-    }
-
-    #[test]
-    fn candidates_are_local_plus_resolvable_machines() {
-        let mut fleet = fleet();
-
-        list(
-            &mut fleet,
-            &[
-                provider_row("exe-dev/bloggy", Some("exedev@bloggy")),
-                provider_row("exe-dev/legacy", None),
-            ],
-        );
-        fleet.track_machines(vec!["exedev@vm".to_string()]);
-
-        assert_eq!(
-            fleet.machine_candidates(),
-            vec![
-                MachineCandidate {
-                    key: LOCAL_MACHINE.to_string(),
-                    label: LOCAL_MACHINE.to_string(),
-                },
-                MachineCandidate {
-                    key: "exe-dev/bloggy".to_string(),
-                    label: "exe-dev/bloggy label".to_string(),
-                },
-                MachineCandidate {
-                    key: "exedev@vm".to_string(),
-                    label: "exedev@vm".to_string(),
-                },
-            ],
-            "a provider machine with no target cannot host a workspace"
-        );
     }
 
     #[test]
@@ -901,7 +896,7 @@ mod tests {
 
         assert!(matches!(
             fleet.state("exe-dev/gone"),
-            MachineState::Connected { .. }
+            MachineState::Connected
         ));
     }
 
@@ -955,11 +950,25 @@ mod tests {
         with_link(&mut fleet, "connecting", Link::Connecting);
         with_link(&mut fleet, "connected", Link::Connected);
 
-        assert_eq!(fleet.connected_machine_count(), 1);
+        let connected = fleet
+            .machines
+            .values()
+            .filter(|machine| {
+                matches!(
+                    machine,
+                    Machine::Linked {
+                        link: Link::Connected,
+                        ..
+                    }
+                )
+            })
+            .count();
+
+        assert_eq!(connected, 1);
         assert_eq!(
-            fleet.linked_machine_count(),
-            2,
-            "a probe is not a connection attempt"
+            fleet.machines.len(),
+            3,
+            "the probe remains tracked but is not linked"
         );
     }
 

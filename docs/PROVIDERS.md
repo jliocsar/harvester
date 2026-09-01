@@ -93,10 +93,22 @@ No stdin args.
 - `ssh` (required): **one of two forms** —
 
   ```json
-  {"host": "bloggy.exe.xyz", "user": "exedev", "port": 22}
+  {"host": "bloggy.exe.xyz", "user": "exedev", "port": 22, "options": ["ProxyCommand=corp-tunnel %h"]}
   ```
 
-  `user`/`port` optional (defaults: current user, 22). Or the escape hatch:
+  `user`/`port` optional (defaults: current user, 22). `options` (optional) is a list of ssh
+  config settings, each passed as one `-o` argument, in order, for platforms whose machines are
+  reached through something other than a routable host — a tunnel, a bastion, a vendor CLI's proxy
+  mode. Harvester appends them **after** its own base options, and ssh takes the first value it
+  obtains for a setting, so a provider can add a `ProxyCommand` or an `IdentityFile` but cannot
+  weaken `BatchMode`, `StrictHostKeyChecking` or the connection-sharing policy. Values are passed
+  to ssh verbatim and never through a shell; a provider is already a user-supplied executable, so
+  this grants it nothing it did not have.
+
+  This is the escape hatch that `argv` below was meant to be, at a fraction of the cost: a
+  `{host, user, port, options}` machine is an ordinary target, so it bootstraps, probes and
+  multiplexes like any other, whereas `argv` needs a second transport that none of that code has.
+  Or the escape hatch proper:
 
   ```json
   {"argv": ["fly", "ssh", "console", "-a", "myapp", "-C"]}
@@ -104,7 +116,7 @@ No stdin args.
 
   `argv` is a command producing a bidirectional byte stream to the machine's shell (ProxyCommand-style). This is what makes arbitrary platforms wireable without Harvester knowing about them.
 
-  **[NOT IMPLEMENTED]** — the client refuses to derive a target from `{argv}` today. Such machines still *list* (they appear in the sidebar, sourced and labelled) but carry no connection target: they never probe, never bootstrap a daemon, and their dot stays gray. Nothing warns the machine's author, so **a provider returning only `{argv}` machines ships a fleet that cannot connect**; return `{host, user, port}` for anything that must work now. Tracked as deferred in `SPEC.md` §Deferred.
+  **[NOT IMPLEMENTED]** — the client refuses to derive a target from `{argv}` today. Such machines still *list* (they appear in the sidebar, sourced and labelled) but carry no connection target: they never probe, never bootstrap a daemon, and their dot stays gray. Nothing warns the machine's author, so **a provider returning only `{argv}` machines ships a fleet that cannot connect**; return `{host, user, port}` for anything that must work now. Tracked as deferred in `SPEC.md` §Deferred, and now mostly superseded: `options` above wires a tunnelled platform through the transport that already exists, which is what `argv` was wanted for. `argv` stays in the contract for a platform that has no ssh at all.
 
 ### `create` — provision a machine
 

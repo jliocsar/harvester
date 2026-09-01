@@ -4,7 +4,7 @@ use gpui::{App, Entity, ScrollHandle, Window};
 use gpui_component::input::InputState;
 use harvester::ui::dialog::{create_multi_line_input, create_single_line_input};
 use harvester::ui::{create_prompt_input, TranscriptPresentation};
-use harvester_client_core::transcript::Transcript;
+use harvester_client_core::Transcript;
 use serde_json::Value;
 
 use crate::fixtures::{self, FixtureLibrary, TranscriptSource};

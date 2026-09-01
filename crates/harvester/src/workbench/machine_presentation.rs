@@ -1,4 +1,4 @@
-use harvester_client_core::MachineState;
+use harvester_client_core::MachineStatus;
 
 use crate::ui::Tone;
 
@@ -17,44 +17,44 @@ pub(super) struct MachinePresentation {
     pub statusbar_link: Option<String>,
 }
 
-pub(super) fn present_machine(state: MachineState<'_>, machine: &str) -> MachinePresentation {
+pub(super) fn present_machine(state: &MachineStatus, machine: &str) -> MachinePresentation {
     match state {
-        MachineState::Connecting => MachinePresentation {
+        MachineStatus::Connecting => MachinePresentation {
             tone: Tone::Pending,
             pane_message: Some(format!("{CONNECTING_PANE_MESSAGE_PREFIX}{machine}…")),
             statusbar_link: Some(CONNECTING_STATUSBAR_LINK.to_string()),
         },
-        MachineState::Connected => MachinePresentation {
+        MachineStatus::Connected => MachinePresentation {
             tone: Tone::Live,
             pane_message: Some(CONNECTED_PANE_MESSAGE.to_string()),
             statusbar_link: Some(machine.to_string()),
         },
-        MachineState::ConnectFailed { detail } => MachinePresentation {
+        MachineStatus::ConnectFailed(detail) => MachinePresentation {
             tone: Tone::Failed,
-            pane_message: Some(detail.to_string()),
+            pane_message: Some(detail.clone()),
             statusbar_link: Some(CONNECT_FAILED_STATUSBAR_LINK.to_string()),
         },
-        MachineState::ConnectionLost => MachinePresentation {
+        MachineStatus::ConnectionLost => MachinePresentation {
             tone: Tone::Failed,
             pane_message: Some(CONNECTION_LOST_MESSAGE.to_string()),
             statusbar_link: Some(CONNECTION_LOST_MESSAGE.to_string()),
         },
-        MachineState::Missing => MachinePresentation {
+        MachineStatus::Missing => MachinePresentation {
             tone: Tone::Failed,
             pane_message: Some(format!("{machine}{MISSING_MACHINE_PANE_MESSAGE_SUFFIX}")),
             statusbar_link: Some(MISSING_MACHINE_DETAIL.to_string()),
         },
-        MachineState::Unreachable => MachinePresentation {
+        MachineStatus::Unreachable => MachinePresentation {
             tone: Tone::Failed,
             pane_message: None,
             statusbar_link: None,
         },
-        MachineState::Reachable => MachinePresentation {
+        MachineStatus::Reachable => MachinePresentation {
             tone: Tone::Muted,
             pane_message: None,
             statusbar_link: None,
         },
-        MachineState::Unknown => MachinePresentation {
+        MachineStatus::Unknown => MachinePresentation {
             tone: Tone::Idle,
             pane_message: None,
             statusbar_link: None,
@@ -68,7 +68,7 @@ mod tests {
 
     #[test]
     fn unknown_is_an_absence_not_a_reachability_verdict() {
-        let presentation = present_machine(MachineState::Unknown, "vm");
+        let presentation = present_machine(&MachineStatus::Unknown, "vm");
 
         assert_eq!(presentation.tone, Tone::Idle);
         assert!(presentation.tone.is_hollow());
@@ -78,7 +78,7 @@ mod tests {
 
     #[test]
     fn missing_is_failed_and_names_the_provider_loss() {
-        let presentation = present_machine(MachineState::Missing, "provider/vm");
+        let presentation = present_machine(&MachineStatus::Missing, "provider/vm");
 
         assert_eq!(presentation.tone, Tone::Failed);
         assert_eq!(
@@ -93,7 +93,7 @@ mod tests {
 
     #[test]
     fn a_live_bridge_is_named_by_its_machine_alone() {
-        let presentation = present_machine(MachineState::Connected, "vm");
+        let presentation = present_machine(&MachineStatus::Connected, "vm");
 
         assert_eq!(presentation.tone, Tone::Live);
         assert_eq!(
@@ -105,8 +105,8 @@ mod tests {
 
     #[test]
     fn a_reachable_machine_is_a_verdict_and_an_unprobed_one_is_not() {
-        let reachable = present_machine(MachineState::Reachable, "vm");
-        let unknown = present_machine(MachineState::Unknown, "vm");
+        let reachable = present_machine(&MachineStatus::Reachable, "vm");
+        let unknown = present_machine(&MachineStatus::Unknown, "vm");
 
         assert_eq!(reachable.tone, Tone::Muted);
         assert!(!reachable.tone.is_hollow());
